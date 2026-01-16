@@ -13,6 +13,3 @@ FROM_EMAIL_PASSWORD = os.getenv("FROM_EMAIL_PASSWORD")
 
 REPORT_INTERVAL = 3600
 GEMINI_MODEL_ID = "gemini-3-pro-preview"# gemini-3-flash-preview
-DRY_RUN=True
-MIN_VOLUME_THRESHOLD = 50000  # $50k minimum volume
-MARGIN_OF_SAFETY = 0.15  # 15% margin of safety 

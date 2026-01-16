@@ -153,8 +153,9 @@ def get_btc_price():
     params = {"symbol":"BTCUSDT"}
     response = requests.get(url + endpoint,params=params)
     response.raise_for_status()
-    result = response.json()
-    return result.get("price", 0)
+    result = response.json().get("price", 0)
+    float_result = float(result)
+    return f"{float_result:,.2f}"
 
 
 if __name__ == "__main__":
@@ -181,7 +182,7 @@ if __name__ == "__main__":
         f.write(f"WARN_PRICE = {warn_prices}")
     print(f"{time_now} AI分析完成,开始发送邮件")
     
-    email_subject = f"{time_now} Polymarket持仓情况分析,当前BTC价格: {get_btc_price():,.2f}"
+    email_subject = f"{time_now} Polymarket持仓情况分析,当前BTC价格: {get_btc_price()}"
     email_content = generate_html_template(analyze_result)
     email_sender.send_html_email(TO_EMAIL, email_subject, email_content)
     print(f"{time_now} 邮件发送完成")
