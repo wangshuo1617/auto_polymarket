@@ -15,7 +15,7 @@ echo "=========================================="
 # 第一步：运行持仓分析脚本
 echo ""
 echo "步骤 1/2: 运行持仓分析脚本 (position_analyze.py)..."
-uv run position_analyze.py
+/root/.local/bin/uv run /root/auto_polymarket/position_analyze.py
 
 if [ $? -eq 0 ]; then
     echo "✓ 持仓分析脚本执行成功"
@@ -50,7 +50,7 @@ fi
 # 使用 nohup 在后台运行
 echo "正在启动新的 btc_price_watcher.py 进程（后台运行）..."
 LOG_FILE="btc_watcher.log"
-nohup uv run btc_price_watcher.py > "$LOG_FILE" 2>&1 &
+nohup /root/.local/bin/uv run /root/auto_polymarket/btc_price_watcher.py > "$LOG_FILE" 2>&1 &
 WATCHER_PID=$!
 
 # 等待一下确保进程启动成功

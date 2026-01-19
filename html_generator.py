@@ -75,6 +75,18 @@ def generate_alert_rows(items):
         """
     return rows
 
+def generate_market_snapshot(snapshot_text):
+    """生成市场快照部分的 HTML"""
+    if not snapshot_text:
+        return ""
+    
+    return f"""
+        <h2 style="color: #3b82f6; margin-top: 20px;">📈 市场与持仓快照 (Market Snapshot)</h2>
+        <div class="market-snapshot">
+            <div class="market-snapshot-content">{snapshot_text}</div>
+        </div>
+    """
+
 # --- 2. 主 HTML 模板 (使用 f-string) ---
 def generate_html_template(data):
     return f"""
@@ -179,11 +191,29 @@ def generate_html_template(data):
         .alert-price {{ font-weight: bold; font-size: 16px; }}
         .alert-action {{ font-size: 14px; color: var(--text-muted); max-width: 60%; text-align: right; }}
 
+        /* 市场快照样式 */
+        .market-snapshot {{
+            background: linear-gradient(135deg, rgba(16, 185, 129, 0.1) 0%, rgba(59, 130, 246, 0.1) 100%);
+            border: 1px solid rgba(59, 130, 246, 0.3);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 30px;
+            line-height: 1.8;
+        }}
+        .market-snapshot-content {{
+            color: var(--text-main);
+            font-size: 15px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }}
+
     </style>
 </head>
 <body>
     <div class="container">
         <h1>📊 Polymarket 仓位分析报告</h1>
+
+        {generate_market_snapshot(data.get("市场与持仓快照", ""))}
 
         <h2 style="color: var(--accent-green);">🛡️ 防守端分析 (Defensive)</h2>
         {generate_defensive_rows(data['防守端分析'])}
