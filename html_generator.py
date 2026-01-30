@@ -15,6 +15,7 @@ def generate_defensive_rows(items):
                 <div class="status-badge" style="background: {status_color}20; color: {status_color};">{item['状态']}</div>
             </div>
             <div class="card-body">
+                <div class="action-box" style="margin-bottom: 8px;">🧮 <strong>希腊值分析:</strong> {item.get('希腊值分析','')}</div>
                 <div class="action-box">👉 <strong>建议:</strong> {item['操作建议']}</div>
                 <div class="logic-text">{item['逻辑']}</div>
             </div>
@@ -31,9 +32,14 @@ def generate_offensive_rows(items):
         for key, val in ladders.items():
             # 定义不同阶梯的图标
             icon = "🛡️" if key == "安全阀" else ("🎯" if key == "目标位" else "🚀")
+            position_pct = val.get("仓位百分比")
+            position_pct_text = f"{position_pct}%" if position_pct is not None else ""
             ladder_html += f"""
             <div class="ladder-step">
-                <div class="step-price"><span class="step-icon">{icon}</span> {key}: <strong>{val['价格']}¢</strong></div>
+                <div class="step-price">
+                    <span class="step-icon">{icon}</span> {key}: <strong>{val['价格']}¢</strong>
+                    <span style="color: #94a3b8; font-weight: 500; margin-left: 8px;">仓位: {position_pct_text}</span>
+                </div>
                 <div class="step-logic">{val['逻辑']}</div>
             </div>
             """
@@ -45,6 +51,7 @@ def generate_offensive_rows(items):
                 <div class="status-badge" style="background: #f59e0b20; color: #f59e0b;">{item['状态']}</div>
             </div>
             <div class="card-body">
+                <div class="action-box" style="margin-bottom: 8px;">🧮 <strong>希腊值分析:</strong> {item.get('希腊值分析','')}</div>
                 <div class="action-box warning">👉 <strong>建议:</strong> {item['操作建议']}</div>
                 <div class="ladder-container">
                     {ladder_html}

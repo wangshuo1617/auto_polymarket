@@ -11,6 +11,7 @@ from config import TO_EMAIL,WALLET_ADDRESS
 from html_generator import generate_html_template
 from defiLlama import StablecoinMonitor
 from etf_data import ETFScraper
+from rsi_get import last_24h_rsi
 
 # 添加项目根目录到 sys.path，以便可以直接运行此文件
 project_root = Path(__file__).parent.parent
@@ -272,7 +273,36 @@ def get_market_sentiment_and_funding():
     else:
         ls_interpretation = f"多空比相对均衡 ({long_short_ratio:.2f})"
     
-    # 6. 获取ETF流入数据
+    # 6. 获取最近24小时 RSI 数据（4小时周期）
+    rsi_24h: list | None = None
+    rsi_interpretation: str = "N/A"
+    try:
+        rsi_24h = last_24h_rsi()
+        if rsi_24h is not None:
+            rsi_24h = [round(x, 2) if x == x else None for x in rsi_24h]  # 保留2位小数，NaN转None
+            valid_rsi = [x for x in rsi_24h if x is not None]
+            if valid_rsi:
+                latest_rsi = valid_rsi[-1]
+                if latest_rsi >= 70:
+                    rsi_interpretation = f"RSI {latest_rsi:.1f} 超买，注意回调风险"
+                elif latest_rsi >= 50:
+                    rsi_interpretation = f"RSI {latest_rsi:.1f} 偏多"
+                elif latest_rsi >= 30:
+                    rsi_interpretation = f"RSI {latest_rsi:.1f} 偏空"
+                else:
+                    rsi_interpretation = f"RSI {latest_rsi:.1f} 超卖，可能反弹机会"
+                if len(valid_rsi) >= 2:
+                    prev_rsi = valid_rsi[-2]
+                    if latest_rsi > prev_rsi + 2:
+                        rsi_interpretation += "；24h内RSI上升"
+                    elif latest_rsi < prev_rsi - 2:
+                        rsi_interpretation += "；24h内RSI下降"
+                    else:
+                        rsi_interpretation += "；24h内RSI震荡"
+    except Exception as e:
+        print(f"RSI获取失败: {e}")
+
+    # 7. 获取ETF流入数据
     etf_inflow_num = None
     scraper = ETFScraper()
     try:
@@ -294,7 +324,7 @@ def get_market_sentiment_and_funding():
         else:
             etf_net_inflow = f"${etf_inflow_num:.2f}"
     
-    # 7. 获取稳定币流动性（可选，如果需要的话）
+    # 8. 获取稳定币流动性（可选，如果需要的话）
     monitor = StablecoinMonitor()
     stablecoin_liquidity = monitor.get_macro_liquidity()
     stablecoin_mcap = stablecoin_liquidity.get("total_mcap_usd", 0) if stablecoin_liquidity else 0
@@ -327,7 +357,9 @@ def get_market_sentiment_and_funding():
                 "interpretation": fng_interpretation
             },
             "long_short_ratio": round(long_short_ratio, 2),
-            "ls_interpretation": ls_interpretation
+            "ls_interpretation": ls_interpretation,
+            "rsi_24h": rsi_24h,
+            "rsi_interpretation": rsi_interpretation,
         },
         "liquidity_data": {
             "funding_rate_pct": funding_rate_pct,
@@ -337,7 +369,7 @@ def get_market_sentiment_and_funding():
             "stablecoin_macro_liquidity": stablecoin_macro_liquidity
         }
     }
-    
+    print(result)
     # 保存当前结果供下次使用
     save_data = {
         "btc_current_price": current_price,
@@ -379,5 +411,7 @@ if __name__ == "__main__":
     
     email_subject = f"{time_now} Polymarket持仓情况分析,当前BTC价格: {get_btc_price():,.2f}"
     email_content = generate_html_template(analyze_result)
+    with open(f"output/{time_now}_email.html","w") as f:
+        f.write(email_content)
     email_sender.send_html_email(TO_EMAIL, email_subject, email_content)
     print(f"{time_now} 邮件发送完成")
