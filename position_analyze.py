@@ -309,6 +309,7 @@ def get_market_sentiment_and_funding():
         etf_data = scraper.get_etf_inflow()
         if etf_data:
             etf_inflow_num = etf_data.get("net_inflow_num")
+            print(f"ETF流入数据: {etf_inflow_num}")
     except Exception as e:
         print(f"ETF抓取失败: {e}")
     

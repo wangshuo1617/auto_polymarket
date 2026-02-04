@@ -21,6 +21,11 @@
 - 结合 BTC 4小时 K 线数据进行综合分析
 - 生成 HTML 格式的详细分析报告
 
+### 📅 月初建仓建议
+- 月初自动汇总宏观流动性与技术面数据
+- 生成新一月 BTC 价格预测市场的趋势判断与建仓方案
+- 通过邮件发送月初策略建议
+
 ### 📧 邮件通知
 - 支持 HTML 和纯文本邮件
 - 自动发送持仓分析报告
@@ -132,6 +137,12 @@ uv run position_analyze.py
 
 ```bash
 uv run btc_price_watcher.py
+```
+
+#### 运行月初建仓建议
+
+```bash
+uv run monthly_btc_strategy.py
 ```
 
 这会：

@@ -143,6 +143,76 @@ RESPONSE_SCHEMA = {
     "required": ["防守端分析", "进攻端分析", "预警信号"]
 }
 
+MONTHLY_STRATEGY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "月份趋势判断": {
+            "type": "string",
+            "description": "对新一月BTC整体趋势的判断（偏多/偏空/震荡），以及核心依据。"
+        },
+        "月内BTC变动区间": {
+            "type": "object",
+            "properties": {
+                "下限": {"type": "number", "description": "月内BTC价格区间下限"},
+                "上限": {"type": "number", "description": "月内BTC价格区间上限"},
+                "逻辑": {"type": "string", "description": "区间判断依据"}
+            },
+            "required": ["下限", "上限", "逻辑"]
+        },
+        "策略方案": {
+            "type": "object",
+            "properties": {
+                "总体建议": {"type": "string"},
+                "建仓方向": {"type": "string", "enum": ["偏多", "偏空", "震荡"]},
+                "仓位建议": {"type": "string"},
+                "分批建仓": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "触发条件": {"type": "string"},
+                            "建议价格区间": {"type": "string"},
+                            "仓位比例": {"type": "string"},
+                            "逻辑": {"type": "string"}
+                        },
+                        "required": ["触发条件", "建议价格区间", "仓位比例", "逻辑"]
+                    }
+                },
+                "风险控制": {"type": "array", "items": {"type": "string"}},
+                "关键观察指标": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["总体建议", "建仓方向", "仓位建议", "分批建仓", "风险控制", "关键观察指标"]
+        },
+        "风险提示": {"type": "array", "items": {"type": "string"}},
+        "参考数据摘要": {
+            "type": "object",
+            "properties": {
+                "btc现价": {"type": "number"},
+                "4h趋势": {"type": "string"},
+                "24h RSI": {"type": "string"},
+                "资金费率": {"type": "string"},
+                "OI": {"type": "string"},
+                "ETF净流入": {"type": "string"},
+                "稳定币流动性": {"type": "string"},
+                "恐惧贪婪": {"type": "string"},
+                "多空比": {"type": "string"}
+            },
+            "required": [
+                "btc现价",
+                "4h趋势",
+                "24h RSI",
+                "资金费率",
+                "OI",
+                "ETF净流入",
+                "稳定币流动性",
+                "恐惧贪婪",
+                "多空比"
+            ]
+        }
+    },
+    "required": ["月份趋势判断", "月内BTC变动区间", "策略方案", "风险提示", "参考数据摘要"]
+}
+
 
 SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 你是一名资深的加密货币衍生品交易员和预测市场（Prediction Market）专家。你精通二元期权（Binary Options）的定价模型、Theta衰减特性、Delta对冲策略，并对Polymarket的流动性陷阱有深刻理解。
@@ -168,7 +238,7 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 
 ## Step 1: 市场环境与定价偏差 (Market Context)
 * 分析 K 线趋势：BTC 是处于上升/下降通道还是震荡？
-* **趋势判断**: 结合 K 线和 资金面。判断当前是"下跌中继"、"底部反转"还是"崩盘开始"？
+* **趋势判断**: 结合 K 线和 资金面。判断当前是"下跌中继"、"底部反转"还是"崩盘开始"？K线是放量下跌，缩量下跌，放量上涨，缩量上涨还是其他情况？
 * **波动率测算**: 基于 K 线的高低点，估算 BTC 未来的潜在波动范围。它是否有能力会在月内波动 10% 以上？
 * **定价偏差检查**：计算当前合约价格隐含的概率（例如 30¢ = 30%）与基于 K 线技术面判断的概率是否存在显著偏差？
     * *Edge Case*: 如果 BTC 价格只差 1% 就要触发 Strike Price，但合约价格只有 40¢，这是低估还是因为时间不够了？
@@ -186,6 +256,23 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
     * **阶梯挂单 (Laddering)**：不要单点止盈。根据 BTC 的阻力位/支撑位，反推合约价格，给出 3 档挂单建议。
 """
 
+MONTHLY_SYSTEM_INSTRUCTION_TEMPLATE = """# Role
+你是一名资深的加密货币策略分析师和预测市场（Prediction Market）交易员，擅长将宏观与技术面信号转化为可执行的月度建仓方案。
+
+# Goal
+根据【BTC价格趋势与K线】、【资金面与情绪数据】和【宏观流动性】为“新一月 Polymarket BTC 价格预测市场”制定建仓建议。
+输出明确的趋势判断、月内价格上下限区间、分批建仓方案和风险控制要点。
+
+# Context
+* 当前时间：{current_date}
+* 目标月份：{target_month}
+
+# Output Constraints
+* 输出必须严格符合 JSON Schema。
+* 使用简明、可执行、可复用的策略语言。
+* 不要包含与实际交易执行无关的内容。
+"""
+
 
 USER_PROMPT_TEMPLATE = """
 以下是当前要分析的具体信息：
@@ -193,6 +280,16 @@ USER_PROMPT_TEMPLATE = """
 Polymarket持仓情况和挂单情况: {polymarket_status}
 比特币过去24小时4h K线数据: {btc_4h_k_data}
 市场情绪与资金面: {market_sentiment_and_funding}
+"""
+
+MONTHLY_USER_PROMPT_TEMPLATE = """
+以下是月初建仓建议所需的输入数据：
+
+BTC 4h K线数据: {btc_4h_k_data}
+市场情绪与资金面: {market_sentiment_and_funding}
+衍生摘要: {derived_summary}
+
+请生成新一月 Polymarket BTC 价格预测市场的趋势判断与建仓方案。
 """
 
 
@@ -211,4 +308,23 @@ def get_user_prompt(
         polymarket_status=polymarket_status,
         btc_4h_k_data=btc_4h_k_data,
         market_sentiment_and_funding=market_sentiment_and_funding,
+    )
+
+
+def get_monthly_system_instruction(current_date: str, target_month: str) -> str:
+    return MONTHLY_SYSTEM_INSTRUCTION_TEMPLATE.format(
+        current_date=current_date,
+        target_month=target_month,
+    )
+
+
+def get_monthly_user_prompt(
+    btc_4h_k_data: list,
+    market_sentiment_and_funding: dict,
+    derived_summary: dict,
+) -> str:
+    return MONTHLY_USER_PROMPT_TEMPLATE.format(
+        btc_4h_k_data=btc_4h_k_data,
+        market_sentiment_and_funding=market_sentiment_and_funding,
+        derived_summary=derived_summary,
     )

@@ -22,6 +22,9 @@ from gemini_prompts import (
     RESPONSE_SCHEMA,
     get_system_instruction,
     get_user_prompt,
+    MONTHLY_STRATEGY_SCHEMA,
+    get_monthly_system_instruction,
+    get_monthly_user_prompt,
 )
 
 
@@ -117,5 +120,62 @@ def analyze_market_with_grounding(
         
         return result
         
+    except Exception as e:
+        raise Exception(f"Error calling Gemini API: {str(e)}") from e
+
+
+def analyze_monthly_strategy_with_grounding(
+    btc_4h_k_data: list,
+    market_sentiment_and_funding: dict,
+    derived_summary: dict,
+    target_month: str,
+) -> Dict[str, Any]:
+    """
+    Analyze month-start strategy for Polymarket BTC monthly market.
+    """
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    client = _get_client()
+    model = GEMINI_MODEL_ID
+
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+
+    config = types.GenerateContentConfig(
+        system_instruction=get_monthly_system_instruction(current_date, target_month),
+        tools=[grounding_tool],
+        response_schema=MONTHLY_STRATEGY_SCHEMA,
+        temperature=0.6,
+    )
+
+    user_prompt = get_monthly_user_prompt(
+        btc_4h_k_data,
+        market_sentiment_and_funding,
+        derived_summary,
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config=config,
+        )
+
+        response_text = response.text
+
+        try:
+            result = json.loads(response_text)
+        except json.JSONDecodeError:
+            if "```json" in response_text:
+                json_start = response_text.find("```json") + 7
+                json_end = response_text.find("```", json_start)
+                response_text = response_text[json_start:json_end].strip()
+            elif "```" in response_text:
+                json_start = response_text.find("```") + 3
+                json_end = response_text.find("```", json_start)
+                response_text = response_text[json_start:json_end].strip()
+
+            result = json.loads(response_text)
+
+        return result
+
     except Exception as e:
         raise Exception(f"Error calling Gemini API: {str(e)}") from e
