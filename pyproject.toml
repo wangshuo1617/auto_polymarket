@@ -5,7 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "dotenv>=0.9.9",
+    "python-dotenv>=0.9.9",
+    "requests>=2.28.0",
     "google-genai>=0.2.0",
     "pandas>=2.3.3",
     "playwright>=1.57.0",

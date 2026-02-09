@@ -41,15 +41,28 @@
 
 ```
 auto_polymarket/
-├── position_analyze.py      # 持仓分析主程序
-├── btc_price_watcher.py     # BTC 价格监控服务
-├── order_func.py            # Polymarket 订单操作
-├── gemini_researcher.py     # Gemini AI 市场研究
-├── email_alert.py           # 邮件发送服务
-├── html_generator.py        # HTML 报告生成器
+├── position_analyze.py      # 持仓分析主程序（入口）
+├── btc_price_watcher.py     # BTC 价格监控服务（入口）
+├── monthly_btc_strategy.py  # 月初建仓建议（入口）
 ├── config.py                # 配置文件
 ├── price_warn_config.py     # 价格预警配置（自动生成）
 ├── auto_polymarket.sh       # 自动化执行脚本
+├── data/                    # 数据源层
+│   ├── polymarket.py        # Polymarket 持仓与订单
+│   ├── binance.py           # Binance 现货与衍生品
+│   ├── etf.py               # SoSoValue ETF 流入
+│   ├── rsi.py               # RSI 指标
+│   └── defillama.py         # DefiLlama 稳定币流动性
+├── services/                # 业务逻辑层
+│   ├── position.py          # 持仓与挂单匹配、格式化
+│   └── market_sentiment.py  # 市场情绪与资金面聚合
+├── ai/                      # AI 分析层
+│   ├── researcher.py       # Gemini 持仓/月度策略分析
+│   └── prompts.py           # 提示词与 Schema
+├── notifications/           # 通知层
+│   ├── email.py             # 邮件发送
+│   └── html.py              # HTML 报告模板
+├── output/                  # 输出目录（自动生成，已 gitignore）
 └── pyproject.toml           # 项目依赖配置
 ```
 
@@ -173,28 +186,29 @@ pkill -f btc_price_watcher.py
 
 ## 主要模块说明
 
-### position_analyze.py
-持仓分析主程序，整合了持仓获取、订单匹配、AI 分析和报告生成功能。
+### 入口脚本
+- **position_analyze.py**：持仓分析主程序，整合持仓获取、订单匹配、AI 分析和报告生成
+- **btc_price_watcher.py**：BTC 价格监控服务，支持 WebSocket 实时监控、价格预警
+- **monthly_btc_strategy.py**：月初建仓建议，结合宏观与技术面生成策略方案
 
-### btc_price_watcher.py
-BTC 价格监控服务，支持多种 WebSocket 流类型，自动重连，可配置的价格预警。
+### services/ 业务逻辑
+- **position.py**：持仓与挂单匹配、格式化
+- **market_sentiment.py**：市场情绪与资金面数据聚合（恐惧贪婪、衍生品、RSI、ETF、稳定币）
 
-### gemini_researcher.py
-使用 Google Gemini API 进行市场研究，支持 Google Search Grounding，生成结构化的分析结果。
+### data/ 数据源
+- **polymarket.py**：Polymarket 持仓、挂单、订单操作
+- **binance.py**：BTC 价格、4h K 线、衍生品数据
+- **etf.py**：SoSoValue ETF 流入爬虫
+- **rsi.py**：RSI 指标计算
+- **defillama.py**：稳定币宏观流动性
 
-### order_func.py
-Polymarket 订单操作模块，支持：
-- 买入订单 (`buy_order`)
-- 卖出订单 (`sell_order`)
-- 取消订单 (`cancel_order`)
-- 获取挂单 (`get_open_orders`)
-- 获取订单历史 (`get_order_history`)
+### ai/ AI 分析
+- **researcher.py**：Gemini API 市场研究，支持 Google Search Grounding
+- **prompts.py**：结构化输出 Schema 与提示词
 
-### email_alert.py
-邮件发送服务，支持纯文本和 HTML 格式邮件。
-
-### html_generator.py
-生成美观的 HTML 格式分析报告，包含持仓详情、AI 分析结果和预警信息。
+### notifications/ 通知
+- **email.py**：邮件发送服务（支持 HTML）
+- **html.py**：分析报告 HTML 模板
 
 ## 价格预警配置
 

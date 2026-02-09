@@ -6,15 +6,12 @@ import json
 from datetime import datetime
 from typing import Dict, Any
 
-from email_alert import EmailSender
-from gemini_researcher import analyze_monthly_strategy_with_grounding
-from html_generator import generate_monthly_strategy_html
-from position_analyze import (
-    get_4h_klines_data,
-    get_market_sentiment_and_funding,
-    get_btc_price,
-)
 from config import TO_EMAIL
+from data.binance import get_btc_price, get_4h_klines_data
+from ai.researcher import analyze_monthly_strategy_with_grounding
+from notifications.email import EmailSender
+from notifications.html import generate_monthly_strategy_html
+from services.market_sentiment import get_market_sentiment_and_funding
 
 
 def _derive_summary(market_sentiment_and_funding: dict, btc_4h_k_data: list) -> Dict[str, Any]:

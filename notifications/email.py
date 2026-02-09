@@ -8,7 +8,7 @@ import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
-from config import TO_EMAIL,SMTP_SERVER,SMTP_PORT,FROM_EMAIL,FROM_EMAIL_PASSWORD
+from config import TO_EMAIL, SMTP_SERVER, SMTP_PORT, FROM_EMAIL, FROM_EMAIL_PASSWORD
 
 # 获取日志记录器（日志配置由主程序统一管理）
 logger = logging.getLogger(__name__)

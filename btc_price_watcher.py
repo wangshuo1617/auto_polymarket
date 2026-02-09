@@ -9,7 +9,7 @@ import logging
 from datetime import datetime
 from typing import Optional, Callable
 from websocket import WebSocketApp
-from email_alert import EmailSender
+from notifications.email import EmailSender
 import config
 from price_warn_config import WARN_PRICE
 
