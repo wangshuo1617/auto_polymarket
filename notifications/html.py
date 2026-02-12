@@ -2,60 +2,39 @@ import json
 
 # --- 1. 生成内部 HTML 片段的辅助函数 ---
 
-def generate_defensive_rows(items):
+def _action_type_icon(action_type: str) -> str:
+    icons = {"加仓": "📈", "减仓": "📉", "挂买单": "🟢", "挂卖单": "🔴", "撤单": "❌", "持有": "✋"}
+    return icons.get(action_type, "•")
+
+
+def generate_action_rows(items: list) -> str:
+    """生成仓位与挂单操作建议的 HTML 行。"""
+    if not items:
+        return '<div class="card"><div class="card-body muted">暂无具体操作建议</div></div>'
     rows = ""
     for item in items:
-        # 根据状态定义颜色
-        status_color = "#10b981" if "安全" in item['状态'] else "#6b7280"
-        
+        action_type = item.get("操作类型", "")
+        icon = _action_type_icon(action_type)
+        price_str = ""
+        if item.get("建议价格") is not None:
+            price_str = f" <strong>{item['建议价格']}¢</strong>"
+        direction_str = item.get("方向", "")
+        if direction_str:
+            direction_str = f" <span class='direction-badge'>{direction_str}</span>"
+        size_str = item.get("建议数量或比例", "")
+        if size_str:
+            size_str = f" · {size_str}"
         rows += f"""
-        <div class="card defensive-card">
-            <div class="card-header" style="border-left: 4px solid {status_color};">
-                <div class="contract-title">{item['合约']}</div>
-                <div class="status-badge" style="background: {status_color}20; color: {status_color};">{item['状态']}</div>
+        <div class="card action-card">
+            <div class="card-header" style="border-left: 4px solid #3b82f6;">
+                <div class="contract-title">{item.get('合约或问题', '')}</div>
+                <div class="status-badge" style="background: #3b82f620; color: #3b82f6;">{icon} {action_type}{direction_str}</div>
             </div>
             <div class="card-body">
-                <div class="action-box" style="margin-bottom: 8px;">🧮 <strong>希腊值分析:</strong> {item.get('希腊值分析','')}</div>
-                <div class="action-box">👉 <strong>建议:</strong> {item['操作建议']}</div>
-                <div class="logic-text">{item['逻辑']}</div>
-            </div>
-        </div>
-        """
-    return rows
-
-def generate_offensive_rows(items):
-    rows = ""
-    for item in items:
-        # 解析阶梯数据
-        ladders = item['阶梯挂单建议']
-        ladder_html = ""
-        for key, val in ladders.items():
-            # 定义不同阶梯的图标
-            icon = "🛡️" if key == "安全阀" else ("🎯" if key == "目标位" else "🚀")
-            position_pct = val.get("仓位百分比")
-            position_pct_text = f"{position_pct}%" if position_pct is not None else ""
-            ladder_html += f"""
-            <div class="ladder-step">
-                <div class="step-price">
-                    <span class="step-icon">{icon}</span> {key}: <strong>{val['价格']}¢</strong>
-                    <span style="color: #94a3b8; font-weight: 500; margin-left: 8px;">仓位: {position_pct_text}</span>
+                <div class="action-box">
+                    {icon} <strong>{action_type}</strong>{price_str}{size_str}
                 </div>
-                <div class="step-logic">{val['逻辑']}</div>
-            </div>
-            """
-
-        rows += f"""
-        <div class="card offensive-card">
-            <div class="card-header" style="border-left: 4px solid #f59e0b;">
-                <div class="contract-title">{item['合约']}</div>
-                <div class="status-badge" style="background: #f59e0b20; color: #f59e0b;">{item['状态']}</div>
-            </div>
-            <div class="card-body">
-                <div class="action-box" style="margin-bottom: 8px;">🧮 <strong>希腊值分析:</strong> {item.get('希腊值分析','')}</div>
-                <div class="action-box warning">👉 <strong>建议:</strong> {item['操作建议']}</div>
-                <div class="ladder-container">
-                    {ladder_html}
-                </div>
+                <div class="logic-text">理由: {item.get('理由', '')}</div>
             </div>
         </div>
         """
@@ -337,6 +316,7 @@ def generate_html_template(data):
         }}
         .step-price {{ font-size: 14px; margin-bottom: 4px; color: #fff; }}
         .step-logic {{ font-size: 12px; color: #64748b; line-height: 1.3; }}
+        .direction-badge {{ font-size: 11px; margin-left: 4px; opacity: 0.9; }}
 
         /* 预警样式 */
         .alert-item {{
@@ -376,14 +356,11 @@ def generate_html_template(data):
 
         {generate_market_snapshot(data.get("市场与持仓快照", ""))}
 
-        <h2 style="color: var(--accent-green);">🛡️ 防守端分析 (Defensive)</h2>
-        {generate_defensive_rows(data['防守端分析'])}
-
-        <h2 style="color: var(--accent-orange);">⚔️ 进攻端分析 (Offensive)</h2>
-        {generate_offensive_rows(data['进攻端分析'])}
+        <h2 style="color: #3b82f6;">📋 仓位与挂单操作建议</h2>
+        {generate_action_rows(data.get('仓位与挂单操作建议', []))}
 
         <h2 style="color: var(--accent-red);">🚨 市场预警 (Signals)</h2>
-        {generate_alert_rows(data['预警信号'])}
+        {generate_alert_rows(data.get('预警信号', []))}
         
         <div style="text-align: center; margin-top: 40px; color: #475569; font-size: 12px;">
             Generated by AI Agent Strategy Analysis

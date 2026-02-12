@@ -5,7 +5,7 @@ Polymarket 持仓分析主入口
 from datetime import datetime
 
 from config import TO_EMAIL
-from data.polymarket import get_positions, get_open_orders
+from data.polymarket import get_positions, get_open_orders, get_event_situation
 from data.binance import get_btc_price, get_4h_klines_data
 from ai.researcher import analyze_market_with_grounding
 from notifications.email import EmailSender
@@ -28,10 +28,13 @@ if __name__ == "__main__":
     print(f"{time_now} 比特币4h K线数据获取完成")
 
     market_sentiment_and_funding = get_market_sentiment_and_funding()
-    print(f"{time_now} 市场情绪与资金面获取完成,开始进行AI分析")
+    print(f"{time_now} 市场情绪与资金面获取完成")
+
+    event_situation = get_event_situation()
+    print(f"{time_now} Polymarket 事件/市场现价获取完成,开始进行AI分析")
 
     analyze_result = analyze_market_with_grounding(
-        formatted, klines_data, market_sentiment_and_funding
+        formatted, klines_data, market_sentiment_and_funding, event_situation
     )
     warn_prices = analyze_result["预警信号"]
     for warn_price in warn_prices:

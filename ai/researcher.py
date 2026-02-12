@@ -33,9 +33,10 @@ def analyze_market_with_grounding(
     polymarket_status: list,
     btc_4h_k_data: list,
     market_sentiment_and_funding: dict,
+    polymarket_event_situation: dict,
 ) -> Dict[str, Any]:
     """
-    Analyze the polymarket positions, orders, and btc 4h k data.
+    Analyze the polymarket positions, orders, event situation, and btc 4h k data.
     """
     
     # Get current date for temporal context
@@ -59,7 +60,10 @@ def analyze_market_with_grounding(
     )
     
     user_prompt = get_user_prompt(
-        polymarket_status, btc_4h_k_data, market_sentiment_and_funding
+        polymarket_status,
+        btc_4h_k_data,
+        market_sentiment_and_funding,
+        polymarket_event_situation,
     )
 
     try:        

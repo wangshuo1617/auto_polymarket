@@ -2,120 +2,48 @@
 Gemini Researcher 的 RESPONSE_SCHEMA、system_instruction、user_prompt 定义。
 与 gemini_researcher.py 配合使用。
 """
+import json
 
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
         "市场与持仓快照": {
             "type": "string",
-            "description": "一段话概括，例如：ETF流出配合K线破位，且散户逆势做多，下跌未结束。分析K线和新闻，简述当前市场环境对我的持仓是顺风还是逆风。预测未来24小时的btc市场走势和ploymarket市场走势。给出预期月内btc的波动范围"
+            "description": "一段话概括，例如：ETF流出配合K线破位，且散户逆势做多，下跌未结束。分析K线和新闻，简述当前市场环境对我的持仓是顺风还是逆风。预测未来24小时的btc市场走势和polymarket市场走势。给出预期月内btc的波动范围"
         },
-        "防守端分析": {
+        "仓位与挂单操作建议": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "合约": {
+                    "合约或问题": {
                         "type": "string",
-                        "description": "合约名称"
+                        "description": "对应的 Polymarket 合约/问题描述，与持仓或事件市场一致"
                     },
-                    "状态": {
+                    "操作类型": {
                         "type": "string",
-                        "description": "状态"
+                        "description": "具体操作",
+                        "enum": ["加仓", "减仓", "挂买单", "挂卖单", "撤单", "持有"]
                     },
-                    "希腊值分析": {
+                    "方向": {
                         "type": "string",
-                        "description": "希腊值分析"
+                        "description": "Yes/No 方向，加仓或挂单时必填",
+                        "enum": ["Yes", "No"]
                     },
-                    "操作建议": {
-                        "type": "string",
-                        "description": "操作建议"
+                    "建议价格": {
+                        "type": "number",
+                        "description": "建议价格（美分 1-99），挂单/加仓/减仓时填写"
                     },
-                    "逻辑": {
+                    "建议数量或比例": {
                         "type": "string",
-                        "description": "逻辑"
+                        "description": "例如：5 张、当前持仓的 50%、适量"
+                    },
+                    "理由": {
+                        "type": "string",
+                        "description": "简短理由，结合当前市场价与 K 线/情绪"
                     }
-                }
-            }
-        },
-        "进攻端分析": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "合约": {
-                        "type": "string",
-                        "description": "合约名称"
-                    },
-                    "状态": {
-                        "type": "string",
-                        "description": "状态"
-                    },
-                    "希腊值分析": {
-                        "type": "string",
-                        "description": "希腊值分析"
-                    },
-                    "操作建议": {
-                        "type": "string",
-                        "description": "操作建议"
-                    },
-                    "阶梯挂单建议": {
-                        "type": "object",
-                        "properties": {
-                            "安全阀": {
-                                "type": "object",
-                                "properties": {
-                                    "价格": {
-                                        "type": "integer",
-                                        "description": "挂单价格"
-                                    },
-                                    "逻辑": {
-                                        "type": "string",
-                                        "description": "逻辑"
-                                    },
-                                    "仓位百分比": {
-                                        "type": "integer",
-                                        "description": "仓位百分比"
-                                    }
-                                }
-                            },
-                            "目标位": {
-                                "type": "object",
-                                "properties": {
-                                    "价格": {
-                                        "type": "integer",
-                                        "description": "挂单价格"
-                                    },
-                                    "逻辑": {
-                                        "type": "string",
-                                        "description": "逻辑"
-                                    },
-                                    "仓位百分比": {
-                                        "type": "integer",
-                                        "description": "仓位百分比"
-                                    }
-                                }
-                            },
-                            "梦想单": {
-                                "type": "object",
-                                "properties": {
-                                    "价格": {
-                                        "type": "integer",
-                                        "description": "挂单价格"
-                                    },
-                                    "逻辑": {
-                                        "type": "string",
-                                        "description": "逻辑"
-                                    },
-                                    "仓位百分比": {
-                                        "type": "integer",
-                                        "description": "仓位百分比"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                },
+                "required": ["合约或问题", "操作类型", "理由"]
             }
         },
         "预警信号": {
@@ -140,7 +68,7 @@ RESPONSE_SCHEMA = {
             }
         }
     },
-    "required": ["防守端分析", "进攻端分析", "预警信号"]
+    "required": ["市场与持仓快照", "仓位与挂单操作建议", "预警信号"]
 }
 
 MONTHLY_STRATEGY_SCHEMA = {
@@ -229,8 +157,9 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 我会提供以下信息：
 1. **持仓情况**：包含合约主题、合约类型（side：Yes/No）、平均买入价（Avg）、当前市场价、持仓数量、初始价值、当前价值、结算日期。
 2. **挂单情况**：未成交的 Limit Orders。
-3. **市场背景**：比特币过去24小时4h K线数据。
-4. **市场情绪与资金面**：包括衍生品情绪、流动性陷阱、机构资金流入流出情况、恐惧贪婪指数。
+3. **Polymarket 事件与市场现价**：当前事件下各问题的题目、选项（outcomes）及对应实时价格（outcomePrices），用于判断买卖价位与仓位建议。
+4. **市场背景**：比特币过去24小时4h K线数据。
+5. **市场情绪与资金面**：包括衍生品情绪、流动性陷阱、机构资金流入流出情况、恐惧贪婪指数。
 
 # Analysis Framework (COT - Chain of Thought)
 
@@ -249,11 +178,11 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
     * 对于 OTM (虚值) 的 Yes 合约，时间流逝是致命的 -> 建议尽早止损或轮动。
     * 对于 ITM (实值) 的 Yes 合约，时间流逝是朋友 -> 建议 Hold。。
 
-## Step 3: 策略生成 (Strategy Generation)
-* **防守型 (Defensive)**：针对已获利需保护利润，或深套需止损的仓位。
-    * 决策：Hold to Maturity (吃满 100¢) vs. Sell Now (释放资金)。
-* **进攻型 (Offensive)**：针对博弈型仓位。
-    * **阶梯挂单 (Laddering)**：不要单点止盈。根据 BTC 的阻力位/支撑位，反推合约价格，给出 3 档挂单建议。
+## Step 3: 仓位与挂单操作建议 (Actionable Recommendations)
+* 结合 **Polymarket 事件现价**（outcomePrices）与持仓、挂单，对每个相关合约给出**一条条可执行建议**。
+* 建议类型：**加仓**、**减仓**、**挂买单**、**挂卖单**、**撤单**、**持有**。每条需包含：合约/问题、操作类型、方向(Yes/No)、建议价格(¢)、建议数量或比例、理由。
+* 价格必须结合当前市场价与 K 线/情绪，给出具体数字（美分），便于直接挂单。
+* 无建议的仓位可不列；优先列出当前最应执行的 3–8 条。
 """
 
 MONTHLY_SYSTEM_INSTRUCTION_TEMPLATE = """# Role
@@ -277,8 +206,12 @@ MONTHLY_SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 USER_PROMPT_TEMPLATE = """
 以下是当前要分析的具体信息：
 
-Polymarket持仓情况和挂单情况: {polymarket_status}
+Polymarket 持仓情况和挂单情况: {polymarket_status}
+
+Polymarket 事件与各市场当前价格（用于对比持仓与挂单、给出具体买卖价位）: {polymarket_event_situation}
+
 比特币过去24小时4h K线数据: {btc_4h_k_data}
+
 市场情绪与资金面: {market_sentiment_and_funding}
 """
 
@@ -302,10 +235,15 @@ def get_user_prompt(
     polymarket_status: list,
     btc_4h_k_data: list,
     market_sentiment_and_funding: dict,
+    polymarket_event_situation: dict,
 ) -> str:
     """根据输入数据生成 user prompt。"""
+    event_situation_str = json.dumps(
+        polymarket_event_situation, ensure_ascii=False, indent=2
+    )
     return USER_PROMPT_TEMPLATE.format(
         polymarket_status=polymarket_status,
+        polymarket_event_situation=event_situation_str,
         btc_4h_k_data=btc_4h_k_data,
         market_sentiment_and_funding=market_sentiment_and_funding,
     )
