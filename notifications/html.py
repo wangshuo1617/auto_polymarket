@@ -2,43 +2,81 @@ import json
 
 # --- 1. 生成内部 HTML 片段的辅助函数 ---
 
-def _action_type_icon(action_type: str) -> str:
-    icons = {"加仓": "📈", "减仓": "📉", "挂买单": "🟢", "挂卖单": "🔴", "撤单": "❌", "持有": "✋"}
-    return icons.get(action_type, "•")
+def generate_overview_section(text: str) -> str:
+    """Part 1: 整体分析"""
+    if not text:
+        return ""
+    return f"""
+        <h2 style="color: #3b82f6; margin-top: 20px;">📈 一、整体分析</h2>
+        <div class="market-snapshot">
+            <div class="market-snapshot-content">{text}</div>
+        </div>
+    """
 
 
-def generate_action_rows(items: list) -> str:
-    """生成仓位与挂单操作建议的 HTML 行。"""
+def generate_position_and_orders_section(items: list) -> str:
+    """Part 2: 当前持仓、当前挂单分析与建议（已参与的 event）"""
     if not items:
-        return '<div class="card"><div class="card-body muted">暂无具体操作建议</div></div>'
-    rows = ""
-    for item in items:
-        action_type = item.get("操作类型", "")
-        icon = _action_type_icon(action_type)
-        price_str = ""
-        if item.get("建议价格") is not None:
-            price_str = f" <strong>{item['建议价格']}¢</strong>"
-        direction_str = item.get("方向", "")
-        if direction_str:
-            direction_str = f" <span class='direction-badge'>{direction_str}</span>"
-        size_str = item.get("建议数量或比例", "")
-        if size_str:
-            size_str = f" · {size_str}"
-        rows += f"""
+        return '<div class="card"><div class="card-body muted">暂无已参与仓位</div></div>'
+    html = ""
+    for block in items:
+        event_name = block.get("事件或合约", "")
+        summary = block.get("仓位简述", "")
+        orders = block.get("挂单建议", [])
+        order_rows = ""
+        for o in orders:
+            op_type = o.get("操作类型", "")
+            icon = "🟢" if op_type == "挂买单" else "🔴"
+            price = o.get("建议价格")
+            price_str = f" <strong>{price}¢</strong>" if price is not None else ""
+            direction = o.get("方向", "")
+            size = o.get("建议数量或比例", "")
+            reason = o.get("理由", "")
+            order_rows += f"""
+            <div class="ladder-step">
+                <div class="step-price">{icon} {op_type} {direction}{price_str} · {size or '-'}</div>
+                <div class="step-logic">{reason}</div>
+            </div>
+            """
+        html += f"""
         <div class="card action-card">
-            <div class="card-header" style="border-left: 4px solid #3b82f6;">
-                <div class="contract-title">{item.get('合约或问题', '')}</div>
-                <div class="status-badge" style="background: #3b82f620; color: #3b82f6;">{icon} {action_type}{direction_str}</div>
+            <div class="card-header" style="border-left: 4px solid #10b981;">
+                <div class="contract-title">{event_name}</div>
             </div>
             <div class="card-body">
-                <div class="action-box">
-                    {icon} <strong>{action_type}</strong>{price_str}{size_str}
-                </div>
-                <div class="logic-text">理由: {item.get('理由', '')}</div>
+                <div class="action-box" style="margin-bottom: 10px;">📋 仓位简述：{summary}</div>
+                <div class="muted" style="margin-bottom: 6px;">挂单建议：</div>
+                <div class="ladder-container">{order_rows}</div>
             </div>
         </div>
         """
-    return rows
+    return html
+
+
+def generate_new_position_section(items: list) -> str:
+    """Part 3: 建仓建议（未参与的 event）"""
+    if not items:
+        return '<div class="card"><div class="card-body muted">暂无建仓建议</div></div>'
+    html = ""
+    for item in items:
+        event_or_question = item.get("事件或问题", "")
+        direction = item.get("建议方向", "")
+        price_range = item.get("建议价格区间", "")
+        amount = item.get("建议投入金额或比例", "")
+        reason = item.get("理由", "")
+        html += f"""
+        <div class="card action-card">
+            <div class="card-header" style="border-left: 4px solid #f59e0b;">
+                <div class="contract-title">{event_or_question}</div>
+                <div class="status-badge" style="background: #f59e0b20; color: #f59e0b;">{direction}</div>
+            </div>
+            <div class="card-body">
+                <div class="action-box">建议价格区间：<strong>{price_range}</strong> · 建议投入：{amount}</div>
+                <div class="logic-text">理由：{reason}</div>
+            </div>
+        </div>
+        """
+    return html
 
 def generate_alert_rows(items):
     rows = ""
@@ -62,16 +100,10 @@ def generate_alert_rows(items):
     return rows
 
 def generate_market_snapshot(snapshot_text):
-    """生成市场快照部分的 HTML"""
+    """生成市场快照部分的 HTML（兼容旧 key 市场与持仓快照）"""
     if not snapshot_text:
         return ""
-    
-    return f"""
-        <h2 style="color: #3b82f6; margin-top: 20px;">📈 市场与持仓快照 (Market Snapshot)</h2>
-        <div class="market-snapshot">
-            <div class="market-snapshot-content">{snapshot_text}</div>
-        </div>
-    """
+    return generate_overview_section(snapshot_text)
 
 
 def generate_monthly_strategy_html(data: dict) -> str:
@@ -300,6 +332,7 @@ def generate_html_template(data):
         }}
         .action-box.warning {{ background: rgba(245, 158, 11, 0.1); color: #fbbf24; }}
         .logic-text {{ color: var(--text-muted); font-size: 13px; font-style: italic; }}
+        .muted {{ color: var(--text-muted); font-size: 14px; }}
 
         /* 阶梯挂单样式 */
         .ladder-container {{
@@ -354,12 +387,15 @@ def generate_html_template(data):
     <div class="container">
         <h1>📊 Polymarket 仓位分析报告</h1>
 
-        {generate_market_snapshot(data.get("市场与持仓快照", ""))}
+        {generate_overview_section(data.get("整体分析", "") or data.get("市场与持仓快照", ""))}
 
-        <h2 style="color: #3b82f6;">📋 仓位与挂单操作建议</h2>
-        {generate_action_rows(data.get('仓位与挂单操作建议', []))}
+        <h2 style="color: #10b981;">📋 二、当前持仓、当前挂单分析与建议</h2>
+        {generate_position_and_orders_section(data.get('当前持仓与挂单分析与建议', []))}
 
-        <h2 style="color: var(--accent-red);">🚨 市场预警 (Signals)</h2>
+        <h2 style="color: #f59e0b;">🆕 三、建仓建议</h2>
+        {generate_new_position_section(data.get('建仓建议', []))}
+
+        <h2 style="color: var(--accent-red);">🚨 四、预警价格及操作</h2>
         {generate_alert_rows(data.get('预警信号', []))}
         
         <div style="text-align: center; margin-top: 40px; color: #475569; font-size: 12px;">

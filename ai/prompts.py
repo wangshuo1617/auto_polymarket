@@ -7,43 +7,56 @@ import json
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "市场与持仓快照": {
+        "整体分析": {
             "type": "string",
-            "description": "一段话概括，例如：ETF流出配合K线破位，且散户逆势做多，下跌未结束。分析K线和新闻，简述当前市场环境对我的持仓是顺风还是逆风。预测未来24小时的btc市场走势和polymarket市场走势。给出预期月内btc的波动范围"
+            "description": "一段话概括市场环境：例如 ETF 流出配合 K 线破位、散户多空比等。简述当前环境对持仓是顺风还是逆风，预测未来 24 小时 BTC 与 Polymarket 走势，以及预期月内 BTC 波动范围。"
         },
-        "仓位与挂单操作建议": {
+        "当前持仓与挂单分析与建议": {
             "type": "array",
+            "description": "针对已参与的 event（有持仓或挂单的），按 event/合约逐条给出仓位简述与挂单建议",
             "items": {
                 "type": "object",
                 "properties": {
-                    "合约或问题": {
+                    "事件或合约": {
                         "type": "string",
-                        "description": "对应的 Polymarket 合约/问题描述，与持仓或事件市场一致"
+                        "description": "事件名或合约/问题描述"
                     },
-                    "操作类型": {
+                    "仓位简述": {
                         "type": "string",
-                        "description": "具体操作",
-                        "enum": ["加仓", "减仓", "挂买单", "挂卖单", "撤单", "持有"]
+                        "description": "当前持仓与挂单的简要分析（盈亏、风险、是否值得持有等）"
                     },
-                    "方向": {
-                        "type": "string",
-                        "description": "Yes/No 方向，加仓或挂单时必填",
-                        "enum": ["Yes", "No"]
-                    },
-                    "建议价格": {
-                        "type": "number",
-                        "description": "建议价格（美分 1-99），挂单/加仓/减仓时填写"
-                    },
-                    "建议数量或比例": {
-                        "type": "string",
-                        "description": "例如：5 张、当前持仓的 50%、适量"
-                    },
-                    "理由": {
-                        "type": "string",
-                        "description": "简短理由，结合当前市场价与 K 线/情绪"
+                    "挂单建议": {
+                        "type": "array",
+                        "description": "针对该合约的挂买单、挂卖单建议",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "操作类型": {"type": "string", "enum": ["挂买单", "挂卖单"]},
+                                "方向": {"type": "string", "enum": ["Yes", "No"]},
+                                "建议价格": {"type": "number", "description": "美分 1-99"},
+                                "建议数量或比例": {"type": "string"},
+                                "理由": {"type": "string"}
+                            },
+                            "required": ["操作类型", "方向", "建议价格", "理由"]
+                        }
                     }
                 },
-                "required": ["合约或问题", "操作类型", "理由"]
+                "required": ["事件或合约", "仓位简述", "挂单建议"]
+            }
+        },
+        "建仓建议": {
+            "type": "array",
+            "description": "针对当前事件中用户尚未参与的 market/问题，结合 USDC 余额、市场情况与各 outcome 现价，给出是否建仓及如何建仓",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "事件或问题": {"type": "string"},
+                    "建议方向": {"type": "string", "enum": ["Yes", "No"]},
+                    "建议价格区间": {"type": "string", "description": "例如 25-35¢"},
+                    "建议投入金额或比例": {"type": "string", "description": "结合可用 USDC 给出，如 50 张、或 10% 余额"},
+                    "理由": {"type": "string"}
+                },
+                "required": ["事件或问题", "建议方向", "建议价格区间", "建议投入金额或比例", "理由"]
             }
         },
         "预警信号": {
@@ -51,24 +64,14 @@ RESPONSE_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "预警方向": {
-                        "type": "string",
-                        "description": "预警方向",
-                        "enum": ["up_to", "down_to"]
-                    },
-                    "价格": {
-                        "type": "integer",
-                        "description": "btc价格"
-                    },
-                    "操作建议": {
-                        "type": "string",
-                        "description": "操作建议"
-                    }
+                    "预警方向": {"type": "string", "enum": ["up_to", "down_to"]},
+                    "价格": {"type": "integer", "description": "BTC 价格"},
+                    "操作建议": {"type": "string"}
                 }
             }
         }
     },
-    "required": ["市场与持仓快照", "仓位与挂单操作建议", "预警信号"]
+    "required": ["整体分析", "当前持仓与挂单分析与建议", "建仓建议", "预警信号"]
 }
 
 MONTHLY_STRATEGY_SCHEMA = {
@@ -157,9 +160,11 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 我会提供以下信息：
 1. **持仓情况**：包含合约主题、合约类型（side：Yes/No）、平均买入价（Avg）、当前市场价、持仓数量、初始价值、当前价值、结算日期。
 2. **挂单情况**：未成交的 Limit Orders。
-3. **Polymarket 事件与市场现价**：当前事件下各问题的题目、选项（outcomes）及对应实时价格（outcomePrices），用于判断买卖价位与仓位建议。
-4. **市场背景**：比特币过去24小时4h K线数据。
-5. **市场情绪与资金面**：包括衍生品情绪、流动性陷阱、机构资金流入流出情况、恐惧贪婪指数。
+3. **Polymarket 事件与市场现价**：当前事件下各问题的题目、选项（outcomes）及对应实时价格（outcomePrices）。
+4. **当前可用 USDC 余额**：用于建仓建议时考虑可投入金额。
+5. **市场背景**：比特币过去24小时4h K线数据。
+6. **市场情绪与资金面**：包括衍生品情绪、流动性陷阱、机构资金流入流出情况、恐惧贪婪指数。
+7. **上一时间段报告**（若有）：上一轮输出的完整报告。可据此延续判断、调整建议（如上次挂单是否仍有效、建仓建议是否更新等），使本期报告与上期衔接。
 
 # Analysis Framework (COT - Chain of Thought)
 
@@ -178,11 +183,17 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
     * 对于 OTM (虚值) 的 Yes 合约，时间流逝是致命的 -> 建议尽早止损或轮动。
     * 对于 ITM (实值) 的 Yes 合约，时间流逝是朋友 -> 建议 Hold。。
 
-## Step 3: 仓位与挂单操作建议 (Actionable Recommendations)
-* 结合 **Polymarket 事件现价**（outcomePrices）与持仓、挂单，对每个相关合约给出**一条条可执行建议**。
-* 建议类型：**加仓**、**减仓**、**挂买单**、**挂卖单**、**撤单**、**持有**。每条需包含：合约/问题、操作类型、方向(Yes/No)、建议价格(¢)、建议数量或比例、理由。
-* 价格必须结合当前市场价与 K 线/情绪，给出具体数字（美分），便于直接挂单。
-* 无建议的仓位可不列；优先列出当前最应执行的 3–8 条。
+## Step 3: 报告输出结构（四部分）
+
+**Part 1 - 整体分析**：一段话概括市场环境、对持仓的影响、未来 24h 与月内波动预期。
+
+**Part 2 - 当前持仓与挂单分析与建议**：仅针对**已参与的 event**（有持仓或挂单的）。按事件/合约逐条：先写仓位简述（盈亏、风险、是否持有），再给出该合约的**挂买单、挂卖单**具体建议（方向、价格¢、数量或比例、理由）。价格要具体可执行。
+
+**Part 3 - 建仓建议**：针对**未参与的 event/问题**（事件现价中有但持仓与挂单中未出现的）。结合**当前 USDC 余额**、市场判断与各 outcome 现价，给出是否建仓、方向(Yes/No)、建议价格区间、建议投入金额或比例、理由。投入金额需在余额可承受范围内。
+
+**Part 4 - 预警信号**：BTC 价格向上/向下触及某价位时的操作建议（与现有格式一致）。
+
+若提供了**上一时间段报告**，可在本报告中延续或修正其判断与建议（例如：上期建议 35¢ 挂卖单若未成交可继续持有、或根据最新行情更新建仓区间）。
 """
 
 MONTHLY_SYSTEM_INSTRUCTION_TEMPLATE = """# Role
@@ -208,11 +219,16 @@ USER_PROMPT_TEMPLATE = """
 
 Polymarket 持仓情况和挂单情况: {polymarket_status}
 
-Polymarket 事件与各市场当前价格（用于对比持仓与挂单、给出具体买卖价位）: {polymarket_event_situation}
+Polymarket 事件与各市场当前价格: {polymarket_event_situation}
+
+当前可用 USDC 余额: {usdc_balance}
 
 比特币过去24小时4h K线数据: {btc_4h_k_data}
 
 市场情绪与资金面: {market_sentiment_and_funding}
+
+上一时间段报告（仅供参考，可在本报告中延续或调整其判断与建议）:
+{previous_report}
 """
 
 MONTHLY_USER_PROMPT_TEMPLATE = """
@@ -236,16 +252,26 @@ def get_user_prompt(
     btc_4h_k_data: list,
     market_sentiment_and_funding: dict,
     polymarket_event_situation: dict,
+    usdc_balance: str,
+    previous_report: dict | None = None,
 ) -> str:
     """根据输入数据生成 user prompt。"""
     event_situation_str = json.dumps(
         polymarket_event_situation, ensure_ascii=False, indent=2
     )
+    if previous_report:
+        previous_report_str = json.dumps(
+            previous_report, ensure_ascii=False, indent=2
+        )
+    else:
+        previous_report_str = "（无）"
     return USER_PROMPT_TEMPLATE.format(
         polymarket_status=polymarket_status,
         polymarket_event_situation=event_situation_str,
+        usdc_balance=usdc_balance,
         btc_4h_k_data=btc_4h_k_data,
         market_sentiment_and_funding=market_sentiment_and_funding,
+        previous_report=previous_report_str,
     )
 
 

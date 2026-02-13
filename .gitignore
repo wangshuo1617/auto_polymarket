@@ -13,4 +13,5 @@ wheels/
 *.ipynb
 output/
 last_market_sentiment_and_funding.json
+last_report.json
 price_warn_config.py

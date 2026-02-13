@@ -34,9 +34,12 @@ def analyze_market_with_grounding(
     btc_4h_k_data: list,
     market_sentiment_and_funding: dict,
     polymarket_event_situation: dict,
+    usdc_balance: str,
+    previous_report: dict | None = None,
 ) -> Dict[str, Any]:
     """
-    Analyze the polymarket positions, orders, event situation, and btc 4h k data.
+    Analyze the polymarket positions, orders, event situation, USDC balance, and btc 4h k data.
+    previous_report: 上一时间段的报告内容，供本次输出参考与延续。
     """
     
     # Get current date for temporal context
@@ -64,6 +67,8 @@ def analyze_market_with_grounding(
         btc_4h_k_data,
         market_sentiment_and_funding,
         polymarket_event_situation,
+        usdc_balance,
+        previous_report=previous_report,
     )
 
     try:        

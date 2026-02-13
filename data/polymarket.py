@@ -11,10 +11,11 @@ if str(_project_root) not in sys.path:
 
 import requests
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, CreateOrderOptions
+from py_clob_client.clob_types import OrderArgs, CreateOrderOptions, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
 from datetime import datetime
 from config import POLYMARKET_KEY, WALLET_ADDRESS
+
 
 host = "https://clob.polymarket.com"
 chain_id = 137
@@ -106,5 +107,11 @@ def get_event_situation(market_slug:str=None):
 def get_order_book(token_id: str):
     return client.get_order_book(token_id)
 
+def get_balance_allowance() -> str:
+    """返回当前可用 USDC 余额，如 $123.45"""
+    response = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+    balance = int(response.get("balance", 0)) / 10**6
+    return f"${balance:.2f}"
+
 if __name__ == "__main__":
-    print(get_event_situation())
+    print(get_balance_allowance())
