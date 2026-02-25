@@ -14,6 +14,15 @@ def get_btc_price() -> float:
     return float(response.json().get("price", 0))
 
 
+def get_1h_klines_data(limit: int = 1) -> list:
+    """获取 BTC 1h K 线数据。每根 K 线: [open_time, open, high, low, close, ...]"""
+    url = "https://data-api.binance.vision"
+    params = {"symbol": "BTCUSDT", "interval": "1h", "limit": limit}
+    response = requests.get(url + "/api/v3/klines", params=params)
+    response.raise_for_status()
+    return response.json()
+
+
 def get_4h_klines_data(limit: int = 10) -> list:
     """获取 BTC 4h K 线数据"""
     url = "https://data-api.binance.vision"

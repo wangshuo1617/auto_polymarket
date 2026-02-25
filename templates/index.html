@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polymarket Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background: #f8f9fa;
+        }
+        .dashboard-shell {
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+        .dashboard-title {
+            font-size: clamp(1.8rem, 4vw, 3rem);
+            margin-bottom: 0.75rem;
+        }
+        .balance-chip {
+            display: inline-block;
+            background: #fff;
+            border: 1px solid #dee2e6;
+            border-radius: 999px;
+            padding: 0.35rem 0.75rem;
+            font-weight: 500;
+        }
+        .tab-pane {
+            padding-top: 0.9rem;
+        }
+        .event-card h3 {
+            font-size: 1rem;
+            margin-bottom: 0.75rem;
+        }
+        .table td, .table th {
+            white-space: nowrap;
+        }
+        .text-wrap-mobile {
+            white-space: normal !important;
+            word-break: break-word;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid px-3 px-md-4 py-3 py-md-4 dashboard-shell">
+        <div class="d-flex justify-content-between align-items-start gap-2">
+            <h1 class="dashboard-title">Polymarket Dashboard</h1>
+            <a href="/logout" class="btn btn-outline-secondary btn-sm mt-1">Logout</a>
+        </div>
+        <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+            <div id="balance" class="balance-chip">Loading...</div>
+            <div id="btc-price" class="balance-chip">BTC: Loading...</div>
+            <button type="button" class="btn btn-outline-primary btn-sm" id="btnPositionAnalyze">Position Analyze</button>
+            <a href="/report/latest" target="_blank" rel="noopener" class="btn btn-outline-secondary btn-sm">Latest Report</a>
+        </div>
+        <ul class="nav nav-tabs" id="myTab" role="tablist">
+            <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="events-tab" data-bs-toggle="tab" data-bs-target="#events" type="button" role="tab" aria-controls="events" aria-selected="true">Events</button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="positions-tab" data-bs-toggle="tab" data-bs-target="#positions" type="button" role="tab" aria-controls="positions" aria-selected="false">My Position</button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="orders-tab" data-bs-toggle="tab" data-bs-target="#orders" type="button" role="tab" aria-controls="orders" aria-selected="false">Open Orders</button>
+            </li>
+        </ul>
+        <div class="tab-content" id="myTabContent">
+            <div class="tab-pane fade show active" id="events" role="tabpanel" aria-labelledby="events-tab">
+                <div id="events-content">Loading...</div>
+            </div>
+            <div class="tab-pane fade" id="positions" role="tabpanel" aria-labelledby="positions-tab">
+                <div id="positions-content">Loading...</div>
+            </div>
+            <div class="tab-pane fade" id="orders" role="tabpanel" aria-labelledby="orders-tab">
+                <div id="orders-content">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal for Order -->
+    <div class="modal fade" id="orderModal" tabindex="-1" aria-labelledby="orderModalLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="orderModalLabel">Create Order</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="orderForm">
+                        <div class="mb-3">
+                            <label for="priceInput" class="form-label">Price</label>
+                            <input type="number" class="form-control" id="priceInput" min="0.001" max="0.999" step="0.001" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label d-block">Input by</label>
+                            <div class="d-flex gap-3">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="radio" name="orderInputMode" id="modeAmount" value="amount">
+                                    <label class="form-check-label" for="modeAmount">Amount ($)</label>
+                                </div>
+                                <div class="form-check">
+                                    <input class="form-check-input" type="radio" name="orderInputMode" id="modeQuantity" value="quantity" checked>
+                                    <label class="form-check-label" for="modeQuantity">Quantity (shares)</label>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label for="amountOrSizeInput" class="form-label" id="amountOrSizeLabel">Quantity (shares)</label>
+                            <input type="number" class="form-control" id="amountOrSizeInput" min="0" step="any" placeholder="Enter amount or quantity">
+                            <small class="form-text text-muted" id="amountOrSizeHint"></small>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-primary" id="submitOrder">Submit</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let currentAction = null;
+        let currentData = null;
+
+        function formatMoneyNum(num) {
+            if (num == null || isNaN(num)) return '—';
+            return '$' + Number(num).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        function loadBalance() {
+            fetch('/api/balance_summary')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        document.getElementById('balance').innerHTML = 'Error: ' + data.error;
+                        return;
+                    }
+                    const profileStr = formatMoneyNum(data.profile_value);
+                    document.getElementById('balance').innerHTML = 'Cash: <strong>' + (data.cash_balance || '—') + '</strong> &nbsp;|&nbsp; Profile: <strong>' + profileStr + '</strong>';
+                })
+                .catch(error => {
+                    document.getElementById('balance').innerText = 'Error loading balance';
+                    console.error(error);
+                });
+        }
+
+        function formatBtcPrice(num) {
+            if (num == null || isNaN(num)) return '—';
+            return '$' + Number(num).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+        }
+
+        function loadBtcPrice() {
+            fetch('/api/btc_1h_kline')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        document.getElementById('btc-price').textContent = 'BTC: Error';
+                        return;
+                    }
+                    const priceStr = formatBtcPrice(data.price);
+                    const o = formatBtcPrice(data.open);
+                    const h = formatBtcPrice(data.high);
+                    const l = formatBtcPrice(data.low);
+                    const c = formatBtcPrice(data.close);
+                    document.getElementById('btc-price').innerHTML = 'BTC: <strong>' + priceStr + '</strong> &nbsp;|&nbsp; 1h O ' + o + ' / H ' + h + ' / L ' + l + ' / C ' + c;
+                })
+                .catch(error => {
+                    document.getElementById('btc-price').textContent = 'BTC: Error';
+                    console.error(error);
+                });
+        }
+
+        document.getElementById('btnPositionAnalyze').addEventListener('click', function() {
+            const btn = this;
+            btn.disabled = true;
+            fetch('/api/run_position_analyze', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        alert('Error: ' + data.error);
+                    } else {
+                        alert('Position analyze started. Report will be sent by email when done.');
+                    }
+                })
+                .catch(error => {
+                    alert('Request failed: ' + error);
+                })
+                .finally(function() { btn.disabled = false; });
+        });
+
+        function loadEvents() {
+            fetch('/api/events')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        document.getElementById('events-content').innerHTML = 'Error: ' + data.error;
+                        return;
+                    }
+                    let content = '<h2 class="h4 mb-3 text-wrap-mobile">' + data.event_name + '</h2>';
+                    data.markets.forEach(market => {
+                        const hasSettledPrice = (market.outcomePrices || []).some(price => Number(price) === 1);
+                        if (hasSettledPrice) {
+                            return;
+                        }
+
+                        content += '<div class="card event-card shadow-sm mb-3"><div class="card-body p-2 p-md-3">';
+                        content += '<h3 class="text-wrap-mobile">' + market.question + '</h3>';
+                        content += '<div class="table-responsive">';
+                        content += '<table class="table table-sm align-middle mb-0"><thead><tr><th>Outcome</th><th>Price</th><th>Actions</th></tr></thead><tbody>';
+                        market.outcomes.forEach((outcome, index) => {
+                            const price = market.outcomePrices[index];
+                            content += '<tr><td class="text-wrap-mobile">' + outcome + '</td><td>' + price + '</td><td><div class="d-flex flex-wrap gap-1">';
+                            content += '<button class="btn btn-success btn-sm" onclick="openBuyModal(\'' + market.market_id + '\', \'' + market.token_id[index] + '\', ' + price + ')">Buy</button>';
+                            content += '<button class="btn btn-danger btn-sm" onclick="openSellModal(\'' + market.market_id + '\', \'' + market.token_id[index] + '\', ' + price + ')">Sell</button>';
+                            content += '</div></td></tr>';
+                        });
+                        content += '</tbody></table></div></div></div>';
+                    });
+                    document.getElementById('events-content').innerHTML = content;
+                })
+                .catch(error => {
+                    document.getElementById('events-content').innerHTML = 'Error loading events: ' + error;
+                });
+        }
+
+        function formatMoney(val) {
+            if (val == null || isNaN(val)) return '—';
+            return '$' + Number(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        function formatPct(val) {
+            if (val == null || isNaN(val)) return '—';
+            const n = Number(val);
+            const s = (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+            return s;
+        }
+
+        function loadPositions() {
+            fetch('/api/positions')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        document.getElementById('positions-content').innerHTML = '<div class="alert alert-warning">' + data.error + '</div>';
+                        return;
+                    }
+                    if (!Array.isArray(data) || data.length === 0) {
+                        document.getElementById('positions-content').innerHTML = '<div class="card shadow-sm"><div class="card-body text-muted">No positions yet.</div></div>';
+                        return;
+                    }
+                    const byMarket = {};
+                    let totalValue = 0;
+                    data.forEach(p => {
+                        const cid = p.conditionId || p.title || 'other';
+                        if (!byMarket[cid]) byMarket[cid] = { title: p.title, positions: [] };
+                        byMarket[cid].positions.push(p);
+                        const val = p.currentValue != null ? p.currentValue : (p.size * p.curPrice);
+                        if (typeof val === 'number' && !isNaN(val)) totalValue += val;
+                    });
+                    let content = '<h2 class="h4 mb-3 text-wrap-mobile">My Position</h2>';
+                    content += '<p class="mb-3"><strong>Total position value:</strong> ' + formatMoney(totalValue) + '</p>';
+                    Object.keys(byMarket).forEach(cid => {
+                        const group = byMarket[cid];
+                        const safeTitle = (group.title || '—').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+                        content += '<div class="card event-card shadow-sm mb-3"><div class="card-body p-2 p-md-3">';
+                        content += '<h3 class="text-wrap-mobile">' + safeTitle + '</h3>';
+                        content += '<div class="table-responsive">';
+                        content += '<table class="table table-sm align-middle mb-0"><thead><tr><th>Outcome</th><th>Size</th><th>Avg</th><th>Current</th><th>Value</th><th>PnL%</th><th>Actions</th></tr></thead><tbody>';
+                        group.positions.forEach(p => {
+                            const value = p.currentValue != null ? p.currentValue : (p.size * p.curPrice);
+                            const pnlClass = (p.percentPnl != null && Number(p.percentPnl) >= 0) ? 'text-success' : 'text-danger';
+                            const marketId = (p.conditionId || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+                            const assetId = (p.asset || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+                            content += '<tr><td class="text-wrap-mobile">' + (p.outcome || '—') + '</td><td>' + (p.size != null ? p.size : '—') + '</td><td>' + (p.avgPrice != null ? p.avgPrice : '—') + '</td><td>' + (p.curPrice != null ? p.curPrice : '—') + '</td><td>' + formatMoney(value) + '</td><td class="' + pnlClass + '">' + formatPct(p.percentPnl) + '</td><td>';
+                            content += '<button class="btn btn-danger btn-sm" onclick="openSellModal(\'' + marketId + '\', \'' + assetId + '\', ' + (p.curPrice != null ? p.curPrice : 0) + ')">Sell</button>';
+                            content += '</td></tr>';
+                        });
+                        content += '</tbody></table></div></div></div>';
+                    });
+                    document.getElementById('positions-content').innerHTML = content;
+                })
+                .catch(error => {
+                    document.getElementById('positions-content').innerHTML = 'Error loading positions: ' + error;
+                });
+        }
+
+        function loadOrders() {
+            fetch('/api/open_orders')
+                .then(response => response.json())
+                .then(data => {
+                    let content = '<div class="card shadow-sm"><div class="card-body p-2 p-md-3"><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Event</th><th>Outcome</th><th>Side</th><th>Size</th><th>Price</th><th>Actions</th></tr></thead><tbody>';
+                    data.forEach(order => {
+                        const eventName = order.event_name || '-';
+                        const outcome = order.outcome || '-';
+                        content += '<tr><td class="text-wrap-mobile">' + eventName + '</td><td>' + outcome + '</td><td>' + order.side + '</td><td>' + order.size + '</td><td>' + order.price + '</td><td>';
+                        content += '<button class="btn btn-warning btn-sm" onclick="cancelOrder(\'' + order.id + '\')">Cancel</button>';
+                        content += '</td></tr>';
+                    });
+                    content += '</tbody></table></div></div></div>';
+                    document.getElementById('orders-content').innerHTML = content;
+                })
+                .catch(error => console.error('Error loading orders:', error));
+        }
+
+        function updateAmountOrSizeLabel() {
+            const isAmount = document.getElementById('modeAmount').checked;
+            const label = document.getElementById('amountOrSizeLabel');
+            const hint = document.getElementById('amountOrSizeHint');
+            const price = parseFloat(document.getElementById('priceInput').value);
+            if (isAmount) {
+                label.textContent = 'Amount ($)';
+                hint.textContent = price > 0 ? 'Order size will be: amount ÷ ' + price + ' ≈ shares' : '';
+            } else {
+                label.textContent = 'Quantity (shares)';
+                hint.textContent = price > 0 ? 'Order value will be: quantity × ' + price + ' ≈ $' : '';
+            }
+        }
+
+        function openBuyModal(marketId, tokenId, price) {
+            currentAction = 'buy';
+            currentData = { market_id: marketId, token_id: tokenId };
+            document.getElementById('orderModalLabel').innerText = 'Create Buy Order';
+            document.getElementById('priceInput').value = price;
+            document.getElementById('modeQuantity').checked = true;
+            document.getElementById('amountOrSizeInput').value = '';
+            document.getElementById('amountOrSizeInput').placeholder = 'Enter quantity';
+            updateAmountOrSizeLabel();
+            new bootstrap.Modal(document.getElementById('orderModal')).show();
+        }
+
+        function openSellModal(marketId, tokenId, price) {
+            currentAction = 'sell';
+            currentData = { market_id: marketId, token_id: tokenId };
+            document.getElementById('orderModalLabel').innerText = 'Create Sell Order';
+            document.getElementById('priceInput').value = price;
+            document.getElementById('modeQuantity').checked = true;
+            document.getElementById('amountOrSizeInput').value = '';
+            document.getElementById('amountOrSizeInput').placeholder = 'Enter quantity';
+            updateAmountOrSizeLabel();
+            new bootstrap.Modal(document.getElementById('orderModal')).show();
+        }
+
+        function cancelOrder(orderId) {
+            if (confirm('Are you sure to cancel this order?')) {
+                fetch('/api/cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ order_id: orderId })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    alert('Order cancelled');
+                    loadOrders();
+                    loadBalance();
+                })
+                .catch(error => console.error('Error cancelling order:', error));
+            }
+        }
+
+        document.getElementById('priceInput').addEventListener('input', updateAmountOrSizeLabel);
+        document.getElementById('modeAmount').addEventListener('change', function() {
+            document.getElementById('amountOrSizeInput').placeholder = this.checked ? 'Enter amount in USD' : 'Enter quantity';
+            updateAmountOrSizeLabel();
+        });
+        document.getElementById('modeQuantity').addEventListener('change', function() {
+            document.getElementById('amountOrSizeInput').placeholder = this.checked ? 'Enter quantity' : 'Enter amount in USD';
+            updateAmountOrSizeLabel();
+        });
+
+        document.getElementById('submitOrder').addEventListener('click', function() {
+            const price = parseFloat(document.getElementById('priceInput').value);
+            const raw = document.getElementById('amountOrSizeInput').value;
+            if (!price || price <= 0 || raw === '' || isNaN(parseFloat(raw))) return;
+            const isAmount = document.getElementById('modeAmount').checked;
+            let size;
+            if (isAmount) {
+                const amount = parseFloat(raw);
+                if (amount <= 0) return;
+                size = Math.floor(amount / price);
+            } else {
+                size = Math.floor(parseFloat(raw));
+            }
+            if (size < 1) return;
+            currentData.price = price;
+            currentData.size = size;
+            const url = currentAction === 'buy' ? '/api/buy' : '/api/sell';
+            fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(currentData)
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    alert('Error: ' + data.error);
+                } else {
+                    alert('Order created: ' + data.order_id);
+                    bootstrap.Modal.getInstance(document.getElementById('orderModal')).hide();
+                    loadOrders();
+                    loadBalance();
+                }
+            })
+            .catch(error => console.error('Error creating order:', error));
+        });
+
+        // Load data on page load
+        loadBalance();
+        loadBtcPrice();
+        loadEvents();
+        loadPositions();
+        loadOrders();
+
+        // Refresh every 30 seconds
+        setInterval(() => {
+            loadBalance();
+            loadBtcPrice();
+            loadEvents();
+            loadPositions();
+            loadOrders();
+        }, 30000);
+    </script>
+</body>
+</html>

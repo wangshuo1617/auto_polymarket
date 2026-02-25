@@ -2,6 +2,7 @@
 Polymarket 持仓与订单 API
 """
 import sys
+import json
 from pathlib import Path
 
 # 添加项目根目录到 sys.path，以便可以导入 config
@@ -104,6 +105,40 @@ def get_event_situation(market_slug:str=None):
     polymarket_event_situation["markets"] = [{"question": i["question"], "outcomes": i["outcomes"], "outcomePrices": i["outcomePrices"]} for i in result["markets"]]
     return polymarket_event_situation
 
+def get_event_token_id(market_slug:str=None):
+    current_month_year = datetime.now().strftime("%B-%Y").lower()  # e.g. february-2026
+    if not market_slug:
+        market_slug = f"what-price-will-bitcoin-hit-in-{current_month_year}"
+    url = f"https://gamma-api.polymarket.com/events/slug/{market_slug}"
+    response = requests.get(url)
+    response.raise_for_status()
+    result = response.json()
+
+    def parse_json_list(value):
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                return []
+        return []
+
+    polymarket_event_situation = {}
+    polymarket_event_situation["event_name"] = result["title"]
+    polymarket_event_situation["markets"] = [
+        {
+            "question": i["question"],
+            "market_id": i["conditionId"],
+            "outcomes": parse_json_list(i.get("outcomes")),
+            "outcomePrices": parse_json_list(i.get("outcomePrices")),
+            "token_id": parse_json_list(i.get("clobTokenIds")),
+        }
+        for i in result["markets"]
+    ]
+    return polymarket_event_situation
+
 def get_order_book(token_id: str):
     return client.get_order_book(token_id)
 
@@ -114,4 +149,4 @@ def get_balance_allowance() -> str:
     return f"${balance:.2f}"
 
 if __name__ == "__main__":
-    print(get_balance_allowance())
+    print(get_open_orders())

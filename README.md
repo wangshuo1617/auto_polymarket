@@ -106,6 +106,16 @@ SMTP_SERVER=smtp.example.com
 SMTP_PORT=465
 FROM_EMAIL=sender@example.com
 FROM_EMAIL_PASSWORD=your_email_password
+
+# Dashboard 访问鉴权（用于外网访问）
+DASHBOARD_PASSWORD=your_strong_password
+# 可选：固定 Flask session 密钥（建议设置为随机长字符串）
+DASHBOARD_SECRET_KEY=your_long_random_secret
+# 可选：监听配置（默认 0.0.0.0:5000）
+DASHBOARD_HOST=0.0.0.0
+DASHBOARD_PORT=5000
+# 仅在你已配置 HTTPS 时设为 true
+DASHBOARD_HTTPS_ONLY=false
 ```
 
 ### 4. 配置参数
@@ -157,6 +167,18 @@ uv run btc_price_watcher.py
 ```bash
 uv run monthly_btc_strategy.py
 ```
+
+#### 运行 Web Dashboard（支持外网访问）
+
+```bash
+uv run app.py
+```
+
+说明：
+- 服务监听 `0.0.0.0:5000`，可从同网络或公网映射后访问。
+- 直接通过 IP 访问示例：`http://<你的公网IP>:5000`。
+- 首次访问会进入登录页，输入 `DASHBOARD_PASSWORD` 后才可使用 Dashboard 和 API。
+- 如需公网访问，建议结合云防火墙/反向代理（Nginx + HTTPS）仅开放必要端口。
 
 这会：
 - 连接到 Binance WebSocket

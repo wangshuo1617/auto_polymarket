@@ -14,4 +14,5 @@ dependencies = [
     "websocket-client>=1.9.0",
     "yfinance>=1.1.0",
     "polymarket-apis>=0.4.3",
+    "flask>=3.0.0",
 ]
