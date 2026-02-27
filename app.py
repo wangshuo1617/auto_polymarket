@@ -1,4 +1,5 @@
 import hmac
+import logging
 import os
 import secrets
 import subprocess
@@ -6,6 +7,8 @@ import sys
 from pathlib import Path
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
+
+logger = logging.getLogger(__name__)
 
 # 添加项目根目录到 sys.path
 _project_root = Path(__file__).resolve().parent
@@ -135,6 +138,7 @@ def api_positions():
 
 @app.route('/api/open_orders')
 def api_open_orders():
+    logger.info("api_open_orders requested")
     try:
         orders = get_open_orders()
 
@@ -171,50 +175,70 @@ def api_open_orders():
                 except Exception:
                     market_cache[market_id] = ""
             order["event_name"] = market_cache.get(market_id, "")
+        logger.info("api_open_orders success: orders_count=%s", len(orders))
         return jsonify(orders)
     except Exception as e:
+        logger.exception("api_open_orders failed: error=%s", e)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/buy', methods=['POST'])
 def api_buy():
-    data = request.json
+    data = request.json or {}
     market_id = data.get('market_id')
     token_id = data.get('token_id')
     price = data.get('price')
     size = data.get('size')
+    logger.info("api_buy requested: market_id=%s price=%s size=%s", market_id, price, size)
     if not all([market_id, token_id, price, size]):
+        logger.warning("api_buy missing parameters: has market_id=%s token_id=%s price=%s size=%s", bool(market_id), bool(token_id), price, size)
         return jsonify({'error': 'Missing parameters'}), 400
     try:
-        order_id = buy_order(market_id, token_id, float(price), int(size))
+        order_id = buy_order(market_id, token_id, float(price), float(size))
+        if order_id is None:
+            logger.warning("api_buy returned null order_id: market_id=%s price=%s size=%s", market_id, price, size)
+            return jsonify({'error': 'Order placement failed (null order_id)', 'order_id': None}), 500
+        logger.info("api_buy success: order_id=%s", order_id)
         return jsonify({'order_id': order_id})
     except Exception as e:
+        logger.exception("api_buy exception: market_id=%s error=%s", market_id, e)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/sell', methods=['POST'])
 def api_sell():
-    data = request.json
+    data = request.json or {}
     market_id = data.get('market_id')
     token_id = data.get('token_id')
     price = data.get('price')
     size = data.get('size')
+    logger.info("api_sell requested: market_id=%s price=%s size=%s", market_id, price, size)
     if not all([market_id, token_id, price, size]):
+        logger.warning("api_sell missing parameters: has market_id=%s token_id=%s price=%s size=%s", bool(market_id), bool(token_id), price, size)
         return jsonify({'error': 'Missing parameters'}), 400
     try:
-        order_id = sell_order(market_id, token_id, float(price), int(size))
+        order_id = sell_order(market_id, token_id, float(price), float(size))
+        if order_id is None:
+            logger.warning("api_sell returned null order_id: market_id=%s price=%s size=%s", market_id, price, size)
+            return jsonify({'error': 'Order placement failed (null order_id)', 'order_id': None}), 500
+        logger.info("api_sell success: order_id=%s", order_id)
         return jsonify({'order_id': order_id})
     except Exception as e:
+        logger.exception("api_sell exception: market_id=%s error=%s", market_id, e)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/cancel', methods=['POST'])
 def api_cancel():
-    data = request.json
+    data = request.json or {}
     order_id = data.get('order_id')
+    logger.info("api_cancel requested: order_id=%s", order_id)
     if not order_id:
+        logger.warning("api_cancel missing order_id")
         return jsonify({'error': 'Missing order_id'}), 400
     try:
         result = cancel_order(order_id)
+        logger.info("api_cancel success: order_id=%s result=%s", order_id, result)
         return jsonify({'result': result})
     except Exception as e:
+        logger.exception("api_cancel failed: order_id=%s error=%s", order_id, e)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/balance')
@@ -327,6 +351,15 @@ def report_latest():
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(_project_root / "logs" / "app.log", encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
     bind_host = os.getenv("DASHBOARD_HOST", "0.0.0.0")
     bind_port = int(os.getenv("DASHBOARD_PORT", "5000"))
     app.run(host=bind_host, port=bind_port, debug=False)

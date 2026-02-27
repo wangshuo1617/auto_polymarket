@@ -1,9 +1,12 @@
 """
 Polymarket 持仓与订单 API
 """
-import sys
 import json
+import logging
+import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # 添加项目根目录到 sys.path，以便可以导入 config
 _project_root = Path(__file__).resolve().parent.parent
@@ -54,12 +57,32 @@ def get_positions() -> list:
 
 def get_open_orders() -> list:
     """获取未成交挂单"""
-    response = client.get_orders()
-    return response
+    logger.info("get_open_orders called")
+    try:
+        response = client.get_orders()
+        count = len(response) if isinstance(response, list) else "non-list"
+        logger.info("get_open_orders success: count=%s", count)
+        return response
+    except Exception as e:
+        logger.exception("get_open_orders failed: error=%s", e)
+        raise
 
 
-def buy_order(market_id: str, token_id: str, price: float, size: int = 5):
-    market = client.get_market(market_id)
+def _token_id_short(tid: str) -> str:
+    """Shorten token_id for logging (first 8 + ... + last 4)."""
+    if not tid or len(tid) <= 16:
+        return tid or ""
+    return f"{tid[:8]}...{tid[-4:]}"
+
+
+def buy_order(market_id: str, token_id: str, price: float, size: float = 5.0):
+    logger.info("buy_order called: market_id=%s token_id=%s price=%s size=%s", market_id, _token_id_short(token_id), price, size)
+    try:
+        market = client.get_market(market_id)
+        logger.debug("buy_order get_market ok: tick_size=%s neg_risk=%s", market.get("minimum_tick_size"), market.get("neg_risk"))
+    except Exception as e:
+        logger.exception("buy_order get_market failed: market_id=%s error=%s", market_id, e)
+        return None
     try:
         response = client.create_and_post_order(
             OrderArgs(token_id=token_id, price=price, size=size, side=BUY),
@@ -68,14 +91,22 @@ def buy_order(market_id: str, token_id: str, price: float, size: int = 5):
                 neg_risk=market["neg_risk"],
             ),
         )
-        return response["orderID"]
+        order_id = response.get("orderID") if isinstance(response, dict) else None
+        logger.info("buy_order success: market_id=%s order_id=%s", market_id, order_id)
+        return order_id
     except Exception as e:
-        print(f"下单失败：{e}")
+        logger.exception("buy_order create_and_post_order failed: market_id=%s token_id=%s price=%s size=%s error=%s", market_id, _token_id_short(token_id), price, size, e)
         return None
 
 
-def sell_order(market_id: str, token_id: str, price: float, size: int = 5):
-    market = client.get_market(market_id)
+def sell_order(market_id: str, token_id: str, price: float, size: float = 5.0):
+    logger.info("sell_order called: market_id=%s token_id=%s price=%s size=%s", market_id, _token_id_short(token_id), price, size)
+    try:
+        market = client.get_market(market_id)
+        logger.debug("sell_order get_market ok: tick_size=%s neg_risk=%s", market.get("minimum_tick_size"), market.get("neg_risk"))
+    except Exception as e:
+        logger.exception("sell_order get_market failed: market_id=%s error=%s", market_id, e)
+        return None
     try:
         response = client.create_and_post_order(
             OrderArgs(token_id=token_id, price=price, size=size, side=SELL),
@@ -84,9 +115,11 @@ def sell_order(market_id: str, token_id: str, price: float, size: int = 5):
                 neg_risk=market["neg_risk"],
             ),
         )
-        return response["orderID"]
+        order_id = response.get("orderID") if isinstance(response, dict) else None
+        logger.info("sell_order success: market_id=%s order_id=%s", market_id, order_id)
+        return order_id
     except Exception as e:
-        print(f"下单失败：{e}")
+        logger.exception("sell_order create_and_post_order failed: market_id=%s token_id=%s price=%s size=%s error=%s", market_id, _token_id_short(token_id), price, size, e)
         return None
 
 def cancel_order(order_id: str):
@@ -149,4 +182,4 @@ def get_balance_allowance() -> str:
     return f"${balance:.2f}"
 
 if __name__ == "__main__":
-    print(get_open_orders())
+    print(get_event_token_id("btc-updown-5m-1772096400"))
