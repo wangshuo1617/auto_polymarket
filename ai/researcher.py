@@ -4,6 +4,7 @@ Uses Google Gemini API with Google Search Grounding for market research.
 """
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Dict, Any
 from google import genai
 from google.genai import types
@@ -17,6 +18,8 @@ from ai.prompts import (
     get_monthly_system_instruction,
     get_monthly_user_prompt,
 )
+
+ET_TIMEZONE = ZoneInfo("America/New_York")
 
 
 # Initialize the Gemini client
@@ -43,7 +46,7 @@ def analyze_market_with_grounding(
     """
     
     # Get current date for temporal context
-    current_date = datetime.now().strftime("%Y-%m-%d")
+    current_date = datetime.now(ET_TIMEZONE).strftime("%Y-%m-%d")
     
     # Initialize client
     client = _get_client()
@@ -133,7 +136,7 @@ def analyze_monthly_strategy_with_grounding(
     """
     Analyze month-start strategy for Polymarket BTC monthly market.
     """
-    current_date = datetime.now().strftime("%Y-%m-%d")
+    current_date = datetime.now(ET_TIMEZONE).strftime("%Y-%m-%d")
     client = _get_client()
     model = GEMINI_MODEL_ID
 

@@ -49,7 +49,7 @@ fi
 
 # 使用 nohup 在后台运行
 echo "正在启动新的 btc_price_watcher.py 进程（后台运行）..."
-LOG_FILE="logs/btc_watcher.log"
+LOG_FILE="/root/auto_polymarket/logs/btc_watcher.log"
 nohup /root/.local/bin/uv run /root/auto_polymarket/btc_price_watcher.py > "$LOG_FILE" 2>&1 &
 WATCHER_PID=$!
 

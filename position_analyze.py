@@ -5,6 +5,7 @@ Polymarket 持仓分析主入口
 import json
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from config import TO_EMAIL
 from data.polymarket import get_positions, get_open_orders, get_event_situation, get_balance_allowance
@@ -16,6 +17,7 @@ from services.position import match_orders_with_positions, format_matched_data
 from services.market_sentiment import get_market_sentiment_and_funding
 
 LAST_REPORT_PATH = Path(__file__).resolve().parent / "last_report.json"
+ET_TIMEZONE = ZoneInfo("America/New_York")
 
 
 def _load_previous_report() -> dict | None:
@@ -40,7 +42,7 @@ def _save_report(data: dict) -> None:
 
 if __name__ == "__main__":
     email_sender = EmailSender()
-    time_now = datetime.now().strftime("%m-%d %H:%M")
+    time_now = datetime.now(ET_TIMEZONE).strftime("%m-%d %H:%M")
 
     positions = get_positions()
     orders = get_open_orders()
@@ -72,14 +74,15 @@ if __name__ == "__main__":
     warn_prices = analyze_result["预警信号"]
     for warn_price in warn_prices:
         warn_price["alert_status"] = False
-    with open("price_warn_config.py", "w") as f:
+    with open("/root/auto_polymarket/price_warn_config.py", "w") as f:
         f.write(f"WARN_PRICE = {warn_prices}")
     print(f"{time_now} AI分析完成,开始发送邮件")
 
     email_subject = f"{time_now} Polymarket持仓情况分析,当前BTC价格: {get_btc_price():,.2f}"
     email_content = generate_html_template(analyze_result)
-    with open(f"output/{time_now}_email.html", "w") as f:
+    with open(f"/root/auto_polymarket/output/{time_now}_email.html", "w") as f:
         f.write(email_content)
-    email_sender.send_html_email(TO_EMAIL, email_subject, email_content)
+    if TO_EMAIL:
+        email_sender.send_html_email(TO_EMAIL, email_subject, email_content)
     _save_report(analyze_result)
     print(f"{time_now} 邮件发送完成")
