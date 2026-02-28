@@ -12,6 +12,7 @@
 ### 📊 实时价格监控
 - 通过 Binance WebSocket 实时监控 BTC/USDT 价格
 - 支持多种价格流类型（ticker、bookTicker、avgPrice）
+- 支持基于 `@aggTrade` 的 15 秒滑窗 Volume Delta 实时判定
 - 可配置的价格预警系统（上涨/下跌预警）
 - 每小时自动发送价格报告邮件
 
@@ -43,6 +44,7 @@
 auto_polymarket/
 ├── position_analyze.py      # 持仓分析主程序（入口）
 ├── btc_price_watcher.py     # BTC 价格监控服务（入口）
+├── btc_volume_delta_service.py # BTC 15秒滑窗 Volume Delta 服务（入口）
 ├── monthly_btc_strategy.py  # 月初建仓建议（入口）
 ├── config.py                # 配置文件
 ├── price_warn_config.py     # 价格预警配置（自动生成）
@@ -161,6 +163,17 @@ uv run position_analyze.py
 ```bash
 uv run btc_price_watcher.py
 ```
+
+#### 运行 Volume Delta 服务（45秒滑窗，45s预测，60s验证）
+
+```bash
+uv run btc_volume_delta_service.py --symbol btcusdt --window-seconds 45
+```
+
+说明：
+- 每分钟 45 秒输出基于过去 45 秒 Delta 的方向预测（预测 60s 价格相对 0s 价格的方向）
+- 到下一分钟 00 秒输出 BTC 实际较该分钟 0 秒价格的上涨/下跌，并统计累计预测命中率
+- 当 `|Delta| <= 1` 时判定为“无法预测”，该次样本不计入命中率统计
 
 #### 运行月初建仓建议
 

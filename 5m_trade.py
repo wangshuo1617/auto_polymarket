@@ -5,10 +5,11 @@ BTC 5m up/down 策略交易服务
 1. 通过 Binance WebSocket 订阅 BTCUSDT 1m K 线，按 5 分钟窗口切片；
 2. 对每个 5 分钟窗口：
    - 记录窗口开盘价（第一根 1m K 线开盘价）；
-   - 第 3 分钟收盘时，根据收盘价相对开盘价的方向（up / down），在对应的
+    - 在配置的第 N 分钟（1-4）收盘时，根据收盘价相对开盘价的方向（up / down），在对应的
      Polymarket 5m updown 市场买入 10 USDC 价值的 token；
-   - 止损：现价跌到买入价的 50% 时止损；
-   - 止盈：现价涨到 min(买入价 * 1.2, 0.99) 时止盈；
+    - 入场过滤：若买入价高于 0.80 则放弃本次开仓；
+    - 止损：现价跌到买入价 - 0.20 时止损；
+    - 止盈：现价涨到买入价 + 0.15 时止盈（上限 0.99）；
    - 特殊止损：如果第 4 分钟收盘价相对开盘价方向与第 3 分钟相反，则立即止损；
    - 特殊止盈：由 min(买入价 * 1.2, 0.99) 实现（当 1.2 * 买入价 > 1 时，在 0.99 止盈）。
 3. 通过 Polymarket WebSocket（ws-subscriptions-clob）订阅当前持仓 token 的价格；
@@ -324,20 +325,29 @@ class FiveMinuteUpDownTrader:
 
     WINDOW_MS = 5 * 60 * 1000
     MINUTE_MS = 60 * 1000
+    MAX_ENTRY_PRICE = 0.80
+    TAKE_PROFIT_SPREAD = 0.15
+    STOP_LOSS_SPREAD = -0.20
 
     def __init__(
         self,
         stake_usd: float = 10.0,
         report_interval_sec: int = 3600,
-        stop_loss_pct: float = 0.5,
-        take_profit_pct: float = 0.2,
+        entry_decision_minute: int = 3,
+        max_entry_price: float = MAX_ENTRY_PRICE,
+        take_profit_spread: float = TAKE_PROFIT_SPREAD,
+        stop_loss_spread: float = STOP_LOSS_SPREAD,
         dry_run: bool = False,
     ) -> None:
         self.stake_usd = stake_usd
         self.report_interval_sec = report_interval_sec
-        self.stop_loss_pct = stop_loss_pct
-        self.take_profit_pct = take_profit_pct
+        self.max_entry_price = max_entry_price
+        self.take_profit_spread = take_profit_spread
+        self.stop_loss_spread = stop_loss_spread
         self.dry_run = dry_run
+        if entry_decision_minute < 1 or entry_decision_minute > 4:
+            raise ValueError("entry_decision_minute 必须在 1-4 之间")
+        self.entry_decision_minute = entry_decision_minute
 
         self._lock = threading.Lock()
         self._binance = BinanceKline1mWatcher(callback=self._on_kline)
@@ -413,8 +423,11 @@ class FiveMinuteUpDownTrader:
 
             self.minute_closes[minute_index] = close_price
 
-            if minute_index == 3 and not self.window_traded:
-                self._handle_minute3()
+            if (
+                minute_index == self.entry_decision_minute
+                and not self.window_traded
+            ):
+                self._handle_entry_minute()
 
             if minute_index == 4:
                 self._handle_minute4_direction_change()
@@ -422,23 +435,26 @@ class FiveMinuteUpDownTrader:
             if minute_index == 5:
                 self._handle_minute5_expiry()
 
-    def _handle_minute3(self) -> None:
+    def _handle_entry_minute(self) -> None:
         if (
             self.current_window_start_ms is None
             or self.window_open_price is None
         ):
             return
         open_price = self.window_open_price
-        close3 = self.minute_closes.get(3)
-        if close3 is None:
+        close_n = self.minute_closes.get(self.entry_decision_minute)
+        if close_n is None:
             return
 
-        if close3 > open_price:
+        if close_n > open_price:
             direction = "up"
-        elif close3 < open_price:
+        elif close_n < open_price:
             direction = "down"
         else:
-            logger.info("第 3 分钟收盘价等于开盘价，跳过本窗口交易")
+            logger.info(
+                "第 %s 分钟收盘价等于开盘价，跳过本窗口交易",
+                self.entry_decision_minute,
+            )
             self.window_traded = True
             return
 
@@ -449,7 +465,10 @@ class FiveMinuteUpDownTrader:
             slug_ts = self.current_window_start_ms // 1000
             market_slug = f"btc-updown-5m-{slug_ts}"
         logger.info(
-            "第 3 分钟收盘，方向=%s，准备在市场 %s 开仓", direction, market_slug
+            "第 %s 分钟收盘，方向=%s，准备在市场 %s 开仓",
+            self.entry_decision_minute,
+            direction,
+            market_slug,
         )
 
         try:
@@ -578,10 +597,18 @@ class FiveMinuteUpDownTrader:
         )
 
         entry_price = self._estimate_entry_price(token_id)
+        if entry_price > self.max_entry_price:
+            logger.info(
+                "放弃开仓：entry_price=%.4f 高于 MAX_ENTRY_PRICE=%.4f",
+                entry_price,
+                self.max_entry_price,
+            )
+            return
+
         size = round(self.stake_usd / entry_price, 6)
 
-        stop_loss_price = entry_price * (1 - self.stop_loss_pct)
-        take_profit_price = min(entry_price * (1 + self.take_profit_pct), 0.99)
+        stop_loss_price = max(0.001, entry_price + self.stop_loss_spread)
+        take_profit_price = min(entry_price + self.take_profit_spread, 0.99)
 
         logger.info(
             "开仓: 市场=%s 方向=%s token=%s 价格=%.4f 数量=%.4f SL=%.4f TP=%.4f",
@@ -783,6 +810,13 @@ def main() -> None:
         action="store_true",
         help="仅模拟交易，不在 Polymarket 实际下单",
     )
+    parser.add_argument(
+        "--entry-minute",
+        type=int,
+        default=3,
+        choices=[1, 2, 3, 4],
+        help="按第几分钟收盘价判断建仓（1-4，默认 3）",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -793,8 +827,10 @@ def main() -> None:
     trader = FiveMinuteUpDownTrader(
         stake_usd=10.0,
         report_interval_sec=3600,
-        stop_loss_pct=0.3,
-        take_profit_pct=0.3,
+        entry_decision_minute=args.entry_minute,
+        max_entry_price=0.80,
+        take_profit_spread=0.15,
+        stop_loss_spread=-0.20,
         dry_run=args.dry_run,
     )
     try:
