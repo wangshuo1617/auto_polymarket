@@ -2,11 +2,12 @@
 BTC 5m up/down 策略交易服务
 
 功能：
-1. 通过 Binance WebSocket 订阅 BTCUSDT 1m K 线，按 5 分钟窗口切片；
+1. 通过 Binance WebSocket 订阅 BTCUSDT 1m K 线（含未收盘增量），按 5 分钟窗口切片；
 2. 对每个 5 分钟窗口：
-   - 记录窗口开盘价（第一根 1m K 线开盘价）；
-    - 在配置的第 N 分钟（1-4）收盘时，根据收盘价相对开盘价的方向（up / down），在对应的
-     Polymarket 5m updown 市场买入 10 USDC 价值的 token；
+    - 记录窗口开盘价（第一根 1m K 线开盘价）；
+     - 在配置的第 N 分钟（1-4）1m K 线收盘前 5 秒，基于当前价格预判收盘方向（up / down），
+      在对应的 Polymarket 5m updown 市场买入 10 USDC 价值的 token；
+     - 入场方向过滤：预判收盘价与窗口开盘价的绝对差值必须大于配置阈值；
     - 入场过滤：若买入价高于 0.80 则放弃本次开仓；
     - 止损：现价跌到买入价 - 0.20 时止损；
     - 止盈：现价涨到买入价 + 0.15 时止盈（上限 0.99）；
@@ -70,7 +71,7 @@ class OpenPosition:
 
 
 class BinanceKline1mWatcher:
-    """订阅 BTCUSDT@kline_1m，回调只在 K 线收盘时触发。"""
+    """订阅 BTCUSDT@kline_1m，回调在 K 线更新与收盘时都触发。"""
 
     BASE_URL = "wss://stream.binance.com:9443"
 
@@ -102,9 +103,6 @@ class BinanceKline1mWatcher:
                 return
 
             k = payload.get("k") or {}
-            if not k.get("x"):
-                return
-
             kline = {
                 "open_time": int(k.get("t", 0)),
                 "close_time": int(k.get("T", 0)),
@@ -112,6 +110,8 @@ class BinanceKline1mWatcher:
                 "high": float(k.get("h", 0.0)),
                 "low": float(k.get("l", 0.0)),
                 "close": float(k.get("c", 0.0)),
+                "is_closed": bool(k.get("x", False)),
+                "event_time": int(payload.get("E", int(time.time() * 1000))),
             }
 
             if self.callback:
@@ -334,6 +334,8 @@ class FiveMinuteUpDownTrader:
         stake_usd: float = 10.0,
         report_interval_sec: int = 3600,
         entry_decision_minute: int = 3,
+        entry_preclose_seconds: int = 5,
+        min_direction_diff: float = 5.0,
         max_entry_price: float = MAX_ENTRY_PRICE,
         take_profit_spread: float = TAKE_PROFIT_SPREAD,
         stop_loss_spread: float = STOP_LOSS_SPREAD,
@@ -347,7 +349,13 @@ class FiveMinuteUpDownTrader:
         self.dry_run = dry_run
         if entry_decision_minute < 1 or entry_decision_minute > 4:
             raise ValueError("entry_decision_minute 必须在 1-4 之间")
+        if entry_preclose_seconds < 1 or entry_preclose_seconds >= 60:
+            raise ValueError("entry_preclose_seconds 必须在 1-59 之间")
+        if min_direction_diff <= 0:
+            raise ValueError("min_direction_diff 必须大于 0")
         self.entry_decision_minute = entry_decision_minute
+        self.entry_preclose_seconds = entry_preclose_seconds
+        self.min_direction_diff = min_direction_diff
 
         self._lock = threading.Lock()
         self._binance = BinanceKline1mWatcher(callback=self._on_kline)
@@ -357,6 +365,7 @@ class FiveMinuteUpDownTrader:
         self.current_market_slug: Optional[str] = None
         self.window_open_price: Optional[float] = None
         self.window_traded: bool = False
+        self.preclose_entry_triggered: bool = False
         self.minute_closes: Dict[int, float] = {}
 
         self.position: Optional[OpenPosition] = None
@@ -389,7 +398,10 @@ class FiveMinuteUpDownTrader:
         with self._lock:
             open_time_ms = kline["open_time"]
             close_price = kline["close"]
-            open_price = kline["open"]
+            minute_open_price = kline["open"]
+            close_time_ms = kline["close_time"]
+            event_time_ms = int(kline.get("event_time", int(time.time() * 1000)))
+            is_closed = bool(kline.get("is_closed", False))
 
             window_start_ms = (
                 open_time_ms // self.WINDOW_MS
@@ -403,8 +415,9 @@ class FiveMinuteUpDownTrader:
                     "进入新 5m 窗口: start_ms=%s", window_start_ms
                 )
                 self.current_window_start_ms = window_start_ms
-                self.window_open_price = open_price
+                self.window_open_price = minute_open_price
                 self.window_traded = False
+                self.preclose_entry_triggered = False
                 self.minute_closes = {}
                 # 预先计算本窗口对应的市场 slug，并预热获取 market_id 与 token_id
                 slug_ts = window_start_ms // 1000
@@ -421,13 +434,24 @@ class FiveMinuteUpDownTrader:
                         e,
                     )
 
-            self.minute_closes[minute_index] = close_price
-
             if (
                 minute_index == self.entry_decision_minute
                 and not self.window_traded
+                and not self.preclose_entry_triggered
+                and not is_closed
             ):
-                self._handle_entry_minute()
+                ms_to_close = close_time_ms - event_time_ms
+                if 0 < ms_to_close <= self.entry_preclose_seconds * 1000:
+                    self._handle_entry_minute(
+                        projected_close=close_price,
+                        ms_to_close=ms_to_close,
+                    )
+                    self.preclose_entry_triggered = True
+
+            if not is_closed:
+                return
+
+            self.minute_closes[minute_index] = close_price
 
             if minute_index == 4:
                 self._handle_minute4_direction_change()
@@ -435,25 +459,38 @@ class FiveMinuteUpDownTrader:
             if minute_index == 5:
                 self._handle_minute5_expiry()
 
-    def _handle_entry_minute(self) -> None:
+    def _handle_entry_minute(self, projected_close: float, ms_to_close: int) -> None:
         if (
             self.current_window_start_ms is None
             or self.window_open_price is None
         ):
             return
         open_price = self.window_open_price
-        close_n = self.minute_closes.get(self.entry_decision_minute)
-        if close_n is None:
+        diff = projected_close - open_price
+        abs_diff = abs(diff)
+
+        if abs_diff <= self.min_direction_diff:
+            logger.info(
+                "第 %s 分钟收盘前 %.2fs 预判价差不足，跳过本窗口交易: projected_close=%.2f open=%.2f abs_diff=%.2f 阈值=%.2f",
+                self.entry_decision_minute,
+                ms_to_close / 1000,
+                projected_close,
+                open_price,
+                abs_diff,
+                self.min_direction_diff,
+            )
+            self.window_traded = True
             return
 
-        if close_n > open_price:
+        if diff > 0:
             direction = "up"
-        elif close_n < open_price:
+        elif diff < 0:
             direction = "down"
         else:
             logger.info(
-                "第 %s 分钟收盘价等于开盘价，跳过本窗口交易",
+                "第 %s 分钟收盘前 %.2fs 预判价等于开盘价，跳过本窗口交易",
                 self.entry_decision_minute,
+                ms_to_close / 1000,
             )
             self.window_traded = True
             return
@@ -465,8 +502,9 @@ class FiveMinuteUpDownTrader:
             slug_ts = self.current_window_start_ms // 1000
             market_slug = f"btc-updown-5m-{slug_ts}"
         logger.info(
-            "第 %s 分钟收盘，方向=%s，准备在市场 %s 开仓",
+            "第 %s 分钟收盘前 %.2fs 预判方向=%s，准备在市场 %s 开仓",
             self.entry_decision_minute,
+            ms_to_close / 1000,
             direction,
             market_slug,
         )
@@ -815,7 +853,19 @@ def main() -> None:
         type=int,
         default=3,
         choices=[1, 2, 3, 4],
-        help="按第几分钟收盘价判断建仓（1-4，默认 3）",
+        help="按第几分钟进行收盘前预判建仓（1-4，默认 3）",
+    )
+    parser.add_argument(
+        "--entry-preclose-sec",
+        type=int,
+        default=5,
+        help="距离 1m 收盘前多少秒执行方向预判建仓（默认 5）",
+    )
+    parser.add_argument(
+        "--min-direction-diff",
+        type=float,
+        default=10.0,
+        help="预判价与窗口开盘价最小绝对差值（USDT），不满足则跳过（默认 10.0）",
     )
     args = parser.parse_args()
 
@@ -828,6 +878,8 @@ def main() -> None:
         stake_usd=10.0,
         report_interval_sec=3600,
         entry_decision_minute=args.entry_minute,
+        entry_preclose_seconds=args.entry_preclose_sec,
+        min_direction_diff=args.min_direction_diff,
         max_entry_price=0.80,
         take_profit_spread=0.15,
         stop_loss_spread=-0.20,

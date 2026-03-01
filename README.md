@@ -42,6 +42,7 @@
 
 ```
 auto_polymarket/
+├── 5m_trade.py              # BTC 5m up/down 策略交易服务（入口）
 ├── position_analyze.py      # 持仓分析主程序（入口）
 ├── btc_price_watcher.py     # BTC 价格监控服务（入口）
 ├── btc_volume_delta_service.py # BTC 15秒滑窗 Volume Delta 服务（入口）
@@ -65,6 +66,9 @@ auto_polymarket/
 │   ├── email.py             # 邮件发送
 │   └── html.py              # HTML 报告模板
 ├── output/                  # 输出目录（自动生成，已 gitignore）
+├── scripts/
+│   ├── auto_polymarket.sh   # 主自动化脚本
+│   └── restart_5m_trade.sh  # 5m_trade 重启脚本
 └── pyproject.toml           # 项目依赖配置
 ```
 
@@ -179,6 +183,32 @@ uv run btc_volume_delta_service.py --symbol btcusdt --window-seconds 45
 
 ```bash
 uv run monthly_btc_strategy.py
+```
+
+#### 运行 BTC 5m up/down 策略
+
+直接运行：
+
+```bash
+uv run 5m_trade.py --dry-run --entry-minute 2 --entry-preclose-sec 5 --min-direction-diff 10
+```
+
+推荐使用重启脚本：
+
+```bash
+chmod +x scripts/restart_5m_trade.sh
+./scripts/restart_5m_trade.sh --dry-run 2 5 10
+```
+
+参数说明：
+- `entry-minute`：在第几分钟做方向预判（1-4）
+- `entry-preclose-sec`：该分钟 1m K 线收盘前多少秒触发“抢跑”建仓
+- `min-direction-diff`：预判价与窗口开盘价的最小绝对差值（USDT），用于过滤震荡
+
+切换实盘：
+
+```bash
+./scripts/restart_5m_trade.sh --live 2 5 10
 ```
 
 #### 运行 Web Dashboard（支持外网访问）
