@@ -4,7 +4,9 @@ Polymarket 持仓与订单 API
 import json
 import logging
 import sys
+import time
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,8 @@ client = ClobClient(
     creds=creds,
 )
 
+_market_meta_cache: Dict[str, Dict[str, Any]] = {}
+
 
 def get_positions() -> list:
     """获取 Polymarket 持仓"""
@@ -75,48 +79,90 @@ def _token_id_short(tid: str) -> str:
     return f"{tid[:8]}...{tid[-4:]}"
 
 
-def buy_order(market_id: str, token_id: str, price: float, size: float = 5.0):
-    logger.info("buy_order called: market_id=%s token_id=%s price=%s size=%s", market_id, _token_id_short(token_id), price, size)
+def get_market_metadata(market_id: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    获取并缓存 market 下单所需元信息，减少下单时延。
+    返回字段：minimum_tick_size, neg_risk
+    """
+    if not market_id:
+        return None
+
+    if not force_refresh:
+        cached = _market_meta_cache.get(market_id)
+        if cached is not None:
+            logger.info("get_market_metadata cache_hit: market_id=%s", market_id)
+            return cached
+
+    t0 = time.perf_counter()
     try:
         market = client.get_market(market_id)
-        logger.debug("buy_order get_market ok: tick_size=%s neg_risk=%s", market.get("minimum_tick_size"), market.get("neg_risk"))
+        meta = {
+            "minimum_tick_size": market.get("minimum_tick_size"),
+            "neg_risk": market.get("neg_risk", False),
+        }
+        _market_meta_cache[market_id] = meta
+        latency_ms = (time.perf_counter() - t0) * 1000
+        logger.info("get_market_metadata fetched: market_id=%s latency=%.2fms", market_id, latency_ms)
+        return meta
     except Exception as e:
-        logger.exception("buy_order get_market failed: market_id=%s error=%s", market_id, e)
+        logger.exception("get_market_metadata failed: market_id=%s error=%s", market_id, e)
         return None
+
+
+def buy_order(
+    market_id: str,
+    token_id: str,
+    price: float,
+    size: float = 5.0,
+    market_meta: Optional[Dict[str, Any]] = None,
+):
+    logger.info("buy_order called: market_id=%s token_id=%s price=%s size=%s", market_id, _token_id_short(token_id), price, size)
+    meta = market_meta or get_market_metadata(market_id)
+    if not meta or meta.get("minimum_tick_size") is None:
+        logger.error("buy_order missing market metadata: market_id=%s", market_id)
+        return None
+    submit_t0 = time.perf_counter()
     try:
         response = client.create_and_post_order(
             OrderArgs(token_id=token_id, price=price, size=size, side=BUY),
             options=CreateOrderOptions(
-                tick_size=str(market["minimum_tick_size"]),
-                neg_risk=market["neg_risk"],
+                tick_size=str(meta["minimum_tick_size"]),
+                neg_risk=bool(meta.get("neg_risk", False)),
             ),
         )
         order_id = response.get("orderID") if isinstance(response, dict) else None
-        logger.info("buy_order success: market_id=%s order_id=%s", market_id, order_id)
+        submit_ms = (time.perf_counter() - submit_t0) * 1000
+        logger.info("buy_order success: market_id=%s order_id=%s submit_latency=%.2fms", market_id, order_id, submit_ms)
         return order_id
     except Exception as e:
         logger.exception("buy_order create_and_post_order failed: market_id=%s token_id=%s price=%s size=%s error=%s", market_id, _token_id_short(token_id), price, size, e)
         return None
 
 
-def sell_order(market_id: str, token_id: str, price: float, size: float = 5.0):
+def sell_order(
+    market_id: str,
+    token_id: str,
+    price: float,
+    size: float = 5.0,
+    market_meta: Optional[Dict[str, Any]] = None,
+):
     logger.info("sell_order called: market_id=%s token_id=%s price=%s size=%s", market_id, _token_id_short(token_id), price, size)
-    try:
-        market = client.get_market(market_id)
-        logger.debug("sell_order get_market ok: tick_size=%s neg_risk=%s", market.get("minimum_tick_size"), market.get("neg_risk"))
-    except Exception as e:
-        logger.exception("sell_order get_market failed: market_id=%s error=%s", market_id, e)
+    meta = market_meta or get_market_metadata(market_id)
+    if not meta or meta.get("minimum_tick_size") is None:
+        logger.error("sell_order missing market metadata: market_id=%s", market_id)
         return None
+    submit_t0 = time.perf_counter()
     try:
         response = client.create_and_post_order(
             OrderArgs(token_id=token_id, price=price, size=size, side=SELL),
             options=CreateOrderOptions(
-                tick_size=str(market["minimum_tick_size"]),
-                neg_risk=market["neg_risk"],
+                tick_size=str(meta["minimum_tick_size"]),
+                neg_risk=bool(meta.get("neg_risk", False)),
             ),
         )
         order_id = response.get("orderID") if isinstance(response, dict) else None
-        logger.info("sell_order success: market_id=%s order_id=%s", market_id, order_id)
+        submit_ms = (time.perf_counter() - submit_t0) * 1000
+        logger.info("sell_order success: market_id=%s order_id=%s submit_latency=%.2fms", market_id, order_id, submit_ms)
         return order_id
     except Exception as e:
         logger.exception("sell_order create_and_post_order failed: market_id=%s token_id=%s price=%s size=%s error=%s", market_id, _token_id_short(token_id), price, size, e)

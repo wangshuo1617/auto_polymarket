@@ -25,7 +25,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from websocket import WebSocketApp
 
@@ -34,6 +34,7 @@ from data.polymarket import (
     buy_order,
     sell_order,
     get_event_token_id,
+    get_market_metadata,
     get_order_book,
 )
 from notifications.email import EmailSender
@@ -328,6 +329,10 @@ class FiveMinuteUpDownTrader:
     MAX_ENTRY_PRICE = 0.80
     TAKE_PROFIT_SPREAD = 0.15
     STOP_LOSS_SPREAD = -0.20
+    MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
+    MAX_ENTRY_SLIPPAGE_BPS = 120.0
+    MAX_EXIT_SLIPPAGE_BPS_WARN = 250.0
+    TOXIC_UTC_HOURS = {16, 19, 20}
 
     def __init__(
         self,
@@ -374,8 +379,213 @@ class FiveMinuteUpDownTrader:
         self._running = False
         self._report_thread: Optional[threading.Thread] = None
         self._last_report_index: int = 0
-        # 预热过的市场信息缓存：slug -> {"market_id", "up_token", "down_token"}
-        self._market_cache: Dict[str, Dict[str, str]] = {}
+        # 预热过的市场信息缓存：slug -> {"market_id", "up_token", "down_token", "market_meta"}
+        self._market_cache: Dict[str, Dict[str, Any]] = {}
+        self._latency_metrics: Dict[str, List[float]] = {}
+        self._latency_report_index: Dict[str, int] = {}
+
+    def _record_latency(self, metric: str, value_ms: float) -> None:
+        if value_ms < 0:
+            return
+        bucket = self._latency_metrics.setdefault(metric, [])
+        bucket.append(float(value_ms))
+
+    @staticmethod
+    def _percentile(values: List[float], p: float) -> float:
+        if not values:
+            return 0.0
+        if len(values) == 1:
+            return values[0]
+        sorted_values = sorted(values)
+        rank = (len(sorted_values) - 1) * p
+        lower = int(rank)
+        upper = min(lower + 1, len(sorted_values) - 1)
+        if lower == upper:
+            return sorted_values[lower]
+        weight = rank - lower
+        return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
+
+    def _format_latency_summary(self, metric: str, values: List[float]) -> str:
+        avg = sum(values) / len(values)
+        p50 = self._percentile(values, 0.50)
+        p95 = self._percentile(values, 0.95)
+        return (
+            f"- {metric}: count={len(values)}, avg={avg:.2f}ms, "
+            f"p50={p50:.2f}ms, p95={p95:.2f}ms"
+        )
+
+    @staticmethod
+    def _to_positive_float(value: object) -> Optional[float]:
+        try:
+            parsed = float(str(value))
+            if parsed <= 0:
+                return None
+            return parsed
+        except Exception:
+            return None
+
+    @classmethod
+    def _is_toxic_time_regime(cls) -> bool:
+        current_utc_hour = datetime.utcnow().hour
+        return current_utc_hour in cls.TOXIC_UTC_HOURS
+
+    def _build_execution_plan(self, token_id: str, side: str, target_size: float) -> Dict[str, Any]:
+        """
+        基于订单簿深度估算执行质量。
+        side: "buy" 使用 asks，"sell" 使用 bids。
+        返回：是否可完整成交、分层成交详情、均价、滑点等。
+        """
+        if target_size <= 0:
+            raise RuntimeError("target_size 必须大于 0")
+
+        book_t0 = time.perf_counter()
+        book = get_order_book(token_id)
+        book_ms = (time.perf_counter() - book_t0) * 1000
+        self._record_latency(f"orderbook_{side}", book_ms)
+        if book is None:
+            raise RuntimeError("订单簿为空")
+        logger.info(
+            "订单簿获取耗时: side=%s token=%s latency=%.2fms",
+            side,
+            token_id,
+            book_ms,
+        )
+
+        if side == "buy":
+            raw_levels = getattr(book, "asks", None) or []
+            sorted_levels = sorted(
+                raw_levels,
+                key=lambda lvl: float(getattr(lvl, "price")),
+            )
+        elif side == "sell":
+            raw_levels = getattr(book, "bids", None) or []
+            sorted_levels = sorted(
+                raw_levels,
+                key=lambda lvl: float(getattr(lvl, "price")),
+                reverse=True,
+            )
+        else:
+            raise RuntimeError(f"未知 side: {side}")
+
+        if not sorted_levels:
+            raise RuntimeError(f"订单簿无可用{'卖' if side == 'buy' else '买'}单")
+
+        total_available = 0.0
+        for lvl in sorted_levels:
+            lvl_size = self._to_positive_float(getattr(lvl, "size", None))
+            if lvl_size is not None:
+                total_available += lvl_size
+
+        remaining = target_size
+        consumed_levels: List[Dict[str, float]] = []
+        executed_size = 0.0
+        executed_notional = 0.0
+
+        for lvl in sorted_levels:
+            lvl_price = self._to_positive_float(getattr(lvl, "price", None))
+            lvl_size = self._to_positive_float(getattr(lvl, "size", None))
+            if lvl_price is None or lvl_size is None:
+                continue
+            if remaining <= 1e-9:
+                break
+            take_size = min(remaining, lvl_size)
+            consumed_levels.append({
+                "price": lvl_price,
+                "size": take_size,
+            })
+            executed_size += take_size
+            executed_notional += take_size * lvl_price
+            remaining -= take_size
+
+        if executed_size <= 0:
+            raise RuntimeError("订单簿深度不足，无法成交")
+
+        best_price = consumed_levels[0]["price"]
+        worst_price = consumed_levels[-1]["price"]
+        vwap_price = executed_notional / executed_size
+
+        if side == "buy":
+            slippage_abs = max(0.0, vwap_price - best_price)
+        else:
+            slippage_abs = max(0.0, best_price - vwap_price)
+
+        slippage_bps = (slippage_abs / best_price * 10000.0) if best_price > 0 else 0.0
+        fill_ratio = executed_size / target_size
+        full_fill = fill_ratio >= 0.999999
+
+        return {
+            "side": side,
+            "target_size": target_size,
+            "available_size": total_available,
+            "executed_size": executed_size,
+            "executed_notional": executed_notional,
+            "fill_ratio": fill_ratio,
+            "full_fill": full_fill,
+            "best_price": best_price,
+            "worst_price": worst_price,
+            "vwap_price": vwap_price,
+            "slippage_abs": slippage_abs,
+            "slippage_bps": slippage_bps,
+            "consumed_levels": consumed_levels,
+        }
+
+    def _log_execution_plan(self, stage: str, market_slug: str, token_id: str, plan: Dict[str, Any]) -> None:
+        side = str(plan.get("side", ""))
+        target_size = float(plan.get("target_size", 0.0))
+        executed_size = float(plan.get("executed_size", 0.0))
+        fill_ratio = float(plan.get("fill_ratio", 0.0))
+        best_price = float(plan.get("best_price", 0.0))
+        worst_price = float(plan.get("worst_price", 0.0))
+        vwap_price = float(plan.get("vwap_price", 0.0))
+        slippage_abs = float(plan.get("slippage_abs", 0.0))
+        slippage_bps = float(plan.get("slippage_bps", 0.0))
+        levels = plan.get("consumed_levels") or []
+
+        if fill_ratio >= 0.999999 and len(levels) == 1:
+            logger.info(
+                "%s 流动性评估: 市场=%s token=%s side=%s 完整在单档成交 price=%.4f size=%.4f",
+                stage,
+                market_slug,
+                token_id,
+                side,
+                best_price,
+                executed_size,
+            )
+            return
+
+        if fill_ratio >= 0.999999:
+            logger.info(
+                "%s 流动性评估: 市场=%s token=%s side=%s 完整分阶成交 target=%.4f levels=%s best=%.4f worst=%.4f avg=%.4f slippage=%.4f(%.2fbps)",
+                stage,
+                market_slug,
+                token_id,
+                side,
+                target_size,
+                len(levels),
+                best_price,
+                worst_price,
+                vwap_price,
+                slippage_abs,
+                slippage_bps,
+            )
+            return
+
+        logger.warning(
+            "%s 流动性评估: 市场=%s token=%s side=%s 未完整成交 target=%.4f 可成交=%.4f(%.2f%%) levels=%s best=%.4f worst=%.4f avg=%.4f slippage=%.4f(%.2fbps)",
+            stage,
+            market_slug,
+            token_id,
+            side,
+            target_size,
+            executed_size,
+            fill_ratio * 100,
+            len(levels),
+            best_price,
+            worst_price,
+            vwap_price,
+            slippage_abs,
+            slippage_bps,
+        )
 
     def start(self) -> None:
         logger.info("启动 FiveMinuteUpDownTrader，单笔仓位金额=%.2f USDC", self.stake_usd)
@@ -423,9 +633,14 @@ class FiveMinuteUpDownTrader:
                 slug_ts = window_start_ms // 1000
                 self.current_market_slug = f"btc-updown-5m-{slug_ts}"
                 try:
+                    prewarm_t0 = time.perf_counter()
                     self._select_market_and_tokens(self.current_market_slug)
+                    prewarm_ms = (time.perf_counter() - prewarm_t0) * 1000
+                    self._record_latency("prewarm_market", prewarm_ms)
                     logger.info(
-                        "5m 窗口市场预热完成: slug=%s", self.current_market_slug
+                        "5m 窗口市场预热完成: slug=%s latency=%.2fms",
+                        self.current_market_slug,
+                        prewarm_ms,
                     )
                 except Exception as e:
                     logger.warning(
@@ -465,6 +680,17 @@ class FiveMinuteUpDownTrader:
             or self.window_open_price is None
         ):
             return
+
+        current_utc_hour = datetime.utcnow().hour
+        if self._is_toxic_time_regime():
+            logger.info(
+                "Skip: Toxic Time Regime (UTC hour=%s in %s)",
+                current_utc_hour,
+                sorted(self.TOXIC_UTC_HOURS),
+            )
+            self.window_traded = True
+            return
+
         open_price = self.window_open_price
         diff = projected_close - open_price
         abs_diff = abs(diff)
@@ -559,12 +785,15 @@ class FiveMinuteUpDownTrader:
 
     def _select_market_and_tokens(
         self, market_slug: str
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
         cached = self._market_cache.get(market_slug)
         if cached is not None:
             return cached
 
+        info_t0 = time.perf_counter()
         info = get_event_token_id(market_slug)
+        info_ms = (time.perf_counter() - info_t0) * 1000
+        self._record_latency("market_event_fetch", info_ms)
         markets = info.get("markets") or []
         if not markets:
             raise RuntimeError(f"未找到市场: {market_slug}")
@@ -590,7 +819,20 @@ class FiveMinuteUpDownTrader:
             "market_id": m.get("market_id") or m.get("conditionId"),
             "up_token": token_ids[up_index],
             "down_token": token_ids[down_index],
+            "market_meta": None,
         }
+        market_id = result["market_id"]
+        if market_id:
+            meta_t0 = time.perf_counter()
+            result["market_meta"] = get_market_metadata(market_id)
+            meta_ms = (time.perf_counter() - meta_t0) * 1000
+            self._record_latency("market_meta_fetch", meta_ms)
+            logger.info(
+                "市场信息拉取耗时: slug=%s event=%.2fms market_meta=%.2fms",
+                market_slug,
+                info_ms,
+                meta_ms,
+            )
         self._market_cache[market_slug] = result
         return result
 
@@ -626,15 +868,39 @@ class FiveMinuteUpDownTrader:
             logger.warning("已有持仓，跳过开仓: %s", self.position)
             return
 
+        open_t0 = time.perf_counter()
         market_info = self._select_market_and_tokens(market_slug)
         market_id = market_info["market_id"]
+        market_meta = market_info.get("market_meta")
         token_id = (
             market_info["up_token"]
             if direction == "up"
             else market_info["down_token"]
         )
 
-        entry_price = self._estimate_entry_price(token_id)
+        rough_entry_price = self._estimate_entry_price(token_id)
+        size = round(self.stake_usd / rough_entry_price, 6)
+
+        plan = self._build_execution_plan(token_id=token_id, side="buy", target_size=size)
+        self._log_execution_plan(stage="建仓", market_slug=market_slug, token_id=token_id, plan=plan)
+
+        if plan["fill_ratio"] < self.MIN_ENTRY_LIQUIDITY_FILL_RATIO:
+            logger.warning(
+                "放弃开仓：流动性不足，fill_ratio=%.2f%% 低于阈值 %.2f%%",
+                plan["fill_ratio"] * 100,
+                self.MIN_ENTRY_LIQUIDITY_FILL_RATIO * 100,
+            )
+            return
+
+        if plan["slippage_bps"] > self.MAX_ENTRY_SLIPPAGE_BPS:
+            logger.warning(
+                "放弃开仓：预估滑点过大 slippage=%.2fbps 超过阈值 %.2fbps",
+                plan["slippage_bps"],
+                self.MAX_ENTRY_SLIPPAGE_BPS,
+            )
+            return
+
+        entry_price = float(plan["worst_price"])
         if entry_price > self.max_entry_price:
             logger.info(
                 "放弃开仓：entry_price=%.4f 高于 MAX_ENTRY_PRICE=%.4f",
@@ -642,8 +908,6 @@ class FiveMinuteUpDownTrader:
                 self.max_entry_price,
             )
             return
-
-        size = round(self.stake_usd / entry_price, 6)
 
         stop_loss_price = max(0.001, entry_price + self.stop_loss_spread)
         take_profit_price = min(entry_price + self.take_profit_spread, 0.99)
@@ -663,10 +927,19 @@ class FiveMinuteUpDownTrader:
             logger.info("dry-run 模式：不实际下单，仅模拟持仓与盈亏")
             order_id = None
         else:
-            order_id = buy_order(market_id, token_id, entry_price, size)
+            submit_t0 = time.perf_counter()
+            order_id = buy_order(
+                market_id,
+                token_id,
+                entry_price,
+                size,
+                market_meta=market_meta,
+            )
+            submit_ms = (time.perf_counter() - submit_t0) * 1000
+            self._record_latency("buy_submit", submit_ms)
             if not order_id:
                 raise RuntimeError("Polymarket 买单下单失败，order_id 为空")
-            logger.info("买单已提交，order_id=%s", order_id)
+            logger.info("买单已提交，order_id=%s submit_latency=%.2fms", order_id, submit_ms)
         self.position = OpenPosition(
             market_slug=market_slug,
             market_id=market_id,
@@ -686,6 +959,9 @@ class FiveMinuteUpDownTrader:
             on_price=self._on_polymarket_price,
         )
         self._poly_watcher.start()
+        open_ms = (time.perf_counter() - open_t0) * 1000
+        self._record_latency("open_total", open_ms)
+        logger.info("开仓链路总耗时: market=%s token=%s latency=%.2fms", market_slug, token_id, open_ms)
 
     def _on_polymarket_price(
         self,
@@ -716,12 +992,20 @@ class FiveMinuteUpDownTrader:
     def _force_close_position(self, reason: str) -> None:
         if not self.position:
             return
+        close_t0 = time.perf_counter()
         pos = self.position
         self.position = None
 
         if self._poly_watcher:
             self._poly_watcher.stop()
             self._poly_watcher = None
+
+        market_meta = None
+        market_info = self._market_cache.get(pos.market_slug)
+        if market_info:
+            market_meta = market_info.get("market_meta")
+        if market_meta is None:
+            market_meta = get_market_metadata(pos.market_id)
 
         exit_price = pos.last_best_bid
         if exit_price is None or exit_price <= 0:
@@ -740,13 +1024,41 @@ class FiveMinuteUpDownTrader:
         if exit_price is None or exit_price <= 0:
             exit_price = pos.entry_price
 
+        sell_plan: Optional[Dict[str, Any]] = None
+        try:
+            sell_plan = self._build_execution_plan(
+                token_id=pos.token_id,
+                side="sell",
+                target_size=pos.size,
+            )
+            self._log_execution_plan(
+                stage=f"平仓[{reason}]",
+                market_slug=pos.market_slug,
+                token_id=pos.token_id,
+                plan=sell_plan,
+            )
+            exit_price = float(sell_plan["worst_price"])
+
+            if sell_plan["slippage_bps"] > self.MAX_EXIT_SLIPPAGE_BPS_WARN:
+                logger.warning(
+                    "平仓预估滑点偏大: slippage=%.2fbps (>%.2fbps)",
+                    sell_plan["slippage_bps"],
+                    self.MAX_EXIT_SLIPPAGE_BPS_WARN,
+                )
+        except Exception as e:
+            logger.warning("平仓深度评估失败，使用回退价格: %s", e)
+
         if not self.dry_run:
+            submit_t0 = time.perf_counter()
             order_id = sell_order(
                 pos.market_id,
                 pos.token_id,
                 exit_price,
                 pos.size,
+                market_meta=market_meta,
             )
+            submit_ms = (time.perf_counter() - submit_t0) * 1000
+            self._record_latency("sell_submit", submit_ms)
             if not order_id:
                 logger.warning(
                     "平仓卖单提交失败，将按估算价格记账: market=%s token=%s price=%.4f size=%.4f",
@@ -756,7 +1068,7 @@ class FiveMinuteUpDownTrader:
                     pos.size,
                 )
             else:
-                logger.info("平仓卖单已提交，order_id=%s", order_id)
+                logger.info("平仓卖单已提交，order_id=%s submit_latency=%.2fms", order_id, submit_ms)
 
         pnl = (exit_price - pos.entry_price) * pos.size
         record = TradeRecord(
@@ -784,6 +1096,9 @@ class FiveMinuteUpDownTrader:
             record.pnl,
             record.reason,
         )
+        close_ms = (time.perf_counter() - close_t0) * 1000
+        self._record_latency("close_total", close_ms)
+        logger.info("平仓链路总耗时: market=%s token=%s reason=%s latency=%.2fms", pos.market_slug, pos.token_id, reason, close_ms)
 
     def _report_loop(self) -> None:
         sender = EmailSender()
@@ -799,6 +1114,13 @@ class FiveMinuteUpDownTrader:
             new_trades = self.trades[self._last_report_index :]
             self._last_report_index = len(self.trades)
             all_trades = list(self.trades)
+            latency_snapshot = {
+                metric: list(values)
+                for metric, values in self._latency_metrics.items()
+            }
+            latency_indices = dict(self._latency_report_index)
+            for metric, values in self._latency_metrics.items():
+                self._latency_report_index[metric] = len(values)
 
         hourly_pnl = sum(t.pnl for t in new_trades)
         hourly_count = len(new_trades)
@@ -810,6 +1132,48 @@ class FiveMinuteUpDownTrader:
             f"服务启动以来累计交易 {cumulative_count} 笔，累计盈亏：{cumulative_pnl:.2f} USDC",
             "",
         ]
+
+        metric_order = [
+            "prewarm_market",
+            "market_event_fetch",
+            "market_meta_fetch",
+            "orderbook_buy",
+            "orderbook_sell",
+            "buy_submit",
+            "sell_submit",
+            "open_total",
+            "close_total",
+        ]
+        hourly_latency_lines: List[str] = []
+        cumulative_latency_lines: List[str] = []
+        for metric in metric_order:
+            values = latency_snapshot.get(metric) or []
+            if not values:
+                continue
+            start_index = latency_indices.get(metric, 0)
+            hourly_values = values[start_index:]
+            if hourly_values:
+                hourly_latency_lines.append(
+                    self._format_latency_summary(metric, hourly_values)
+                )
+            cumulative_latency_lines.append(
+                self._format_latency_summary(metric, values)
+            )
+
+        lines.append("耗时统计（过去一小时）:")
+        if hourly_latency_lines:
+            lines.extend(hourly_latency_lines)
+        else:
+            lines.append("- 无新增耗时样本")
+
+        lines.append("")
+        lines.append("耗时统计（服务启动以来）:")
+        if cumulative_latency_lines:
+            lines.extend(cumulative_latency_lines)
+        else:
+            lines.append("- 无耗时样本")
+        lines.append("")
+
         for t in new_trades:
             lines.append(
                 f"- {t.entry_time.isoformat(timespec='seconds')} -> {t.exit_time.isoformat(timespec='seconds')}, "
