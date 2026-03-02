@@ -195,10 +195,18 @@ class PolymarketAssetPriceWatcher:
     def __init__(
         self,
         asset_id: str,
-        on_price: Callable[[float], None],
+        on_price: Optional[Callable[[float], None]],
+        on_book: Optional[Callable[[Dict[str, Any]], None]] = None,
+        extra_asset_ids: Optional[List[str]] = None,
     ) -> None:
         self.asset_id = asset_id
+        self.asset_ids: List[str] = [asset_id]
+        for item in (extra_asset_ids or []):
+            token = str(item)
+            if token and token not in self.asset_ids:
+                self.asset_ids.append(token)
         self.on_price = on_price
+        self.on_book = on_book
         self.ws: Optional[WebSocketApp] = None
         self.running = False
         self._thread: Optional[threading.Thread] = None
@@ -226,8 +234,8 @@ class PolymarketAssetPriceWatcher:
             time.sleep(10)
 
     def _on_open(self, ws: WebSocketApp) -> None:
-        logger.info("Polymarket WebSocket 已连接, 订阅 asset_id=%s", self.asset_id)
-        sub_msg = {"type": "Market", "assets_ids": [self.asset_id], "custom_feature_enabled": True}
+        logger.info("Polymarket WebSocket 已连接, 订阅 asset_ids=%s", self.asset_ids)
+        sub_msg = {"type": "Market", "assets_ids": self.asset_ids, "custom_feature_enabled": True}
         try:
             ws.send(json.dumps(sub_msg))
         except Exception as e:
@@ -254,11 +262,96 @@ class PolymarketAssetPriceWatcher:
         try:
             if event_type == "best_bid_ask":
                 best_bid = self._to_float(payload.get("best_bid"))
+            elif event_type == "book":
+                raw_bids = payload.get("bids") or []
+                raw_asks = payload.get("asks") or []
+                bids: List[Dict[str, float]] = []
+                asks: List[Dict[str, float]] = []
+
+                for lvl in raw_bids:
+                    if not isinstance(lvl, dict):
+                        continue
+                    price = self._to_float(lvl.get("price"))
+                    size = self._to_float(lvl.get("size"))
+                    if price is None or size is None:
+                        continue
+                    bids.append({"price": price, "size": size})
+
+                for lvl in raw_asks:
+                    if not isinstance(lvl, dict):
+                        continue
+                    price = self._to_float(lvl.get("price"))
+                    size = self._to_float(lvl.get("size"))
+                    if price is None or size is None:
+                        continue
+                    asks.append({"price": price, "size": size})
+
+                ts_ms: Optional[int] = None
+                try:
+                    raw_ts = payload.get("timestamp")
+                    if raw_ts is not None:
+                        ts_ms = int(str(raw_ts))
+                except Exception:
+                    ts_ms = None
+
+                # 按交易所约定：best_bid 是 bids 最后一个，best_ask 是 asks 第一个
+                if bids:
+                    best_bid = bids[-1]["price"]
+                best_ask = asks[0]["price"] if asks else None
+
+                if self.on_book and (bids or asks):
+                    self.on_book(
+                        {
+                            "asset_id": str(payload.get("asset_id") or self.asset_id),
+                            "market": payload.get("market"),
+                            "timestamp_ms": ts_ms,
+                            "received_ms": int(time.time() * 1000),
+                            "bids": bids,
+                            "asks": asks,
+                            "best_bid": best_bid,
+                            "best_ask": best_ask,
+                        }
+                    )
+            elif event_type == "price_change":
+                price_changes = payload.get("price_changes") or []
+                ts_ms: Optional[int] = None
+                try:
+                    raw_ts = payload.get("timestamp")
+                    if raw_ts is not None:
+                        ts_ms = int(str(raw_ts))
+                except Exception:
+                    ts_ms = None
+
+                for item in price_changes:
+                    if not isinstance(item, dict):
+                        continue
+                    asset_id = str(item.get("asset_id") or "")
+                    if not asset_id:
+                        continue
+
+                    item_best_bid = self._to_float(item.get("best_bid"))
+                    item_best_ask = self._to_float(item.get("best_ask"))
+
+                    if asset_id == self.asset_id and item_best_bid is not None:
+                        best_bid = item_best_bid
+
+                    if self.on_book:
+                        self.on_book(
+                            {
+                                "asset_id": asset_id,
+                                "market": payload.get("market"),
+                                "timestamp_ms": ts_ms,
+                                "received_ms": int(time.time() * 1000),
+                                "price_change_only": True,
+                                "best_bid": item_best_bid,
+                                "best_ask": item_best_ask,
+                            }
+                        )
         except Exception as e:
             logger.debug("解析 Polymarket 价格消息异常: %s", e)
             best_bid = None
 
-        if best_bid is None:
+        if best_bid is None or self.on_price is None:
             return
 
         try:
@@ -333,6 +426,7 @@ class FiveMinuteUpDownTrader:
     MAX_ENTRY_SLIPPAGE_BPS = 120.0
     MAX_EXIT_SLIPPAGE_BPS_WARN = 250.0
     TOXIC_UTC_HOURS = {16, 19, 20}
+    WS_BOOK_MAX_AGE_MS = 1200
 
     def __init__(
         self,
@@ -365,6 +459,7 @@ class FiveMinuteUpDownTrader:
         self._lock = threading.Lock()
         self._binance = BinanceKline1mWatcher(callback=self._on_kline)
         self._poly_watcher: Optional[PolymarketAssetPriceWatcher] = None
+        self._window_book_watcher: Optional[PolymarketAssetPriceWatcher] = None
 
         self.current_window_start_ms: Optional[int] = None
         self.current_market_slug: Optional[str] = None
@@ -383,6 +478,19 @@ class FiveMinuteUpDownTrader:
         self._market_cache: Dict[str, Dict[str, Any]] = {}
         self._latency_metrics: Dict[str, List[float]] = {}
         self._latency_report_index: Dict[str, int] = {}
+        self._ws_book_cache: Dict[str, Dict[str, Any]] = {}
+        self._book_source_counts: Dict[str, int] = {
+            "buy_ws": 0,
+            "buy_http": 0,
+            "sell_ws": 0,
+            "sell_http": 0,
+        }
+        self._book_source_report_index: Dict[str, int] = {
+            "buy_ws": 0,
+            "buy_http": 0,
+            "sell_ws": 0,
+            "sell_http": 0,
+        }
 
     def _record_latency(self, metric: str, value_ms: float) -> None:
         if value_ms < 0:
@@ -426,10 +534,136 @@ class FiveMinuteUpDownTrader:
 
     @classmethod
     def _is_toxic_time_regime(cls) -> bool:
-        current_utc_hour = datetime.utcnow().hour
+        current_utc_hour = datetime.now(timezone.utc).hour
         return current_utc_hour in cls.TOXIC_UTC_HOURS
 
-    def _build_execution_plan(self, token_id: str, side: str, target_size: float) -> Dict[str, Any]:
+    def _fetch_orderbook_levels(self, token_id: str, side: str) -> Dict[str, Any]:
+        """
+        返回统一格式盘口档位：[{"price": float, "size": float}, ...]
+        source: ws / http
+        """
+        ws_snapshot = self._ws_book_cache.get(token_id)
+        levels: List[Dict[str, float]] = []
+        source = "http"
+
+        if ws_snapshot is not None:
+            now_ms = int(time.time() * 1000)
+            snapshot_ts = int(ws_snapshot.get("received_ms") or now_ms)
+            age_ms = now_ms - snapshot_ts
+            if age_ms <= self.WS_BOOK_MAX_AGE_MS:
+                if side == "buy":
+                    levels = list(ws_snapshot.get("asks") or [])
+                elif side == "sell":
+                    # 按交易所约定 bids[-1] 为 best bid，卖出时从后往前吃单
+                    levels = list(reversed(ws_snapshot.get("bids") or []))
+                else:
+                    raise RuntimeError(f"未知 side: {side}")
+
+                if levels:
+                    source = "ws"
+                    self._record_latency(f"orderbook_{side}_ws", float(age_ms))
+                    source_key = f"{side}_ws"
+                    self._book_source_counts[source_key] = (
+                        self._book_source_counts.get(source_key, 0) + 1
+                    )
+                    logger.info(
+                        "订单簿来源: side=%s token=%s source=ws_book snapshot_age=%.2fms",
+                        side,
+                        token_id,
+                        float(age_ms),
+                    )
+            else:
+                logger.info(
+                    "订单簿WS快照过期，回退HTTP: side=%s token=%s snapshot_age=%.2fms threshold=%.2fms",
+                    side,
+                    token_id,
+                    float(age_ms),
+                    float(self.WS_BOOK_MAX_AGE_MS),
+                )
+        else:
+            logger.info(
+                "订单簿无WS快照，回退HTTP: side=%s token=%s",
+                side,
+                token_id,
+            )
+
+        if source != "ws":
+            book_t0 = time.perf_counter()
+            book = get_order_book(token_id)
+            book_ms = (time.perf_counter() - book_t0) * 1000
+            self._record_latency(f"orderbook_{side}", book_ms)
+            source_key = f"{side}_http"
+            self._book_source_counts[source_key] = (
+                self._book_source_counts.get(source_key, 0) + 1
+            )
+            if book is None:
+                raise RuntimeError("订单簿为空")
+            logger.info(
+                "订单簿获取耗时: side=%s token=%s latency=%.2fms source=http",
+                side,
+                token_id,
+                book_ms,
+            )
+
+            if side == "buy":
+                raw_levels = getattr(book, "asks", None) or []
+                sorted_levels = sorted(
+                    raw_levels,
+                    key=lambda lvl: float(getattr(lvl, "price")),
+                )
+            elif side == "sell":
+                raw_levels = getattr(book, "bids", None) or []
+                sorted_levels = sorted(
+                    raw_levels,
+                    key=lambda lvl: float(getattr(lvl, "price")),
+                    reverse=True,
+                )
+            else:
+                raise RuntimeError(f"未知 side: {side}")
+
+            levels = []
+            for lvl in sorted_levels:
+                lvl_price = self._to_positive_float(getattr(lvl, "price", None))
+                lvl_size = self._to_positive_float(getattr(lvl, "size", None))
+                if lvl_price is None or lvl_size is None:
+                    continue
+                levels.append({"price": lvl_price, "size": lvl_size})
+
+        normalized_levels: List[Dict[str, float]] = []
+        for lvl in levels:
+            if not isinstance(lvl, dict):
+                continue
+            lvl_price = self._to_positive_float(lvl.get("price"))
+            lvl_size = self._to_positive_float(lvl.get("size"))
+            if lvl_price is None or lvl_size is None:
+                continue
+            normalized_levels.append({"price": lvl_price, "size": lvl_size})
+
+        # 无论 WS/HTTP，统一按价格排序，避免上游顺序变化导致 best ask/bid 选错
+        if side == "buy":
+            normalized_levels = sorted(normalized_levels, key=lambda lvl: float(lvl["price"]))
+        elif side == "sell":
+            normalized_levels = sorted(normalized_levels, key=lambda lvl: float(lvl["price"]), reverse=True)
+        else:
+            raise RuntimeError(f"未知 side: {side}")
+
+        if not normalized_levels:
+            raise RuntimeError(f"订单簿无可用{'卖' if side == 'buy' else '买'}单")
+
+        return {
+            "source": source,
+            "levels": normalized_levels,
+            "best_ask": self._to_positive_float((ws_snapshot or {}).get("best_ask")),
+            "best_bid": self._to_positive_float((ws_snapshot or {}).get("best_bid")),
+        }
+
+    def _build_execution_plan(
+        self,
+        token_id: str,
+        side: str,
+        target_size: float,
+        levels_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         基于订单簿深度估算执行质量。
         side: "buy" 使用 asks，"sell" 使用 bids。
@@ -438,41 +672,13 @@ class FiveMinuteUpDownTrader:
         if target_size <= 0:
             raise RuntimeError("target_size 必须大于 0")
 
-        book_t0 = time.perf_counter()
-        book = get_order_book(token_id)
-        book_ms = (time.perf_counter() - book_t0) * 1000
-        self._record_latency(f"orderbook_{side}", book_ms)
-        if book is None:
-            raise RuntimeError("订单簿为空")
-        logger.info(
-            "订单簿获取耗时: side=%s token=%s latency=%.2fms",
-            side,
-            token_id,
-            book_ms,
-        )
-
-        if side == "buy":
-            raw_levels = getattr(book, "asks", None) or []
-            sorted_levels = sorted(
-                raw_levels,
-                key=lambda lvl: float(getattr(lvl, "price")),
-            )
-        elif side == "sell":
-            raw_levels = getattr(book, "bids", None) or []
-            sorted_levels = sorted(
-                raw_levels,
-                key=lambda lvl: float(getattr(lvl, "price")),
-                reverse=True,
-            )
-        else:
-            raise RuntimeError(f"未知 side: {side}")
-
-        if not sorted_levels:
-            raise RuntimeError(f"订单簿无可用{'卖' if side == 'buy' else '买'}单")
+        payload = levels_payload or self._fetch_orderbook_levels(token_id=token_id, side=side)
+        sorted_levels = payload.get("levels") or []
+        book_source = str(payload.get("source") or "unknown")
 
         total_available = 0.0
         for lvl in sorted_levels:
-            lvl_size = self._to_positive_float(getattr(lvl, "size", None))
+            lvl_size = self._to_positive_float(lvl.get("size")) if isinstance(lvl, dict) else None
             if lvl_size is not None:
                 total_available += lvl_size
 
@@ -482,8 +688,8 @@ class FiveMinuteUpDownTrader:
         executed_notional = 0.0
 
         for lvl in sorted_levels:
-            lvl_price = self._to_positive_float(getattr(lvl, "price", None))
-            lvl_size = self._to_positive_float(getattr(lvl, "size", None))
+            lvl_price = self._to_positive_float(lvl.get("price")) if isinstance(lvl, dict) else None
+            lvl_size = self._to_positive_float(lvl.get("size")) if isinstance(lvl, dict) else None
             if lvl_price is None or lvl_size is None:
                 continue
             if remaining <= 1e-9:
@@ -503,6 +709,11 @@ class FiveMinuteUpDownTrader:
         best_price = consumed_levels[0]["price"]
         worst_price = consumed_levels[-1]["price"]
         vwap_price = executed_notional / executed_size
+        level_prices_preview = [
+            float(lvl["price"])
+            for lvl in sorted_levels[:10]
+            if isinstance(lvl, dict) and lvl.get("price") is not None
+        ]
 
         if side == "buy":
             slippage_abs = max(0.0, vwap_price - best_price)
@@ -515,6 +726,7 @@ class FiveMinuteUpDownTrader:
 
         return {
             "side": side,
+            "book_source": book_source,
             "target_size": target_size,
             "available_size": total_available,
             "executed_size": executed_size,
@@ -527,6 +739,7 @@ class FiveMinuteUpDownTrader:
             "slippage_abs": slippage_abs,
             "slippage_bps": slippage_bps,
             "consumed_levels": consumed_levels,
+            "level_prices_preview": level_prices_preview,
         }
 
     def _log_execution_plan(self, stage: str, market_slug: str, token_id: str, plan: Dict[str, Any]) -> None:
@@ -540,6 +753,7 @@ class FiveMinuteUpDownTrader:
         slippage_abs = float(plan.get("slippage_abs", 0.0))
         slippage_bps = float(plan.get("slippage_bps", 0.0))
         levels = plan.get("consumed_levels") or []
+        book_source = str(plan.get("book_source", "unknown"))
 
         if fill_ratio >= 0.999999 and len(levels) == 1:
             logger.info(
@@ -550,6 +764,14 @@ class FiveMinuteUpDownTrader:
                 side,
                 best_price,
                 executed_size,
+            )
+            logger.info(
+                "%s 订单簿路径: market=%s token=%s side=%s source=%s",
+                stage,
+                market_slug,
+                token_id,
+                side,
+                book_source,
             )
             return
 
@@ -567,6 +789,14 @@ class FiveMinuteUpDownTrader:
                 vwap_price,
                 slippage_abs,
                 slippage_bps,
+            )
+            logger.info(
+                "%s 订单簿路径: market=%s token=%s side=%s source=%s",
+                stage,
+                market_slug,
+                token_id,
+                side,
+                book_source,
             )
             return
 
@@ -586,6 +816,14 @@ class FiveMinuteUpDownTrader:
             slippage_abs,
             slippage_bps,
         )
+        logger.info(
+            "%s 订单簿路径: market=%s token=%s side=%s source=%s",
+            stage,
+            market_slug,
+            token_id,
+            side,
+            book_source,
+        )
 
     def start(self) -> None:
         logger.info("启动 FiveMinuteUpDownTrader，单笔仓位金额=%.2f USDC", self.stake_usd)
@@ -600,9 +838,41 @@ class FiveMinuteUpDownTrader:
         logger.info("停止 FiveMinuteUpDownTrader")
         self._running = False
         self._binance.stop()
+        if self._window_book_watcher:
+            self._window_book_watcher.stop()
+            self._window_book_watcher = None
         if self._poly_watcher:
             self._poly_watcher.stop()
             self._poly_watcher = None
+
+    def _start_window_book_watcher(self, market_slug: str) -> None:
+        try:
+            market_info = self._select_market_and_tokens(market_slug)
+            up_token = str(market_info.get("up_token") or "")
+            down_token = str(market_info.get("down_token") or "")
+            if not up_token or not down_token:
+                logger.warning("窗口book预订阅失败，token为空: slug=%s", market_slug)
+                return
+
+            if self._window_book_watcher:
+                self._window_book_watcher.stop()
+                self._window_book_watcher = None
+
+            self._window_book_watcher = PolymarketAssetPriceWatcher(
+                asset_id=up_token,
+                extra_asset_ids=[down_token],
+                on_price=None,
+                on_book=self._on_polymarket_book,
+            )
+            self._window_book_watcher.start()
+            logger.info(
+                "窗口book预订阅已启动: slug=%s up_token=%s down_token=%s",
+                market_slug,
+                up_token,
+                down_token,
+            )
+        except Exception as e:
+            logger.warning("窗口book预订阅启动失败: slug=%s error=%s", market_slug, e)
 
     def _on_kline(self, kline: Dict) -> None:
         with self._lock:
@@ -635,6 +905,7 @@ class FiveMinuteUpDownTrader:
                 try:
                     prewarm_t0 = time.perf_counter()
                     self._select_market_and_tokens(self.current_market_slug)
+                    self._start_window_book_watcher(self.current_market_slug)
                     prewarm_ms = (time.perf_counter() - prewarm_t0) * 1000
                     self._record_latency("prewarm_market", prewarm_ms)
                     logger.info(
@@ -681,7 +952,7 @@ class FiveMinuteUpDownTrader:
         ):
             return
 
-        current_utc_hour = datetime.utcnow().hour
+        current_utc_hour = datetime.now(timezone.utc).hour
         if self._is_toxic_time_regime():
             logger.info(
                 "Skip: Toxic Time Regime (UTC hour=%s in %s)",
@@ -836,53 +1107,49 @@ class FiveMinuteUpDownTrader:
         self._market_cache[market_slug] = result
         return result
 
-    def _estimate_entry_price(self, token_id: str) -> float:
-        """
-        使用 py_clob_client 返回的 OrderBookSummary 对象估算入场价：
-        - 优先取所有卖单中「最低」的 ask.price 作为最优卖价。
-        """
-        book = get_order_book(token_id)
-        if book is None:
-            raise RuntimeError("订单簿为空，无法获取卖单")
-
-        asks = getattr(book, "asks", None) or []
-        if not asks:
-            raise RuntimeError("订单簿无卖单，流动性不足")
-
-        # OrderSummary 对象通常有 price/size 属性，选择价格最低的一档作为入场价
-        try:
-            best_ask_level = min(
-                asks, key=lambda lvl: float(getattr(lvl, "price"))
-            )
-            best_ask = float(getattr(best_ask_level, "price"))
-        except Exception as e:
-            raise RuntimeError(f"读取订单簿卖价失败: {e}") from e
-
-        if best_ask <= 0:
-            raise RuntimeError("订单簿价格异常（卖价 <= 0）")
-
-        return best_ask
-
     def _open_position(self, market_slug: str, direction: str) -> None:
         if self.position is not None:
             logger.warning("已有持仓，跳过开仓: %s", self.position)
             return
 
+        if direction not in {"up", "down"}:
+            raise RuntimeError(f"非法方向 direction={direction}")
+
         open_t0 = time.perf_counter()
         market_info = self._select_market_and_tokens(market_slug)
         market_id = market_info["market_id"]
         market_meta = market_info.get("market_meta")
-        token_id = (
-            market_info["up_token"]
-            if direction == "up"
-            else market_info["down_token"]
+        up_token = str(market_info["up_token"])
+        down_token = str(market_info["down_token"])
+        token_id = up_token if direction == "up" else down_token
+
+        logger.info(
+            "建仓token映射: market=%s direction=%s up_token=%s down_token=%s selected_token=%s",
+            market_slug,
+            direction,
+            up_token,
+            down_token,
+            token_id,
         )
 
-        rough_entry_price = self._estimate_entry_price(token_id)
+        entry_levels_payload = self._fetch_orderbook_levels(token_id=token_id, side="buy")
+        entry_levels = entry_levels_payload.get("levels") or []
+        if not entry_levels:
+            raise RuntimeError("订单簿无卖单，流动性不足")
+        best_ask_price = self._to_positive_float(entry_levels_payload.get("best_ask"))
+        if best_ask_price is None:
+            best_ask_price = float(entry_levels[0]["price"])
+        rough_entry_price = best_ask_price
         size = round(self.stake_usd / rough_entry_price, 6)
 
-        plan = self._build_execution_plan(token_id=token_id, side="buy", target_size=size)
+        plan = self._build_execution_plan(
+            token_id=token_id,
+            side="buy",
+            target_size=size,
+            levels_payload=entry_levels_payload,
+        )
         self._log_execution_plan(stage="建仓", market_slug=market_slug, token_id=token_id, plan=plan)
+        open_book_source = str(plan.get("book_source", "unknown"))
 
         if plan["fill_ratio"] < self.MIN_ENTRY_LIQUIDITY_FILL_RATIO:
             logger.warning(
@@ -901,13 +1168,21 @@ class FiveMinuteUpDownTrader:
             return
 
         entry_price = float(plan["worst_price"])
-        if entry_price > self.max_entry_price:
+        if best_ask_price > self.max_entry_price:
             logger.info(
-                "放弃开仓：entry_price=%.4f 高于 MAX_ENTRY_PRICE=%.4f",
-                entry_price,
+                "放弃开仓：best_ask=%.4f 高于 MAX_ENTRY_PRICE=%.4f (worst_fill=%.4f)",
+                best_ask_price,
                 self.max_entry_price,
+                entry_price,
             )
             return
+
+        logger.info(
+            "建仓价格判定: best_ask=%.4f worst_fill=%.4f max_entry=%.4f",
+            best_ask_price,
+            entry_price,
+            self.max_entry_price,
+        )
 
         stop_loss_price = max(0.001, entry_price + self.stop_loss_spread)
         take_profit_price = min(entry_price + self.take_profit_spread, 0.99)
@@ -957,11 +1232,18 @@ class FiveMinuteUpDownTrader:
         self._poly_watcher = PolymarketAssetPriceWatcher(
             asset_id=token_id,
             on_price=self._on_polymarket_price,
+            on_book=self._on_polymarket_book,
         )
         self._poly_watcher.start()
         open_ms = (time.perf_counter() - open_t0) * 1000
         self._record_latency("open_total", open_ms)
-        logger.info("开仓链路总耗时: market=%s token=%s latency=%.2fms", market_slug, token_id, open_ms)
+        logger.info(
+            "开仓链路总耗时: market=%s token=%s source=%s latency=%.2fms",
+            market_slug,
+            token_id,
+            open_book_source,
+            open_ms,
+        )
 
     def _on_polymarket_price(
         self,
@@ -988,6 +1270,38 @@ class FiveMinuteUpDownTrader:
                     self.position.take_profit_price,
                 )
                 self._force_close_position(reason="tp")
+
+    def _on_polymarket_book(self, snapshot: Dict[str, Any]) -> None:
+        asset_id = str(snapshot.get("asset_id") or "")
+        if not asset_id:
+            return
+        with self._lock:
+            existing = self._ws_book_cache.get(asset_id)
+            if snapshot.get("price_change_only") and existing:
+                merged = dict(existing)
+                merged["received_ms"] = snapshot.get("received_ms", existing.get("received_ms"))
+                merged["timestamp_ms"] = snapshot.get("timestamp_ms", existing.get("timestamp_ms"))
+                if snapshot.get("best_bid") is not None:
+                    merged["best_bid"] = snapshot.get("best_bid")
+                if snapshot.get("best_ask") is not None:
+                    merged["best_ask"] = snapshot.get("best_ask")
+
+                asks = merged.get("asks") or []
+                merged_best_ask = self._to_positive_float(snapshot.get("best_ask"))
+                if merged_best_ask is not None and asks and isinstance(asks[0], dict):
+                    asks[0]["price"] = merged_best_ask
+                    merged["asks"] = asks
+
+                bids = merged.get("bids") or []
+                merged_best_bid = self._to_positive_float(snapshot.get("best_bid"))
+                if merged_best_bid is not None and bids and isinstance(bids[-1], dict):
+                    bids[-1]["price"] = merged_best_bid
+                    merged["bids"] = bids
+
+                self._ws_book_cache[asset_id] = merged
+                return
+
+            self._ws_book_cache[asset_id] = snapshot
 
     def _force_close_position(self, reason: str) -> None:
         if not self.position:
@@ -1031,6 +1345,12 @@ class FiveMinuteUpDownTrader:
                 side="sell",
                 target_size=pos.size,
             )
+            bid_prices = sell_plan.get("level_prices_preview") or []
+            if bid_prices:
+                logger.info(
+                    "平仓买单价格(按高到低, 前10档): %s",
+                    ",".join(f"{float(price):.4f}" for price in bid_prices),
+                )
             self._log_execution_plan(
                 stage=f"平仓[{reason}]",
                 market_slug=pos.market_slug,
@@ -1047,6 +1367,12 @@ class FiveMinuteUpDownTrader:
                 )
         except Exception as e:
             logger.warning("平仓深度评估失败，使用回退价格: %s", e)
+
+        close_book_source = (
+            str(sell_plan.get("book_source", "unknown"))
+            if sell_plan is not None
+            else "unknown"
+        )
 
         if not self.dry_run:
             submit_t0 = time.perf_counter()
@@ -1098,7 +1424,14 @@ class FiveMinuteUpDownTrader:
         )
         close_ms = (time.perf_counter() - close_t0) * 1000
         self._record_latency("close_total", close_ms)
-        logger.info("平仓链路总耗时: market=%s token=%s reason=%s latency=%.2fms", pos.market_slug, pos.token_id, reason, close_ms)
+        logger.info(
+            "平仓链路总耗时: market=%s token=%s reason=%s source=%s latency=%.2fms",
+            pos.market_slug,
+            pos.token_id,
+            reason,
+            close_book_source,
+            close_ms,
+        )
 
     def _report_loop(self) -> None:
         sender = EmailSender()
@@ -1121,6 +1454,10 @@ class FiveMinuteUpDownTrader:
             latency_indices = dict(self._latency_report_index)
             for metric, values in self._latency_metrics.items():
                 self._latency_report_index[metric] = len(values)
+            source_counts_snapshot = dict(self._book_source_counts)
+            source_counts_index = dict(self._book_source_report_index)
+            for key, val in self._book_source_counts.items():
+                self._book_source_report_index[key] = val
 
         hourly_pnl = sum(t.pnl for t in new_trades)
         hourly_count = len(new_trades)
@@ -1137,6 +1474,8 @@ class FiveMinuteUpDownTrader:
             "prewarm_market",
             "market_event_fetch",
             "market_meta_fetch",
+            "orderbook_buy_ws",
+            "orderbook_sell_ws",
             "orderbook_buy",
             "orderbook_sell",
             "buy_submit",
@@ -1166,12 +1505,64 @@ class FiveMinuteUpDownTrader:
         else:
             lines.append("- 无新增耗时样本")
 
+        hourly_source_lines = [
+            f"- book_source.buy.ws={source_counts_snapshot['buy_ws'] - source_counts_index.get('buy_ws', 0)}",
+            f"- book_source.buy.http={source_counts_snapshot['buy_http'] - source_counts_index.get('buy_http', 0)}",
+            f"- book_source.sell.ws={source_counts_snapshot['sell_ws'] - source_counts_index.get('sell_ws', 0)}",
+            f"- book_source.sell.http={source_counts_snapshot['sell_http'] - source_counts_index.get('sell_http', 0)}",
+        ]
+
+        hourly_buy_ws = source_counts_snapshot["buy_ws"] - source_counts_index.get("buy_ws", 0)
+        hourly_buy_http = source_counts_snapshot["buy_http"] - source_counts_index.get("buy_http", 0)
+        hourly_sell_ws = source_counts_snapshot["sell_ws"] - source_counts_index.get("sell_ws", 0)
+        hourly_sell_http = source_counts_snapshot["sell_http"] - source_counts_index.get("sell_http", 0)
+
+        hourly_buy_total = hourly_buy_ws + hourly_buy_http
+        hourly_sell_total = hourly_sell_ws + hourly_sell_http
+        hourly_buy_hit_rate = (
+            hourly_buy_ws / hourly_buy_total * 100 if hourly_buy_total > 0 else 0.0
+        )
+        hourly_sell_hit_rate = (
+            hourly_sell_ws / hourly_sell_total * 100 if hourly_sell_total > 0 else 0.0
+        )
+
+        lines.extend(hourly_source_lines)
+        lines.append(
+            f"- book_source.buy.ws_hit_rate={hourly_buy_hit_rate:.2f}% ({hourly_buy_ws}/{hourly_buy_total})"
+        )
+        lines.append(
+            f"- book_source.sell.ws_hit_rate={hourly_sell_hit_rate:.2f}% ({hourly_sell_ws}/{hourly_sell_total})"
+        )
+
         lines.append("")
         lines.append("耗时统计（服务启动以来）:")
         if cumulative_latency_lines:
             lines.extend(cumulative_latency_lines)
         else:
             lines.append("- 无耗时样本")
+        lines.append(f"- book_source.buy.ws={source_counts_snapshot['buy_ws']}")
+        lines.append(f"- book_source.buy.http={source_counts_snapshot['buy_http']}")
+        lines.append(f"- book_source.sell.ws={source_counts_snapshot['sell_ws']}")
+        lines.append(f"- book_source.sell.http={source_counts_snapshot['sell_http']}")
+
+        cumulative_buy_total = source_counts_snapshot["buy_ws"] + source_counts_snapshot["buy_http"]
+        cumulative_sell_total = source_counts_snapshot["sell_ws"] + source_counts_snapshot["sell_http"]
+        cumulative_buy_hit_rate = (
+            source_counts_snapshot["buy_ws"] / cumulative_buy_total * 100
+            if cumulative_buy_total > 0
+            else 0.0
+        )
+        cumulative_sell_hit_rate = (
+            source_counts_snapshot["sell_ws"] / cumulative_sell_total * 100
+            if cumulative_sell_total > 0
+            else 0.0
+        )
+        lines.append(
+            f"- book_source.buy.ws_hit_rate={cumulative_buy_hit_rate:.2f}% ({source_counts_snapshot['buy_ws']}/{cumulative_buy_total})"
+        )
+        lines.append(
+            f"- book_source.sell.ws_hit_rate={cumulative_sell_hit_rate:.2f}% ({source_counts_snapshot['sell_ws']}/{cumulative_sell_total})"
+        )
         lines.append("")
 
         for t in new_trades:
