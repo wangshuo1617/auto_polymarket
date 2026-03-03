@@ -28,6 +28,7 @@ from py_clob_client.clob_types import (
     MarketOrderArgs,
     PartialCreateOrderOptions,
     OrderType,
+    PostOrdersArgs,
 )
 from py_clob_client.order_builder.builder import ROUNDING_CONFIG
 from py_clob_client.order_builder.helpers import round_down
@@ -221,6 +222,28 @@ def normalize_order_size(size: float, tick_size: Any) -> float:
     except Exception:
         normalized = int(float(size) * 100) / 100
         return max(0.0, float(normalized))
+
+
+def _clamp_order_price(price: float, tick_size: Any) -> float:
+    tick = _safe_positive_float(tick_size)
+    if tick is None:
+        tick = 0.01
+
+    min_price = tick
+    max_price = max(tick, 1.0 - tick)
+    clamped = min(max(float(price), min_price), max_price)
+
+    tick_key = str(tick_size)
+    round_config = ROUNDING_CONFIG.get(tick_key)
+    if round_config is not None:
+        try:
+            price_digits = int(round_config.price)
+            clamped = float(round_down(clamped, price_digits))
+        except Exception:
+            pass
+
+    clamped = min(max(clamped, min_price), max_price)
+    return float(clamped)
 
 
 def get_conditional_token_balance(token_id: str) -> float:
@@ -468,6 +491,19 @@ def sell_order(
             meta["minimum_tick_size"],
         )
 
+    normalized_price = _clamp_order_price(
+        price=float(price),
+        tick_size=meta["minimum_tick_size"],
+    )
+    if abs(normalized_price - float(price)) > 1e-12:
+        logger.info(
+            "sell_order price adjusted to valid range: token_id=%s original=%.8f adjusted=%.8f tick_size=%s",
+            _token_id_short(token_id),
+            float(price),
+            normalized_price,
+            meta["minimum_tick_size"],
+        )
+
     prefetch_order_metadata_for_tokens(
         token_ids=[token_id],
         market_meta=meta,
@@ -479,7 +515,7 @@ def sell_order(
         return client.create_and_post_order(
             OrderArgs(
                 token_id=token_id,
-                price=price,
+                price=normalized_price,
                 size=submit_size,
                 side=SELL,
                 fee_rate_bps=fee_rate_bps,
@@ -502,6 +538,123 @@ def sell_order(
         if "not enough balance / allowance" not in err_msg:
             logger.exception("sell_order create_and_post_order failed: market_id=%s token_id=%s price=%s size=%s error=%s", market_id, _token_id_short(token_id), price, size, e)
             return None
+
+
+def batch_sell_orders(
+    market_id: str,
+    token_id: str,
+    order_items: List[Dict[str, float]],
+    market_meta: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    批量提交限价卖单（单次HTTP请求）。
+    order_items 结构: [{"price": float, "size": float}, ...]
+    """
+    logger.info(
+        "batch_sell_orders called: market_id=%s token_id=%s items=%s",
+        market_id,
+        _token_id_short(token_id),
+        len(order_items or []),
+    )
+    if not order_items:
+        logger.warning("batch_sell_orders skipped: empty order_items")
+        return None
+
+    meta = market_meta or get_market_metadata(market_id)
+    if not meta or meta.get("minimum_tick_size") is None:
+        logger.error("batch_sell_orders missing market metadata: market_id=%s", market_id)
+        return None
+
+    prefetch_order_metadata_for_tokens(
+        token_ids=[token_id],
+        market_meta=meta,
+        refresh_fee_rate=False,
+    )
+    fee_rate_bps = _get_cached_fee_rate_bps(token_id)
+
+    prepared_items: List[Dict[str, float]] = []
+    for item in order_items:
+        if not isinstance(item, dict):
+            continue
+        raw_price = _safe_positive_float(item.get("price"))
+        raw_size = _safe_positive_float(item.get("size"))
+        if raw_price is None or raw_size is None:
+            continue
+        normalized_size = normalize_order_size(raw_size, tick_size=meta["minimum_tick_size"])
+        normalized_price = _clamp_order_price(raw_price, tick_size=meta["minimum_tick_size"])
+        if normalized_size <= 0:
+            continue
+        prepared_items.append({"price": normalized_price, "size": normalized_size})
+
+    if not prepared_items:
+        logger.warning("batch_sell_orders skipped: no valid normalized items")
+        return None
+
+    submit_t0 = time.perf_counter()
+    try:
+        post_args: List[PostOrdersArgs] = []
+        for item in prepared_items:
+            signed_order = client.create_order(
+                OrderArgs(
+                    token_id=token_id,
+                    price=float(item["price"]),
+                    size=float(item["size"]),
+                    side=SELL,
+                    fee_rate_bps=fee_rate_bps,
+                ),
+                options=PartialCreateOrderOptions(
+                    tick_size=str(meta["minimum_tick_size"]),
+                    neg_risk=bool(meta.get("neg_risk", False)),
+                ),
+            )
+            post_args.append(
+                PostOrdersArgs(
+                    order=signed_order,
+                    orderType=OrderType.GTC,
+                    postOnly=False,
+                )
+            )
+
+        response = client.post_orders(post_args)
+        submit_ms = (time.perf_counter() - submit_t0) * 1000
+
+        order_ids: List[str] = []
+        if isinstance(response, list):
+            for item in response:
+                if isinstance(item, dict):
+                    oid = item.get("orderID") or item.get("id")
+                    if oid:
+                        order_ids.append(str(oid))
+        elif isinstance(response, dict):
+            maybe_orders = response.get("orders")
+            if isinstance(maybe_orders, list):
+                for item in maybe_orders:
+                    if isinstance(item, dict):
+                        oid = item.get("orderID") or item.get("id")
+                        if oid:
+                            order_ids.append(str(oid))
+
+        logger.info(
+            "batch_sell_orders success: market_id=%s token_id=%s submitted=%s order_ids=%s submit_latency=%.2fms",
+            market_id,
+            _token_id_short(token_id),
+            len(prepared_items),
+            len(order_ids),
+            submit_ms,
+        )
+        return {
+            "order_ids": order_ids,
+            "submitted_items": prepared_items,
+            "raw_response": response,
+        }
+    except Exception as e:
+        logger.exception(
+            "batch_sell_orders failed: market_id=%s token_id=%s error=%s",
+            market_id,
+            _token_id_short(token_id),
+            e,
+        )
+        return None
 
         available_balance = get_conditional_token_balance(token_id)
         retry_size = normalize_order_size(
@@ -607,6 +760,10 @@ def market_stop_loss_sell_order(
         refresh_fee_rate=False,
     )
     fee_rate_bps = _get_cached_fee_rate_bps(token_id)
+    tick_size = meta["minimum_tick_size"]
+
+    def _normalize_submit_size(value: float) -> float:
+        return normalize_order_size(value, tick_size=tick_size)
 
     def _submit_once(submit_size: float):
         market_order = client.create_market_order(
@@ -627,61 +784,76 @@ def market_stop_loss_sell_order(
 
     submit_t0 = time.perf_counter()
     response: Optional[Dict[str, Any]] = None
-    submitted_size = normalized_size
-    try:
-        response = _submit_once(normalized_size)
-    except Exception as e:
-        err_msg = str(e).lower()
-        if "not enough balance / allowance" not in err_msg:
+    submitted_size = 0.0
+    last_error: Optional[Exception] = None
+    current_size = normalized_size
+    no_liquidity_error_seen = False
+
+    for attempt in range(1, 6):
+        current_size = _normalize_submit_size(current_size)
+        if current_size <= 0:
+            break
+
+        try:
+            response = _submit_once(current_size)
+            submitted_size = current_size
+            break
+        except Exception as e:
+            last_error = e
+            err_msg = str(e).lower()
+
+            if "no orders found to match" in err_msg or "fak orders are partially filled or killed" in err_msg:
+                no_liquidity_error_seen = True
+                next_size = _normalize_submit_size(current_size * 0.9)
+                logger.warning(
+                    "market_stop_loss_sell_order FAK无对手盘，降量重试: token_id=%s attempt=%s size=%.6f -> %.6f",
+                    _token_id_short(token_id),
+                    attempt,
+                    current_size,
+                    next_size,
+                )
+                if next_size <= 0 or next_size >= current_size:
+                    break
+                current_size = next_size
+                continue
+
+            if "not enough balance / allowance" in err_msg:
+                available_balance = get_conditional_token_balance(token_id)
+                next_size = _normalize_submit_size(min(current_size, available_balance))
+                logger.warning(
+                    "market_stop_loss_sell_order 余额不足，降量重试: token_id=%s attempt=%s requested=%.6f available=%.6f next=%.6f",
+                    _token_id_short(token_id),
+                    attempt,
+                    current_size,
+                    available_balance,
+                    next_size,
+                )
+                if next_size <= 0 or next_size >= current_size:
+                    break
+                current_size = next_size
+                continue
+
             logger.exception(
-                "market_stop_loss_sell_order submit failed: market_id=%s token_id=%s target_stop_price=%s size=%s error=%s",
+                "market_stop_loss_sell_order submit failed: market_id=%s token_id=%s target_stop_price=%s size=%s attempt=%s error=%s",
                 market_id,
                 _token_id_short(token_id),
                 target_stop_price,
                 size,
+                attempt,
                 e,
             )
-            return None
+            break
 
-        available_balance = get_conditional_token_balance(token_id)
-        retry_size = normalize_order_size(
-            size=min(normalized_size, available_balance),
-            tick_size=meta["minimum_tick_size"],
-        )
-        if retry_size <= 0 or retry_size + 1e-12 >= normalized_size:
-            logger.warning(
-                "market_stop_loss_sell_order balance clamp unavailable: market_id=%s token_id=%s requested=%.6f normalized=%.6f available=%.6f error=%s",
-                market_id,
-                _token_id_short(token_id),
-                float(size),
-                normalized_size,
-                available_balance,
-                e,
-            )
-            return None
-
+    if response is None:
         logger.warning(
-            "market_stop_loss_sell_order retry with clamped size: token_id=%s requested=%.6f normalized=%.6f retry=%.6f available=%.6f",
+            "market_stop_loss_sell_order failed after retries: market_id=%s token_id=%s requested=%.6f no_liquidity=%s last_error=%s",
+            market_id,
             _token_id_short(token_id),
-            float(size),
             normalized_size,
-            retry_size,
-            available_balance,
+            no_liquidity_error_seen,
+            last_error,
         )
-        submitted_size = retry_size
-        try:
-            response = _submit_once(retry_size)
-        except Exception as retry_err:
-            logger.exception(
-                "market_stop_loss_sell_order retry failed: market_id=%s token_id=%s target_stop_price=%s requested=%.6f retry=%.6f error=%s",
-                market_id,
-                _token_id_short(token_id),
-                target_stop_price,
-                float(size),
-                retry_size,
-                retry_err,
-            )
-            return None
+        return None
 
     order_id = response.get("orderID") if isinstance(response, dict) else None
     submit_ms = (time.perf_counter() - submit_t0) * 1000
@@ -724,6 +896,19 @@ def market_stop_loss_sell_order(
 
 def cancel_order(order_id: str):
     return client.cancel(order_id)
+
+
+def get_order_detail(order_id: str) -> Optional[Dict[str, Any]]:
+    if not order_id:
+        return None
+    try:
+        detail = client.get_order(order_id)
+        if isinstance(detail, dict):
+            return detail
+        return None
+    except Exception as e:
+        logger.warning("get_order_detail failed: order_id=%s error=%s", order_id, e)
+        return None
 
 def get_event_situation(market_slug:str=None):
     current_month_year = datetime.now().strftime("%B-%Y").lower()  # e.g. february-2026

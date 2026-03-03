@@ -33,7 +33,10 @@ from config import TO_EMAIL
 from data.polymarket import (
     buy_order,
     sell_order,
+    batch_sell_orders,
     market_stop_loss_sell_order,
+    cancel_order,
+    get_order_detail,
     get_event_token_id,
     get_market_metadata,
     get_order_book,
@@ -84,6 +87,7 @@ class OpenPosition:
     take_profit_price: float
     last_best_bid: Optional[float] = None
     balance_confirmed: bool = False
+    entry_order_id: Optional[str] = None
     entry_best_ask: Optional[float] = None
     entry_avg_fill_price: Optional[float] = None
     entry_full_fill: Optional[bool] = None
@@ -304,6 +308,9 @@ class PolymarketAssetPriceWatcher:
                         continue
                     asks.append({"price": price, "size": size})
 
+                bids = sorted(bids, key=lambda lvl: float(lvl["price"]))
+                asks = sorted(asks, key=lambda lvl: float(lvl["price"]))
+
                 ts_ms: Optional[int] = None
                 try:
                     raw_ts = payload.get("timestamp")
@@ -312,7 +319,7 @@ class PolymarketAssetPriceWatcher:
                 except Exception:
                     ts_ms = None
 
-                # 按交易所约定：best_bid 是 bids 最后一个，best_ask 是 asks 第一个
+                # 统一按价格排序后取 best，避免上游顺序变化导致 best 选错
                 if bids:
                     best_bid = bids[-1]["price"]
                 best_ask = asks[0]["price"] if asks else None
@@ -443,6 +450,7 @@ class FiveMinuteUpDownTrader:
     MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
     MAX_ENTRY_SLIPPAGE_BPS = 120.0
     MAX_EXIT_SLIPPAGE_BPS_WARN = 250.0
+    LIMIT_CLOSE_BATCH_LEVELS = 3
     TOXIC_UTC_HOURS = {16, 19, 20}
     WS_BOOK_MAX_AGE_MS = 1200
     MIN_HOLD_BEFORE_CLOSE_SEC = 5
@@ -669,11 +677,22 @@ class FiveMinuteUpDownTrader:
         if not normalized_levels:
             raise RuntimeError(f"订单簿无可用{'卖' if side == 'buy' else '买'}单")
 
+        best_ask_from_levels: Optional[float] = None
+        best_bid_from_levels: Optional[float] = None
+        if side == "buy":
+            best_ask_from_levels = float(normalized_levels[0]["price"])
+        elif side == "sell":
+            best_bid_from_levels = float(normalized_levels[0]["price"])
+
         return {
             "source": source,
             "levels": normalized_levels,
-            "best_ask": self._to_positive_float((ws_snapshot or {}).get("best_ask")),
-            "best_bid": self._to_positive_float((ws_snapshot or {}).get("best_bid")),
+            "best_ask": best_ask_from_levels
+            if best_ask_from_levels is not None
+            else self._to_positive_float((ws_snapshot or {}).get("best_ask")),
+            "best_bid": best_bid_from_levels
+            if best_bid_from_levels is not None
+            else self._to_positive_float((ws_snapshot or {}).get("best_bid")),
         }
 
     def _build_execution_plan(
@@ -1282,6 +1301,7 @@ class FiveMinuteUpDownTrader:
             entry_time=datetime.now(timezone.utc),
             stop_loss_price=stop_loss_price,
             take_profit_price=take_profit_price,
+            entry_order_id=order_id,
             entry_best_ask=best_ask_price,
             entry_avg_fill_price=float(plan["vwap_price"]),
             entry_full_fill=bool(plan.get("full_fill", False)),
@@ -1290,6 +1310,7 @@ class FiveMinuteUpDownTrader:
             self._schedule_position_balance_confirmation(
                 market_slug=market_slug,
                 token_id=token_id,
+                entry_order_id=order_id,
                 delay_sec=3,
             )
 
@@ -1315,7 +1336,10 @@ class FiveMinuteUpDownTrader:
         self,
         market_slug: str,
         token_id: str,
+        entry_order_id: Optional[str],
         delay_sec: int = 3,
+        max_attempts: int = 6,
+        retry_interval_sec: int = 2,
     ) -> None:
         def _run() -> None:
             time.sleep(max(0, delay_sec))
@@ -1332,8 +1356,67 @@ class FiveMinuteUpDownTrader:
                 market_meta = market_info.get("market_meta") or {}
                 tick_size = market_meta.get("minimum_tick_size", "0.01")
 
-            raw_balance = get_conditional_token_balance(token_id)
-            confirmed_size = normalize_order_size(raw_balance, tick_size=tick_size)
+            for attempt in range(1, max(1, max_attempts) + 1):
+                raw_balance = get_conditional_token_balance(token_id)
+                confirmed_size = normalize_order_size(raw_balance, tick_size=tick_size)
+
+                order_status = ""
+                matched_size = 0.0
+                if entry_order_id:
+                    order_detail = get_order_detail(entry_order_id)
+                    if order_detail:
+                        order_status = str(order_detail.get("status") or "").upper()
+                        matched_raw = self._to_positive_float(order_detail.get("size_matched"))
+                        if matched_raw is not None:
+                            matched_size = normalize_order_size(matched_raw, tick_size=tick_size)
+
+                effective_size = max(confirmed_size, matched_size)
+
+                with self._lock:
+                    pos = self.position
+                    if (
+                        pos is None
+                        or pos.market_slug != market_slug
+                        or pos.token_id != token_id
+                    ):
+                        return
+
+                    if effective_size > 0:
+                        old_size = float(pos.size)
+                        pos.size = effective_size
+                        pos.balance_confirmed = True
+                        logger.info(
+                            "建仓后余额确认成功: market=%s token=%s old_size=%.6f confirmed_size=%.6f raw_balance=%.6f matched_size=%.6f status=%s attempt=%s/%s",
+                            market_slug,
+                            token_id,
+                            old_size,
+                            effective_size,
+                            raw_balance,
+                            matched_size,
+                            order_status or "N/A",
+                            attempt,
+                            max_attempts,
+                        )
+                        return
+
+                    if order_status in {"CANCELED", "EXPIRED", "REJECTED"}:
+                        logger.info(
+                            "建仓后确认到订单未成交且已结束，清理本地持仓: market=%s token=%s order_id=%s status=%s attempt=%s/%s",
+                            market_slug,
+                            token_id,
+                            entry_order_id,
+                            order_status,
+                            attempt,
+                            max_attempts,
+                        )
+                        self.position = None
+                        if self._poly_watcher:
+                            self._poly_watcher.stop()
+                            self._poly_watcher = None
+                        return
+
+                if attempt < max_attempts:
+                    time.sleep(max(1, retry_interval_sec))
 
             with self._lock:
                 pos = self.position
@@ -1343,30 +1426,13 @@ class FiveMinuteUpDownTrader:
                     or pos.token_id != token_id
                 ):
                     return
-
-                old_size = float(pos.size)
-                pos.size = confirmed_size
-                pos.balance_confirmed = True
-                logger.info(
-                    "建仓后余额确认: market=%s token=%s old_size=%.6f confirmed_size=%.6f raw_balance=%.6f delay=%ss",
+                logger.warning(
+                    "建仓后余额多次确认仍为0，保留本地持仓避免误清仓: market=%s token=%s order_id=%s attempts=%s",
                     market_slug,
                     token_id,
-                    old_size,
-                    confirmed_size,
-                    raw_balance,
-                    delay_sec,
+                    entry_order_id,
+                    max_attempts,
                 )
-
-                if confirmed_size <= 0:
-                    logger.info(
-                        "建仓后余额确认为0，清理本地持仓避免阻塞后续开仓: market=%s token=%s",
-                        market_slug,
-                        token_id,
-                    )
-                    self.position = None
-                    if self._poly_watcher:
-                        self._poly_watcher.stop()
-                        self._poly_watcher = None
 
         threading.Thread(
             target=_run,
@@ -1432,6 +1498,31 @@ class FiveMinuteUpDownTrader:
 
             self._ws_book_cache[asset_id] = snapshot
 
+    def _restore_position_after_close_failure(
+        self,
+        pos: OpenPosition,
+        fallback_best_bid: float,
+        reason: str,
+    ) -> None:
+        pos.last_best_bid = fallback_best_bid
+        self.position = pos
+
+        if self._poly_watcher:
+            self._poly_watcher.stop()
+        self._poly_watcher = PolymarketAssetPriceWatcher(
+            asset_id=pos.token_id,
+            on_price=self._on_polymarket_price,
+            on_book=self._on_polymarket_book,
+        )
+        self._poly_watcher.start()
+        logger.info(
+            "平仓失败后恢复持仓监听: market=%s token=%s reason=%s size=%.6f",
+            pos.market_slug,
+            pos.token_id,
+            reason,
+            pos.size,
+        )
+
     def _force_close_position(self, reason: str) -> None:
         if not self.position:
             return
@@ -1460,6 +1551,7 @@ class FiveMinuteUpDownTrader:
             market_meta = market_info.get("market_meta")
         if market_meta is None:
             market_meta = get_market_metadata(pos.market_id)
+        tick_size = (market_meta or {}).get("minimum_tick_size", "0.01")
 
         exit_price = pos.last_best_bid
         stop_target_price: Optional[float] = None
@@ -1546,58 +1638,213 @@ class FiveMinuteUpDownTrader:
                 reason,
                 pos.balance_confirmed,
             )
-            self.position = pos
+            self._restore_position_after_close_failure(
+                pos=pos,
+                fallback_best_bid=exit_price,
+                reason=reason,
+            )
             return
 
+        order_id: Optional[str] = None
+        initial_target_close_size = target_close_size
+        executed_close_size = 0.0
+        executed_notional = 0.0
+        market_executed_size = 0.0
+        market_executed_notional = 0.0
+
+        def _poll_matched_size(order_id_value: str, polls: int = 4) -> tuple[float, str]:
+            matched = 0.0
+            status = ""
+            for _ in range(max(1, polls)):
+                detail = get_order_detail(order_id_value)
+                if detail:
+                    status = str(detail.get("status") or "").upper()
+                    raw_matched = self._to_positive_float(detail.get("size_matched"))
+                    if raw_matched is not None:
+                        matched = max(
+                            matched,
+                            normalize_order_size(raw_matched, tick_size=tick_size),
+                        )
+                    if status == "MATCHED":
+                        break
+                time.sleep(0.25)
+            return matched, status
+
         if not self.dry_run:
+            remaining_size = target_close_size
+
+            # 1) 先批量限价平仓（所有平仓统一先走限价）
+            limit_order_items: List[Dict[str, float]] = []
+            consumed_levels = (sell_plan or {}).get("consumed_levels") or []
+            accumulated_size = 0.0
+            for lvl in consumed_levels[: self.LIMIT_CLOSE_BATCH_LEVELS]:
+                if not isinstance(lvl, dict):
+                    continue
+                lvl_price = self._to_positive_float(lvl.get("price"))
+                lvl_size = self._to_positive_float(lvl.get("size"))
+                if lvl_price is None or lvl_size is None:
+                    continue
+                place_size = min(lvl_size, max(0.0, remaining_size - accumulated_size))
+                if place_size <= 0:
+                    continue
+                limit_order_items.append({"price": float(lvl_price), "size": float(place_size)})
+                accumulated_size += place_size
+                if accumulated_size + 1e-9 >= remaining_size:
+                    break
+
+            if not limit_order_items:
+                limit_order_items = [{"price": float(exit_price), "size": float(remaining_size)}]
+
             submit_t0 = time.perf_counter()
-            if reason in {"sl", "sl_direction_change"}:
-                market_stop_result = market_stop_loss_sell_order(
-                    pos.market_id,
-                    pos.token_id,
-                    target_stop_price=stop_target_price if stop_target_price is not None else exit_price,
-                    size=target_close_size,
-                    market_meta=market_meta,
-                )
-                order_id = market_stop_result.get("order_id") if market_stop_result else None
-                if market_stop_result is not None:
-                    target_close_size = float(market_stop_result.get("size") or target_close_size)
-                    stop_actual_price = market_stop_result.get("actual_stop_price")
-                    stop_slippage = market_stop_result.get("slippage")
-                    if stop_actual_price is not None and stop_actual_price > 0:
-                        exit_price = float(stop_actual_price)
+            batch_result = batch_sell_orders(
+                market_id=pos.market_id,
+                token_id=pos.token_id,
+                order_items=limit_order_items,
+                market_meta=market_meta,
+            )
+            submit_ms = (time.perf_counter() - submit_t0) * 1000
+            self._record_latency("sell_submit", submit_ms)
+
+            batch_order_ids: List[str] = []
+            if batch_result and isinstance(batch_result, dict):
+                raw_ids = batch_result.get("order_ids") or []
+                if isinstance(raw_ids, list):
+                    batch_order_ids = [str(item) for item in raw_ids if str(item)]
+
+            if batch_order_ids:
                 logger.info(
-                    "市价止损执行结果: reason=%s order_id=%s target_stop=%.4f actual_stop=%s slippage=%s",
-                    reason,
-                    order_id,
-                    float(stop_target_price if stop_target_price is not None else exit_price),
-                    f"{float(stop_actual_price):.4f}" if stop_actual_price is not None else "N/A",
-                    f"{float(stop_slippage):.4f}" if stop_slippage is not None else "N/A",
+                    "平仓批量限价单已提交: orders=%s submit_latency=%.2fms",
+                    len(batch_order_ids),
+                    submit_ms,
                 )
+
+                limit_matched_total = 0.0
+                for oid in batch_order_ids:
+                    matched_size, close_order_status = _poll_matched_size(oid)
+                    if matched_size > 0:
+                        limit_matched_total += matched_size
+                    if close_order_status != "MATCHED":
+                        try:
+                            cancel_order(oid)
+                        except Exception as cancel_err:
+                            logger.warning("平仓批量限价单撤单失败: order_id=%s error=%s", oid, cancel_err)
+
+                limit_matched_total = min(remaining_size, limit_matched_total)
+                if limit_matched_total > 0:
+                    executed_close_size += limit_matched_total
+                    executed_notional += limit_matched_total * exit_price
+                    remaining_size = normalize_order_size(
+                        remaining_size - limit_matched_total,
+                        tick_size=tick_size,
+                    )
+
+                if remaining_size > 0:
+                    logger.warning(
+                        "平仓批量限价单未完全成交，转市价补平: matched=%.6f remaining=%.6f orders=%s",
+                        limit_matched_total,
+                        remaining_size,
+                        len(batch_order_ids),
+                    )
             else:
+                # 兜底单笔限价，避免批量返回不含order_id时完全跳过限价阶段
                 order_id = sell_order(
                     pos.market_id,
                     pos.token_id,
                     exit_price,
-                    target_close_size,
+                    remaining_size,
                     market_meta=market_meta,
                 )
-            submit_ms = (time.perf_counter() - submit_t0) * 1000
-            self._record_latency("sell_submit", submit_ms)
-            if not order_id:
-                logger.warning(
-                    "平仓卖单提交失败，恢复持仓等待下一次平仓: market=%s token=%s price=%.4f size=%.4f",
+                if order_id:
+                    logger.info("平仓限价兜底单已提交，order_id=%s submit_latency=%.2fms", order_id, submit_ms)
+                    matched_size, close_order_status = _poll_matched_size(order_id)
+                    matched_size = min(remaining_size, matched_size)
+                    if matched_size > 0:
+                        executed_close_size += matched_size
+                        executed_notional += matched_size * exit_price
+                        remaining_size = normalize_order_size(
+                            remaining_size - matched_size,
+                            tick_size=tick_size,
+                        )
+                    if close_order_status != "MATCHED":
+                        try:
+                            cancel_order(order_id)
+                        except Exception as cancel_err:
+                            logger.warning("平仓限价兜底单撤单失败: order_id=%s error=%s", order_id, cancel_err)
+                else:
+                    logger.warning(
+                        "平仓批量限价提交失败，直接转市价补平: market=%s token=%s price=%.4f size=%.4f",
+                        pos.market_id,
+                        pos.token_id,
+                        exit_price,
+                        remaining_size,
+                    )
+
+            # 2) 限价未完成 -> 市价循环补平
+            market_attempt = 0
+            while remaining_size > 0 and market_attempt < 8:
+                market_attempt += 1
+                market_stop_result = market_stop_loss_sell_order(
                     pos.market_id,
                     pos.token_id,
-                    exit_price,
-                    pos.size,
+                    target_stop_price=stop_target_price if stop_target_price is not None else exit_price,
+                    size=remaining_size,
+                    market_meta=market_meta,
                 )
-                pos.last_best_bid = exit_price
-                self.position = pos
+                market_order_id = market_stop_result.get("order_id") if market_stop_result else None
+                if not market_order_id:
+                    logger.warning(
+                        "市价补平失败: attempt=%s remaining=%.6f",
+                        market_attempt,
+                        remaining_size,
+                    )
+                    break
+
+                market_matched_size, market_status = _poll_matched_size(market_order_id)
+                market_matched_size = min(remaining_size, market_matched_size)
+                if market_matched_size <= 0:
+                    logger.warning(
+                        "市价补平未成交: attempt=%s order_id=%s status=%s remaining=%.6f",
+                        market_attempt,
+                        market_order_id,
+                        market_status or "N/A",
+                        remaining_size,
+                    )
+                    break
+
+                market_fill_price = self._to_positive_float(
+                    (market_stop_result or {}).get("actual_stop_price")
+                )
+                if market_fill_price is None:
+                    market_fill_price = exit_price
+
+                executed_close_size += market_matched_size
+                executed_notional += market_matched_size * market_fill_price
+                market_executed_size += market_matched_size
+                market_executed_notional += market_matched_size * market_fill_price
+                remaining_size = normalize_order_size(
+                    remaining_size - market_matched_size,
+                    tick_size=tick_size,
+                )
+
+                logger.info(
+                    "市价补平成交: attempt=%s order_id=%s matched=%.6f remaining=%.6f fill_price=%.4f",
+                    market_attempt,
+                    market_order_id,
+                    market_matched_size,
+                    remaining_size,
+                    market_fill_price,
+                )
+
+            if executed_close_size <= 0:
+                self._restore_position_after_close_failure(
+                    pos=pos,
+                    fallback_best_bid=exit_price,
+                    reason=reason,
+                )
                 close_ms = (time.perf_counter() - close_t0) * 1000
                 self._record_latency("close_total", close_ms)
                 logger.info(
-                    "平仓链路总耗时(失败): market=%s token=%s reason=%s source=%s latency=%.2fms",
+                    "平仓链路总耗时(未成交): market=%s token=%s reason=%s source=%s latency=%.2fms",
                     pos.market_slug,
                     pos.token_id,
                     reason,
@@ -1605,8 +1852,45 @@ class FiveMinuteUpDownTrader:
                     close_ms,
                 )
                 return
-            else:
-                logger.info("平仓卖单已提交，order_id=%s submit_latency=%.2fms", order_id, submit_ms)
+
+            target_close_size = executed_close_size
+            exit_price = executed_notional / executed_close_size
+            exit_full_fill = target_close_size + 1e-9 >= initial_target_close_size
+
+            if remaining_size > 0:
+                pos.size = remaining_size
+                self._restore_position_after_close_failure(
+                    pos=pos,
+                    fallback_best_bid=exit_price,
+                    reason=reason,
+                )
+                logger.warning(
+                    "平仓未完成，保留剩余仓位: market=%s token=%s reason=%s executed=%.6f remaining=%.6f",
+                    pos.market_slug,
+                    pos.token_id,
+                    reason,
+                    target_close_size,
+                    remaining_size,
+                )
+
+            if reason in {"sl", "sl_direction_change"} and market_executed_size > 0 and stop_target_price is not None:
+                stop_actual_price = market_executed_notional / market_executed_size
+                stop_slippage = stop_actual_price - float(stop_target_price)
+                logger.info(
+                    "市价止损执行结果: reason=%s target_stop=%.4f actual_stop=%.4f slippage=%.4f market_filled=%.6f",
+                    reason,
+                    float(stop_target_price),
+                    float(stop_actual_price),
+                    float(stop_slippage),
+                    market_executed_size,
+                )
+        else:
+            executed_close_size = target_close_size
+            executed_notional = executed_close_size * exit_price
+            exit_full_fill = True
+
+        if target_close_size <= 0:
+            return
 
         pnl = (exit_price - pos.entry_price) * target_close_size
         record = TradeRecord(
@@ -1642,6 +1926,23 @@ class FiveMinuteUpDownTrader:
             record.exit_price,
             record.pnl,
             record.reason,
+        )
+        remaining_after_close = 0.0
+        if (
+            self.position is not None
+            and self.position.market_slug == pos.market_slug
+            and self.position.token_id == pos.token_id
+        ):
+            remaining_after_close = float(self.position.size)
+        logger.info(
+            "平仓结果汇总: market=%s token=%s reason=%s requested=%.6f executed=%.6f remaining=%.6f full_fill=%s",
+            pos.market_slug,
+            pos.token_id,
+            reason,
+            initial_target_close_size,
+            target_close_size,
+            remaining_after_close,
+            bool(exit_full_fill),
         )
         close_ms = (time.perf_counter() - close_t0) * 1000
         self._record_latency("close_total", close_ms)
