@@ -190,25 +190,46 @@ uv run monthly_btc_strategy.py
 直接运行：
 
 ```bash
-uv run 5m_trade.py --dry-run --entry-minute 2 --entry-preclose-sec 5 --min-direction-diff 10
+uv run 5m_trade.py \
+    --dry-run \
+    --entry-minute 3 \
+    --entry-preclose-sec 5 \
+    --min-direction-diff 10 \
+    --stake-usd 5.0 \
+    --report-interval-sec 3600 \
+    --max-entry-price 0.80 \
+    --take-profit-spread 0.15 \
+    --stop-loss-spread -0.20
 ```
 
 推荐使用重启脚本：
 
 ```bash
 chmod +x scripts/restart_5m_trade.sh
-./scripts/restart_5m_trade.sh --dry-run 2 5 10
+./scripts/restart_5m_trade.sh --dry-run 3 5 10 5.0 3600 0.80 0.15 -0.20
 ```
 
 参数说明：
-- `entry-minute`：在第几分钟做方向预判（1-4）
-- `entry-preclose-sec`：该分钟 1m K 线收盘前多少秒触发“抢跑”建仓
-- `min-direction-diff`：预判价与窗口开盘价的最小绝对差值（USDT），用于过滤震荡
+- `--dry-run`：仅模拟交易，不实际下单（脚本模式参数使用 `--dry-run|--live`）
+- `--entry-minute`：在第几分钟做方向预判（1-4，默认 `3`）
+- `--entry-preclose-sec`：该分钟 1m K 线收盘前多少秒触发“抢跑”建仓（默认 `5`）
+- `--min-direction-diff`：预判价与窗口开盘价最小绝对差值（USDT，默认 `10`）
+- `--stake-usd`：单笔仓位金额（USDC，默认 `5.0`）
+- `--report-interval-sec`：盈亏报告发送间隔秒数（默认 `3600`）
+- `--max-entry-price`：允许开仓的最高 best ask 价格（默认 `0.80`）
+- `--take-profit-spread`：止盈价差（相对买入价，默认 `0.15`）
+- `--stop-loss-spread`：止损价差（相对买入价，默认 `-0.20`）
+
+重启脚本参数顺序：
+
+```bash
+./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread]
+```
 
 切换实盘：
 
 ```bash
-./scripts/restart_5m_trade.sh --live 2 5 10
+./scripts/restart_5m_trade.sh --live 3 5 10 5.0 3600 0.80 0.15 -0.20
 ```
 
 #### 运行 Web Dashboard（支持外网访问）

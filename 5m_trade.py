@@ -1604,6 +1604,18 @@ def main() -> None:
         help="仅模拟交易，不在 Polymarket 实际下单",
     )
     parser.add_argument(
+        "--stake-usd",
+        type=float,
+        default=5.0,
+        help="单笔仓位金额（USDC，默认 5.0）",
+    )
+    parser.add_argument(
+        "--report-interval-sec",
+        type=int,
+        default=3600,
+        help="盈亏报告发送间隔（秒，默认 3600）",
+    )
+    parser.add_argument(
         "--entry-minute",
         type=int,
         default=3,
@@ -1622,6 +1634,24 @@ def main() -> None:
         default=10.0,
         help="预判价与窗口开盘价最小绝对差值（USDT），不满足则跳过（默认 10.0）",
     )
+    parser.add_argument(
+        "--max-entry-price",
+        type=float,
+        default=0.80,
+        help="允许开仓的最高 best ask 价格（默认 0.80）",
+    )
+    parser.add_argument(
+        "--take-profit-spread",
+        type=float,
+        default=0.15,
+        help="止盈价差（相对买入价，默认 +0.15）",
+    )
+    parser.add_argument(
+        "--stop-loss-spread",
+        type=float,
+        default=-0.20,
+        help="止损价差（相对买入价，默认 -0.20）",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1630,14 +1660,14 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     trader = FiveMinuteUpDownTrader(
-        stake_usd=10.0,
-        report_interval_sec=3600,
+        stake_usd=args.stake_usd,
+        report_interval_sec=args.report_interval_sec,
         entry_decision_minute=args.entry_minute,
         entry_preclose_seconds=args.entry_preclose_sec,
         min_direction_diff=args.min_direction_diff,
-        max_entry_price=0.80,
-        take_profit_spread=0.15,
-        stop_loss_spread=-0.20,
+        max_entry_price=args.max_entry_price,
+        take_profit_spread=args.take_profit_spread,
+        stop_loss_spread=args.stop_loss_spread,
         dry_run=args.dry_run,
     )
     try:

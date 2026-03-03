@@ -12,4 +12,4 @@ FROM_EMAIL = os.getenv("FROM_EMAIL")
 FROM_EMAIL_PASSWORD = os.getenv("FROM_EMAIL_PASSWORD")
 
 REPORT_INTERVAL = 3600
-GEMINI_MODEL_ID = "gemini-3.1-pro-preview"
+GEMINI_MODEL_ID = "gemini-3-flash-preview"#"gemini-3.1-pro-preview"
