@@ -59,6 +59,12 @@ class TradeRecord:
     entry_time: datetime
     exit_time: datetime
     reason: str  # "tp", "sl", "sl_direction_change", "expiry", "error"
+    entry_best_ask: Optional[float] = None
+    entry_avg_fill_price: Optional[float] = None
+    entry_full_fill: Optional[bool] = None
+    exit_best_bid: Optional[float] = None
+    exit_avg_fill_price: Optional[float] = None
+    exit_full_fill: Optional[bool] = None
 
 
 @dataclass
@@ -74,6 +80,9 @@ class OpenPosition:
     take_profit_price: float
     last_best_bid: Optional[float] = None
     balance_confirmed: bool = False
+    entry_best_ask: Optional[float] = None
+    entry_avg_fill_price: Optional[float] = None
+    entry_full_fill: Optional[bool] = None
 
 
 class BinanceKline1mWatcher:
@@ -1127,8 +1136,16 @@ class FiveMinuteUpDownTrader:
 
     def _open_position(self, market_slug: str, direction: str) -> None:
         if self.position is not None:
-            logger.warning("已有持仓，跳过开仓: %s", self.position)
-            return
+            # 余额已确认且为 0 时，说明链上已无可卖仓位，清理本地残留持仓并允许继续开仓
+            if self.position.balance_confirmed and self.position.size <= 0:
+                logger.warning(
+                    "检测到零仓位残留，清理后继续开仓: %s",
+                    self.position,
+                )
+                self.position = None
+            else:
+                logger.warning("已有持仓，跳过开仓: %s", self.position)
+                return
 
         if direction not in {"up", "down"}:
             raise RuntimeError(f"非法方向 direction={direction}")
@@ -1261,6 +1278,9 @@ class FiveMinuteUpDownTrader:
             entry_time=datetime.now(timezone.utc),
             stop_loss_price=stop_loss_price,
             take_profit_price=take_profit_price,
+            entry_best_ask=best_ask_price,
+            entry_avg_fill_price=float(plan["vwap_price"]),
+            entry_full_fill=bool(plan.get("full_fill", False)),
         )
         if not self.dry_run:
             self._schedule_position_balance_confirmation(
@@ -1332,6 +1352,17 @@ class FiveMinuteUpDownTrader:
                     raw_balance,
                     delay_sec,
                 )
+
+                if confirmed_size <= 0:
+                    logger.info(
+                        "建仓后余额确认为0，清理本地持仓避免阻塞后续开仓: market=%s token=%s",
+                        market_slug,
+                        token_id,
+                    )
+                    self.position = None
+                    if self._poly_watcher:
+                        self._poly_watcher.stop()
+                        self._poly_watcher = None
 
         threading.Thread(
             target=_run,
@@ -1444,6 +1475,9 @@ class FiveMinuteUpDownTrader:
             exit_price = pos.entry_price
 
         sell_plan: Optional[Dict[str, Any]] = None
+        exit_best_bid: Optional[float] = None
+        exit_avg_fill_price: Optional[float] = None
+        exit_full_fill: Optional[bool] = None
         try:
             sell_plan = self._build_execution_plan(
                 token_id=pos.token_id,
@@ -1462,6 +1496,9 @@ class FiveMinuteUpDownTrader:
                 token_id=pos.token_id,
                 plan=sell_plan,
             )
+            exit_best_bid = float(sell_plan["best_price"])
+            exit_avg_fill_price = float(sell_plan["vwap_price"])
+            exit_full_fill = bool(sell_plan.get("full_fill", False))
             exit_price = float(sell_plan["worst_price"])
 
             if sell_plan["slippage_bps"] > self.MAX_EXIT_SLIPPAGE_BPS_WARN:
@@ -1480,8 +1517,17 @@ class FiveMinuteUpDownTrader:
         )
         target_close_size = pos.size
         if target_close_size <= 0:
+            if pos.balance_confirmed:
+                logger.info(
+                    "平仓时发现已确认零仓位，视为已平仓并清理本地持仓: market=%s token=%s reason=%s",
+                    pos.market_slug,
+                    pos.token_id,
+                    reason,
+                )
+                return
+
             logger.warning(
-                "平仓跳过：持仓确认余额为0，等待下一次机会 market=%s token=%s reason=%s confirmed=%s",
+                "平仓跳过：持仓数量为0但尚未确认，恢复持仓等待后续确认 market=%s token=%s reason=%s confirmed=%s",
                 pos.market_slug,
                 pos.token_id,
                 reason,
@@ -1538,6 +1584,12 @@ class FiveMinuteUpDownTrader:
             entry_time=pos.entry_time,
             exit_time=datetime.now(timezone.utc),
             reason=reason,
+            entry_best_ask=pos.entry_best_ask,
+            entry_avg_fill_price=pos.entry_avg_fill_price,
+            entry_full_fill=pos.entry_full_fill,
+            exit_best_bid=exit_best_bid,
+            exit_avg_fill_price=exit_avg_fill_price,
+            exit_full_fill=exit_full_fill,
         )
         self.trades.append(record)
 
@@ -1598,6 +1650,69 @@ class FiveMinuteUpDownTrader:
             f"服务启动以来累计交易 {cumulative_count} 笔，累计盈亏：{cumulative_pnl:.2f} USDC",
             "",
         ]
+
+        def _calc_slippage_bps(trades: List[TradeRecord]) -> Optional[float]:
+            values: List[float] = []
+            for t in trades:
+                if (
+                    t.entry_best_ask is None
+                    or t.entry_avg_fill_price is None
+                    or t.entry_best_ask <= 0
+                ):
+                    continue
+                values.append((t.entry_avg_fill_price - t.entry_best_ask) / t.entry_best_ask * 10000.0)
+            if not values:
+                return None
+            return sum(values) / len(values)
+
+        def _calc_full_fill_rate(trades: List[TradeRecord]) -> Optional[float]:
+            flags: List[bool] = []
+            for t in trades:
+                if t.entry_full_fill is not None:
+                    flags.append(bool(t.entry_full_fill))
+                if t.exit_full_fill is not None:
+                    flags.append(bool(t.exit_full_fill))
+            if not flags:
+                return None
+            return sum(1 for item in flags if item) / len(flags)
+
+        recent_100 = all_trades[-100:]
+        rolling_base = len(recent_100)
+        rolling_tp_count = sum(1 for t in recent_100 if t.reason == "tp")
+        rolling_win_rate = (rolling_tp_count / rolling_base * 100.0) if rolling_base > 0 else 0.0
+
+        hourly_slippage_bps = _calc_slippage_bps(new_trades)
+        cumulative_slippage_bps = _calc_slippage_bps(all_trades)
+        hourly_full_fill_rate = _calc_full_fill_rate(new_trades)
+        cumulative_full_fill_rate = _calc_full_fill_rate(all_trades)
+
+        lines.append("关键策略统计:")
+        if hourly_slippage_bps is None:
+            lines.append("- 真实滑点率(本小时): N/A")
+        else:
+            lines.append(f"- 真实滑点率(本小时): {hourly_slippage_bps:.2f} bps")
+        if cumulative_slippage_bps is None:
+            lines.append("- 真实滑点率(累计): N/A")
+        else:
+            lines.append(f"- 真实滑点率(累计): {cumulative_slippage_bps:.2f} bps")
+
+        lines.append(
+            f"- 滚动100单胜率(tp占比): {rolling_win_rate:.2f}% ({rolling_tp_count}/{rolling_base})"
+        )
+
+        if hourly_full_fill_rate is None:
+            lines.append("- 订单成交率(本小时，全成占比): N/A")
+        else:
+            lines.append(
+                f"- 订单成交率(本小时，全成占比): {hourly_full_fill_rate * 100:.2f}%"
+            )
+        if cumulative_full_fill_rate is None:
+            lines.append("- 订单成交率(累计，全成占比): N/A")
+        else:
+            lines.append(
+                f"- 订单成交率(累计，全成占比): {cumulative_full_fill_rate * 100:.2f}%"
+            )
+        lines.append("")
 
         metric_order = [
             "prewarm_market",
