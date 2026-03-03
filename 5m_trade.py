@@ -33,6 +33,7 @@ from config import TO_EMAIL
 from data.polymarket import (
     buy_order,
     sell_order,
+    market_stop_loss_sell_order,
     get_event_token_id,
     get_market_metadata,
     get_order_book,
@@ -65,6 +66,9 @@ class TradeRecord:
     exit_best_bid: Optional[float] = None
     exit_avg_fill_price: Optional[float] = None
     exit_full_fill: Optional[bool] = None
+    stop_target_price: Optional[float] = None
+    stop_actual_price: Optional[float] = None
+    stop_slippage: Optional[float] = None
 
 
 @dataclass
@@ -1458,6 +1462,9 @@ class FiveMinuteUpDownTrader:
             market_meta = get_market_metadata(pos.market_id)
 
         exit_price = pos.last_best_bid
+        stop_target_price: Optional[float] = None
+        stop_actual_price: Optional[float] = None
+        stop_slippage: Optional[float] = None
         if exit_price is None or exit_price <= 0:
             try:
                 book = get_order_book(pos.token_id)
@@ -1473,6 +1480,12 @@ class FiveMinuteUpDownTrader:
                 logger.warning("获取平仓价格失败，将使用入场价: %s", e)
         if exit_price is None or exit_price <= 0:
             exit_price = pos.entry_price
+
+        if reason in {"sl", "sl_direction_change"}:
+            if reason == "sl":
+                stop_target_price = pos.stop_loss_price
+            else:
+                stop_target_price = exit_price
 
         sell_plan: Optional[Dict[str, Any]] = None
         exit_best_bid: Optional[float] = None
@@ -1538,13 +1551,37 @@ class FiveMinuteUpDownTrader:
 
         if not self.dry_run:
             submit_t0 = time.perf_counter()
-            order_id = sell_order(
-                pos.market_id,
-                pos.token_id,
-                exit_price,
-                target_close_size,
-                market_meta=market_meta,
-            )
+            if reason in {"sl", "sl_direction_change"}:
+                market_stop_result = market_stop_loss_sell_order(
+                    pos.market_id,
+                    pos.token_id,
+                    target_stop_price=stop_target_price if stop_target_price is not None else exit_price,
+                    size=target_close_size,
+                    market_meta=market_meta,
+                )
+                order_id = market_stop_result.get("order_id") if market_stop_result else None
+                if market_stop_result is not None:
+                    target_close_size = float(market_stop_result.get("size") or target_close_size)
+                    stop_actual_price = market_stop_result.get("actual_stop_price")
+                    stop_slippage = market_stop_result.get("slippage")
+                    if stop_actual_price is not None and stop_actual_price > 0:
+                        exit_price = float(stop_actual_price)
+                logger.info(
+                    "市价止损执行结果: reason=%s order_id=%s target_stop=%.4f actual_stop=%s slippage=%s",
+                    reason,
+                    order_id,
+                    float(stop_target_price if stop_target_price is not None else exit_price),
+                    f"{float(stop_actual_price):.4f}" if stop_actual_price is not None else "N/A",
+                    f"{float(stop_slippage):.4f}" if stop_slippage is not None else "N/A",
+                )
+            else:
+                order_id = sell_order(
+                    pos.market_id,
+                    pos.token_id,
+                    exit_price,
+                    target_close_size,
+                    market_meta=market_meta,
+                )
             submit_ms = (time.perf_counter() - submit_t0) * 1000
             self._record_latency("sell_submit", submit_ms)
             if not order_id:
@@ -1590,6 +1627,9 @@ class FiveMinuteUpDownTrader:
             exit_best_bid=exit_best_bid,
             exit_avg_fill_price=exit_avg_fill_price,
             exit_full_fill=exit_full_fill,
+            stop_target_price=stop_target_price,
+            stop_actual_price=stop_actual_price,
+            stop_slippage=stop_slippage,
         )
         self.trades.append(record)
 
@@ -1676,6 +1716,28 @@ class FiveMinuteUpDownTrader:
                 return None
             return sum(1 for item in flags if item) / len(flags)
 
+        def _calc_stop_slippage_stats(trades: List[TradeRecord]) -> Optional[Dict[str, float]]:
+            values: List[float] = []
+            for t in trades:
+                if t.stop_slippage is None:
+                    continue
+                values.append(float(t.stop_slippage))
+
+            if not values:
+                return None
+
+            adverse_count = sum(1 for value in values if value < 0)
+            return {
+                "count": float(len(values)),
+                "avg": sum(values) / len(values),
+                "p50": self._percentile(values, 0.50),
+                "p95": self._percentile(values, 0.95),
+                "worst": min(values),
+                "best": max(values),
+                "adverse_count": float(adverse_count),
+                "adverse_rate": adverse_count / len(values),
+            }
+
         recent_100 = all_trades[-100:]
         rolling_base = len(recent_100)
         rolling_tp_count = sum(1 for t in recent_100 if t.reason == "tp")
@@ -1685,6 +1747,8 @@ class FiveMinuteUpDownTrader:
         cumulative_slippage_bps = _calc_slippage_bps(all_trades)
         hourly_full_fill_rate = _calc_full_fill_rate(new_trades)
         cumulative_full_fill_rate = _calc_full_fill_rate(all_trades)
+        hourly_stop_slippage_stats = _calc_stop_slippage_stats(new_trades)
+        cumulative_stop_slippage_stats = _calc_stop_slippage_stats(all_trades)
 
         lines.append("关键策略统计:")
         if hourly_slippage_bps is None:
@@ -1711,6 +1775,36 @@ class FiveMinuteUpDownTrader:
         else:
             lines.append(
                 f"- 订单成交率(累计，全成占比): {cumulative_full_fill_rate * 100:.2f}%"
+            )
+
+        if hourly_stop_slippage_stats is None:
+            lines.append("- 止损滑点(本小时): N/A")
+        else:
+            hourly_count = int(hourly_stop_slippage_stats["count"])
+            hourly_adverse_count = int(hourly_stop_slippage_stats["adverse_count"])
+            lines.append(
+                "- 止损滑点(本小时, 负值更差): "
+                f"count={hourly_count}, "
+                f"avg={hourly_stop_slippage_stats['avg']:.4f}, "
+                f"p50={hourly_stop_slippage_stats['p50']:.4f}, "
+                f"p95={hourly_stop_slippage_stats['p95']:.4f}, "
+                f"worst={hourly_stop_slippage_stats['worst']:.4f}, "
+                f"adverse={hourly_adverse_count}/{hourly_count}({hourly_stop_slippage_stats['adverse_rate'] * 100:.2f}%)"
+            )
+
+        if cumulative_stop_slippage_stats is None:
+            lines.append("- 止损滑点(累计): N/A")
+        else:
+            cumulative_count = int(cumulative_stop_slippage_stats["count"])
+            cumulative_adverse_count = int(cumulative_stop_slippage_stats["adverse_count"])
+            lines.append(
+                "- 止损滑点(累计, 负值更差): "
+                f"count={cumulative_count}, "
+                f"avg={cumulative_stop_slippage_stats['avg']:.4f}, "
+                f"p50={cumulative_stop_slippage_stats['p50']:.4f}, "
+                f"p95={cumulative_stop_slippage_stats['p95']:.4f}, "
+                f"worst={cumulative_stop_slippage_stats['worst']:.4f}, "
+                f"adverse={cumulative_adverse_count}/{cumulative_count}({cumulative_stop_slippage_stats['adverse_rate'] * 100:.2f}%)"
             )
         lines.append("")
 
@@ -1810,10 +1904,21 @@ class FiveMinuteUpDownTrader:
         lines.append("")
 
         for t in new_trades:
+            stop_slippage_suffix = ""
+            if t.stop_slippage is not None:
+                target_label = (
+                    f"{t.stop_target_price:.4f}" if t.stop_target_price is not None else "N/A"
+                )
+                actual_label = (
+                    f"{t.stop_actual_price:.4f}" if t.stop_actual_price is not None else "N/A"
+                )
+                stop_slippage_suffix = (
+                    f", stop_target={target_label}, stop_actual={actual_label}, stop_slippage={t.stop_slippage:.4f}"
+                )
             lines.append(
                 f"- {t.entry_time.isoformat(timespec='seconds')} -> {t.exit_time.isoformat(timespec='seconds')}, "
                 f"slug={t.market_slug}, dir={t.direction}, size={t.size:.4f}, "
-                f"entry={t.entry_price:.4f}, exit={t.exit_price:.4f}, pnl={t.pnl:.4f}, reason={t.reason}"
+                f"entry={t.entry_price:.4f}, exit={t.exit_price:.4f}, pnl={t.pnl:.4f}, reason={t.reason}{stop_slippage_suffix}"
             )
         if not new_trades:
             lines.append("- 本小时无新平仓交易")

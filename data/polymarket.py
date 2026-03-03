@@ -20,7 +20,15 @@ import requests
 import httpx
 import py_clob_client.http_helpers.helpers as clob_http_helpers
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, CreateOrderOptions, BalanceAllowanceParams, AssetType
+from py_clob_client.clob_types import (
+    OrderArgs,
+    CreateOrderOptions,
+    BalanceAllowanceParams,
+    AssetType,
+    MarketOrderArgs,
+    PartialCreateOrderOptions,
+    OrderType,
+)
 from py_clob_client.order_builder.builder import ROUNDING_CONFIG
 from py_clob_client.order_builder.helpers import round_down
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -137,6 +145,70 @@ def _get_cached_fee_rate_bps(token_id: str) -> int:
         except Exception:
             return 0
     return 0
+
+
+def _safe_positive_float(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+        if parsed <= 0:
+            return None
+        return parsed
+    except Exception:
+        return None
+
+
+def _extract_execution_price_from_order(order_payload: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(order_payload, dict):
+        return None
+
+    for key in ("avgPrice", "avg_price", "price"):
+        price = _safe_positive_float(order_payload.get(key))
+        if price is not None:
+            return price
+
+    taker = _safe_positive_float(
+        order_payload.get("takerAmount")
+        if order_payload.get("takerAmount") is not None
+        else order_payload.get("taker_amount")
+    )
+    maker = _safe_positive_float(
+        order_payload.get("makerAmount")
+        if order_payload.get("makerAmount") is not None
+        else order_payload.get("maker_amount")
+    )
+    if taker is not None and maker is not None and maker > 0:
+        ratio_price = taker / maker
+        if ratio_price > 0:
+            return ratio_price
+    return None
+
+
+def _wait_order_execution_price(
+    order_id: str,
+    max_attempts: int = 8,
+    sleep_sec: float = 0.25,
+) -> Optional[float]:
+    if not order_id:
+        return None
+
+    for attempt in range(max(1, int(max_attempts))):
+        try:
+            detail = client.get_order(order_id)
+            price = _extract_execution_price_from_order(detail)
+            if price is not None:
+                return price
+        except Exception as e:
+            logger.debug(
+                "wait_order_execution_price failed: order_id=%s attempt=%s error=%s",
+                order_id,
+                attempt + 1,
+                e,
+            )
+
+        if attempt < max_attempts - 1:
+            time.sleep(max(0.05, float(sleep_sec)))
+
+    return None
 
 
 def normalize_order_size(size: float, tick_size: Any) -> float:
@@ -494,6 +566,161 @@ def sell_order(
                 retry_err,
             )
             return None
+
+
+def market_stop_loss_sell_order(
+    market_id: str,
+    token_id: str,
+    target_stop_price: float,
+    size: float = 5.0,
+    market_meta: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    logger.info(
+        "market_stop_loss_sell_order called: market_id=%s token_id=%s target_stop_price=%s size=%s",
+        market_id,
+        _token_id_short(token_id),
+        target_stop_price,
+        size,
+    )
+
+    meta = market_meta or get_market_metadata(market_id)
+    if not meta or meta.get("minimum_tick_size") is None:
+        logger.error(
+            "market_stop_loss_sell_order missing market metadata: market_id=%s",
+            market_id,
+        )
+        return None
+
+    normalized_size = normalize_order_size(size=size, tick_size=meta["minimum_tick_size"])
+    if normalized_size <= 0:
+        logger.error(
+            "market_stop_loss_sell_order normalized_size is zero: market_id=%s token_id=%s original_size=%s",
+            market_id,
+            _token_id_short(token_id),
+            size,
+        )
+        return None
+
+    prefetch_order_metadata_for_tokens(
+        token_ids=[token_id],
+        market_meta=meta,
+        refresh_fee_rate=False,
+    )
+    fee_rate_bps = _get_cached_fee_rate_bps(token_id)
+
+    def _submit_once(submit_size: float):
+        market_order = client.create_market_order(
+            MarketOrderArgs(
+                token_id=token_id,
+                amount=submit_size,
+                side=SELL,
+                price=0,
+                fee_rate_bps=fee_rate_bps,
+                order_type=OrderType.FAK,
+            ),
+            options=PartialCreateOrderOptions(
+                tick_size=str(meta["minimum_tick_size"]),
+                neg_risk=bool(meta.get("neg_risk", False)),
+            ),
+        )
+        return client.post_order(market_order, orderType=OrderType.FAK)
+
+    submit_t0 = time.perf_counter()
+    response: Optional[Dict[str, Any]] = None
+    submitted_size = normalized_size
+    try:
+        response = _submit_once(normalized_size)
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "not enough balance / allowance" not in err_msg:
+            logger.exception(
+                "market_stop_loss_sell_order submit failed: market_id=%s token_id=%s target_stop_price=%s size=%s error=%s",
+                market_id,
+                _token_id_short(token_id),
+                target_stop_price,
+                size,
+                e,
+            )
+            return None
+
+        available_balance = get_conditional_token_balance(token_id)
+        retry_size = normalize_order_size(
+            size=min(normalized_size, available_balance),
+            tick_size=meta["minimum_tick_size"],
+        )
+        if retry_size <= 0 or retry_size + 1e-12 >= normalized_size:
+            logger.warning(
+                "market_stop_loss_sell_order balance clamp unavailable: market_id=%s token_id=%s requested=%.6f normalized=%.6f available=%.6f error=%s",
+                market_id,
+                _token_id_short(token_id),
+                float(size),
+                normalized_size,
+                available_balance,
+                e,
+            )
+            return None
+
+        logger.warning(
+            "market_stop_loss_sell_order retry with clamped size: token_id=%s requested=%.6f normalized=%.6f retry=%.6f available=%.6f",
+            _token_id_short(token_id),
+            float(size),
+            normalized_size,
+            retry_size,
+            available_balance,
+        )
+        submitted_size = retry_size
+        try:
+            response = _submit_once(retry_size)
+        except Exception as retry_err:
+            logger.exception(
+                "market_stop_loss_sell_order retry failed: market_id=%s token_id=%s target_stop_price=%s requested=%.6f retry=%.6f error=%s",
+                market_id,
+                _token_id_short(token_id),
+                target_stop_price,
+                float(size),
+                retry_size,
+                retry_err,
+            )
+            return None
+
+    order_id = response.get("orderID") if isinstance(response, dict) else None
+    submit_ms = (time.perf_counter() - submit_t0) * 1000
+    if not order_id:
+        logger.warning(
+            "market_stop_loss_sell_order response missing orderID: market_id=%s token_id=%s resp=%s latency=%.2fms",
+            market_id,
+            _token_id_short(token_id),
+            response,
+            submit_ms,
+        )
+        return None
+
+    actual_stop_price = _wait_order_execution_price(order_id=order_id)
+    if actual_stop_price is None:
+        actual_stop_price = _safe_positive_float(target_stop_price)
+
+    slippage = None
+    if actual_stop_price is not None:
+        slippage = actual_stop_price - float(target_stop_price)
+
+    logger.info(
+        "market_stop_loss_sell_order success: market_id=%s order_id=%s submit_size=%.6f target_stop=%.4f actual_stop=%s slippage=%s submit_latency=%.2fms",
+        market_id,
+        order_id,
+        submitted_size,
+        float(target_stop_price),
+        f"{actual_stop_price:.4f}" if actual_stop_price is not None else "N/A",
+        f"{slippage:.4f}" if slippage is not None else "N/A",
+        submit_ms,
+    )
+
+    return {
+        "order_id": order_id,
+        "size": submitted_size,
+        "target_stop_price": float(target_stop_price),
+        "actual_stop_price": actual_stop_price,
+        "slippage": slippage,
+    }
 
 def cancel_order(order_id: str):
     return client.cancel(order_id)
