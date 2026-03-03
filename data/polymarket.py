@@ -4,9 +4,10 @@ Polymarket 持仓与订单 API
 import json
 import logging
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +17,12 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 import requests
+import httpx
+import py_clob_client.http_helpers.helpers as clob_http_helpers
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, CreateOrderOptions, BalanceAllowanceParams, AssetType
+from py_clob_client.order_builder.builder import ROUNDING_CONFIG
+from py_clob_client.order_builder.helpers import round_down
 from py_clob_client.order_builder.constants import BUY, SELL
 from datetime import datetime
 from config import POLYMARKET_KEY, WALLET_ADDRESS
@@ -47,6 +52,199 @@ client = ClobClient(
 )
 
 _market_meta_cache: Dict[str, Dict[str, Any]] = {}
+_token_order_meta_cache: Dict[str, Dict[str, Any]] = {}
+_http_keepalive_started = False
+_http_keepalive_lock = threading.Lock()
+
+
+def _configure_clob_http_client() -> None:
+    limits = httpx.Limits(
+        max_connections=100,
+        max_keepalive_connections=32,
+        keepalive_expiry=300.0,
+    )
+    timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
+    old_client = getattr(clob_http_helpers, "_http_client", None)
+    clob_http_helpers._http_client = httpx.Client(
+        http2=True,
+        limits=limits,
+        timeout=timeout,
+    )
+    if old_client is not None:
+        try:
+            old_client.close()
+        except Exception:
+            pass
+
+
+def _get_clob_cache(attr_name: str) -> Dict[str, Any]:
+    cache = getattr(client, attr_name, None)
+    if isinstance(cache, dict):
+        return cache
+    cache = {}
+    setattr(client, attr_name, cache)
+    return cache
+
+
+def _cache_token_order_metadata(
+    token_id: str,
+    minimum_tick_size: Optional[Any] = None,
+    neg_risk: Optional[bool] = None,
+    fee_rate_bps: Optional[int] = None,
+) -> Dict[str, Any]:
+    token = str(token_id or "")
+    if not token:
+        return {}
+
+    record = _token_order_meta_cache.setdefault(token, {})
+    tick_cache = _get_clob_cache("_ClobClient__tick_sizes")
+    neg_risk_cache = _get_clob_cache("_ClobClient__neg_risk")
+    fee_rate_cache = _get_clob_cache("_ClobClient__fee_rates")
+
+    if minimum_tick_size is not None:
+        tick_size_str = str(minimum_tick_size)
+        record["minimum_tick_size"] = tick_size_str
+        tick_cache[token] = tick_size_str
+
+    if neg_risk is not None:
+        neg_risk_bool = bool(neg_risk)
+        record["neg_risk"] = neg_risk_bool
+        neg_risk_cache[token] = neg_risk_bool
+
+    if fee_rate_bps is not None:
+        fee_int = int(fee_rate_bps)
+        record["fee_rate_bps"] = fee_int
+        fee_rate_cache[token] = fee_int
+
+    return record
+
+
+def _get_cached_fee_rate_bps(token_id: str) -> int:
+    token = str(token_id or "")
+    if not token:
+        return 0
+    cached = _token_order_meta_cache.get(token) or {}
+    if "fee_rate_bps" in cached:
+        try:
+            return int(cached.get("fee_rate_bps") or 0)
+        except Exception:
+            return 0
+
+    fee_rate_cache = _get_clob_cache("_ClobClient__fee_rates")
+    if token in fee_rate_cache:
+        try:
+            return int(fee_rate_cache.get(token) or 0)
+        except Exception:
+            return 0
+    return 0
+
+
+def normalize_order_size(size: float, tick_size: Any) -> float:
+    try:
+        tick_key = str(tick_size)
+        round_config = ROUNDING_CONFIG.get(tick_key)
+        size_digits = int(round_config.size) if round_config is not None else 2
+        normalized = float(round_down(float(size), size_digits))
+        return max(0.0, normalized)
+    except Exception:
+        normalized = int(float(size) * 100) / 100
+        return max(0.0, float(normalized))
+
+
+def get_conditional_token_balance(token_id: str) -> float:
+    try:
+        response = client.get_balance_allowance(
+            BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=str(token_id),
+            )
+        )
+        if not isinstance(response, dict):
+            return 0.0
+        raw_balance = int(response.get("balance", 0) or 0)
+        return max(0.0, raw_balance / 10**6)
+    except Exception as e:
+        logger.warning(
+            "get_conditional_token_balance failed: token_id=%s error=%s",
+            _token_id_short(str(token_id)),
+            e,
+        )
+        return 0.0
+
+
+def prefetch_order_metadata_for_tokens(
+    token_ids: List[str],
+    market_meta: Optional[Dict[str, Any]] = None,
+    refresh_fee_rate: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    minimum_tick_size = None
+    neg_risk = None
+    if isinstance(market_meta, dict):
+        minimum_tick_size = market_meta.get("minimum_tick_size")
+        neg_risk = market_meta.get("neg_risk")
+
+    for token_id in token_ids:
+        token = str(token_id or "")
+        if not token:
+            continue
+
+        _cache_token_order_metadata(
+            token,
+            minimum_tick_size=minimum_tick_size,
+            neg_risk=neg_risk,
+        )
+
+        fee_rate_bps: Optional[int] = None
+        if refresh_fee_rate:
+            try:
+                fee_rate_bps = int(client.get_fee_rate_bps(token) or 0)
+            except Exception as e:
+                logger.warning(
+                    "prefetch fee_rate failed, fallback to cached/default: token_id=%s error=%s",
+                    _token_id_short(token),
+                    e,
+                )
+                fee_rate_bps = _get_cached_fee_rate_bps(token)
+        else:
+            fee_rate_bps = _get_cached_fee_rate_bps(token)
+
+        meta = _cache_token_order_metadata(
+            token,
+            minimum_tick_size=minimum_tick_size,
+            neg_risk=neg_risk,
+            fee_rate_bps=fee_rate_bps,
+        )
+        result[token] = dict(meta)
+
+    return result
+
+
+def _http_keepalive_loop(interval_sec: int) -> None:
+    while True:
+        try:
+            ping_t0 = time.perf_counter()
+            client.get_server_time()
+            ping_ms = (time.perf_counter() - ping_t0) * 1000
+            logger.info("clob_http_keepalive ping ok: latency=%.2fms", ping_ms)
+        except Exception as e:
+            logger.warning("clob_http_keepalive ping failed: %s", e)
+        time.sleep(max(5, interval_sec))
+
+
+def ensure_http_keepalive(interval_sec: int = 20) -> None:
+    global _http_keepalive_started
+    with _http_keepalive_lock:
+        if _http_keepalive_started:
+            return
+        thread = threading.Thread(
+            target=_http_keepalive_loop,
+            args=(interval_sec,),
+            daemon=True,
+            name="polymarket-http-keepalive",
+        )
+        thread.start()
+        _http_keepalive_started = True
 
 
 def get_positions() -> list:
@@ -121,10 +319,39 @@ def buy_order(
     if not meta or meta.get("minimum_tick_size") is None:
         logger.error("buy_order missing market metadata: market_id=%s", market_id)
         return None
+    normalized_size = normalize_order_size(size=size, tick_size=meta["minimum_tick_size"])
+    if normalized_size <= 0:
+        logger.error(
+            "buy_order normalized_size is zero: market_id=%s token_id=%s original_size=%s",
+            market_id,
+            _token_id_short(token_id),
+            size,
+        )
+        return None
+    if abs(normalized_size - float(size)) > 1e-12:
+        logger.info(
+            "buy_order size normalized by SDK rule: token_id=%s original=%.6f normalized=%.6f tick_size=%s",
+            _token_id_short(token_id),
+            float(size),
+            normalized_size,
+            meta["minimum_tick_size"],
+        )
+    prefetch_order_metadata_for_tokens(
+        token_ids=[token_id],
+        market_meta=meta,
+        refresh_fee_rate=False,
+    )
+    fee_rate_bps = _get_cached_fee_rate_bps(token_id)
     submit_t0 = time.perf_counter()
     try:
         response = client.create_and_post_order(
-            OrderArgs(token_id=token_id, price=price, size=size, side=BUY),
+            OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=normalized_size,
+                side=BUY,
+                fee_rate_bps=fee_rate_bps,
+            ),
             options=CreateOrderOptions(
                 tick_size=str(meta["minimum_tick_size"]),
                 neg_risk=bool(meta.get("neg_risk", False)),
@@ -151,22 +378,122 @@ def sell_order(
     if not meta or meta.get("minimum_tick_size") is None:
         logger.error("sell_order missing market metadata: market_id=%s", market_id)
         return None
-    submit_t0 = time.perf_counter()
-    try:
-        response = client.create_and_post_order(
-            OrderArgs(token_id=token_id, price=price, size=size, side=SELL),
+    normalized_size = normalize_order_size(size=size, tick_size=meta["minimum_tick_size"])
+    if normalized_size <= 0:
+        logger.error(
+            "sell_order normalized_size is zero: market_id=%s token_id=%s original_size=%s",
+            market_id,
+            _token_id_short(token_id),
+            size,
+        )
+        return None
+    if abs(normalized_size - float(size)) > 1e-12:
+        logger.info(
+            "sell_order size normalized by SDK rule: token_id=%s original=%.6f normalized=%.6f tick_size=%s",
+            _token_id_short(token_id),
+            float(size),
+            normalized_size,
+            meta["minimum_tick_size"],
+        )
+
+    prefetch_order_metadata_for_tokens(
+        token_ids=[token_id],
+        market_meta=meta,
+        refresh_fee_rate=False,
+    )
+    fee_rate_bps = _get_cached_fee_rate_bps(token_id)
+
+    def _submit_once(submit_size: float):
+        return client.create_and_post_order(
+            OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=submit_size,
+                side=SELL,
+                fee_rate_bps=fee_rate_bps,
+            ),
             options=CreateOrderOptions(
                 tick_size=str(meta["minimum_tick_size"]),
                 neg_risk=bool(meta.get("neg_risk", False)),
             ),
         )
+
+    submit_t0 = time.perf_counter()
+    try:
+        response = _submit_once(normalized_size)
         order_id = response.get("orderID") if isinstance(response, dict) else None
         submit_ms = (time.perf_counter() - submit_t0) * 1000
         logger.info("sell_order success: market_id=%s order_id=%s submit_latency=%.2fms", market_id, order_id, submit_ms)
         return order_id
     except Exception as e:
-        logger.exception("sell_order create_and_post_order failed: market_id=%s token_id=%s price=%s size=%s error=%s", market_id, _token_id_short(token_id), price, size, e)
-        return None
+        err_msg = str(e).lower()
+        if "not enough balance / allowance" not in err_msg:
+            logger.exception("sell_order create_and_post_order failed: market_id=%s token_id=%s price=%s size=%s error=%s", market_id, _token_id_short(token_id), price, size, e)
+            return None
+
+        available_balance = get_conditional_token_balance(token_id)
+        retry_size = normalize_order_size(
+            size=min(normalized_size, available_balance),
+            tick_size=meta["minimum_tick_size"],
+        )
+        if retry_size <= 0:
+            logger.exception(
+                "sell_order fast-path failed and retry aborted: market_id=%s token_id=%s requested=%.6f normalized=%.6f available=%.6f error=%s",
+                market_id,
+                _token_id_short(token_id),
+                float(size),
+                normalized_size,
+                available_balance,
+                e,
+            )
+            return None
+
+        if retry_size + 1e-12 >= normalized_size:
+            logger.exception(
+                "sell_order fast-path failed and no smaller retry possible: market_id=%s token_id=%s requested=%.6f normalized=%.6f available=%.6f error=%s",
+                market_id,
+                _token_id_short(token_id),
+                float(size),
+                normalized_size,
+                available_balance,
+                e,
+            )
+            return None
+
+        logger.warning(
+            "sell_order fast-path failed, retry with clamped size: token_id=%s requested=%.6f normalized=%.6f retry=%.6f available=%.6f",
+            _token_id_short(token_id),
+            float(size),
+            normalized_size,
+            retry_size,
+            available_balance,
+        )
+        retry_t0 = time.perf_counter()
+        try:
+            retry_resp = _submit_once(retry_size)
+            order_id = retry_resp.get("orderID") if isinstance(retry_resp, dict) else None
+            retry_ms = (time.perf_counter() - retry_t0) * 1000
+            total_ms = (time.perf_counter() - submit_t0) * 1000
+            logger.info(
+                "sell_order retry success: market_id=%s order_id=%s retry_size=%.6f retry_latency=%.2fms total_latency=%.2fms",
+                market_id,
+                order_id,
+                retry_size,
+                retry_ms,
+                total_ms,
+            )
+            return order_id
+        except Exception as retry_err:
+            logger.exception(
+                "sell_order retry failed: market_id=%s token_id=%s price=%s requested=%.6f retry=%.6f error=%s",
+                market_id,
+                _token_id_short(token_id),
+                price,
+                float(size),
+                retry_size,
+                retry_err,
+            )
+            return None
 
 def cancel_order(order_id: str):
     return client.cancel(order_id)
@@ -229,3 +556,6 @@ def get_balance_allowance() -> str:
 
 if __name__ == "__main__":
     print(get_event_token_id("btc-updown-5m-1772096400"))
+
+
+_configure_clob_http_client()

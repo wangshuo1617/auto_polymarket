@@ -36,6 +36,9 @@ from data.polymarket import (
     get_event_token_id,
     get_market_metadata,
     get_order_book,
+    prefetch_order_metadata_for_tokens,
+    ensure_http_keepalive,
+    normalize_order_size,
 )
 from notifications.email import EmailSender
 
@@ -827,6 +830,7 @@ class FiveMinuteUpDownTrader:
 
     def start(self) -> None:
         logger.info("启动 FiveMinuteUpDownTrader，单笔仓位金额=%.2f USDC", self.stake_usd)
+        ensure_http_keepalive(interval_sec=20)
         self._running = True
         self._binance.start()
         self._report_thread = threading.Thread(
@@ -1098,11 +1102,22 @@ class FiveMinuteUpDownTrader:
             result["market_meta"] = get_market_metadata(market_id)
             meta_ms = (time.perf_counter() - meta_t0) * 1000
             self._record_latency("market_meta_fetch", meta_ms)
+
+            prefetch_t0 = time.perf_counter()
+            prefetch_order_metadata_for_tokens(
+                token_ids=[str(result["up_token"]), str(result["down_token"])],
+                market_meta=result["market_meta"],
+                refresh_fee_rate=True,
+            )
+            prefetch_ms = (time.perf_counter() - prefetch_t0) * 1000
+            self._record_latency("order_meta_prefetch", prefetch_ms)
+
             logger.info(
-                "市场信息拉取耗时: slug=%s event=%.2fms market_meta=%.2fms",
+                "市场信息拉取耗时: slug=%s event=%.2fms market_meta=%.2fms order_meta_prefetch=%.2fms",
                 market_slug,
                 info_ms,
                 meta_ms,
+                prefetch_ms,
             )
         self._market_cache[market_slug] = result
         return result
@@ -1141,6 +1156,24 @@ class FiveMinuteUpDownTrader:
             best_ask_price = float(entry_levels[0]["price"])
         rough_entry_price = best_ask_price
         size = round(self.stake_usd / rough_entry_price, 6)
+        normalized_size = normalize_order_size(
+            size=size,
+            tick_size=(market_meta or {}).get("minimum_tick_size", "0.01"),
+        )
+        if normalized_size <= 0:
+            logger.warning(
+                "放弃开仓：归一化后下单数量为0，original=%.6f price=%.4f",
+                size,
+                rough_entry_price,
+            )
+            return
+        if abs(normalized_size - size) > 1e-12:
+            logger.info(
+                "建仓size按SDK规则归一化: original=%.6f normalized=%.6f",
+                size,
+                normalized_size,
+            )
+        size = normalized_size
 
         plan = self._build_execution_plan(
             token_id=token_id,
@@ -1373,6 +1406,7 @@ class FiveMinuteUpDownTrader:
             if sell_plan is not None
             else "unknown"
         )
+        target_close_size = pos.size
 
         if not self.dry_run:
             submit_t0 = time.perf_counter()
@@ -1380,7 +1414,7 @@ class FiveMinuteUpDownTrader:
                 pos.market_id,
                 pos.token_id,
                 exit_price,
-                pos.size,
+                target_close_size,
                 market_meta=market_meta,
             )
             submit_ms = (time.perf_counter() - submit_t0) * 1000
@@ -1396,13 +1430,13 @@ class FiveMinuteUpDownTrader:
             else:
                 logger.info("平仓卖单已提交，order_id=%s submit_latency=%.2fms", order_id, submit_ms)
 
-        pnl = (exit_price - pos.entry_price) * pos.size
+        pnl = (exit_price - pos.entry_price) * target_close_size
         record = TradeRecord(
             market_slug=pos.market_slug,
             market_id=pos.market_id,
             token_id=pos.token_id,
             direction=pos.direction,
-            size=pos.size,
+            size=target_close_size,
             entry_price=pos.entry_price,
             exit_price=exit_price,
             pnl=pnl,
