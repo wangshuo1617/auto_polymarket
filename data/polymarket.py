@@ -437,7 +437,7 @@ def sell_order(
             tick_size=meta["minimum_tick_size"],
         )
         if retry_size <= 0:
-            logger.exception(
+            logger.warning(
                 "sell_order fast-path failed and retry aborted: market_id=%s token_id=%s requested=%.6f normalized=%.6f available=%.6f error=%s",
                 market_id,
                 _token_id_short(token_id),
@@ -449,7 +449,7 @@ def sell_order(
             return None
 
         if retry_size + 1e-12 >= normalized_size:
-            logger.exception(
+            logger.warning(
                 "sell_order fast-path failed and no smaller retry possible: market_id=%s token_id=%s requested=%.6f normalized=%.6f available=%.6f error=%s",
                 market_id,
                 _token_id_short(token_id),

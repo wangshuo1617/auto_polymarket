@@ -39,6 +39,7 @@ from data.polymarket import (
     prefetch_order_metadata_for_tokens,
     ensure_http_keepalive,
     normalize_order_size,
+    get_conditional_token_balance,
 )
 from notifications.email import EmailSender
 
@@ -72,6 +73,7 @@ class OpenPosition:
     stop_loss_price: float
     take_profit_price: float
     last_best_bid: Optional[float] = None
+    balance_confirmed: bool = False
 
 
 class BinanceKline1mWatcher:
@@ -430,6 +432,7 @@ class FiveMinuteUpDownTrader:
     MAX_EXIT_SLIPPAGE_BPS_WARN = 250.0
     TOXIC_UTC_HOURS = {16, 19, 20}
     WS_BOOK_MAX_AGE_MS = 1200
+    MIN_HOLD_BEFORE_CLOSE_SEC = 5
 
     def __init__(
         self,
@@ -1259,6 +1262,12 @@ class FiveMinuteUpDownTrader:
             stop_loss_price=stop_loss_price,
             take_profit_price=take_profit_price,
         )
+        if not self.dry_run:
+            self._schedule_position_balance_confirmation(
+                market_slug=market_slug,
+                token_id=token_id,
+                delay_sec=3,
+            )
 
         if self._poly_watcher:
             self._poly_watcher.stop()
@@ -1277,6 +1286,58 @@ class FiveMinuteUpDownTrader:
             open_book_source,
             open_ms,
         )
+
+    def _schedule_position_balance_confirmation(
+        self,
+        market_slug: str,
+        token_id: str,
+        delay_sec: int = 3,
+    ) -> None:
+        def _run() -> None:
+            time.sleep(max(0, delay_sec))
+
+            with self._lock:
+                pos = self.position
+                if (
+                    pos is None
+                    or pos.market_slug != market_slug
+                    or pos.token_id != token_id
+                ):
+                    return
+                market_info = self._market_cache.get(market_slug) or {}
+                market_meta = market_info.get("market_meta") or {}
+                tick_size = market_meta.get("minimum_tick_size", "0.01")
+
+            raw_balance = get_conditional_token_balance(token_id)
+            confirmed_size = normalize_order_size(raw_balance, tick_size=tick_size)
+
+            with self._lock:
+                pos = self.position
+                if (
+                    pos is None
+                    or pos.market_slug != market_slug
+                    or pos.token_id != token_id
+                ):
+                    return
+
+                old_size = float(pos.size)
+                pos.size = confirmed_size
+                pos.balance_confirmed = True
+                logger.info(
+                    "建仓后余额确认: market=%s token=%s old_size=%.6f confirmed_size=%.6f raw_balance=%.6f delay=%ss",
+                    market_slug,
+                    token_id,
+                    old_size,
+                    confirmed_size,
+                    raw_balance,
+                    delay_sec,
+                )
+
+        threading.Thread(
+            target=_run,
+            daemon=True,
+            name="position-balance-confirm",
+        ).start()
 
     def _on_polymarket_price(
         self,
@@ -1339,6 +1400,17 @@ class FiveMinuteUpDownTrader:
     def _force_close_position(self, reason: str) -> None:
         if not self.position:
             return
+
+        hold_seconds = (datetime.now(timezone.utc) - self.position.entry_time).total_seconds()
+        if hold_seconds < self.MIN_HOLD_BEFORE_CLOSE_SEC:
+            logger.info(
+                "平仓保护期生效，暂不平仓: reason=%s hold=%.2fs need>=%.2fs",
+                reason,
+                hold_seconds,
+                float(self.MIN_HOLD_BEFORE_CLOSE_SEC),
+            )
+            return
+
         close_t0 = time.perf_counter()
         pos = self.position
         self.position = None
@@ -1407,6 +1479,16 @@ class FiveMinuteUpDownTrader:
             else "unknown"
         )
         target_close_size = pos.size
+        if target_close_size <= 0:
+            logger.warning(
+                "平仓跳过：持仓确认余额为0，等待下一次机会 market=%s token=%s reason=%s confirmed=%s",
+                pos.market_slug,
+                pos.token_id,
+                reason,
+                pos.balance_confirmed,
+            )
+            self.position = pos
+            return
 
         if not self.dry_run:
             submit_t0 = time.perf_counter()
@@ -1421,12 +1503,25 @@ class FiveMinuteUpDownTrader:
             self._record_latency("sell_submit", submit_ms)
             if not order_id:
                 logger.warning(
-                    "平仓卖单提交失败，将按估算价格记账: market=%s token=%s price=%.4f size=%.4f",
+                    "平仓卖单提交失败，恢复持仓等待下一次平仓: market=%s token=%s price=%.4f size=%.4f",
                     pos.market_id,
                     pos.token_id,
                     exit_price,
                     pos.size,
                 )
+                pos.last_best_bid = exit_price
+                self.position = pos
+                close_ms = (time.perf_counter() - close_t0) * 1000
+                self._record_latency("close_total", close_ms)
+                logger.info(
+                    "平仓链路总耗时(失败): market=%s token=%s reason=%s source=%s latency=%.2fms",
+                    pos.market_slug,
+                    pos.token_id,
+                    reason,
+                    close_book_source,
+                    close_ms,
+                )
+                return
             else:
                 logger.info("平仓卖单已提交，order_id=%s submit_latency=%.2fms", order_id, submit_ms)
 
