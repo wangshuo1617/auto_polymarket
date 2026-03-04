@@ -398,7 +398,7 @@ class PolymarketAssetPriceWatcher:
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-                self.ws.run_forever()
+                self.ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
                 logger.error("Polymarket WebSocket 运行异常: %s", e)
             finally:
