@@ -967,7 +967,5 @@ def get_balance_allowance() -> str:
     return f"${balance:.2f}"
 
 if __name__ == "__main__":
-    print(get_event_token_id("btc-updown-5m-1772096400"))
-
-
-_configure_clob_http_client()
+    result = get_order_detail("0x3bc345be937cd5f0beb27e95e1b7faa642dcb202f9bae64ebeca841783703582")
+    print(result)

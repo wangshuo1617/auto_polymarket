@@ -33,10 +33,6 @@ from config import TO_EMAIL
 from data.polymarket import (
     buy_order,
     sell_order,
-    batch_sell_orders,
-    market_stop_loss_sell_order,
-    cancel_order,
-    get_order_detail,
     get_event_token_id,
     get_market_metadata,
     get_order_book,
@@ -69,9 +65,6 @@ class TradeRecord:
     exit_best_bid: Optional[float] = None
     exit_avg_fill_price: Optional[float] = None
     exit_full_fill: Optional[bool] = None
-    stop_target_price: Optional[float] = None
-    stop_actual_price: Optional[float] = None
-    stop_slippage: Optional[float] = None
 
 
 @dataclass
@@ -87,7 +80,6 @@ class OpenPosition:
     take_profit_price: float
     last_best_bid: Optional[float] = None
     balance_confirmed: bool = False
-    entry_order_id: Optional[str] = None
     entry_best_ask: Optional[float] = None
     entry_avg_fill_price: Optional[float] = None
     entry_full_fill: Optional[bool] = None
@@ -308,9 +300,6 @@ class PolymarketAssetPriceWatcher:
                         continue
                     asks.append({"price": price, "size": size})
 
-                bids = sorted(bids, key=lambda lvl: float(lvl["price"]))
-                asks = sorted(asks, key=lambda lvl: float(lvl["price"]))
-
                 ts_ms: Optional[int] = None
                 try:
                     raw_ts = payload.get("timestamp")
@@ -319,7 +308,7 @@ class PolymarketAssetPriceWatcher:
                 except Exception:
                     ts_ms = None
 
-                # 统一按价格排序后取 best，避免上游顺序变化导致 best 选错
+                # 按交易所约定：best_bid 是 bids 最后一个，best_ask 是 asks 第一个
                 if bids:
                     best_bid = bids[-1]["price"]
                 best_ask = asks[0]["price"] if asks else None
@@ -450,7 +439,6 @@ class FiveMinuteUpDownTrader:
     MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
     MAX_ENTRY_SLIPPAGE_BPS = 120.0
     MAX_EXIT_SLIPPAGE_BPS_WARN = 250.0
-    LIMIT_CLOSE_BATCH_LEVELS = 3
     TOXIC_UTC_HOURS = {16, 19, 20}
     WS_BOOK_MAX_AGE_MS = 1200
     MIN_HOLD_BEFORE_CLOSE_SEC = 5
@@ -558,51 +546,6 @@ class FiveMinuteUpDownTrader:
             return parsed
         except Exception:
             return None
-
-    def _reconcile_position_snapshot(
-        self,
-        token_id: str,
-        entry_order_id: Optional[str],
-        tick_size: str,
-        base_size: float = 0.0,
-        cancel_live_entry: bool = False,
-    ) -> Dict[str, Any]:
-        order_status = ""
-        matched_size = 0.0
-        canceled_live_entry = False
-
-        if entry_order_id:
-            order_detail = get_order_detail(entry_order_id)
-            if order_detail:
-                order_status = str(order_detail.get("status") or "").upper()
-                matched_raw = self._to_positive_float(order_detail.get("size_matched"))
-                if matched_raw is not None:
-                    matched_size = normalize_order_size(matched_raw, tick_size=tick_size)
-
-            if cancel_live_entry and order_status == "LIVE":
-                try:
-                    cancel_order(entry_order_id)
-                    canceled_live_entry = True
-                except Exception as e:
-                    logger.warning(
-                        "仓位对账撤销入场挂单失败: token=%s order_id=%s error=%s",
-                        token_id,
-                        entry_order_id,
-                        e,
-                    )
-
-        raw_balance = get_conditional_token_balance(token_id)
-        balance_size = normalize_order_size(raw_balance, tick_size=tick_size)
-        reconciled_size = max(float(base_size), balance_size, matched_size)
-
-        return {
-            "reconciled_size": reconciled_size,
-            "balance_size": balance_size,
-            "raw_balance": raw_balance,
-            "matched_size": matched_size,
-            "order_status": order_status,
-            "canceled_live_entry": canceled_live_entry,
-        }
 
     @classmethod
     def _is_toxic_time_regime(cls) -> bool:
@@ -722,22 +665,11 @@ class FiveMinuteUpDownTrader:
         if not normalized_levels:
             raise RuntimeError(f"订单簿无可用{'卖' if side == 'buy' else '买'}单")
 
-        best_ask_from_levels: Optional[float] = None
-        best_bid_from_levels: Optional[float] = None
-        if side == "buy":
-            best_ask_from_levels = float(normalized_levels[0]["price"])
-        elif side == "sell":
-            best_bid_from_levels = float(normalized_levels[0]["price"])
-
         return {
             "source": source,
             "levels": normalized_levels,
-            "best_ask": best_ask_from_levels
-            if best_ask_from_levels is not None
-            else self._to_positive_float((ws_snapshot or {}).get("best_ask")),
-            "best_bid": best_bid_from_levels
-            if best_bid_from_levels is not None
-            else self._to_positive_float((ws_snapshot or {}).get("best_bid")),
+            "best_ask": self._to_positive_float((ws_snapshot or {}).get("best_ask")),
+            "best_bid": self._to_positive_float((ws_snapshot or {}).get("best_bid")),
         }
 
     def _build_execution_plan(
@@ -1346,7 +1278,6 @@ class FiveMinuteUpDownTrader:
             entry_time=datetime.now(timezone.utc),
             stop_loss_price=stop_loss_price,
             take_profit_price=take_profit_price,
-            entry_order_id=order_id,
             entry_best_ask=best_ask_price,
             entry_avg_fill_price=float(plan["vwap_price"]),
             entry_full_fill=bool(plan.get("full_fill", False)),
@@ -1355,7 +1286,6 @@ class FiveMinuteUpDownTrader:
             self._schedule_position_balance_confirmation(
                 market_slug=market_slug,
                 token_id=token_id,
-                entry_order_id=order_id,
                 delay_sec=3,
             )
 
@@ -1381,10 +1311,7 @@ class FiveMinuteUpDownTrader:
         self,
         market_slug: str,
         token_id: str,
-        entry_order_id: Optional[str],
         delay_sec: int = 3,
-        max_attempts: int = 6,
-        retry_interval_sec: int = 2,
     ) -> None:
         def _run() -> None:
             time.sleep(max(0, delay_sec))
@@ -1401,101 +1328,8 @@ class FiveMinuteUpDownTrader:
                 market_meta = market_info.get("market_meta") or {}
                 tick_size = market_meta.get("minimum_tick_size", "0.01")
 
-            observed_positive_size = False
-            for attempt in range(1, max(1, max_attempts) + 1):
-                snapshot = self._reconcile_position_snapshot(
-                    token_id=token_id,
-                    entry_order_id=entry_order_id,
-                    tick_size=tick_size,
-                    base_size=0.0,
-                    cancel_live_entry=False,
-                )
-                effective_size = float(snapshot["reconciled_size"])
-                raw_balance = float(snapshot["raw_balance"])
-                matched_size = float(snapshot["matched_size"])
-                order_status = str(snapshot["order_status"] or "")
-
-                with self._lock:
-                    pos = self.position
-                    if (
-                        pos is None
-                        or pos.market_slug != market_slug
-                        or pos.token_id != token_id
-                    ):
-                        return
-
-                    if effective_size > 0:
-                        old_size = float(pos.size)
-                        pos.size = max(old_size, effective_size)
-                        pos.balance_confirmed = True
-                        observed_positive_size = True
-                        if pos.size > old_size + 1e-9:
-                            logger.info(
-                                "建仓后余额确认更新: market=%s token=%s old_size=%.6f confirmed_size=%.6f raw_balance=%.6f matched_size=%.6f status=%s attempt=%s/%s",
-                                market_slug,
-                                token_id,
-                                old_size,
-                                pos.size,
-                                raw_balance,
-                                matched_size,
-                                order_status or "N/A",
-                                attempt,
-                                max_attempts,
-                            )
-                        elif attempt == 1:
-                            logger.info(
-                                "建仓后余额确认成功: market=%s token=%s old_size=%.6f confirmed_size=%.6f raw_balance=%.6f matched_size=%.6f status=%s attempt=%s/%s",
-                                market_slug,
-                                token_id,
-                                old_size,
-                                pos.size,
-                                raw_balance,
-                                matched_size,
-                                order_status or "N/A",
-                                attempt,
-                                max_attempts,
-                            )
-
-                        if order_status in {"MATCHED", "CANCELED", "EXPIRED", "REJECTED"}:
-                            return
-
-                    if order_status in {"CANCELED", "EXPIRED", "REJECTED"}:
-                        logger.info(
-                            "建仓后确认到订单未成交且已结束，清理本地持仓: market=%s token=%s order_id=%s status=%s attempt=%s/%s",
-                            market_slug,
-                            token_id,
-                            entry_order_id,
-                            order_status,
-                            attempt,
-                            max_attempts,
-                        )
-                        self.position = None
-                        if self._poly_watcher:
-                            self._poly_watcher.stop()
-                            self._poly_watcher = None
-                        return
-
-                if attempt < max_attempts:
-                    time.sleep(max(1, retry_interval_sec))
-
-            if observed_positive_size:
-                with self._lock:
-                    pos = self.position
-                    if (
-                        pos is None
-                        or pos.market_slug != market_slug
-                        or pos.token_id != token_id
-                    ):
-                        return
-                    logger.info(
-                        "建仓后余额确认结束: market=%s token=%s final_size=%.6f order_id=%s attempts=%s",
-                        market_slug,
-                        token_id,
-                        float(pos.size),
-                        entry_order_id,
-                        max_attempts,
-                    )
-                return
+            raw_balance = get_conditional_token_balance(token_id)
+            confirmed_size = normalize_order_size(raw_balance, tick_size=tick_size)
 
             with self._lock:
                 pos = self.position
@@ -1505,18 +1339,151 @@ class FiveMinuteUpDownTrader:
                     or pos.token_id != token_id
                 ):
                     return
-                logger.warning(
-                    "建仓后余额多次确认仍为0，保留本地持仓避免误清仓: market=%s token=%s order_id=%s attempts=%s",
+
+                old_size = float(pos.size)
+                pos.size = confirmed_size
+                pos.balance_confirmed = True
+                logger.info(
+                    "建仓后余额确认: market=%s token=%s old_size=%.6f confirmed_size=%.6f raw_balance=%.6f delay=%ss",
                     market_slug,
                     token_id,
-                    entry_order_id,
-                    max_attempts,
+                    old_size,
+                    confirmed_size,
+                    raw_balance,
+                    delay_sec,
                 )
+
+                if confirmed_size <= 0:
+                    logger.info(
+                        "建仓后余额确认为0，清理本地持仓避免阻塞后续开仓: market=%s token=%s",
+                        market_slug,
+                        token_id,
+                    )
+                    self.position = None
+                    if self._poly_watcher:
+                        self._poly_watcher.stop()
+                        self._poly_watcher = None
 
         threading.Thread(
             target=_run,
             daemon=True,
             name="position-balance-confirm",
+        ).start()
+
+    def _schedule_post_close_balance_check(
+        self,
+        closed_position: OpenPosition,
+        reason: str,
+        target_close_size: float,  # <--- 新增：用于快通道比对预期平仓数量
+        order_id: Optional[str] = None,  # <--- 新增：用于快通道查询订单状态
+        delay_sec: int = 3,
+    ) -> None:
+        def _run() -> None:
+            # === 快通道 (Fast Path): 查撮合引擎订单状态 ===
+            if order_id:
+                try:
+                    # 局部引入，避免未在顶部 import 报错
+                    from data.polymarket import get_order_detail 
+                    order_detail = get_order_detail(order_id)
+                    
+                    if order_detail:
+                        order_status = str(order_detail.get("status") or "").upper()
+                        matched_raw = float(order_detail.get("size_matched", 0.0))
+                        
+                        logger.info(
+                            "平仓快通道检查: order_id=%s status=%s matched=%.4f target=%.4f", 
+                            order_id, order_status, matched_raw, target_close_size
+                        )
+                        
+                        # 如果引擎确认已完全撮合 (MATCHED) 或撮合数量达到了 99.9%
+                        if order_status == "MATCHED" or matched_raw >= target_close_size * 0.999:
+                            logger.info("⚡ 快通道确认: 订单已在撮合引擎完全成交，平仓成功，跳过余额等待！")
+                            return
+                except Exception as e:
+                    logger.warning("快通道查询订单状态失败，降级到慢通道: %s", e)
+
+            # === 慢通道 (Slow Path): 延迟等待数据库与链上余额同步 ===
+            logger.info("快通道未确认完全成交 (可能发生部分成交/撤单)，等待 %ss 后启动慢通道余额复核...", delay_sec)
+            time.sleep(max(0, delay_sec))
+
+            market_info = self._market_cache.get(closed_position.market_slug) or {}
+            market_meta = market_info.get("market_meta") or {}
+            tick_size = market_meta.get("minimum_tick_size", "0.01")
+
+            # 去链上/API查最真实的粉尘和残仓
+            raw_balance = get_conditional_token_balance(closed_position.token_id)
+            remaining_size = normalize_order_size(raw_balance, tick_size=tick_size)
+
+            should_retry = False
+            with self._lock:
+                logger.info(
+                    "平仓慢通道余额确认: market=%s token=%s remaining_size=%.6f raw_balance=%.6f delay=%ss reason=%s",
+                    closed_position.market_slug,
+                    closed_position.token_id,
+                    remaining_size,
+                    raw_balance,
+                    delay_sec,
+                    reason,
+                )
+
+                if remaining_size <= 0:
+                    logger.info("慢通道确认: 余额已归零，平仓彻底完成。")
+                    return
+
+                # 走到这里，说明真的是因为盘口太薄等原因没卖干净，恢复持仓状态以备重试
+                existing = self.position
+                if (
+                    existing is not None
+                    and existing.market_slug == closed_position.market_slug
+                    and existing.token_id == closed_position.token_id
+                ):
+                    if remaining_size > existing.size:
+                        existing.size = remaining_size
+                    existing.balance_confirmed = True
+                    should_retry = True
+                elif existing is None:
+                    self.position = OpenPosition(
+                        market_slug=closed_position.market_slug,
+                        market_id=closed_position.market_id,
+                        token_id=closed_position.token_id,
+                        direction=closed_position.direction,
+                        size=remaining_size,
+                        entry_price=closed_position.entry_price,
+                        entry_time=closed_position.entry_time,
+                        stop_loss_price=closed_position.stop_loss_price,
+                        take_profit_price=closed_position.take_profit_price,
+                        last_best_bid=closed_position.last_best_bid,
+                        balance_confirmed=True,  # 标记为链上真实确认
+                        entry_best_ask=closed_position.entry_best_ask,
+                        entry_avg_fill_price=closed_position.entry_avg_fill_price,
+                        entry_full_fill=closed_position.entry_full_fill,
+                    )
+                    should_retry = True
+                    # 重新启动 WebSocket 监听
+                    if self._poly_watcher:
+                        self._poly_watcher.stop()
+                    self._poly_watcher = PolymarketAssetPriceWatcher(
+                        asset_id=closed_position.token_id,
+                        on_price=self._on_polymarket_price,
+                        on_book=self._on_polymarket_book,
+                    )
+                    self._poly_watcher.start()
+                    logger.warning(
+                        "平仓慢通道发现真实残仓，已恢复持仓并准备重试平仓: market=%s token=%s size=%.6f",
+                        closed_position.market_slug,
+                        closed_position.token_id,
+                        remaining_size,
+                    )
+
+            if should_retry:
+                # 触发残仓平仓，给 reason 加上 _residual 后缀防止无限死循环
+                residual_reason = f"{reason}_residual" if not reason.endswith("_residual") else reason
+                self._force_close_position(reason=residual_reason)
+
+        threading.Thread(
+            target=_run,
+            daemon=True,
+            name="position-post-close-confirm",
         ).start()
 
     def _on_polymarket_price(
@@ -1577,31 +1544,6 @@ class FiveMinuteUpDownTrader:
 
             self._ws_book_cache[asset_id] = snapshot
 
-    def _restore_position_after_close_failure(
-        self,
-        pos: OpenPosition,
-        fallback_best_bid: float,
-        reason: str,
-    ) -> None:
-        pos.last_best_bid = fallback_best_bid
-        self.position = pos
-
-        if self._poly_watcher:
-            self._poly_watcher.stop()
-        self._poly_watcher = PolymarketAssetPriceWatcher(
-            asset_id=pos.token_id,
-            on_price=self._on_polymarket_price,
-            on_book=self._on_polymarket_book,
-        )
-        self._poly_watcher.start()
-        logger.info(
-            "平仓失败后恢复持仓监听: market=%s token=%s reason=%s size=%.6f",
-            pos.market_slug,
-            pos.token_id,
-            reason,
-            pos.size,
-        )
-
     def _force_close_position(self, reason: str) -> None:
         if not self.position:
             return
@@ -1630,51 +1572,8 @@ class FiveMinuteUpDownTrader:
             market_meta = market_info.get("market_meta")
         if market_meta is None:
             market_meta = get_market_metadata(pos.market_id)
-        tick_size = (market_meta or {}).get("minimum_tick_size", "0.01")
-
-        # 平仓前强制对账：避免依赖后台轮询导致只拿到首笔成交仓位
-        if not self.dry_run:
-            reconciled_size = float(pos.size)
-            latest_matched_size = 0.0
-            latest_order_status = ""
-            canceled_live_entry = False
-
-            snapshot = self._reconcile_position_snapshot(
-                token_id=pos.token_id,
-                entry_order_id=pos.entry_order_id,
-                tick_size=tick_size,
-                base_size=reconciled_size,
-                cancel_live_entry=True,
-            )
-            reconciled_size = max(reconciled_size, float(snapshot["reconciled_size"]))
-            latest_matched_size = max(latest_matched_size, float(snapshot["matched_size"]))
-            latest_order_status = str(snapshot["order_status"] or "")
-            canceled_live_entry = canceled_live_entry or bool(snapshot["canceled_live_entry"])
-
-            old_size = float(pos.size)
-            pos.size = reconciled_size
-            pos.balance_confirmed = True
-            if canceled_live_entry and pos.entry_order_id:
-                logger.info(
-                    "平仓前撤销入场挂单: market=%s token=%s order_id=%s",
-                    pos.market_slug,
-                    pos.token_id,
-                    pos.entry_order_id,
-                )
-            logger.info(
-                "平仓前仓位对账: market=%s token=%s old_size=%.6f reconciled_size=%.6f matched_size=%.6f status=%s",
-                pos.market_slug,
-                pos.token_id,
-                old_size,
-                pos.size,
-                latest_matched_size,
-                latest_order_status or "N/A",
-            )
 
         exit_price = pos.last_best_bid
-        stop_target_price: Optional[float] = None
-        stop_actual_price: Optional[float] = None
-        stop_slippage: Optional[float] = None
         if exit_price is None or exit_price <= 0:
             try:
                 book = get_order_book(pos.token_id)
@@ -1690,12 +1589,6 @@ class FiveMinuteUpDownTrader:
                 logger.warning("获取平仓价格失败，将使用入场价: %s", e)
         if exit_price is None or exit_price <= 0:
             exit_price = pos.entry_price
-
-        if reason in {"sl", "sl_direction_change"}:
-            if reason == "sl":
-                stop_target_price = pos.stop_loss_price
-            else:
-                stop_target_price = exit_price
 
         sell_plan: Optional[Dict[str, Any]] = None
         exit_best_bid: Optional[float] = None
@@ -1738,6 +1631,7 @@ class FiveMinuteUpDownTrader:
             if sell_plan is not None
             else "unknown"
         )
+        sweep_price = exit_price
         target_close_size = pos.size
         if target_close_size <= 0:
             if pos.balance_confirmed:
@@ -1756,213 +1650,51 @@ class FiveMinuteUpDownTrader:
                 reason,
                 pos.balance_confirmed,
             )
-            self._restore_position_after_close_failure(
-                pos=pos,
-                fallback_best_bid=exit_price,
-                reason=reason,
-            )
+            self.position = pos
             return
 
-        order_id: Optional[str] = None
-        initial_target_close_size = target_close_size
-        executed_close_size = 0.0
-        executed_notional = 0.0
-        market_executed_size = 0.0
-        market_executed_notional = 0.0
-
-        def _poll_matched_size(order_id_value: str, polls: int = 4) -> tuple[float, str]:
-            matched = 0.0
-            status = ""
-            for _ in range(max(1, polls)):
-                detail = get_order_detail(order_id_value)
-                if detail:
-                    status = str(detail.get("status") or "").upper()
-                    raw_matched = self._to_positive_float(detail.get("size_matched"))
-                    if raw_matched is not None:
-                        matched = max(
-                            matched,
-                            normalize_order_size(raw_matched, tick_size=tick_size),
-                        )
-                    if status == "MATCHED":
-                        break
-                time.sleep(0.25)
-            return matched, status
-
         if not self.dry_run:
-            remaining_size = target_close_size
+            # --- 新增核心：根据平仓原因，设置强平滑点 (人造 FAK 机制) ---
+            # 获取当前最悲观的价格：在 WS 报警价和订单簿买一价中取最低者
+            current_bid = min(
+                pos.last_best_bid if pos.last_best_bid else exit_price,
+                exit_price
+            )
 
-            # 1) 先批量限价平仓（所有平仓统一先走限价）
-            limit_order_items: List[Dict[str, float]] = []
-            consumed_levels = (sell_plan or {}).get("consumed_levels") or []
-            accumulated_size = 0.0
-            for lvl in consumed_levels[: self.LIMIT_CLOSE_BATCH_LEVELS]:
-                if not isinstance(lvl, dict):
-                    continue
-                lvl_price = self._to_positive_float(lvl.get("price"))
-                lvl_size = self._to_positive_float(lvl.get("size"))
-                if lvl_price is None or lvl_size is None:
-                    continue
-                place_size = min(lvl_size, max(0.0, remaining_size - accumulated_size))
-                if place_size <= 0:
-                    continue
-                limit_order_items.append({"price": float(lvl_price), "size": float(place_size)})
-                accumulated_size += place_size
-                if accumulated_size + 1e-9 >= remaining_size:
-                    break
-
-            if not limit_order_items:
-                limit_order_items = [{"price": float(exit_price), "size": float(remaining_size)}]
+            if reason in {"sl", "sl_direction_change", "expiry", "sl_residual", "tp_residual"}:
+                # 止损逃命 或 处理残仓：核弹级滑点，无脑往下砸 0.05 刀 (5 美分)
+                # 哪怕盘口只剩 0.34，你发 0.29 的卖单，引擎依然会按最优价给你成交，绝不挂单！
+                sweep_price = max(0.01, float(current_bid) - 0.05) 
+            else:
+                # 止盈让利：往下让利 0.02 刀，确保瞬间吃透微小波动
+                sweep_price = max(0.01, float(current_bid) - 0.01)
+                
+            logger.info("应用强平滑点: 预估价=%.4f 实际强平挂单价(sweep)=%.4f", exit_price, sweep_price)
 
             submit_t0 = time.perf_counter()
-            batch_result = batch_sell_orders(
-                market_id=pos.market_id,
-                token_id=pos.token_id,
-                order_items=limit_order_items,
+            order_id = sell_order(
+                pos.market_id,
+                pos.token_id,
+                sweep_price,             # <--- 关键修改：用加了滑点的 sweep_price 发单
+                target_close_size,
                 market_meta=market_meta,
             )
             submit_ms = (time.perf_counter() - submit_t0) * 1000
             self._record_latency("sell_submit", submit_ms)
-
-            batch_order_ids: List[str] = []
-            if batch_result and isinstance(batch_result, dict):
-                raw_ids = batch_result.get("order_ids") or []
-                if isinstance(raw_ids, list):
-                    batch_order_ids = [str(item) for item in raw_ids if str(item)]
-
-            if batch_order_ids:
-                logger.info(
-                    "平仓批量限价单已提交: orders=%s submit_latency=%.2fms",
-                    len(batch_order_ids),
-                    submit_ms,
-                )
-
-                limit_matched_total = 0.0
-                for oid in batch_order_ids:
-                    matched_size, close_order_status = _poll_matched_size(oid)
-                    if matched_size > 0:
-                        limit_matched_total += matched_size
-                    if close_order_status != "MATCHED":
-                        try:
-                            cancel_order(oid)
-                        except Exception as cancel_err:
-                            logger.warning("平仓批量限价单撤单失败: order_id=%s error=%s", oid, cancel_err)
-
-                limit_matched_total = min(remaining_size, limit_matched_total)
-                if limit_matched_total > 0:
-                    executed_close_size += limit_matched_total
-                    executed_notional += limit_matched_total * exit_price
-                    remaining_size = normalize_order_size(
-                        remaining_size - limit_matched_total,
-                        tick_size=tick_size,
-                    )
-
-                if remaining_size > 0:
-                    logger.warning(
-                        "平仓批量限价单未完全成交，转市价补平: matched=%.6f remaining=%.6f orders=%s",
-                        limit_matched_total,
-                        remaining_size,
-                        len(batch_order_ids),
-                    )
-            else:
-                # 兜底单笔限价，避免批量返回不含order_id时完全跳过限价阶段
-                order_id = sell_order(
+            if not order_id:
+                logger.warning(
+                    "平仓卖单提交失败，恢复持仓等待下一次平仓: market=%s token=%s price=%.4f size=%.4f",
                     pos.market_id,
                     pos.token_id,
-                    exit_price,
-                    remaining_size,
-                    market_meta=market_meta,
+                    sweep_price,
+                    target_close_size,
                 )
-                if order_id:
-                    logger.info("平仓限价兜底单已提交，order_id=%s submit_latency=%.2fms", order_id, submit_ms)
-                    matched_size, close_order_status = _poll_matched_size(order_id)
-                    matched_size = min(remaining_size, matched_size)
-                    if matched_size > 0:
-                        executed_close_size += matched_size
-                        executed_notional += matched_size * exit_price
-                        remaining_size = normalize_order_size(
-                            remaining_size - matched_size,
-                            tick_size=tick_size,
-                        )
-                    if close_order_status != "MATCHED":
-                        try:
-                            cancel_order(order_id)
-                        except Exception as cancel_err:
-                            logger.warning("平仓限价兜底单撤单失败: order_id=%s error=%s", order_id, cancel_err)
-                else:
-                    logger.warning(
-                        "平仓批量限价提交失败，直接转市价补平: market=%s token=%s price=%.4f size=%.4f",
-                        pos.market_id,
-                        pos.token_id,
-                        exit_price,
-                        remaining_size,
-                    )
-
-            # 2) 限价未完成 -> 市价循环补平
-            market_attempt = 0
-            while remaining_size > 0 and market_attempt < 8:
-                market_attempt += 1
-                market_stop_result = market_stop_loss_sell_order(
-                    pos.market_id,
-                    pos.token_id,
-                    target_stop_price=stop_target_price if stop_target_price is not None else exit_price,
-                    size=remaining_size,
-                    market_meta=market_meta,
-                )
-                market_order_id = market_stop_result.get("order_id") if market_stop_result else None
-                if not market_order_id:
-                    logger.warning(
-                        "市价补平失败: attempt=%s remaining=%.6f",
-                        market_attempt,
-                        remaining_size,
-                    )
-                    break
-
-                market_matched_size, market_status = _poll_matched_size(market_order_id)
-                market_matched_size = min(remaining_size, market_matched_size)
-                if market_matched_size <= 0:
-                    logger.warning(
-                        "市价补平未成交: attempt=%s order_id=%s status=%s remaining=%.6f",
-                        market_attempt,
-                        market_order_id,
-                        market_status or "N/A",
-                        remaining_size,
-                    )
-                    break
-
-                market_fill_price = self._to_positive_float(
-                    (market_stop_result or {}).get("actual_stop_price")
-                )
-                if market_fill_price is None:
-                    market_fill_price = exit_price
-
-                executed_close_size += market_matched_size
-                executed_notional += market_matched_size * market_fill_price
-                market_executed_size += market_matched_size
-                market_executed_notional += market_matched_size * market_fill_price
-                remaining_size = normalize_order_size(
-                    remaining_size - market_matched_size,
-                    tick_size=tick_size,
-                )
-
-                logger.info(
-                    "市价补平成交: attempt=%s order_id=%s matched=%.6f remaining=%.6f fill_price=%.4f",
-                    market_attempt,
-                    market_order_id,
-                    market_matched_size,
-                    remaining_size,
-                    market_fill_price,
-                )
-
-            if executed_close_size <= 0:
-                self._restore_position_after_close_failure(
-                    pos=pos,
-                    fallback_best_bid=exit_price,
-                    reason=reason,
-                )
+                pos.last_best_bid = sweep_price
+                self.position = pos
                 close_ms = (time.perf_counter() - close_t0) * 1000
                 self._record_latency("close_total", close_ms)
                 logger.info(
-                    "平仓链路总耗时(未成交): market=%s token=%s reason=%s source=%s latency=%.2fms",
+                    "平仓链路总耗时(失败): market=%s token=%s reason=%s source=%s latency=%.2fms",
                     pos.market_slug,
                     pos.token_id,
                     reason,
@@ -1970,45 +1702,16 @@ class FiveMinuteUpDownTrader:
                     close_ms,
                 )
                 return
-
-            target_close_size = executed_close_size
-            exit_price = executed_notional / executed_close_size
-            exit_full_fill = target_close_size + 1e-9 >= initial_target_close_size
-
-            if remaining_size > 0:
-                pos.size = remaining_size
-                self._restore_position_after_close_failure(
-                    pos=pos,
-                    fallback_best_bid=exit_price,
+            else:
+                logger.info("平仓卖单已提交，order_id=%s submit_latency=%.2fms", order_id, submit_ms)
+                
+                self._schedule_post_close_balance_check(
+                    closed_position=pos,
                     reason=reason,
+                    target_close_size=target_close_size, # 传入目标平仓数量
+                    order_id=order_id,                   # 传入刚刚产生的 order_id
+                    delay_sec=3,                         # 如果快通道失败，兜底等待 3 秒
                 )
-                logger.warning(
-                    "平仓未完成，保留剩余仓位: market=%s token=%s reason=%s executed=%.6f remaining=%.6f",
-                    pos.market_slug,
-                    pos.token_id,
-                    reason,
-                    target_close_size,
-                    remaining_size,
-                )
-
-            if reason in {"sl", "sl_direction_change"} and market_executed_size > 0 and stop_target_price is not None:
-                stop_actual_price = market_executed_notional / market_executed_size
-                stop_slippage = stop_actual_price - float(stop_target_price)
-                logger.info(
-                    "市价止损执行结果: reason=%s target_stop=%.4f actual_stop=%.4f slippage=%.4f market_filled=%.6f",
-                    reason,
-                    float(stop_target_price),
-                    float(stop_actual_price),
-                    float(stop_slippage),
-                    market_executed_size,
-                )
-        else:
-            executed_close_size = target_close_size
-            executed_notional = executed_close_size * exit_price
-            exit_full_fill = True
-
-        if target_close_size <= 0:
-            return
 
         pnl = (exit_price - pos.entry_price) * target_close_size
         record = TradeRecord(
@@ -2018,7 +1721,7 @@ class FiveMinuteUpDownTrader:
             direction=pos.direction,
             size=target_close_size,
             entry_price=pos.entry_price,
-            exit_price=exit_price,
+            exit_price=sweep_price,
             pnl=pnl,
             entry_time=pos.entry_time,
             exit_time=datetime.now(timezone.utc),
@@ -2029,9 +1732,6 @@ class FiveMinuteUpDownTrader:
             exit_best_bid=exit_best_bid,
             exit_avg_fill_price=exit_avg_fill_price,
             exit_full_fill=exit_full_fill,
-            stop_target_price=stop_target_price,
-            stop_actual_price=stop_actual_price,
-            stop_slippage=stop_slippage,
         )
         self.trades.append(record)
 
@@ -2044,23 +1744,6 @@ class FiveMinuteUpDownTrader:
             record.exit_price,
             record.pnl,
             record.reason,
-        )
-        remaining_after_close = 0.0
-        if (
-            self.position is not None
-            and self.position.market_slug == pos.market_slug
-            and self.position.token_id == pos.token_id
-        ):
-            remaining_after_close = float(self.position.size)
-        logger.info(
-            "平仓结果汇总: market=%s token=%s reason=%s requested=%.6f executed=%.6f remaining=%.6f full_fill=%s",
-            pos.market_slug,
-            pos.token_id,
-            reason,
-            initial_target_close_size,
-            target_close_size,
-            remaining_after_close,
-            bool(exit_full_fill),
         )
         close_ms = (time.perf_counter() - close_t0) * 1000
         self._record_latency("close_total", close_ms)
@@ -2135,28 +1818,6 @@ class FiveMinuteUpDownTrader:
                 return None
             return sum(1 for item in flags if item) / len(flags)
 
-        def _calc_stop_slippage_stats(trades: List[TradeRecord]) -> Optional[Dict[str, float]]:
-            values: List[float] = []
-            for t in trades:
-                if t.stop_slippage is None:
-                    continue
-                values.append(float(t.stop_slippage))
-
-            if not values:
-                return None
-
-            adverse_count = sum(1 for value in values if value < 0)
-            return {
-                "count": float(len(values)),
-                "avg": sum(values) / len(values),
-                "p50": self._percentile(values, 0.50),
-                "p95": self._percentile(values, 0.95),
-                "worst": min(values),
-                "best": max(values),
-                "adverse_count": float(adverse_count),
-                "adverse_rate": adverse_count / len(values),
-            }
-
         recent_100 = all_trades[-100:]
         rolling_base = len(recent_100)
         rolling_tp_count = sum(1 for t in recent_100 if t.reason == "tp")
@@ -2166,8 +1827,6 @@ class FiveMinuteUpDownTrader:
         cumulative_slippage_bps = _calc_slippage_bps(all_trades)
         hourly_full_fill_rate = _calc_full_fill_rate(new_trades)
         cumulative_full_fill_rate = _calc_full_fill_rate(all_trades)
-        hourly_stop_slippage_stats = _calc_stop_slippage_stats(new_trades)
-        cumulative_stop_slippage_stats = _calc_stop_slippage_stats(all_trades)
 
         lines.append("关键策略统计:")
         if hourly_slippage_bps is None:
@@ -2194,36 +1853,6 @@ class FiveMinuteUpDownTrader:
         else:
             lines.append(
                 f"- 订单成交率(累计，全成占比): {cumulative_full_fill_rate * 100:.2f}%"
-            )
-
-        if hourly_stop_slippage_stats is None:
-            lines.append("- 止损滑点(本小时): N/A")
-        else:
-            hourly_count = int(hourly_stop_slippage_stats["count"])
-            hourly_adverse_count = int(hourly_stop_slippage_stats["adverse_count"])
-            lines.append(
-                "- 止损滑点(本小时, 负值更差): "
-                f"count={hourly_count}, "
-                f"avg={hourly_stop_slippage_stats['avg']:.4f}, "
-                f"p50={hourly_stop_slippage_stats['p50']:.4f}, "
-                f"p95={hourly_stop_slippage_stats['p95']:.4f}, "
-                f"worst={hourly_stop_slippage_stats['worst']:.4f}, "
-                f"adverse={hourly_adverse_count}/{hourly_count}({hourly_stop_slippage_stats['adverse_rate'] * 100:.2f}%)"
-            )
-
-        if cumulative_stop_slippage_stats is None:
-            lines.append("- 止损滑点(累计): N/A")
-        else:
-            cumulative_count = int(cumulative_stop_slippage_stats["count"])
-            cumulative_adverse_count = int(cumulative_stop_slippage_stats["adverse_count"])
-            lines.append(
-                "- 止损滑点(累计, 负值更差): "
-                f"count={cumulative_count}, "
-                f"avg={cumulative_stop_slippage_stats['avg']:.4f}, "
-                f"p50={cumulative_stop_slippage_stats['p50']:.4f}, "
-                f"p95={cumulative_stop_slippage_stats['p95']:.4f}, "
-                f"worst={cumulative_stop_slippage_stats['worst']:.4f}, "
-                f"adverse={cumulative_adverse_count}/{cumulative_count}({cumulative_stop_slippage_stats['adverse_rate'] * 100:.2f}%)"
             )
         lines.append("")
 
@@ -2323,21 +1952,10 @@ class FiveMinuteUpDownTrader:
         lines.append("")
 
         for t in new_trades:
-            stop_slippage_suffix = ""
-            if t.stop_slippage is not None:
-                target_label = (
-                    f"{t.stop_target_price:.4f}" if t.stop_target_price is not None else "N/A"
-                )
-                actual_label = (
-                    f"{t.stop_actual_price:.4f}" if t.stop_actual_price is not None else "N/A"
-                )
-                stop_slippage_suffix = (
-                    f", stop_target={target_label}, stop_actual={actual_label}, stop_slippage={t.stop_slippage:.4f}"
-                )
             lines.append(
                 f"- {t.entry_time.isoformat(timespec='seconds')} -> {t.exit_time.isoformat(timespec='seconds')}, "
                 f"slug={t.market_slug}, dir={t.direction}, size={t.size:.4f}, "
-                f"entry={t.entry_price:.4f}, exit={t.exit_price:.4f}, pnl={t.pnl:.4f}, reason={t.reason}{stop_slippage_suffix}"
+                f"entry={t.entry_price:.4f}, exit={t.exit_price:.4f}, pnl={t.pnl:.4f}, reason={t.reason}"
             )
         if not new_trades:
             lines.append("- 本小时无新平仓交易")
