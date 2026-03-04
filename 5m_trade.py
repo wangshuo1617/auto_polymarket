@@ -950,6 +950,12 @@ class FiveMinuteUpDownTrader:
                         ms_to_close=ms_to_close,
                     )
                     self.preclose_entry_triggered = True
+                    
+            if minute_index == 5 and not is_closed:
+                # 在第 5 分钟即将结束前 10 秒，提前出局，防止 Polymarket 冻结市场导致单子发不出去
+                ms_to_close = close_time_ms - event_time_ms
+                if 0 < ms_to_close <= 10000:
+                    self._handle_minute5_expiry()
 
             if not is_closed:
                 return
@@ -958,9 +964,6 @@ class FiveMinuteUpDownTrader:
 
             if minute_index == 4:
                 self._handle_minute4_direction_change()
-
-            if minute_index == 5:
-                self._handle_minute5_expiry()
 
     def _handle_entry_minute(self, projected_close: float, ms_to_close: int) -> None:
         if (

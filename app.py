@@ -7,6 +7,16 @@ import sys
 from pathlib import Path
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
+from py_clob_client.clob_types import (
+    OrderArgs,
+    CreateOrderOptions,
+    BalanceAllowanceParams,
+    AssetType,
+    MarketOrderArgs,
+    PartialCreateOrderOptions,
+    OrderType,
+    PostOrdersArgs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +225,7 @@ def api_sell():
         logger.warning("api_sell missing parameters: has market_id=%s token_id=%s price=%s size=%s", bool(market_id), bool(token_id), price, size)
         return jsonify({'error': 'Missing parameters'}), 400
     try:
-        order_id = sell_order(market_id, token_id, float(price), float(size))
+        order_id = sell_order(market_id, token_id, float(price), float(size), order_type= OrderType.GTC)
         if order_id is None:
             logger.warning("api_sell returned null order_id: market_id=%s price=%s size=%s", market_id, price, size)
             return jsonify({'error': 'Order placement failed (null order_id)', 'order_id': None}), 500

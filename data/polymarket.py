@@ -467,52 +467,25 @@ def sell_order(
     price: float,
     size: float = 5.0,
     market_meta: Optional[Dict[str, Any]] = None,
+    order_type: OrderType = OrderType.FAK,  # <--- 核心新增：默认使用 FAK 拒绝挂单被套
 ):
-    logger.info("sell_order called: market_id=%s token_id=%s price=%s size=%s", market_id, _token_id_short(token_id), price, size)
+    logger.info("sell_order called: market_id=%s token_id=%s price=%s size=%s type=%s", market_id, _token_id_short(token_id), price, size, order_type)
     meta = market_meta or get_market_metadata(market_id)
     if not meta or meta.get("minimum_tick_size") is None:
-        logger.error("sell_order missing market metadata: market_id=%s", market_id)
         return None
+
     normalized_size = normalize_order_size(size=size, tick_size=meta["minimum_tick_size"])
     if normalized_size <= 0:
-        logger.error(
-            "sell_order normalized_size is zero: market_id=%s token_id=%s original_size=%s",
-            market_id,
-            _token_id_short(token_id),
-            size,
-        )
         return None
-    if abs(normalized_size - float(size)) > 1e-12:
-        logger.info(
-            "sell_order size normalized by SDK rule: token_id=%s original=%.6f normalized=%.6f tick_size=%s",
-            _token_id_short(token_id),
-            float(size),
-            normalized_size,
-            meta["minimum_tick_size"],
-        )
 
-    normalized_price = _clamp_order_price(
-        price=float(price),
-        tick_size=meta["minimum_tick_size"],
-    )
-    if abs(normalized_price - float(price)) > 1e-12:
-        logger.info(
-            "sell_order price adjusted to valid range: token_id=%s original=%.8f adjusted=%.8f tick_size=%s",
-            _token_id_short(token_id),
-            float(price),
-            normalized_price,
-            meta["minimum_tick_size"],
-        )
-
-    prefetch_order_metadata_for_tokens(
-        token_ids=[token_id],
-        market_meta=meta,
-        refresh_fee_rate=False,
-    )
+    normalized_price = _clamp_order_price(price=float(price), tick_size=meta["minimum_tick_size"])
+    
+    prefetch_order_metadata_for_tokens(token_ids=[token_id], market_meta=meta, refresh_fee_rate=False)
     fee_rate_bps = _get_cached_fee_rate_bps(token_id)
 
     def _submit_once(submit_size: float):
-        return client.create_and_post_order(
+        # 核心修改：拆分 create 和 post，强行注入 order_type
+        signed_order = client.create_order(
             OrderArgs(
                 token_id=token_id,
                 price=normalized_price,
@@ -520,23 +493,44 @@ def sell_order(
                 side=SELL,
                 fee_rate_bps=fee_rate_bps,
             ),
-            options=CreateOrderOptions(
+            options=PartialCreateOrderOptions(
                 tick_size=str(meta["minimum_tick_size"]),
                 neg_risk=bool(meta.get("neg_risk", False)),
             ),
         )
+        return client.post_order(signed_order, orderType=order_type)
 
     submit_t0 = time.perf_counter()
     try:
         response = _submit_once(normalized_size)
         order_id = response.get("orderID") if isinstance(response, dict) else None
         submit_ms = (time.perf_counter() - submit_t0) * 1000
-        logger.info("sell_order success: market_id=%s order_id=%s submit_latency=%.2fms", market_id, order_id, submit_ms)
+        logger.info("sell_order success: order_id=%s submit_latency=%.2fms", order_id, submit_ms)
         return order_id
     except Exception as e:
         err_msg = str(e).lower()
         if "not enough balance / allowance" not in err_msg:
-            logger.exception("sell_order create_and_post_order failed: market_id=%s token_id=%s price=%s size=%s error=%s", market_id, _token_id_short(token_id), price, size, e)
+            logger.exception("sell_order failed: %s", e)
+            return None
+
+        # --- 救回那段死代码：自动降量重试机制 ---
+        logger.warning("sell_order 触发余额不足，尝试去链上核实真实余额并重试...")
+        available_balance = get_conditional_token_balance(token_id)
+        retry_size = normalize_order_size(
+            size=min(normalized_size, available_balance),
+            tick_size=meta["minimum_tick_size"],
+        )
+        
+        if retry_size <= 0 or retry_size + 1e-12 >= normalized_size:
+            logger.warning("sell_order 真实余额验证失败: 目标=%.6f, 实际=%.6f", normalized_size, available_balance)
+            return None
+
+        try:
+            logger.info("sell_order 使用真实余额重试: size=%.6f", retry_size)
+            retry_resp = _submit_once(retry_size)
+            return retry_resp.get("orderID") if isinstance(retry_resp, dict) else None
+        except Exception as retry_err:
+            logger.exception("sell_order 降量重试依然失败: %s", retry_err)
             return None
 
 
@@ -655,71 +649,6 @@ def batch_sell_orders(
             e,
         )
         return None
-
-        available_balance = get_conditional_token_balance(token_id)
-        retry_size = normalize_order_size(
-            size=min(normalized_size, available_balance),
-            tick_size=meta["minimum_tick_size"],
-        )
-        if retry_size <= 0:
-            logger.warning(
-                "sell_order fast-path failed and retry aborted: market_id=%s token_id=%s requested=%.6f normalized=%.6f available=%.6f error=%s",
-                market_id,
-                _token_id_short(token_id),
-                float(size),
-                normalized_size,
-                available_balance,
-                e,
-            )
-            return None
-
-        if retry_size + 1e-12 >= normalized_size:
-            logger.warning(
-                "sell_order fast-path failed and no smaller retry possible: market_id=%s token_id=%s requested=%.6f normalized=%.6f available=%.6f error=%s",
-                market_id,
-                _token_id_short(token_id),
-                float(size),
-                normalized_size,
-                available_balance,
-                e,
-            )
-            return None
-
-        logger.warning(
-            "sell_order fast-path failed, retry with clamped size: token_id=%s requested=%.6f normalized=%.6f retry=%.6f available=%.6f",
-            _token_id_short(token_id),
-            float(size),
-            normalized_size,
-            retry_size,
-            available_balance,
-        )
-        retry_t0 = time.perf_counter()
-        try:
-            retry_resp = _submit_once(retry_size)
-            order_id = retry_resp.get("orderID") if isinstance(retry_resp, dict) else None
-            retry_ms = (time.perf_counter() - retry_t0) * 1000
-            total_ms = (time.perf_counter() - submit_t0) * 1000
-            logger.info(
-                "sell_order retry success: market_id=%s order_id=%s retry_size=%.6f retry_latency=%.2fms total_latency=%.2fms",
-                market_id,
-                order_id,
-                retry_size,
-                retry_ms,
-                total_ms,
-            )
-            return order_id
-        except Exception as retry_err:
-            logger.exception(
-                "sell_order retry failed: market_id=%s token_id=%s price=%s requested=%.6f retry=%.6f error=%s",
-                market_id,
-                _token_id_short(token_id),
-                price,
-                float(size),
-                retry_size,
-                retry_err,
-            )
-            return None
-
 
 def market_stop_loss_sell_order(
     market_id: str,
