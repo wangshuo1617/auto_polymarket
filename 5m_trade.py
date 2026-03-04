@@ -1490,8 +1490,8 @@ class FiveMinuteUpDownTrader:
                     reason,
                 )
 
-                if remaining_size <= 0:
-                    logger.info("慢通道确认: 余额已归零，平仓彻底完成。")
+                if remaining_size <= 0.02:
+                    logger.info("慢通道确认: 残余份额不足 0.05 (实余 %.6f)，视为粉尘忽略，平仓彻底完成。", remaining_size)
                     return
 
                 # 走到这里，说明真的是因为盘口太薄等原因没卖干净，恢复持仓状态以备重试
@@ -1697,6 +1697,9 @@ class FiveMinuteUpDownTrader:
         )
         sweep_price = exit_price
         target_close_size = pos.size
+        if target_close_size > 0 and target_close_size < 0.02:
+            logger.info("平仓拦截: 当前仓位(%.6f)极小，视为粉尘忽略，直接清理本地持仓", target_close_size)
+            return
         if target_close_size <= 0:
             if pos.balance_confirmed:
                 logger.info(
