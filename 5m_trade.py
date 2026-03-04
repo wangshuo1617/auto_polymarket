@@ -792,11 +792,13 @@ class FiveMinuteUpDownTrader:
         if not normalized_levels:
             raise RuntimeError(f"订单簿无可用{'卖' if side == 'buy' else '买'}单")
 
+        best_price_from_levels = self._to_positive_float(normalized_levels[0].get("price"))
+
         return {
             "source": source,
             "levels": normalized_levels,
-            "best_ask": self._to_positive_float((ws_snapshot or {}).get("best_ask")),
-            "best_bid": self._to_positive_float((ws_snapshot or {}).get("best_bid")),
+            "best_ask": best_price_from_levels if side == "buy" else None,
+            "best_bid": best_price_from_levels if side == "sell" else None,
         }
 
     def _build_execution_plan(
@@ -1333,6 +1335,14 @@ class FiveMinuteUpDownTrader:
         )
         self._log_execution_plan(stage="建仓", market_slug=market_slug, token_id=token_id, plan=plan)
         open_book_source = str(plan.get("book_source", "unknown"))
+        logger.info(
+            "建仓价格观测: market=%s token=%s source=%s best_from_levels=%.4f worst_fill=%.4f",
+            market_slug,
+            token_id,
+            open_book_source,
+            float(plan["best_price"]),
+            float(plan["worst_price"]),
+        )
 
         if plan["fill_ratio"] < self.MIN_ENTRY_LIQUIDITY_FILL_RATIO:
             logger.warning(
@@ -1932,6 +1942,15 @@ class FiveMinuteUpDownTrader:
                 market_slug=pos.market_slug,
                 token_id=pos.token_id,
                 plan=sell_plan,
+            )
+            logger.info(
+                "平仓价格观测: market=%s token=%s reason=%s source=%s best_from_levels=%.4f worst_fill=%.4f",
+                pos.market_slug,
+                pos.token_id,
+                reason,
+                str(sell_plan.get("book_source", "unknown")),
+                float(sell_plan["best_price"]),
+                float(sell_plan["worst_price"]),
             )
             exit_best_bid = float(sell_plan["best_price"])
             exit_avg_fill_price = float(sell_plan["vwap_price"])
