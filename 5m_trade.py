@@ -461,6 +461,7 @@ class FiveMinuteUpDownTrader:
         max_entry_price: float = MAX_ENTRY_PRICE,
         take_profit_spread: float = TAKE_PROFIT_SPREAD,
         stop_loss_spread: float = STOP_LOSS_SPREAD,
+        min_hold_before_close_sec: int = MIN_HOLD_BEFORE_CLOSE_SEC,
         dry_run: bool = False,
     ) -> None:
         self.stake_usd = stake_usd
@@ -475,9 +476,12 @@ class FiveMinuteUpDownTrader:
             raise ValueError("entry_preclose_seconds 必须在 1-59 之间")
         if min_direction_diff <= 0:
             raise ValueError("min_direction_diff 必须大于 0")
+        if min_hold_before_close_sec < 0:
+            raise ValueError("min_hold_before_close_sec 必须大于等于 0")
         self.entry_decision_minute = entry_decision_minute
         self.entry_preclose_seconds = entry_preclose_seconds
         self.min_direction_diff = min_direction_diff
+        self.min_hold_before_close_sec = int(min_hold_before_close_sec)
 
         self._lock = threading.RLock()
         self._binance = BinanceKline1mWatcher(callback=self._on_kline)
@@ -1866,12 +1870,12 @@ class FiveMinuteUpDownTrader:
             return
 
         hold_seconds = (datetime.now(timezone.utc) - self.position.entry_time).total_seconds()
-        if hold_seconds < self.MIN_HOLD_BEFORE_CLOSE_SEC:
+        if (hold_seconds < self.min_hold_before_close_sec) and (reason == "sl"):
             logger.info(
                 "平仓保护期生效，暂不平仓: reason=%s hold=%.2fs need>=%.2fs",
                 reason,
                 hold_seconds,
-                float(self.MIN_HOLD_BEFORE_CLOSE_SEC),
+                float(self.min_hold_before_close_sec),
             )
             return
 
@@ -2452,6 +2456,12 @@ def main() -> None:
         default=-0.20,
         help="止损价差（相对买入价，默认 -0.20）",
     )
+    parser.add_argument(
+        "--min-hold-before-close-sec",
+        type=int,
+        default=5,
+        help="最短持仓保护时间（秒，默认 5；0 表示关闭保护）",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -2468,6 +2478,7 @@ def main() -> None:
         max_entry_price=args.max_entry_price,
         take_profit_spread=args.take_profit_spread,
         stop_loss_spread=args.stop_loss_spread,
+        min_hold_before_close_sec=args.min_hold_before_close_sec,
         dry_run=args.dry_run,
     )
     try:
