@@ -35,6 +35,7 @@ from data.polymarket import (
     sell_order,
     get_event_token_id,
     get_market_metadata,
+    get_order_detail,
     get_order_book,
     prefetch_order_metadata_for_tokens,
     ensure_http_keepalive,
@@ -1286,7 +1287,7 @@ class FiveMinuteUpDownTrader:
             self._schedule_position_balance_confirmation(
                 market_slug=market_slug,
                 token_id=token_id,
-                delay_sec=3,
+                order_id=order_id,
             )
 
         if self._poly_watcher:
@@ -1311,10 +1312,38 @@ class FiveMinuteUpDownTrader:
         self,
         market_slug: str,
         token_id: str,
-        delay_sec: int = 3,
+        order_id: Optional[str] = None,
+        match_check_delay_sec: int = 3,
+        first_balance_delay_sec: int = 5,
+        retry_balance_delay_sec: int = 7,
     ) -> None:
         def _run() -> None:
-            time.sleep(max(0, delay_sec))
+            start_ts = time.monotonic()
+
+            def _sleep_until(offset_sec: int) -> None:
+                remain = float(offset_sec) - (time.monotonic() - start_ts)
+                if remain > 0:
+                    time.sleep(remain)
+
+            matched_size = 0.0
+            order_status = ""
+            if order_id:
+                _sleep_until(match_check_delay_sec)
+                try:
+                    detail = get_order_detail(order_id)
+                    if isinstance(detail, dict):
+                        matched_size = float(detail.get("size_matched", 0.0) or 0.0)
+                        order_status = str(detail.get("status") or "").upper()
+                        logger.info(
+                            "建仓快通道检查: order_id=%s status=%s matched=%.6f",
+                            order_id,
+                            order_status,
+                            matched_size,
+                        )
+                except Exception as e:
+                    logger.warning("建仓快通道查询订单状态失败，继续余额确认: order_id=%s error=%s", order_id, e)
+
+            _sleep_until(first_balance_delay_sec)
 
             with self._lock:
                 pos = self.position
@@ -1330,6 +1359,35 @@ class FiveMinuteUpDownTrader:
 
             raw_balance = get_conditional_token_balance(token_id)
             confirmed_size = normalize_order_size(raw_balance, tick_size=tick_size)
+
+            if confirmed_size <= 0 and matched_size > 0:
+                extra_wait = max(0, retry_balance_delay_sec - first_balance_delay_sec)
+                if extra_wait > 0:
+                    logger.warning(
+                        "建仓后%ss余额为0但订单已有成交，%ss 后执行二次确认: market=%s token=%s order_id=%s status=%s matched=%.6f",
+                        first_balance_delay_sec,
+                        extra_wait,
+                        market_slug,
+                        token_id,
+                        order_id,
+                        order_status,
+                        matched_size,
+                    )
+                    _sleep_until(retry_balance_delay_sec)
+                raw_balance_retry = get_conditional_token_balance(token_id)
+                confirmed_size_retry = normalize_order_size(raw_balance_retry, tick_size=tick_size)
+                logger.info(
+                    "建仓后余额二次确认: market=%s token=%s first=%.6f retry=%.6f raw_retry=%.6f order_id=%s retry_delay=%ss",
+                    market_slug,
+                    token_id,
+                    confirmed_size,
+                    confirmed_size_retry,
+                    raw_balance_retry,
+                    order_id,
+                    retry_balance_delay_sec,
+                )
+                raw_balance = raw_balance_retry
+                confirmed_size = confirmed_size_retry
 
             with self._lock:
                 pos = self.position
@@ -1350,7 +1408,7 @@ class FiveMinuteUpDownTrader:
                     old_size,
                     confirmed_size,
                     raw_balance,
-                    delay_sec,
+                    first_balance_delay_sec,
                 )
 
                 if confirmed_size <= 0:

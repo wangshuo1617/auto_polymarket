@@ -967,5 +967,5 @@ def get_balance_allowance() -> str:
     return f"${balance:.2f}"
 
 if __name__ == "__main__":
-    result = get_order_detail("0x3bc345be937cd5f0beb27e95e1b7faa642dcb202f9bae64ebeca841783703582")
+    result = get_conditional_token_balance("83582917465492104783167246373060788120751252963368969711566208606542081356292")
     print(result)
