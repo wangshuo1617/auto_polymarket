@@ -1415,15 +1415,18 @@ class FiveMinuteUpDownTrader:
                 )
 
                 if confirmed_size <= 0:
-                    logger.info(
-                        "建仓后余额确认为0，清理本地持仓避免阻塞后续开仓: market=%s token=%s",
-                        market_slug,
-                        token_id,
-                    )
-                    self.position = None
-                    if self._poly_watcher:
-                        self._poly_watcher.stop()
-                        self._poly_watcher = None
+                    if matched_size > 0:
+                        # 引擎确切表明已成交，这是 API 数据库在严重撒谎！绝不能清空仓位！
+                        logger.error("重大延迟: 引擎已成交 %.6f 但 API 余额为 0，强制保留持仓以维持风控保护！", matched_size)
+                        # 按照撮合数量扣除保守手续费(如 1.5%)作为估算仓位，继续保护！
+                        pos.size = normalize_order_size(matched_size * 0.985, tick_size=tick_size)
+                        pos.balance_confirmed = True
+                    else:
+                        logger.info("建仓后余额确认为0且无撮合记录，清理本地持仓避免阻塞后续开仓: market=%s token=%s", market_slug, token_id)
+                        self.position = None
+                        if self._poly_watcher:
+                            self._poly_watcher.stop()
+                            self._poly_watcher = None
 
         threading.Thread(
             target=_run,
