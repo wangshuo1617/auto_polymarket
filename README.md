@@ -13,6 +13,7 @@
 - 通过 Binance WebSocket 实时监控 BTC/USDT 价格
 - 支持多种价格流类型（ticker、bookTicker、avgPrice）
 - 支持基于 `@aggTrade` 的 15 秒滑窗 Volume Delta 实时判定
+- 支持 BTC + Polymarket 5m 市场的逐秒对齐采样（写入 DuckDB）
 - 可配置的价格预警系统（上涨/下跌预警）
 - 每小时自动发送价格报告邮件
 
@@ -230,6 +231,23 @@ chmod +x scripts/restart_5m_trade.sh
 
 ```bash
 ./scripts/restart_5m_trade.sh --live 3 5 10 5.0 3600 0.80 0.15 -0.20
+```
+
+#### 运行 BTC + Polymarket 逐秒监控（DuckDB）
+
+```bash
+uv run btc_1s_market_monitor.py --db-path logs/btc_poly_1s.duckdb --symbol btcusdt
+```
+
+说明：
+- Binance 使用 WS 维护 BTC 最新价格；
+- Polymarket 使用 WS 订阅当前 5m 市场 up/down 双边盘口；
+- 服务每秒写入一条对齐快照到 `btc_poly_1s_ticks` 表，便于后续分析。
+
+快速查询示例：
+
+```bash
+uv run python -c "import duckdb; c=duckdb.connect('logs/btc_poly_1s.duckdb'); print(c.execute('SELECT * FROM btc_poly_1s_ticks ORDER BY ts_sec DESC LIMIT 5').fetchdf())"
 ```
 
 #### 运行 Web Dashboard（支持外网访问）
