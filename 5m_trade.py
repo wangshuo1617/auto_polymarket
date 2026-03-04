@@ -66,6 +66,10 @@ class TradeRecord:
     exit_best_bid: Optional[float] = None
     exit_avg_fill_price: Optional[float] = None
     exit_full_fill: Optional[bool] = None
+    entry_invested_usdc: Optional[float] = None
+    exit_recovered_usdc: Optional[float] = None
+    exit_expected_price: Optional[float] = None
+    exit_slippage_leakage: Optional[float] = None
 
 
 @dataclass
@@ -84,6 +88,9 @@ class OpenPosition:
     entry_best_ask: Optional[float] = None
     entry_avg_fill_price: Optional[float] = None
     entry_full_fill: Optional[bool] = None
+    actual_entry_price: Optional[float] = None
+    actual_entry_size: Optional[float] = None
+    total_invested_usdc: Optional[float] = None
 
 
 class BinanceKline1mWatcher:
@@ -472,7 +479,7 @@ class FiveMinuteUpDownTrader:
         self.entry_preclose_seconds = entry_preclose_seconds
         self.min_direction_diff = min_direction_diff
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._binance = BinanceKline1mWatcher(callback=self._on_kline)
         self._poly_watcher: Optional[PolymarketAssetPriceWatcher] = None
         self._window_book_watcher: Optional[PolymarketAssetPriceWatcher] = None
@@ -547,6 +554,121 @@ class FiveMinuteUpDownTrader:
             return parsed
         except Exception:
             return None
+
+    def _parse_order_matched_size(self, order_detail: Optional[Dict[str, Any]]) -> float:
+        if not isinstance(order_detail, dict):
+            return 0.0
+        for key in ("size_matched", "sizeMatched", "matched_size"):
+            matched = self._to_positive_float(order_detail.get(key))
+            if matched is not None:
+                return matched
+        return 0.0
+
+    def _extract_execution_price_from_order(self, order_detail: Optional[Dict[str, Any]]) -> Optional[float]:
+        if not isinstance(order_detail, dict):
+            return None
+
+        for key in ("avgPrice", "avg_price", "price"):
+            price = self._to_positive_float(order_detail.get(key))
+            if price is not None:
+                return price
+
+        taker = self._to_positive_float(
+            order_detail.get("takerAmount")
+            if order_detail.get("takerAmount") is not None
+            else order_detail.get("taker_amount")
+        )
+        maker = self._to_positive_float(
+            order_detail.get("makerAmount")
+            if order_detail.get("makerAmount") is not None
+            else order_detail.get("maker_amount")
+        )
+        if taker is not None and maker is not None and maker > 0:
+            ratio = taker / maker
+            if ratio > 0:
+                return ratio
+        return None
+
+    def _compute_allocated_entry_cost(self, pos: OpenPosition, close_size: float) -> float:
+        if close_size <= 0:
+            return 0.0
+
+        if (
+            pos.total_invested_usdc is not None
+            and pos.actual_entry_size is not None
+            and pos.actual_entry_size > 0
+        ):
+            ratio = min(1.0, max(0.0, close_size / pos.actual_entry_size))
+            return float(pos.total_invested_usdc) * ratio
+
+        entry_unit_price = (
+            pos.actual_entry_price
+            if pos.actual_entry_price is not None and pos.actual_entry_price > 0
+            else pos.entry_price
+        )
+        return float(entry_unit_price) * close_size
+
+    def _append_realized_trade(
+        self,
+        pos: OpenPosition,
+        reason: str,
+        matched_size: float,
+        actual_exit_price: float,
+        expected_exit_price: Optional[float],
+        exit_best_bid: Optional[float],
+        exit_avg_fill_price: Optional[float],
+        exit_full_fill: Optional[bool],
+    ) -> None:
+        if matched_size <= 0:
+            return
+
+        entry_cost = self._compute_allocated_entry_cost(pos, matched_size)
+        recovered = actual_exit_price * matched_size
+        pnl = recovered - entry_cost
+
+        entry_price = (entry_cost / matched_size) if matched_size > 0 else pos.entry_price
+        leakage = None
+        if expected_exit_price is not None and expected_exit_price > 0:
+            leakage = (expected_exit_price - actual_exit_price) * matched_size
+
+        record = TradeRecord(
+            market_slug=pos.market_slug,
+            market_id=pos.market_id,
+            token_id=pos.token_id,
+            direction=pos.direction,
+            size=matched_size,
+            entry_price=entry_price,
+            exit_price=actual_exit_price,
+            pnl=pnl,
+            entry_time=pos.entry_time,
+            exit_time=datetime.now(timezone.utc),
+            reason=reason,
+            entry_best_ask=pos.entry_best_ask,
+            entry_avg_fill_price=pos.entry_avg_fill_price,
+            entry_full_fill=pos.entry_full_fill,
+            exit_best_bid=exit_best_bid,
+            exit_avg_fill_price=exit_avg_fill_price,
+            exit_full_fill=exit_full_fill,
+            entry_invested_usdc=entry_cost,
+            exit_recovered_usdc=recovered,
+            exit_expected_price=expected_exit_price,
+            exit_slippage_leakage=leakage,
+        )
+        with self._lock:
+            self.trades.append(record)
+
+        logger.info(
+            "平仓真实记账: 市场=%s 方向=%s size=%.4f entry_avg=%.4f exit_avg=%.4f invested=%.4f recovered=%.4f pnl=%.4f reason=%s",
+            record.market_slug,
+            record.direction,
+            record.size,
+            record.entry_price,
+            record.exit_price,
+            record.entry_invested_usdc or 0.0,
+            record.exit_recovered_usdc or 0.0,
+            record.pnl,
+            record.reason,
+        )
 
     @classmethod
     def _is_toxic_time_regime(cls) -> bool:
@@ -1285,6 +1407,9 @@ class FiveMinuteUpDownTrader:
             entry_best_ask=best_ask_price,
             entry_avg_fill_price=float(plan["vwap_price"]),
             entry_full_fill=bool(plan.get("full_fill", False)),
+            actual_entry_price=float(plan["vwap_price"]),
+            actual_entry_size=size,
+            total_invested_usdc=float(plan["vwap_price"]) * size,
         )
         if not self.dry_run:
             self._schedule_position_balance_confirmation(
@@ -1330,18 +1455,21 @@ class FiveMinuteUpDownTrader:
 
             matched_size = 0.0
             order_status = ""
+            matched_price: Optional[float] = None
             if order_id:
                 _sleep_until(match_check_delay_sec)
                 try:
                     detail = get_order_detail(order_id)
                     if isinstance(detail, dict):
-                        matched_size = float(detail.get("size_matched", 0.0) or 0.0)
+                        matched_size = self._parse_order_matched_size(detail)
+                        matched_price = self._extract_execution_price_from_order(detail)
                         order_status = str(detail.get("status") or "").upper()
                         logger.info(
-                            "建仓快通道检查: order_id=%s status=%s matched=%.6f",
+                            "建仓快通道检查: order_id=%s status=%s matched=%.6f avg_price=%s",
                             order_id,
                             order_status,
                             matched_size,
+                            f"{matched_price:.6f}" if matched_price is not None else "N/A",
                         )
                 except Exception as e:
                     logger.warning("建仓快通道查询订单状态失败，继续余额确认: order_id=%s error=%s", order_id, e)
@@ -1404,13 +1532,32 @@ class FiveMinuteUpDownTrader:
                 old_size = float(pos.size)
                 pos.size = confirmed_size
                 pos.balance_confirmed = True
+                if matched_size > 0:
+                    pos.actual_entry_size = matched_size
+                elif pos.actual_entry_size is None and confirmed_size > 0:
+                    pos.actual_entry_size = confirmed_size
+
+                if matched_price is not None:
+                    pos.actual_entry_price = matched_price
+                elif pos.actual_entry_price is None and pos.entry_avg_fill_price is not None:
+                    pos.actual_entry_price = pos.entry_avg_fill_price
+
+                if (
+                    pos.actual_entry_price is not None
+                    and pos.actual_entry_size is not None
+                    and pos.actual_entry_size > 0
+                ):
+                    pos.total_invested_usdc = pos.actual_entry_price * pos.actual_entry_size
                 logger.info(
-                    "建仓后余额确认: market=%s token=%s old_size=%.6f confirmed_size=%.6f raw_balance=%.6f delay=%ss",
+                    "建仓后余额确认: market=%s token=%s old_size=%.6f confirmed_size=%.6f raw_balance=%.6f entry_size=%.6f entry_price=%s invested=%s delay=%ss",
                     market_slug,
                     token_id,
                     old_size,
                     confirmed_size,
                     raw_balance,
+                    pos.actual_entry_size or 0.0,
+                    f"{pos.actual_entry_price:.6f}" if pos.actual_entry_price is not None else "N/A",
+                    f"{pos.total_invested_usdc:.6f}" if pos.total_invested_usdc is not None else "N/A",
                     first_balance_delay_sec,
                 )
 
@@ -1420,6 +1567,17 @@ class FiveMinuteUpDownTrader:
                         logger.error("重大延迟: 引擎已成交 %.6f 但 API 余额为 0，强制保留持仓以维持风控保护！", matched_size)
                         # 按照撮合数量扣除保守手续费(如 1.5%)作为估算仓位，继续保护！
                         pos.size = normalize_order_size(matched_size * 0.985, tick_size=tick_size)
+                        if pos.actual_entry_size is None:
+                            pos.actual_entry_size = matched_size
+                        if pos.actual_entry_price is None and matched_price is not None:
+                            pos.actual_entry_price = matched_price
+                        if (
+                            pos.total_invested_usdc is None
+                            and pos.actual_entry_price is not None
+                            and pos.actual_entry_size is not None
+                            and pos.actual_entry_size > 0
+                        ):
+                            pos.total_invested_usdc = pos.actual_entry_price * pos.actual_entry_size
                         pos.balance_confirmed = True
                     else:
                         logger.info("建仓后余额确认为0且无撮合记录，清理本地持仓避免阻塞后续开仓: market=%s token=%s", market_slug, token_id)
@@ -1438,35 +1596,67 @@ class FiveMinuteUpDownTrader:
         self,
         closed_position: OpenPosition,
         reason: str,
-        target_close_size: float,  # <--- 新增：用于快通道比对预期平仓数量
-        order_id: Optional[str] = None,  # <--- 新增：用于快通道查询订单状态
+        target_close_size: float,
+        expected_exit_price: Optional[float] = None,
+        exit_best_bid: Optional[float] = None,
+        exit_avg_fill_price: Optional[float] = None,
+        exit_full_fill: Optional[bool] = None,
+        order_id: Optional[str] = None,
         delay_sec: int = 3,
     ) -> None:
         def _run() -> None:
-            # === 快通道 (Fast Path): 查撮合引擎订单状态 ===
+            order_detail: Optional[Dict[str, Any]] = None
+            matched_raw = 0.0
+            actual_exit_price = None
+            order_status = ""
+
             if order_id:
                 try:
-                    # 局部引入，避免未在顶部 import 报错
-                    from data.polymarket import get_order_detail 
                     order_detail = get_order_detail(order_id)
-                    
-                    if order_detail:
+                    if isinstance(order_detail, dict):
                         order_status = str(order_detail.get("status") or "").upper()
-                        matched_raw = float(order_detail.get("size_matched", 0.0))
-                        
+                        matched_raw = self._parse_order_matched_size(order_detail)
+                        actual_exit_price = self._extract_execution_price_from_order(order_detail)
+
                         logger.info(
-                            "平仓快通道检查: order_id=%s status=%s matched=%.4f target=%.4f", 
-                            order_id, order_status, matched_raw, target_close_size
+                            "平仓快通道检查: order_id=%s status=%s matched=%.6f target=%.6f avg_price=%s",
+                            order_id,
+                            order_status,
+                            matched_raw,
+                            target_close_size,
+                            f"{actual_exit_price:.6f}" if actual_exit_price is not None else "N/A",
                         )
-                        
-                        # 如果引擎确认已完全撮合 (MATCHED) 或撮合数量达到了 99.9%
+
                         if order_status == "MATCHED" or matched_raw >= target_close_size * 0.999:
-                            logger.info("⚡ 快通道确认: 订单已在撮合引擎完全成交，平仓成功，跳过余额等待！")
+                            realized_size = min(max(matched_raw, 0.0), target_close_size)
+                            final_exit_price = (
+                                actual_exit_price
+                                if actual_exit_price is not None and actual_exit_price > 0
+                                else (
+                                    expected_exit_price
+                                    if expected_exit_price is not None and expected_exit_price > 0
+                                    else closed_position.entry_price
+                                )
+                            )
+                            self._append_realized_trade(
+                                pos=closed_position,
+                                reason=reason,
+                                matched_size=realized_size,
+                                actual_exit_price=final_exit_price,
+                                expected_exit_price=expected_exit_price,
+                                exit_best_bid=exit_best_bid,
+                                exit_avg_fill_price=(
+                                    actual_exit_price
+                                    if actual_exit_price is not None
+                                    else exit_avg_fill_price
+                                ),
+                                exit_full_fill=True,
+                            )
+                            logger.info("⚡ 快通道确认: 订单已完全成交，已按真实成交价记账")
                             return
                 except Exception as e:
                     logger.warning("快通道查询订单状态失败，降级到慢通道: %s", e)
 
-            # === 慢通道 (Slow Path): 延迟等待数据库与链上余额同步 ===
             logger.info("快通道未确认完全成交 (可能发生部分成交/撤单)，等待 %ss 后启动慢通道余额复核...", delay_sec)
             time.sleep(max(0, delay_sec))
 
@@ -1477,22 +1667,79 @@ class FiveMinuteUpDownTrader:
             # 去链上/API查最真实的粉尘和残仓
             raw_balance = get_conditional_token_balance(closed_position.token_id)
             remaining_size = normalize_order_size(raw_balance, tick_size=tick_size)
+            sold_by_balance = max(0.0, target_close_size - remaining_size)
+
+            if order_id:
+                try:
+                    refreshed_detail = get_order_detail(order_id)
+                    if isinstance(refreshed_detail, dict):
+                        order_detail = refreshed_detail
+                        matched_raw = max(matched_raw, self._parse_order_matched_size(refreshed_detail))
+                        refreshed_exit_price = self._extract_execution_price_from_order(refreshed_detail)
+                        if refreshed_exit_price is not None:
+                            actual_exit_price = refreshed_exit_price
+                except Exception as e:
+                    logger.warning("慢通道刷新订单详情失败: order_id=%s error=%s", order_id, e)
+
+            realized_size = min(target_close_size, max(matched_raw, sold_by_balance))
+            final_exit_price = (
+                actual_exit_price
+                if actual_exit_price is not None and actual_exit_price > 0
+                else (
+                    expected_exit_price
+                    if expected_exit_price is not None and expected_exit_price > 0
+                    else closed_position.entry_price
+                )
+            )
 
             should_retry = False
             with self._lock:
                 logger.info(
-                    "平仓慢通道余额确认: market=%s token=%s remaining_size=%.6f raw_balance=%.6f delay=%ss reason=%s",
+                    "平仓慢通道余额确认: market=%s token=%s remaining_size=%.6f sold_by_balance=%.6f matched=%.6f raw_balance=%.6f delay=%ss reason=%s",
                     closed_position.market_slug,
                     closed_position.token_id,
                     remaining_size,
+                    sold_by_balance,
+                    matched_raw,
                     raw_balance,
                     delay_sec,
                     reason,
                 )
 
                 if remaining_size <= 0.02:
+                    if realized_size > 0:
+                        self._append_realized_trade(
+                            pos=closed_position,
+                            reason=reason,
+                            matched_size=realized_size,
+                            actual_exit_price=final_exit_price,
+                            expected_exit_price=expected_exit_price,
+                            exit_best_bid=exit_best_bid,
+                            exit_avg_fill_price=(
+                                actual_exit_price
+                                if actual_exit_price is not None
+                                else exit_avg_fill_price
+                            ),
+                            exit_full_fill=True,
+                        )
                     logger.info("慢通道确认: 残余份额不足 0.05 (实余 %.6f)，视为粉尘忽略，平仓彻底完成。", remaining_size)
                     return
+
+                if realized_size > 0:
+                    self._append_realized_trade(
+                        pos=closed_position,
+                        reason=f"{reason}_partial",
+                        matched_size=realized_size,
+                        actual_exit_price=final_exit_price,
+                        expected_exit_price=expected_exit_price,
+                        exit_best_bid=exit_best_bid,
+                        exit_avg_fill_price=(
+                            actual_exit_price
+                            if actual_exit_price is not None
+                            else exit_avg_fill_price
+                        ),
+                        exit_full_fill=False,
+                    )
 
                 # 走到这里，说明真的是因为盘口太薄等原因没卖干净，恢复持仓状态以备重试
                 existing = self.position
@@ -1521,6 +1768,12 @@ class FiveMinuteUpDownTrader:
                         entry_best_ask=closed_position.entry_best_ask,
                         entry_avg_fill_price=closed_position.entry_avg_fill_price,
                         entry_full_fill=closed_position.entry_full_fill,
+                        actual_entry_price=closed_position.actual_entry_price,
+                        actual_entry_size=remaining_size,
+                        total_invested_usdc=self._compute_allocated_entry_cost(
+                            closed_position,
+                            remaining_size,
+                        ),
                     )
                     should_retry = True
                     # 重新启动 WebSocket 监听
@@ -1775,43 +2028,27 @@ class FiveMinuteUpDownTrader:
                 self._schedule_post_close_balance_check(
                     closed_position=pos,
                     reason=reason,
-                    target_close_size=target_close_size, # 传入目标平仓数量
-                    order_id=order_id,                   # 传入刚刚产生的 order_id
-                    delay_sec=3,                         # 如果快通道失败，兜底等待 3 秒
+                    target_close_size=target_close_size,
+                    expected_exit_price=exit_price,
+                    exit_best_bid=exit_best_bid,
+                    exit_avg_fill_price=exit_avg_fill_price,
+                    exit_full_fill=exit_full_fill,
+                    order_id=order_id,
+                    delay_sec=3,
                 )
+        elif self.dry_run:
+            dry_run_exit = exit_price
+            self._append_realized_trade(
+                pos=pos,
+                reason=reason,
+                matched_size=target_close_size,
+                actual_exit_price=dry_run_exit,
+                expected_exit_price=exit_price,
+                exit_best_bid=exit_best_bid,
+                exit_avg_fill_price=exit_avg_fill_price,
+                exit_full_fill=exit_full_fill,
+            )
 
-        pnl = (exit_price - pos.entry_price) * target_close_size
-        record = TradeRecord(
-            market_slug=pos.market_slug,
-            market_id=pos.market_id,
-            token_id=pos.token_id,
-            direction=pos.direction,
-            size=target_close_size,
-            entry_price=pos.entry_price,
-            exit_price=sweep_price,
-            pnl=pnl,
-            entry_time=pos.entry_time,
-            exit_time=datetime.now(timezone.utc),
-            reason=reason,
-            entry_best_ask=pos.entry_best_ask,
-            entry_avg_fill_price=pos.entry_avg_fill_price,
-            entry_full_fill=pos.entry_full_fill,
-            exit_best_bid=exit_best_bid,
-            exit_avg_fill_price=exit_avg_fill_price,
-            exit_full_fill=exit_full_fill,
-        )
-        self.trades.append(record)
-
-        logger.info(
-            "平仓完成: 市场=%s 方向=%s size=%.4f entry=%.4f exit=%.4f pnl=%.4f 原因=%s",
-            record.market_slug,
-            record.direction,
-            record.size,
-            record.entry_price,
-            record.exit_price,
-            record.pnl,
-            record.reason,
-        )
         close_ms = (time.perf_counter() - close_t0) * 1000
         self._record_latency("close_total", close_ms)
         logger.info(
@@ -1885,6 +2122,59 @@ class FiveMinuteUpDownTrader:
                 return None
             return sum(1 for item in flags if item) / len(flags)
 
+        def _profit_factor(trades: List[TradeRecord]) -> Optional[float]:
+            gross_profit = sum(t.pnl for t in trades if t.pnl > 0)
+            gross_loss = abs(sum(t.pnl for t in trades if t.pnl < 0))
+            if gross_loss <= 1e-12:
+                if gross_profit > 0:
+                    return float("inf")
+                return None
+            return gross_profit / gross_loss
+
+        def _ev_per_trade(trades: List[TradeRecord]) -> Optional[float]:
+            if not trades:
+                return None
+            return sum(t.pnl for t in trades) / len(trades)
+
+        def _slippage_leakage(trades: List[TradeRecord]) -> float:
+            return sum(
+                float(t.exit_slippage_leakage or 0.0)
+                for t in trades
+            )
+
+        def _base_reason(reason: str) -> str:
+            if reason.endswith("_partial"):
+                return reason[: -len("_partial")]
+            if reason.endswith("_residual"):
+                return reason[: -len("_residual")]
+            return reason
+
+        def _reason_breakdown(trades: List[TradeRecord]) -> Dict[str, Dict[str, float]]:
+            groups: Dict[str, List[TradeRecord]] = {}
+            for t in trades:
+                key = _base_reason(t.reason)
+                groups.setdefault(key, []).append(t)
+
+            result: Dict[str, Dict[str, float]] = {}
+            for key, items in groups.items():
+                count = len(items)
+                wins = sum(1 for item in items if item.pnl > 0)
+                avg_pnl = sum(item.pnl for item in items) / count if count > 0 else 0.0
+                avg_loss_items = [item.pnl for item in items if item.pnl < 0]
+                avg_loss = (
+                    sum(avg_loss_items) / len(avg_loss_items)
+                    if avg_loss_items
+                    else 0.0
+                )
+                result[key] = {
+                    "count": float(count),
+                    "wins": float(wins),
+                    "win_rate": (wins / count * 100.0) if count > 0 else 0.0,
+                    "avg_pnl": avg_pnl,
+                    "avg_loss": avg_loss,
+                }
+            return result
+
         recent_100 = all_trades[-100:]
         rolling_base = len(recent_100)
         rolling_tp_count = sum(1 for t in recent_100 if t.reason == "tp")
@@ -1894,6 +2184,14 @@ class FiveMinuteUpDownTrader:
         cumulative_slippage_bps = _calc_slippage_bps(all_trades)
         hourly_full_fill_rate = _calc_full_fill_rate(new_trades)
         cumulative_full_fill_rate = _calc_full_fill_rate(all_trades)
+        hourly_profit_factor = _profit_factor(new_trades)
+        cumulative_profit_factor = _profit_factor(all_trades)
+        hourly_ev = _ev_per_trade(new_trades)
+        cumulative_ev = _ev_per_trade(all_trades)
+        hourly_leakage = _slippage_leakage(new_trades)
+        cumulative_leakage = _slippage_leakage(all_trades)
+        hourly_reason_stats = _reason_breakdown(new_trades)
+        cumulative_reason_stats = _reason_breakdown(all_trades)
 
         lines.append("关键策略统计:")
         if hourly_slippage_bps is None:
@@ -1921,6 +2219,53 @@ class FiveMinuteUpDownTrader:
             lines.append(
                 f"- 订单成交率(累计，全成占比): {cumulative_full_fill_rate * 100:.2f}%"
             )
+
+        if hourly_profit_factor is None:
+            lines.append("- Profit Factor(本小时): N/A")
+        elif hourly_profit_factor == float("inf"):
+            lines.append("- Profit Factor(本小时): INF")
+        else:
+            lines.append(f"- Profit Factor(本小时): {hourly_profit_factor:.4f}")
+
+        if cumulative_profit_factor is None:
+            lines.append("- Profit Factor(累计): N/A")
+        elif cumulative_profit_factor == float("inf"):
+            lines.append("- Profit Factor(累计): INF")
+        else:
+            lines.append(f"- Profit Factor(累计): {cumulative_profit_factor:.4f}")
+
+        lines.append(
+            f"- EV/Trade(本小时): {(hourly_ev if hourly_ev is not None else 0.0):.4f} USDC"
+            if hourly_ev is not None
+            else "- EV/Trade(本小时): N/A"
+        )
+        lines.append(
+            f"- EV/Trade(累计): {(cumulative_ev if cumulative_ev is not None else 0.0):.4f} USDC"
+            if cumulative_ev is not None
+            else "- EV/Trade(累计): N/A"
+        )
+        lines.append(f"- 滑点泄漏(本小时): {hourly_leakage:.4f} USDC")
+        lines.append(f"- 滑点泄漏(累计): {cumulative_leakage:.4f} USDC")
+
+        lines.append("- 原因细分(本小时):")
+        if hourly_reason_stats:
+            for reason_key in sorted(hourly_reason_stats.keys()):
+                stats = hourly_reason_stats[reason_key]
+                lines.append(
+                    f"  * {reason_key}: count={int(stats['count'])}, win_rate={stats['win_rate']:.2f}%, avg_pnl={stats['avg_pnl']:.4f}, avg_loss={stats['avg_loss']:.4f}"
+                )
+        else:
+            lines.append("  * N/A")
+
+        lines.append("- 原因细分(累计):")
+        if cumulative_reason_stats:
+            for reason_key in sorted(cumulative_reason_stats.keys()):
+                stats = cumulative_reason_stats[reason_key]
+                lines.append(
+                    f"  * {reason_key}: count={int(stats['count'])}, win_rate={stats['win_rate']:.2f}%, avg_pnl={stats['avg_pnl']:.4f}, avg_loss={stats['avg_loss']:.4f}"
+                )
+        else:
+            lines.append("  * N/A")
         lines.append("")
 
         metric_order = [
@@ -2022,7 +2367,9 @@ class FiveMinuteUpDownTrader:
             lines.append(
                 f"- {t.entry_time.isoformat(timespec='seconds')} -> {t.exit_time.isoformat(timespec='seconds')}, "
                 f"slug={t.market_slug}, dir={t.direction}, size={t.size:.4f}, "
-                f"entry={t.entry_price:.4f}, exit={t.exit_price:.4f}, pnl={t.pnl:.4f}, reason={t.reason}"
+                f"entry={t.entry_price:.4f}, exit={t.exit_price:.4f}, pnl={t.pnl:.4f}, "
+                f"invested={(t.entry_invested_usdc or 0.0):.4f}, recovered={(t.exit_recovered_usdc or 0.0):.4f}, "
+                f"leakage={(t.exit_slippage_leakage or 0.0):.4f}, reason={t.reason}"
             )
         if not new_trades:
             lines.append("- 本小时无新平仓交易")
