@@ -559,6 +559,51 @@ class FiveMinuteUpDownTrader:
         except Exception:
             return None
 
+    def _reconcile_position_snapshot(
+        self,
+        token_id: str,
+        entry_order_id: Optional[str],
+        tick_size: str,
+        base_size: float = 0.0,
+        cancel_live_entry: bool = False,
+    ) -> Dict[str, Any]:
+        order_status = ""
+        matched_size = 0.0
+        canceled_live_entry = False
+
+        if entry_order_id:
+            order_detail = get_order_detail(entry_order_id)
+            if order_detail:
+                order_status = str(order_detail.get("status") or "").upper()
+                matched_raw = self._to_positive_float(order_detail.get("size_matched"))
+                if matched_raw is not None:
+                    matched_size = normalize_order_size(matched_raw, tick_size=tick_size)
+
+            if cancel_live_entry and order_status == "LIVE":
+                try:
+                    cancel_order(entry_order_id)
+                    canceled_live_entry = True
+                except Exception as e:
+                    logger.warning(
+                        "仓位对账撤销入场挂单失败: token=%s order_id=%s error=%s",
+                        token_id,
+                        entry_order_id,
+                        e,
+                    )
+
+        raw_balance = get_conditional_token_balance(token_id)
+        balance_size = normalize_order_size(raw_balance, tick_size=tick_size)
+        reconciled_size = max(float(base_size), balance_size, matched_size)
+
+        return {
+            "reconciled_size": reconciled_size,
+            "balance_size": balance_size,
+            "raw_balance": raw_balance,
+            "matched_size": matched_size,
+            "order_status": order_status,
+            "canceled_live_entry": canceled_live_entry,
+        }
+
     @classmethod
     def _is_toxic_time_regime(cls) -> bool:
         current_utc_hour = datetime.now(timezone.utc).hour
@@ -1356,21 +1401,19 @@ class FiveMinuteUpDownTrader:
                 market_meta = market_info.get("market_meta") or {}
                 tick_size = market_meta.get("minimum_tick_size", "0.01")
 
+            observed_positive_size = False
             for attempt in range(1, max(1, max_attempts) + 1):
-                raw_balance = get_conditional_token_balance(token_id)
-                confirmed_size = normalize_order_size(raw_balance, tick_size=tick_size)
-
-                order_status = ""
-                matched_size = 0.0
-                if entry_order_id:
-                    order_detail = get_order_detail(entry_order_id)
-                    if order_detail:
-                        order_status = str(order_detail.get("status") or "").upper()
-                        matched_raw = self._to_positive_float(order_detail.get("size_matched"))
-                        if matched_raw is not None:
-                            matched_size = normalize_order_size(matched_raw, tick_size=tick_size)
-
-                effective_size = max(confirmed_size, matched_size)
+                snapshot = self._reconcile_position_snapshot(
+                    token_id=token_id,
+                    entry_order_id=entry_order_id,
+                    tick_size=tick_size,
+                    base_size=0.0,
+                    cancel_live_entry=False,
+                )
+                effective_size = float(snapshot["reconciled_size"])
+                raw_balance = float(snapshot["raw_balance"])
+                matched_size = float(snapshot["matched_size"])
+                order_status = str(snapshot["order_status"] or "")
 
                 with self._lock:
                     pos = self.position
@@ -1383,21 +1426,38 @@ class FiveMinuteUpDownTrader:
 
                     if effective_size > 0:
                         old_size = float(pos.size)
-                        pos.size = effective_size
+                        pos.size = max(old_size, effective_size)
                         pos.balance_confirmed = True
-                        logger.info(
-                            "建仓后余额确认成功: market=%s token=%s old_size=%.6f confirmed_size=%.6f raw_balance=%.6f matched_size=%.6f status=%s attempt=%s/%s",
-                            market_slug,
-                            token_id,
-                            old_size,
-                            effective_size,
-                            raw_balance,
-                            matched_size,
-                            order_status or "N/A",
-                            attempt,
-                            max_attempts,
-                        )
-                        return
+                        observed_positive_size = True
+                        if pos.size > old_size + 1e-9:
+                            logger.info(
+                                "建仓后余额确认更新: market=%s token=%s old_size=%.6f confirmed_size=%.6f raw_balance=%.6f matched_size=%.6f status=%s attempt=%s/%s",
+                                market_slug,
+                                token_id,
+                                old_size,
+                                pos.size,
+                                raw_balance,
+                                matched_size,
+                                order_status or "N/A",
+                                attempt,
+                                max_attempts,
+                            )
+                        elif attempt == 1:
+                            logger.info(
+                                "建仓后余额确认成功: market=%s token=%s old_size=%.6f confirmed_size=%.6f raw_balance=%.6f matched_size=%.6f status=%s attempt=%s/%s",
+                                market_slug,
+                                token_id,
+                                old_size,
+                                pos.size,
+                                raw_balance,
+                                matched_size,
+                                order_status or "N/A",
+                                attempt,
+                                max_attempts,
+                            )
+
+                        if order_status in {"MATCHED", "CANCELED", "EXPIRED", "REJECTED"}:
+                            return
 
                     if order_status in {"CANCELED", "EXPIRED", "REJECTED"}:
                         logger.info(
@@ -1417,6 +1477,25 @@ class FiveMinuteUpDownTrader:
 
                 if attempt < max_attempts:
                     time.sleep(max(1, retry_interval_sec))
+
+            if observed_positive_size:
+                with self._lock:
+                    pos = self.position
+                    if (
+                        pos is None
+                        or pos.market_slug != market_slug
+                        or pos.token_id != token_id
+                    ):
+                        return
+                    logger.info(
+                        "建仓后余额确认结束: market=%s token=%s final_size=%.6f order_id=%s attempts=%s",
+                        market_slug,
+                        token_id,
+                        float(pos.size),
+                        entry_order_id,
+                        max_attempts,
+                    )
+                return
 
             with self._lock:
                 pos = self.position
@@ -1552,6 +1631,45 @@ class FiveMinuteUpDownTrader:
         if market_meta is None:
             market_meta = get_market_metadata(pos.market_id)
         tick_size = (market_meta or {}).get("minimum_tick_size", "0.01")
+
+        # 平仓前强制对账：避免依赖后台轮询导致只拿到首笔成交仓位
+        if not self.dry_run:
+            reconciled_size = float(pos.size)
+            latest_matched_size = 0.0
+            latest_order_status = ""
+            canceled_live_entry = False
+
+            snapshot = self._reconcile_position_snapshot(
+                token_id=pos.token_id,
+                entry_order_id=pos.entry_order_id,
+                tick_size=tick_size,
+                base_size=reconciled_size,
+                cancel_live_entry=True,
+            )
+            reconciled_size = max(reconciled_size, float(snapshot["reconciled_size"]))
+            latest_matched_size = max(latest_matched_size, float(snapshot["matched_size"]))
+            latest_order_status = str(snapshot["order_status"] or "")
+            canceled_live_entry = canceled_live_entry or bool(snapshot["canceled_live_entry"])
+
+            old_size = float(pos.size)
+            pos.size = reconciled_size
+            pos.balance_confirmed = True
+            if canceled_live_entry and pos.entry_order_id:
+                logger.info(
+                    "平仓前撤销入场挂单: market=%s token=%s order_id=%s",
+                    pos.market_slug,
+                    pos.token_id,
+                    pos.entry_order_id,
+                )
+            logger.info(
+                "平仓前仓位对账: market=%s token=%s old_size=%.6f reconciled_size=%.6f matched_size=%.6f status=%s",
+                pos.market_slug,
+                pos.token_id,
+                old_size,
+                pos.size,
+                latest_matched_size,
+                latest_order_status or "N/A",
+            )
 
         exit_price = pos.last_best_bid
         stop_target_price: Optional[float] = None
