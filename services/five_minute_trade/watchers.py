@@ -1,0 +1,350 @@
+import json
+import logging
+import threading
+import time
+from typing import Any, Callable, Dict, List, Optional
+
+from websocket import WebSocketApp
+
+logger = logging.getLogger(__name__)
+
+
+class BinanceKline1mWatcher:
+    """订阅 BTCUSDT@kline_1m，回调在 K 线更新与收盘时都触发。"""
+
+    BASE_URL = "wss://stream.binance.com:9443"
+
+    def __init__(
+        self,
+        symbol: str = "btcusdt",
+        callback: Optional[Callable[[Dict], None]] = None,
+    ) -> None:
+        self.symbol = symbol.lower()
+        self.callback = callback
+        self.ws: Optional[WebSocketApp] = None
+        self._thread: Optional[threading.Thread] = None
+        self.running = False
+
+    def _on_message(self, ws: WebSocketApp, message: str) -> None:
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError as e:
+            logger.error("Binance WS JSON 解析失败: %s", e)
+            return
+
+        try:
+            if isinstance(data, dict) and "stream" in data and "data" in data:
+                payload = data["data"]
+            else:
+                payload = data
+
+            if payload.get("e") != "kline":
+                return
+
+            k = payload.get("k") or {}
+            kline = {
+                "open_time": int(k.get("t", 0)),
+                "close_time": int(k.get("T", 0)),
+                "open": float(k.get("o", 0.0)),
+                "high": float(k.get("h", 0.0)),
+                "low": float(k.get("l", 0.0)),
+                "close": float(k.get("c", 0.0)),
+                "is_closed": bool(k.get("x", False)),
+                "event_time": int(payload.get("E", int(time.time() * 1000))),
+            }
+
+            if self.callback:
+                try:
+                    self.callback(kline)
+                except Exception as e:
+                    logger.error("Binance kline 回调异常: %s", e)
+        except Exception as e:
+            logger.error("处理 Binance kline 消息异常: %s", e)
+
+    def _on_error(self, ws: WebSocketApp, error: Exception) -> None:
+        logger.error("Binance WebSocket 错误: %s", error)
+
+    def _on_close(
+        self,
+        ws: WebSocketApp,
+        close_status_code: Optional[int],
+        close_msg: Optional[str],
+    ) -> None:
+        logger.warning(
+            "Binance WebSocket 关闭: code=%s msg=%s", close_status_code, close_msg
+        )
+        self.ws = None
+        if self.running:
+            time.sleep(5)
+            self._start_ws()
+
+    def _on_open(self, ws: WebSocketApp) -> None:
+        logger.info("Binance WebSocket 已连接")
+
+    def _start_ws(self) -> None:
+        streams = f"{self.symbol}@kline_1m"
+        url = f"{self.BASE_URL}/stream?streams={streams}"
+        logger.info("连接 Binance WebSocket: %s", url)
+
+        self.ws = WebSocketApp(
+            url,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+            on_open=self._on_open,
+        )
+        self.ws.run_forever(ping_interval=20, ping_timeout=10)
+
+    def start(self) -> None:
+        if self.running:
+            logger.warning("BinanceKline1mWatcher 已在运行中")
+            return
+        self.running = True
+
+        def _run() -> None:
+            while self.running:
+                try:
+                    self._start_ws()
+                except Exception as e:
+                    logger.error("Binance WebSocket 运行异常: %s", e)
+                    time.sleep(5)
+
+        self._thread = threading.Thread(target=_run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+
+
+class PolymarketAssetPriceWatcher:
+    """
+    订阅单个 token_id 的市场价格。
+    使用 ws-subscriptions-clob.polymarket.com/ws/market。
+    """
+
+    WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+    def __init__(
+        self,
+        asset_id: str,
+        on_price: Optional[Callable[[float], None]],
+        on_book: Optional[Callable[[Dict[str, Any]], None]] = None,
+        extra_asset_ids: Optional[List[str]] = None,
+    ) -> None:
+        self.asset_id = asset_id
+        self.asset_ids: List[str] = [asset_id]
+        for item in (extra_asset_ids or []):
+            token = str(item)
+            if token and token not in self.asset_ids:
+                self.asset_ids.append(token)
+        self.on_price = on_price
+        self.on_book = on_book
+        self.ws: Optional[WebSocketApp] = None
+        self.running = False
+        self._thread: Optional[threading.Thread] = None
+        self._ping_thread: Optional[threading.Thread] = None
+
+    @staticmethod
+    def _to_float(value: object) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            parsed = float(str(value))
+            if parsed <= 0:
+                return None
+            return parsed
+        except Exception:
+            return None
+
+    def _send_ping_loop(self) -> None:
+        while self.running:
+            try:
+                if self.ws:
+                    self.ws.send("PING")
+            except Exception as e:
+                logger.debug("发送 Polymarket ping 异常: %s", e)
+            time.sleep(10)
+
+    def _on_open(self, ws: WebSocketApp) -> None:
+        logger.info("Polymarket WebSocket 已连接, 订阅 asset_ids=%s", self.asset_ids)
+        sub_msg = {"type": "Market", "assets_ids": self.asset_ids, "custom_feature_enabled": True}
+        try:
+            ws.send(json.dumps(sub_msg))
+        except Exception as e:
+            logger.error("发送 Polymarket 订阅消息失败: %s", e)
+
+    def _on_message(self, ws: WebSocketApp, message: str) -> None:
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            return
+        # 某些情况下服务器可能返回数组，逐个元素处理
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    self._handle_payload(item)
+            return
+        if isinstance(data, dict):
+            self._handle_payload(data)
+
+    def _handle_payload(self, payload: Dict) -> None:
+        event_type = str(payload.get("event_type", "")).lower()
+        best_bid: Optional[float] = None
+
+        try:
+            if event_type == "best_bid_ask":
+                best_bid = self._to_float(payload.get("best_bid"))
+            elif event_type == "book":
+                raw_bids = payload.get("bids") or []
+                raw_asks = payload.get("asks") or []
+                bids: List[Dict[str, float]] = []
+                asks: List[Dict[str, float]] = []
+
+                for lvl in raw_bids:
+                    if not isinstance(lvl, dict):
+                        continue
+                    price = self._to_float(lvl.get("price"))
+                    size = self._to_float(lvl.get("size"))
+                    if price is None or size is None:
+                        continue
+                    bids.append({"price": price, "size": size})
+
+                for lvl in raw_asks:
+                    if not isinstance(lvl, dict):
+                        continue
+                    price = self._to_float(lvl.get("price"))
+                    size = self._to_float(lvl.get("size"))
+                    if price is None or size is None:
+                        continue
+                    asks.append({"price": price, "size": size})
+
+                ts_ms: Optional[int] = None
+                try:
+                    raw_ts = payload.get("timestamp")
+                    if raw_ts is not None:
+                        ts_ms = int(str(raw_ts))
+                except Exception:
+                    ts_ms = None
+
+                # 按交易所约定：best_bid 是 bids 最后一个，best_ask 是 asks 第一个
+                if bids:
+                    best_bid = bids[-1]["price"]
+                best_ask = asks[0]["price"] if asks else None
+
+                if self.on_book and (bids or asks):
+                    self.on_book(
+                        {
+                            "asset_id": str(payload.get("asset_id") or self.asset_id),
+                            "market": payload.get("market"),
+                            "timestamp_ms": ts_ms,
+                            "received_ms": int(time.time() * 1000),
+                            "bids": bids,
+                            "asks": asks,
+                            "best_bid": best_bid,
+                            "best_ask": best_ask,
+                        }
+                    )
+            elif event_type == "price_change":
+                price_changes = payload.get("price_changes") or []
+                ts_ms: Optional[int] = None
+                try:
+                    raw_ts = payload.get("timestamp")
+                    if raw_ts is not None:
+                        ts_ms = int(str(raw_ts))
+                except Exception:
+                    ts_ms = None
+
+                for item in price_changes:
+                    if not isinstance(item, dict):
+                        continue
+                    asset_id = str(item.get("asset_id") or "")
+                    if not asset_id:
+                        continue
+
+                    item_best_bid = self._to_float(item.get("best_bid"))
+                    item_best_ask = self._to_float(item.get("best_ask"))
+
+                    if asset_id == self.asset_id and item_best_bid is not None:
+                        best_bid = item_best_bid
+
+                    if self.on_book:
+                        self.on_book(
+                            {
+                                "asset_id": asset_id,
+                                "market": payload.get("market"),
+                                "timestamp_ms": ts_ms,
+                                "received_ms": int(time.time() * 1000),
+                                "price_change_only": True,
+                                "best_bid": item_best_bid,
+                                "best_ask": item_best_ask,
+                            }
+                        )
+        except Exception as e:
+            logger.debug("解析 Polymarket 价格消息异常: %s", e)
+            best_bid = None
+
+        if best_bid is None or self.on_price is None:
+            return
+
+        try:
+            self.on_price(best_bid)
+        except Exception as e:
+            logger.error("Polymarket 价格回调异常: %s", e)
+
+    def _on_error(self, ws: WebSocketApp, error: Exception) -> None:
+        logger.error("Polymarket WebSocket 错误: %s", error)
+
+    def _on_close(
+        self,
+        ws: WebSocketApp,
+        close_status_code: Optional[int],
+        close_msg: Optional[str],
+    ) -> None:
+        logger.info(
+            "Polymarket WebSocket 关闭: code=%s msg=%s", close_status_code, close_msg
+        )
+        self.ws = None
+
+    def _run_ws(self) -> None:
+        while self.running:
+            try:
+                self.ws = WebSocketApp(
+                    self.WS_URL,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as e:
+                logger.error("Polymarket WebSocket 运行异常: %s", e)
+            finally:
+                if self.running:
+                    time.sleep(5)
+
+    def start(self) -> None:
+        if self.running:
+            logger.warning("PolymarketAssetPriceWatcher 已在运行中")
+            return
+        self.running = True
+        self._thread = threading.Thread(target=self._run_ws, daemon=True)
+        self._thread.start()
+        self._ping_thread = threading.Thread(
+            target=self._send_ping_loop, daemon=True
+        )
+        self._ping_thread.start()
+
+    def stop(self) -> None:
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None

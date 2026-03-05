@@ -8,7 +8,6 @@ BTC 与 Polymarket 5m 市场逐秒监控服务。
 """
 
 import argparse
-import importlib.util
 import logging
 import os
 import queue
@@ -22,25 +21,9 @@ import duckdb
 
 from btc_price_watcher import BTCPriceWatcher
 from data.polymarket import get_event_token_id
+from services.five_minute_trade.watchers import PolymarketAssetPriceWatcher
 
 logger = logging.getLogger(__name__)
-
-
-def _load_polymarket_asset_price_watcher_class():
-	current_dir = os.path.dirname(os.path.abspath(__file__))
-	trade_path = os.path.join(current_dir, "5m_trade.py")
-	spec = importlib.util.spec_from_file_location("trade5m_module", trade_path)
-	if spec is None or spec.loader is None:
-		raise RuntimeError(f"无法加载模块: {trade_path}")
-	module = importlib.util.module_from_spec(spec)
-	spec.loader.exec_module(module)
-	watcher_cls = getattr(module, "PolymarketAssetPriceWatcher", None)
-	if watcher_cls is None:
-		raise RuntimeError("5m_trade.py 中未找到 PolymarketAssetPriceWatcher")
-	return watcher_cls
-
-
-PolymarketAssetPriceWatcher = _load_polymarket_asset_price_watcher_class()
 
 
 @dataclass
