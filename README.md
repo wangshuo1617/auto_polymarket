@@ -44,6 +44,7 @@
 ```
 auto_polymarket/
 ├── 5m_trade.py              # BTC 5m up/down 策略交易服务（入口）
+├── btc_1s_market_monitor.py  # BTC + Polymarket 5m 逐秒采样监控（入口）
 ├── position_analyze.py      # 持仓分析主程序（入口）
 ├── btc_price_watcher.py     # BTC 价格监控服务（入口）
 ├── btc_volume_delta_service.py # BTC 15秒滑窗 Volume Delta 服务（入口）
@@ -60,6 +61,13 @@ auto_polymarket/
 ├── services/                # 业务逻辑层
 │   ├── position.py          # 持仓与挂单匹配、格式化
 │   └── market_sentiment.py  # 市场情绪与资金面聚合
+│   └── five_minute_trade/   # 5m_trade 领域模块（重构后）
+│       ├── models.py        # TradeRecord/OpenPosition/日志过滤器
+│       ├── watchers.py      # Binance/Polymarket WS 监听
+│       ├── entry_ops.py     # 开仓与市场 token 选择
+│       ├── execution_plans.py # 订单簿获取与执行质量评估
+│       ├── position_close_ops.py # 平仓与仓位确认流程
+│       └── reporting.py     # 盈亏报告统计与文本拼装
 ├── ai/                      # AI 分析层
 │   ├── researcher.py       # Gemini 持仓/月度策略分析
 │   └── prompts.py           # 提示词与 Schema
@@ -207,7 +215,7 @@ uv run 5m_trade.py \
 
 ```bash
 chmod +x scripts/restart_5m_trade.sh
-./scripts/restart_5m_trade.sh --dry-run 3 5 10 5.0 3600 0.80 0.15 -0.20
+./scripts/restart_5m_trade.sh --dry-run 3 5 10 5.0 3600 0.80 0.15 -0.20 60
 ```
 
 参数说明：
@@ -220,18 +228,34 @@ chmod +x scripts/restart_5m_trade.sh
 - `--max-entry-price`：允许开仓的最高 best ask 价格（默认 `0.80`）
 - `--take-profit-spread`：止盈价差（相对买入价，默认 `0.15`）
 - `--stop-loss-spread`：止损价差（相对买入价，默认 `-0.20`）
+- `--min-hold-before-close-sec`：最短持仓保护时间（秒，默认 `5`，`0` 表示关闭保护）
 
 重启脚本参数顺序：
 
 ```bash
-./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread]
+./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec]
 ```
+
+说明：
+- 若未传最后一个参数，`restart_5m_trade.sh` 默认 `min_hold_before_close_sec=60`（脚本侧默认），与 `5m_trade.py` 直接运行默认值 `5` 不同。
 
 切换实盘：
 
 ```bash
-./scripts/restart_5m_trade.sh --live 3 5 10 5.0 3600 0.80 0.15 -0.20
+./scripts/restart_5m_trade.sh --live 3 5 10 5.0 3600 0.80 0.15 -0.20 60
 ```
+
+#### 5m_trade 模块化说明（重构后）
+
+`5m_trade.py` 保留策略编排与入口逻辑，核心子能力拆分到 `services/five_minute_trade/`：
+
+- `watchers.py`：Binance/Polymarket WebSocket 监听
+- `entry_ops.py`：建仓链路与市场选择
+- `execution_plans.py`：订单簿读取、滑点评估、成交计划日志
+- `position_close_ops.py`：平仓提交、快慢通道对账、残仓恢复
+- `reporting.py`：每小时/累计统计计算与报告文本生成
+
+`btc_1s_market_monitor.py` 已直接依赖 `services.five_minute_trade.watchers.PolymarketAssetPriceWatcher`，不再通过动态加载 `5m_trade.py` 获取 watcher 类。
 
 #### 运行 BTC + Polymarket 逐秒监控（DuckDB）
 
