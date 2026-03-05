@@ -1623,15 +1623,24 @@ class FiveMinuteUpDownTrader:
         exit_avg_fill_price: Optional[float] = None,
         exit_full_fill: Optional[bool] = None,
         order_id: Optional[str] = None,
-        delay_sec: int = 3,
+        match_check_delay_sec: int = 3,
+        balance_check_delay_sec: int = 5,
     ) -> None:
         def _run() -> None:
+            start_ts = time.monotonic()
+
+            def _sleep_until(offset_sec: int) -> None:
+                remain = float(offset_sec) - (time.monotonic() - start_ts)
+                if remain > 0:
+                    time.sleep(remain)
+
             order_detail: Optional[Dict[str, Any]] = None
             matched_raw = 0.0
             actual_exit_price = None
             order_status = ""
 
             if order_id:
+                _sleep_until(match_check_delay_sec)
                 try:
                     order_detail = get_order_detail(order_id)
                     if isinstance(order_detail, dict):
@@ -1678,8 +1687,11 @@ class FiveMinuteUpDownTrader:
                 except Exception as e:
                     logger.warning("快通道查询订单状态失败，降级到慢通道: %s", e)
 
-            logger.info("快通道未确认完全成交 (可能发生部分成交/撤单)，等待 %ss 后启动慢通道余额复核...", delay_sec)
-            time.sleep(max(0, delay_sec))
+            logger.info(
+                "快通道未确认完全成交 (可能发生部分成交/撤单)，将在下单后第 %ss 启动慢通道余额复核...",
+                balance_check_delay_sec,
+            )
+            _sleep_until(balance_check_delay_sec)
 
             market_info = self._market_cache.get(closed_position.market_slug) or {}
             market_meta = market_info.get("market_meta") or {}
@@ -1723,7 +1735,7 @@ class FiveMinuteUpDownTrader:
                     sold_by_balance,
                     matched_raw,
                     raw_balance,
-                    delay_sec,
+                    balance_check_delay_sec,
                     reason,
                 )
 
@@ -2005,17 +2017,18 @@ class FiveMinuteUpDownTrader:
 
         if not self.dry_run:
             # --- 新增核心：根据平仓原因，设置强平滑点 (人造 FAK 机制) ---
-            # 获取当前最悲观的价格：在 WS 报警价和订单簿买一价中取最低者
-            current_bid = min(
-                pos.last_best_bid if pos.last_best_bid else exit_price,
-                exit_price
-            )
-
             if reason in {"sl", "sl_direction_change", "sl_residual"}:
+                # 止损场景优先保守，取 WS 报价与盘口评估中的较低值
+                current_bid = min(
+                    pos.last_best_bid if pos.last_best_bid else exit_price,
+                    exit_price,
+                )
                 # 止损逃命 或 处理残仓：核弹级滑点，无脑往下砸 0.05 刀 (5 美分)
                 # 哪怕盘口只剩 0.34，你发 0.29 的卖单，引擎依然会按最优价给你成交，绝不挂单！
-                sweep_price = max(0.01, float(current_bid) - 0.05) 
+                sweep_price = max(0.01, float(current_bid) - 0.05)
             else:
+                # 止盈/到期等非止损场景，直接基于盘口评估价做微让利，避免被旧报警价拖低
+                current_bid = exit_price
                 # 止盈让利：往下让利 0.02 刀，确保瞬间吃透微小波动
                 sweep_price = max(0.01, float(current_bid) - 0.01)
                 
@@ -2033,14 +2046,24 @@ class FiveMinuteUpDownTrader:
             self._record_latency("sell_submit", submit_ms)
             if not order_id:
                 logger.warning(
-                    "平仓卖单提交失败，恢复持仓等待下一次平仓: market=%s token=%s price=%.4f size=%.4f",
+                    "平仓卖单提交失败，转入慢通道余额复核: market=%s token=%s price=%.4f size=%.4f",
                     pos.market_id,
                     pos.token_id,
                     sweep_price,
                     target_close_size,
                 )
-                pos.last_best_bid = sweep_price
-                self.position = pos
+                self._schedule_post_close_balance_check(
+                    closed_position=pos,
+                    reason=f"{reason}_submit_fail",
+                    target_close_size=target_close_size,
+                    expected_exit_price=exit_price,
+                    exit_best_bid=exit_best_bid,
+                    exit_avg_fill_price=exit_avg_fill_price,
+                    exit_full_fill=exit_full_fill,
+                    order_id=None,
+                    match_check_delay_sec=3,
+                    balance_check_delay_sec=5,
+                )
                 close_ms = (time.perf_counter() - close_t0) * 1000
                 self._record_latency("close_total", close_ms)
                 logger.info(
@@ -2064,7 +2087,8 @@ class FiveMinuteUpDownTrader:
                     exit_avg_fill_price=exit_avg_fill_price,
                     exit_full_fill=exit_full_fill,
                     order_id=order_id,
-                    delay_sec=3,
+                    match_check_delay_sec=3,
+                    balance_check_delay_sec=5,
                 )
         elif self.dry_run:
             dry_run_exit = exit_price
