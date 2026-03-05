@@ -1268,8 +1268,15 @@ class FiveMinuteUpDownTrader:
 
     def _open_position(self, market_slug: str, direction: str) -> None:
         if self.position is not None:
+            if self.position.market_slug != market_slug:
+                logger.warning(
+                    "检测到历史持仓，清空本地持仓后继续开仓: local_market=%s target_market=%s",
+                    self.position.market_slug,
+                    market_slug,
+                )
+                self.position = None
             # 余额已确认且为 0 时，说明链上已无可卖仓位，清理本地残留持仓并允许继续开仓
-            if self.position.balance_confirmed and self.position.size <= 0:
+            elif self.position.balance_confirmed and self.position.size <= 0.02:
                 logger.warning(
                     "检测到零仓位残留，清理后继续开仓: %s",
                     self.position,
@@ -2004,7 +2011,7 @@ class FiveMinuteUpDownTrader:
                 exit_price
             )
 
-            if reason in {"sl", "sl_direction_change", "expiry", "sl_residual", "tp_residual"}:
+            if reason in {"sl", "sl_direction_change", "sl_residual"}:
                 # 止损逃命 或 处理残仓：核弹级滑点，无脑往下砸 0.05 刀 (5 美分)
                 # 哪怕盘口只剩 0.34，你发 0.29 的卖单，引擎依然会按最优价给你成交，绝不挂单！
                 sweep_price = max(0.01, float(current_bid) - 0.05) 

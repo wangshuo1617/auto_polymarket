@@ -10,7 +10,7 @@ MODE="${1:---live}"
 ENTRY_MINUTE="${2:-2}"
 ENTRY_PRECLOSE_SEC="${3:-6}"
 MIN_DIRECTION_DIFF="${4:-10}"
-STAKE_USD="${5:-5.0}"
+STAKE_USD="${5:-2.0}"
 REPORT_INTERVAL_SEC="${6:-3600}"
 MAX_ENTRY_PRICE="${7:-0.80}"
 TAKE_PROFIT_SPREAD="${8:-0.15}"
@@ -123,9 +123,9 @@ CMD=(
 )
 
 if [ "$MODE" = "--live" ]; then
-  nohup "${CMD[@]}" > "$LOG_FILE" 2>&1 &
+  nohup "${CMD[@]}" >> "$LOG_FILE" 2>&1 &
 else
-  nohup "${CMD[@]}" --dry-run > "$LOG_FILE" 2>&1 &
+  nohup "${CMD[@]}" --dry-run >> "$LOG_FILE" 2>&1 &
 fi
 
 NEW_PID=$!
