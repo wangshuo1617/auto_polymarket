@@ -62,6 +62,9 @@ case "$CMD" in
   schema)
     run_sql "DESCRIBE btc_poly_1s_ticks"
     ;;
+  num)
+    run_sql "SELECT COUNT(*) FROM btc_poly_1s_ticks"
+    ;;
   latest)
     N="${ARG3:-20}"
     if ! [[ "$N" =~ ^[0-9]+$ ]]; then

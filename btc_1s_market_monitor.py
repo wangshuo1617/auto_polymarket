@@ -2,7 +2,7 @@
 BTC 与 Polymarket 5m 市场逐秒监控服务。
 
 目标：
-1. 使用 Binance WS 实时维护 BTC 价格；
+1. 使用 Polymarket RTDS（Chainlink 源）实时维护 BTC 价格；
 2. 进入每个 5m Polymarket 市场后，使用 WS 实时维护 up/down 双边盘口 best bid/ask；
 3. 每秒对齐采样一条记录，写入 DuckDB（高吞吐、便于后续分析）。
 """
@@ -19,9 +19,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from btc_price_watcher import BTCPriceWatcher
 from data.polymarket import get_event_token_id
-from services.five_minute_trade.watchers import PolymarketAssetPriceWatcher
+from services.five_minute_trade.watchers import (
+	ChainlinkBTCPriceWatcher,
+	PolymarketAssetPriceWatcher,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -195,9 +197,8 @@ class BTC1sMarketMonitor:
 		self._sampler_thread: Optional[threading.Thread] = None
 
 		self._writer = DuckDBBatchWriter(db_path=self.db_path)
-		self._btc_watcher = BTCPriceWatcher(
+		self._btc_watcher = ChainlinkBTCPriceWatcher(
 			symbol=self.symbol,
-			stream_type="bookTicker",
 			callback=self._on_btc_price,
 		)
 		self._poly_watcher: Optional[PolymarketAssetPriceWatcher] = None

@@ -9,6 +9,272 @@ from websocket import WebSocketApp
 logger = logging.getLogger(__name__)
 
 
+class ChainlinkBTCPriceWatcher:
+    """通过 Polymarket RTDS 的 Chainlink 源订阅 BTC/USD 实时价格。"""
+
+    WS_URL = "wss://ws-live-data.polymarket.com"
+    TOPIC = "crypto_prices_chainlink"
+
+    def __init__(
+        self,
+        symbol: str = "btcusdt",
+        callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
+        self.symbol = symbol.lower()
+        self.chainlink_symbol = self._to_chainlink_symbol(self.symbol)
+        self.callback = callback
+        self.ws: Optional[WebSocketApp] = None
+        self._thread: Optional[threading.Thread] = None
+        self._ping_thread: Optional[threading.Thread] = None
+        self.running = False
+        self.last_price: Optional[float] = None
+        self.last_update_time: Optional[float] = None
+
+    @staticmethod
+    def _to_chainlink_symbol(symbol: str) -> str:
+        mapping = {
+            "btcusdt": "btc/usd",
+            "ethusdt": "eth/usd",
+            "solusdt": "sol/usd",
+            "xrpusdt": "xrp/usd",
+        }
+        return mapping.get(symbol.lower(), "btc/usd")
+
+    @staticmethod
+    def _to_float(value: object) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            parsed = float(str(value))
+            if parsed <= 0:
+                return None
+            return parsed
+        except Exception:
+            return None
+
+    def _send_ping_loop(self) -> None:
+        while self.running:
+            try:
+                if self.ws:
+                    self.ws.send("PING")
+            except Exception as e:
+                logger.debug("发送 Chainlink RTDS ping 异常: %s", e)
+            time.sleep(5)
+
+    def _on_open(self, ws: WebSocketApp) -> None:
+        filters = json.dumps({"symbol": self.chainlink_symbol}, separators=(",", ":"))
+        subscribe_msg = {
+            "action": "subscribe",
+            "subscriptions": [
+                {
+                    "topic": self.TOPIC,
+                    "type": "*",
+                    "filters": filters,
+                }
+            ],
+        }
+        logger.info(
+            "Chainlink RTDS 已连接，订阅 symbol=%s (%s)",
+            self.symbol,
+            self.chainlink_symbol,
+        )
+        try:
+            ws.send(json.dumps(subscribe_msg))
+        except Exception as e:
+            logger.error("发送 Chainlink RTDS 订阅失败: %s", e)
+
+    def _on_message(self, ws: WebSocketApp, message: str) -> None:
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            return
+
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    self._handle_payload(item)
+            return
+
+        if isinstance(data, dict):
+            self._handle_payload(data)
+
+    def _handle_payload(self, message: Dict[str, Any]) -> None:
+        if str(message.get("topic", "")).lower() != self.TOPIC:
+            return
+        payload = message.get("payload") or {}
+        if not isinstance(payload, dict):
+            return
+
+        symbol = str(payload.get("symbol") or "").lower()
+        if symbol and symbol != self.chainlink_symbol:
+            return
+
+        price = self._to_float(payload.get("value"))
+        if price is None:
+            return
+
+        raw_ts = payload.get("timestamp")
+        try:
+            event_ms = int(raw_ts) if raw_ts is not None else int(message.get("timestamp"))
+        except Exception:
+            event_ms = int(time.time() * 1000)
+
+        now_ts = time.time()
+        self.last_price = price
+        self.last_update_time = now_ts
+
+        if self.callback is None:
+            return
+
+        self.callback(
+            {
+                "symbol": self.symbol,
+                "chainlink_symbol": self.chainlink_symbol,
+                "last_price": price,
+                "mid_price": price,
+                "timestamp": event_ms,
+                "update_time": now_ts,
+                "source": "chainlink_rtds",
+            }
+        )
+
+    def _on_error(self, ws: WebSocketApp, error: Exception) -> None:
+        logger.error("Chainlink RTDS 错误: %s", error)
+
+    def _on_close(
+        self,
+        ws: WebSocketApp,
+        close_status_code: Optional[int],
+        close_msg: Optional[str],
+    ) -> None:
+        logger.warning(
+            "Chainlink RTDS 连接关闭: code=%s msg=%s", close_status_code, close_msg
+        )
+        self.ws = None
+
+    def _run_ws(self) -> None:
+        while self.running:
+            try:
+                self.ws = WebSocketApp(
+                    self.WS_URL,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as e:
+                logger.error("Chainlink RTDS 运行异常: %s", e)
+            finally:
+                if self.running:
+                    time.sleep(3)
+
+    def start(self) -> None:
+        if self.running:
+            logger.warning("ChainlinkBTCPriceWatcher 已在运行中")
+            return
+        self.running = True
+        self._thread = threading.Thread(target=self._run_ws, daemon=True)
+        self._thread.start()
+        self._ping_thread = threading.Thread(target=self._send_ping_loop, daemon=True)
+        self._ping_thread.start()
+
+    def stop(self) -> None:
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+
+
+class ChainlinkKline1mWatcher:
+    """基于 Chainlink 逐笔价格流聚合 1m K 线，并按 Binance kline 字段回调。"""
+
+    MINUTE_MS = 60 * 1000
+
+    def __init__(
+        self,
+        symbol: str = "btcusdt",
+        callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
+        self.callback = callback
+        self._price_watcher = ChainlinkBTCPriceWatcher(symbol=symbol, callback=self._on_price)
+
+        self._curr_open_time_ms: Optional[int] = None
+        self._curr_open: Optional[float] = None
+        self._curr_high: Optional[float] = None
+        self._curr_low: Optional[float] = None
+        self._curr_close: Optional[float] = None
+
+    def _emit_kline(self, event_time_ms: int, is_closed: bool) -> None:
+        if self.callback is None or self._curr_open_time_ms is None:
+            return
+        if self._curr_open is None or self._curr_high is None or self._curr_low is None or self._curr_close is None:
+            return
+
+        kline = {
+            "open_time": self._curr_open_time_ms,
+            "close_time": self._curr_open_time_ms + self.MINUTE_MS,
+            "open": float(self._curr_open),
+            "high": float(self._curr_high),
+            "low": float(self._curr_low),
+            "close": float(self._curr_close),
+            "is_closed": bool(is_closed),
+            "event_time": int(event_time_ms),
+        }
+        try:
+            self.callback(kline)
+        except Exception as e:
+            logger.error("ChainlinkKline1mWatcher 回调异常: %s", e)
+
+    def _on_price(self, payload: Dict[str, Any]) -> None:
+        price = payload.get("mid_price")
+        if price is None:
+            price = payload.get("last_price")
+        if price is None:
+            return
+
+        try:
+            parsed_price = float(price)
+        except Exception:
+            return
+
+        event_time_ms = int(payload.get("timestamp") or int(time.time() * 1000))
+        minute_open_time_ms = (event_time_ms // self.MINUTE_MS) * self.MINUTE_MS
+
+        if self._curr_open_time_ms is None:
+            self._curr_open_time_ms = minute_open_time_ms
+            self._curr_open = parsed_price
+            self._curr_high = parsed_price
+            self._curr_low = parsed_price
+            self._curr_close = parsed_price
+            self._emit_kline(event_time_ms=event_time_ms, is_closed=False)
+            return
+
+        if minute_open_time_ms != self._curr_open_time_ms:
+            self._emit_kline(event_time_ms=event_time_ms, is_closed=True)
+            self._curr_open_time_ms = minute_open_time_ms
+            self._curr_open = parsed_price
+            self._curr_high = parsed_price
+            self._curr_low = parsed_price
+            self._curr_close = parsed_price
+            self._emit_kline(event_time_ms=event_time_ms, is_closed=False)
+            return
+
+        self._curr_high = max(float(self._curr_high), parsed_price)
+        self._curr_low = min(float(self._curr_low), parsed_price)
+        self._curr_close = parsed_price
+        self._emit_kline(event_time_ms=event_time_ms, is_closed=False)
+
+    def start(self) -> None:
+        self._price_watcher.start()
+
+    def stop(self) -> None:
+        self._price_watcher.stop()
+
+
 class BinanceKline1mWatcher:
     """订阅 BTCUSDT@kline_1m，回调在 K 线更新与收盘时都触发。"""
 

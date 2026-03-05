@@ -13,13 +13,20 @@ from .position_close_ops import (
     schedule_post_close_balance_check,
 )
 from .reporting import build_pnl_report_content_and_subject
-from .watchers import BinanceKline1mWatcher, PolymarketAssetPriceWatcher
+from .watchers import (
+    BinanceKline1mWatcher,
+    ChainlinkBTCPriceWatcher,
+    ChainlinkKline1mWatcher,
+    PolymarketAssetPriceWatcher,
+)
 
 __all__ = [
     "ProjectDiagFilter",
     "OpenPosition",
     "TradeRecord",
     "BinanceKline1mWatcher",
+    "ChainlinkBTCPriceWatcher",
+    "ChainlinkKline1mWatcher",
     "PolymarketAssetPriceWatcher",
     "select_market_and_tokens",
     "open_position",

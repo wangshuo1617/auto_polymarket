@@ -2,7 +2,7 @@
 BTC 5m up/down 策略交易服务
 
 功能：
-1. 通过 Binance WebSocket 订阅 BTCUSDT 1m K 线（含未收盘增量），按 5 分钟窗口切片；
+1. 通过 Polymarket RTDS（Chainlink 数据源）订阅 BTC/USD 价格并聚合为 1m K 线（含未收盘增量），按 5 分钟窗口切片；
 2. 对每个 5 分钟窗口：
     - 记录窗口开盘价（第一根 1m K 线开盘价）；
      - 在配置的第 N 分钟（1-4）1m K 线收盘前 5 秒，基于当前价格预判收盘方向（up / down），
@@ -48,7 +48,7 @@ from services.five_minute_trade.position_close_ops import (
 )
 from services.five_minute_trade.reporting import build_pnl_report_content_and_subject
 from services.five_minute_trade.watchers import (
-    BinanceKline1mWatcher,
+    ChainlinkKline1mWatcher,
     PolymarketAssetPriceWatcher,
 )
 
@@ -106,7 +106,7 @@ class FiveMinuteUpDownTrader:
         self.min_hold_before_close_sec = int(min_hold_before_close_sec)
 
         self._lock = threading.RLock()
-        self._binance = BinanceKline1mWatcher(callback=self._on_kline)
+        self._binance = ChainlinkKline1mWatcher(callback=self._on_kline)
         self._poly_watcher: Optional[PolymarketAssetPriceWatcher] = None
         self._window_book_watcher: Optional[PolymarketAssetPriceWatcher] = None
 
