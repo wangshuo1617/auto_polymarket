@@ -405,13 +405,19 @@ def force_close_position(trader: Any, reason: str) -> None:
         return
 
     hold_seconds = (datetime.now(timezone.utc) - self.position.entry_time).total_seconds()
-    if (hold_seconds < self.min_hold_before_close_sec) and (reason == "sl"):
-        logger.info(
-            "平仓保护期生效，暂不平仓: reason=%s hold=%.2fs need>=%.2fs",
-            reason,
-            hold_seconds,
-            float(self.min_hold_before_close_sec),
-        )
+    min_hold = float(self.min_hold_before_close_sec)
+    # 给边界比较留出极小浮点余量，避免日志显示 60.00s 仍被判定未达保护期。
+    if (reason == "sl") and (hold_seconds + 1e-6 < min_hold):
+        if self._should_emit_log(
+            key=f"close_protection:{self.position.market_slug}:{self.position.token_id}:{reason}",
+            interval_sec=10.0,
+        ):
+            logger.info(
+                "平仓保护期生效，暂不平仓: reason=%s hold=%.2fs need>=%.2fs",
+                reason,
+                hold_seconds,
+                min_hold,
+            )
         return
 
     close_t0 = time.perf_counter()

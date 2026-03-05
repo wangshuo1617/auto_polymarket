@@ -643,11 +643,15 @@ class FiveMinuteUpDownTrader:
             self.position.last_best_bid = best_bid
 
             if best_bid <= self.position.stop_loss_price:
-                logger.info(
-                    "触发价格止损: best_bid=%.4f SL=%.4f",
-                    best_bid,
-                    self.position.stop_loss_price,
-                )
+                if self._should_emit_log(
+                    key=f"sl_trigger:{self.position.market_slug}:{self.position.token_id}",
+                    interval_sec=2.0,
+                ):
+                    logger.info(
+                        "触发价格止损: best_bid=%.4f SL=%.4f",
+                        best_bid,
+                        self.position.stop_loss_price,
+                    )
                 self._force_close_position(reason="sl")
                 return
 
