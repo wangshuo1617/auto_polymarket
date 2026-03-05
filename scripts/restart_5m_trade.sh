@@ -16,7 +16,7 @@ MAX_ENTRY_PRICE="${7:-0.80}"
 TAKE_PROFIT_SPREAD="${8:-0.15}"
 STOP_LOSS_SPREAD="${9:--0.20}"
 MIN_HOLD_BEFORE_CLOSE_SEC="${10:-60}"
-LOG_FILE="logs/5m_trade.log"
+LOG_FILE="logs/5m_trade.stdout.log"
 PID_FILE="logs/5m_trade.pid"
 
 mkdir -p logs
@@ -137,8 +137,10 @@ if ps -p "$NEW_PID" > /dev/null 2>&1; then
   echo "✅ 5m_trade 启动成功"
   echo "PID: $NEW_PID"
   echo "PID 文件: $PID_FILE"
-  echo "日志文件: $LOG_FILE"
-  echo "查看日志: tail -f $LOG_FILE"
+  echo "业务日志(轮转): logs/5m_trade.log"
+  echo "诊断日志(轮转): logs/5m_trade_diag.log"
+  echo "进程输出日志: $LOG_FILE"
+  echo "查看业务日志: tail -f logs/5m_trade.log"
 else
   echo "❌ 5m_trade 启动失败，请检查日志: $LOG_FILE"
   exit 1

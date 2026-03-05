@@ -316,12 +316,19 @@ def prefetch_order_metadata_for_tokens(
 
 
 def _http_keepalive_loop(interval_sec: int) -> None:
+    ping_count = 0
     while True:
         try:
             ping_t0 = time.perf_counter()
             client.get_server_time()
             ping_ms = (time.perf_counter() - ping_t0) * 1000
-            logger.info("clob_http_keepalive ping ok: latency=%.2fms", ping_ms)
+            ping_count += 1
+            if ping_count % 30 == 1:
+                logger.debug(
+                    "clob_http_keepalive ping ok: latency=%.2fms sample=%s/30",
+                    ping_ms,
+                    ping_count % 30,
+                )
         except Exception as e:
             logger.warning("clob_http_keepalive ping failed: %s", e)
         time.sleep(max(5, interval_sec))

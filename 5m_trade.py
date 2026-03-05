@@ -21,10 +21,12 @@ BTC 5m up/down 策略交易服务
 import argparse
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from typing import Any, Callable, Dict, List, Optional
 
 from websocket import WebSocketApp
@@ -45,6 +47,25 @@ from data.polymarket import (
 from notifications.email import EmailSender
 
 logger = logging.getLogger(__name__)
+
+
+class _ProjectDiagFilter(logging.Filter):
+    _PROJECT_PREFIXES = (
+        "__main__",
+        "data",
+        "services",
+        "notifications",
+        "ai",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        name = record.name or ""
+        return any(
+            name == prefix or name.startswith(f"{prefix}.")
+            for prefix in self._PROJECT_PREFIXES
+        )
 
 
 @dataclass
@@ -450,6 +471,7 @@ class FiveMinuteUpDownTrader:
     TOXIC_UTC_HOURS = {16, 19, 20}
     WS_BOOK_MAX_AGE_MS = 1200
     MIN_HOLD_BEFORE_CLOSE_SEC = 5
+    REPEATED_LOG_THROTTLE_SEC = 10.0
 
     def __init__(
         self,
@@ -518,6 +540,20 @@ class FiveMinuteUpDownTrader:
             "sell_ws": 0,
             "sell_http": 0,
         }
+        self._log_throttle_last_ts: Dict[str, float] = {}
+
+    def _should_emit_log(self, key: str, interval_sec: Optional[float] = None) -> bool:
+        interval = (
+            float(interval_sec)
+            if interval_sec is not None
+            else float(self.REPEATED_LOG_THROTTLE_SEC)
+        )
+        now = time.monotonic()
+        last_ts = self._log_throttle_last_ts.get(key)
+        if last_ts is not None and (now - last_ts) < interval:
+            return False
+        self._log_throttle_last_ts[key] = now
+        return True
 
     def _record_latency(self, metric: str, value_ms: float) -> None:
         if value_ms < 0:
@@ -708,14 +744,14 @@ class FiveMinuteUpDownTrader:
                     self._book_source_counts[source_key] = (
                         self._book_source_counts.get(source_key, 0) + 1
                     )
-                    logger.info(
+                    logger.debug(
                         "订单簿来源: side=%s token=%s source=ws_book snapshot_age=%.2fms",
                         side,
                         token_id,
                         float(age_ms),
                     )
             else:
-                logger.info(
+                logger.debug(
                     "订单簿WS快照过期，回退HTTP: side=%s token=%s snapshot_age=%.2fms threshold=%.2fms",
                     side,
                     token_id,
@@ -723,7 +759,7 @@ class FiveMinuteUpDownTrader:
                     float(self.WS_BOOK_MAX_AGE_MS),
                 )
         else:
-            logger.info(
+            logger.debug(
                 "订单簿无WS快照，回退HTTP: side=%s token=%s",
                 side,
                 token_id,
@@ -740,7 +776,7 @@ class FiveMinuteUpDownTrader:
             )
             if book is None:
                 raise RuntimeError("订单簿为空")
-            logger.info(
+            logger.debug(
                 "订单簿获取耗时: side=%s token=%s latency=%.2fms source=http",
                 side,
                 token_id,
@@ -1199,7 +1235,11 @@ class FiveMinuteUpDownTrader:
             != str(self.current_window_start_ms // 1000)
         ):
             return
-        logger.info("第 5 分钟收盘，强制平仓当前持仓")
+        if self._should_emit_log(
+            key=f"minute5_expiry:{self.position.market_slug}:{self.position.token_id}",
+            interval_sec=2.0,
+        ):
+            logger.info("第 5 分钟收盘，强制平仓当前持仓")
         self._force_close_position(reason="expiry")
 
     def _select_market_and_tokens(
@@ -1950,27 +1990,32 @@ class FiveMinuteUpDownTrader:
                 side="sell",
                 target_size=pos.size,
             )
+            emit_close_detail_log = self._should_emit_log(
+                key=f"close_detail:{pos.market_slug}:{pos.token_id}:{reason}",
+                interval_sec=10.0,
+            )
             bid_prices = sell_plan.get("level_prices_preview") or []
-            if bid_prices:
+            if bid_prices and emit_close_detail_log:
                 logger.info(
                     "平仓买单价格(按高到低, 前10档): %s",
                     ",".join(f"{float(price):.4f}" for price in bid_prices),
                 )
-            self._log_execution_plan(
-                stage=f"平仓[{reason}]",
-                market_slug=pos.market_slug,
-                token_id=pos.token_id,
-                plan=sell_plan,
-            )
-            logger.info(
-                "平仓价格观测: market=%s token=%s reason=%s source=%s best_from_levels=%.4f worst_fill=%.4f",
-                pos.market_slug,
-                pos.token_id,
-                reason,
-                str(sell_plan.get("book_source", "unknown")),
-                float(sell_plan["best_price"]),
-                float(sell_plan["worst_price"]),
-            )
+            if emit_close_detail_log:
+                self._log_execution_plan(
+                    stage=f"平仓[{reason}]",
+                    market_slug=pos.market_slug,
+                    token_id=pos.token_id,
+                    plan=sell_plan,
+                )
+                logger.info(
+                    "平仓价格观测: market=%s token=%s reason=%s source=%s best_from_levels=%.4f worst_fill=%.4f",
+                    pos.market_slug,
+                    pos.token_id,
+                    reason,
+                    str(sell_plan.get("book_source", "unknown")),
+                    float(sell_plan["best_price"]),
+                    float(sell_plan["worst_price"]),
+                )
             exit_best_bid = float(sell_plan["best_price"])
             exit_avg_fill_price = float(sell_plan["vwap_price"])
             exit_full_fill = bool(sell_plan.get("full_fill", False))
@@ -2450,6 +2495,49 @@ class FiveMinuteUpDownTrader:
             logger.error("盈亏报告邮件发送失败: %s", subject)
 
 
+def _configure_logging() -> None:
+    os.makedirs("logs", exist_ok=True)
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.handlers.clear()
+
+    trade_handler = RotatingFileHandler(
+        filename="logs/5m_trade.log",
+        maxBytes=50 * 1024 * 1024,
+        backupCount=10,
+        encoding="utf-8",
+    )
+    trade_handler.setLevel(logging.INFO)
+    trade_handler.setFormatter(formatter)
+
+    diag_handler = RotatingFileHandler(
+        filename="logs/5m_trade_diag.log",
+        maxBytes=30 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    diag_handler.setLevel(logging.DEBUG)
+    diag_handler.setFormatter(formatter)
+    diag_handler.addFilter(_ProjectDiagFilter())
+
+    root_logger.addHandler(trade_handler)
+    root_logger.addHandler(diag_handler)
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("websocket").setLevel(logging.WARNING)
+    logging.getLogger("hpack").setLevel(logging.WARNING)
+    logging.getLogger("h2").setLevel(logging.WARNING)
+    logging.getLogger("hyperframe").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="BTC 5m up/down 策略交易服务")
     parser.add_argument(
@@ -2514,11 +2602,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    _configure_logging()
     trader = FiveMinuteUpDownTrader(
         stake_usd=args.stake_usd,
         report_interval_sec=args.report_interval_sec,
