@@ -208,25 +208,11 @@ class FiveMinuteUpDownTrader:
         if not isinstance(order_detail, dict):
             return None
 
-        for key in ("avgPrice", "avg_price", "price"):
+        for key in ("avgPrice", "avg_price", "average_price"):
             price = self._to_positive_float(order_detail.get(key))
             if price is not None:
                 return price
-
-        taker = self._to_positive_float(
-            order_detail.get("takerAmount")
-            if order_detail.get("takerAmount") is not None
-            else order_detail.get("taker_amount")
-        )
-        maker = self._to_positive_float(
-            order_detail.get("makerAmount")
-            if order_detail.get("makerAmount") is not None
-            else order_detail.get("maker_amount")
-        )
-        if taker is not None and maker is not None and maker > 0:
-            ratio = taker / maker
-            if ratio > 0:
-                return ratio
+            
         return None
 
     def _compute_allocated_entry_cost(self, pos: OpenPosition, close_size: float) -> float:

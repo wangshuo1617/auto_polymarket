@@ -228,9 +228,13 @@ def schedule_post_close_balance_check(
                             actual_exit_price
                             if actual_exit_price is not None and actual_exit_price > 0
                             else (
-                                expected_exit_price
-                                if expected_exit_price is not None and expected_exit_price > 0
-                                else closed_position.entry_price
+                                exit_avg_fill_price    # <--- 这里是救命的关键，真实的吃单均价
+                                if exit_avg_fill_price is not None and exit_avg_fill_price > 0
+                                else (
+                                    expected_exit_price
+                                    if expected_exit_price is not None and expected_exit_price > 0
+                                    else closed_position.entry_price
+                                )
                             )
                         )
                         self._append_realized_trade(
