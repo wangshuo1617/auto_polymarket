@@ -100,13 +100,13 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         "--take-profit-spread",
         type=float,
         default=0.15,
-        help="止盈价差（相对买入价，默认 +0.15）",
+        help="兼容保留参数：当前使用动态止盈 TP值=min(0.15, 0.95-entry_price)",
     )
     parser.add_argument(
         "--stop-loss-spread",
         type=float,
         default=-0.20,
-        help="止损价差（相对买入价，默认 -0.20）",
+        help="兼容保留参数：当前使用动态止损 SL值=TP值*4/3",
     )
     parser.add_argument(
         "--min-hold-before-close-sec",
