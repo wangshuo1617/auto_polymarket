@@ -121,6 +121,8 @@ class SQLiteBatchWriter:
 	) -> None:
 		if not rows:
 			return
+		batch_created_at_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+		rows_with_created = [(*row, batch_created_at_utc) for row in rows]
 		conn.executemany(
 			"""
 			INSERT INTO btc_poly_1s_ticks (
@@ -141,10 +143,11 @@ class SQLiteBatchWriter:
 				down_best_bid,
 				down_best_ask,
 				down_event_ms,
-				down_age_ms
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				down_age_ms,
+				created_at_utc
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			""",
-			rows,
+			rows_with_created,
 		)
 		conn.commit()
 
