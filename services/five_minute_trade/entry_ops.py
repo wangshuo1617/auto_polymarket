@@ -248,6 +248,8 @@ def open_position(trader: Any, market_slug: str, direction: str) -> None:
         actual_entry_size=size,
         total_invested_usdc=float(plan["vwap_price"]) * size,
     )
+    self._persist_entry_event(position=self.position, order_id=order_id)
+
     if not self.dry_run:
         self._schedule_position_balance_confirmation(
             market_slug=market_slug,

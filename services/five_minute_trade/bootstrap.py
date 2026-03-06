@@ -4,6 +4,8 @@ import os
 from logging.handlers import RotatingFileHandler
 from typing import Any, Type
 
+from config import SQLITE_DB_PATH
+
 from .models import ProjectDiagFilter
 
 
@@ -112,6 +114,12 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         default=5,
         help="最短持仓保护时间（秒，默认 5；0 表示关闭保护）",
     )
+    parser.add_argument(
+        "--trade-db-path",
+        type=str,
+        default=SQLITE_DB_PATH,
+        help="交易事件SQLite文件路径（默认读取 config.SQLITE_DB_PATH）",
+    )
     return parser
 
 
@@ -126,5 +134,6 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         take_profit_spread=args.take_profit_spread,
         stop_loss_spread=args.stop_loss_spread,
         min_hold_before_close_sec=args.min_hold_before_close_sec,
+        trade_db_path=args.trade_db_path,
         dry_run=args.dry_run,
     )

@@ -11,5 +11,8 @@ SMTP_PORT = os.getenv("SMTP_PORT")
 FROM_EMAIL = os.getenv("FROM_EMAIL")
 FROM_EMAIL_PASSWORD = os.getenv("FROM_EMAIL_PASSWORD")
 
+# Shared SQLite database path used by 5m_trade and btc_1s_market_monitor.
+SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "logs/trade.sqlite3")
+
 REPORT_INTERVAL = 3600
 GEMINI_MODEL_ID = "gemini-3-flash-preview"#"gemini-3.1-pro-preview"

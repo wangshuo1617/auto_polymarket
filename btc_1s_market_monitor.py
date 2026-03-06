@@ -4,20 +4,21 @@ BTC 与 Polymarket 5m 市场逐秒监控服务。
 目标：
 1. 使用 Polymarket RTDS（Chainlink 源）实时维护 BTC 价格；
 2. 进入每个 5m Polymarket 市场后，使用 WS 实时维护 up/down 双边盘口 best bid/ask；
-3. 每秒对齐采样一条记录，写入 DuckDB（高吞吐、便于后续分析）。
+3. 每秒对齐采样一条记录，写入 SQLite（与 5m_trade 共用数据库，不同数据表）。
 """
 
 import argparse
 import logging
 import os
 import queue
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import duckdb
+from config import SQLITE_DB_PATH
 
 from data.polymarket import get_event_token_id
 from services.five_minute_trade.watchers import (
@@ -36,7 +37,7 @@ class PriceBookState:
 	received_ms: Optional[int] = None
 
 
-class DuckDBBatchWriter:
+class SQLiteBatchWriter:
 	def __init__(
 		self,
 		db_path: str,
@@ -72,31 +73,35 @@ class DuckDBBatchWriter:
 		try:
 			self._queue.put(row, timeout=1)
 		except queue.Full:
-			logger.warning("DuckDB 写入队列已满，丢弃 1 条记录")
+			logger.warning("SQLite 写入队列已满，丢弃 1 条记录")
 
-	def _init_db(self, conn: duckdb.DuckDBPyConnection) -> None:
-		conn.execute("PRAGMA threads=4")
+	def _init_db(self, conn: sqlite3.Connection) -> None:
+		conn.execute("PRAGMA journal_mode=WAL;")
+		conn.execute("PRAGMA synchronous=NORMAL;")
+		conn.execute("PRAGMA busy_timeout=5000;")
+		conn.execute("PRAGMA temp_store=MEMORY;")
 		conn.execute(
 			"""
 			CREATE TABLE IF NOT EXISTS btc_poly_1s_ticks (
-				ts_sec BIGINT,
-				ts_utc VARCHAR,
-				market_slug VARCHAR,
-				window_start_ms BIGINT,
-				window_start_utc VARCHAR,
-				btc_price DOUBLE,
-				btc_event_ms BIGINT,
-				btc_age_ms BIGINT,
-				up_token VARCHAR,
-				down_token VARCHAR,
-				up_best_bid DOUBLE,
-				up_best_ask DOUBLE,
-				up_event_ms BIGINT,
-				up_age_ms BIGINT,
-				down_best_bid DOUBLE,
-				down_best_ask DOUBLE,
-				down_event_ms BIGINT,
-				down_age_ms BIGINT,
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				ts_sec INTEGER NOT NULL,
+				ts_utc TEXT NOT NULL,
+				market_slug TEXT NOT NULL,
+				window_start_ms INTEGER NOT NULL,
+				window_start_utc TEXT NOT NULL,
+				btc_price REAL,
+				btc_event_ms INTEGER,
+				btc_age_ms INTEGER,
+				up_token TEXT,
+				down_token TEXT,
+				up_best_bid REAL,
+				up_best_ask REAL,
+				up_event_ms INTEGER,
+				up_age_ms INTEGER,
+				down_best_bid REAL,
+				down_best_ask REAL,
+				down_event_ms INTEGER,
+				down_age_ms INTEGER,
 				created_at_utc TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 			)
 			"""
@@ -107,10 +112,11 @@ class DuckDBBatchWriter:
 		conn.execute(
 			"CREATE INDEX IF NOT EXISTS idx_btc_poly_1s_ticks_market ON btc_poly_1s_ticks(market_slug)"
 		)
+		conn.commit()
 
 	def _flush_rows(
 		self,
-		conn: duckdb.DuckDBPyConnection,
+		conn: sqlite3.Connection,
 		rows: List[Tuple[Any, ...]],
 	) -> None:
 		if not rows:
@@ -140,9 +146,15 @@ class DuckDBBatchWriter:
 			""",
 			rows,
 		)
+		conn.commit()
 
 	def _run(self) -> None:
-		conn = duckdb.connect(self.db_path)
+		conn = sqlite3.connect(
+			self.db_path,
+			timeout=5.0,
+			check_same_thread=False,
+			isolation_level=None,
+		)
 		self._init_db(conn)
 		buffer: List[Tuple[Any, ...]] = []
 		last_flush = time.time()
@@ -186,7 +198,7 @@ class BTC1sMarketMonitor:
 
 	def __init__(
 		self,
-		db_path: str = "logs/btc_poly_1s.duckdb",
+		db_path: str = SQLITE_DB_PATH,
 		symbol: str = "btcusdt",
 	) -> None:
 		self.db_path = db_path
@@ -196,7 +208,7 @@ class BTC1sMarketMonitor:
 		self._running = False
 		self._sampler_thread: Optional[threading.Thread] = None
 
-		self._writer = DuckDBBatchWriter(db_path=self.db_path)
+		self._writer = SQLiteBatchWriter(db_path=self.db_path)
 		self._btc_watcher = ChainlinkBTCPriceWatcher(
 			symbol=self.symbol,
 			callback=self._on_btc_price,
@@ -369,7 +381,7 @@ class BTC1sMarketMonitor:
 			up_idx = next((i for i, x in enumerate(outcomes) if "up" in x), 0)
 			down_idx = next((i for i, x in enumerate(outcomes) if "down" in x), 1)
 
-			result = {
+			result: Dict[str, Optional[str]] = {
 				"up_token": str(token_ids[up_idx]),
 				"down_token": str(token_ids[down_idx]),
 			}
@@ -465,8 +477,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="BTC 与 Polymarket 5m 市场逐秒监控")
 	parser.add_argument(
 		"--db-path",
-		default="logs/btc_poly_1s.duckdb",
-		help="DuckDB 文件路径（默认: logs/btc_poly_1s.duckdb）",
+		default=SQLITE_DB_PATH,
+		help="SQLite 文件路径（默认读取 config.SQLITE_DB_PATH）",
 	)
 	parser.add_argument(
 		"--symbol",

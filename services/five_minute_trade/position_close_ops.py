@@ -185,6 +185,7 @@ def schedule_post_close_balance_check(
     exit_best_bid: Optional[float] = None,
     exit_avg_fill_price: Optional[float] = None,
     exit_full_fill: Optional[bool] = None,
+    btc_price_at_trade: Optional[float] = None,
     order_id: Optional[str] = None,
     match_check_delay_sec: int = 3,
     balance_check_delay_sec: int = 5,
@@ -250,6 +251,7 @@ def schedule_post_close_balance_check(
                                 else exit_avg_fill_price
                             ),
                             exit_full_fill=True,
+                            btc_price_at_trade=btc_price_at_trade,
                         )
                         logger.info("⚡ 快通道确认: 订单已完全成交，已按真实成交价记账")
                         return
@@ -322,6 +324,7 @@ def schedule_post_close_balance_check(
                             else exit_avg_fill_price
                         ),
                         exit_full_fill=True,
+                        btc_price_at_trade=btc_price_at_trade,
                     )
                 logger.info("慢通道确认: 残余份额不足 0.05 (实余 %.6f)，视为粉尘忽略，平仓彻底完成。", remaining_size)
                 return
@@ -340,6 +343,7 @@ def schedule_post_close_balance_check(
                         else exit_avg_fill_price
                     ),
                     exit_full_fill=False,
+                    btc_price_at_trade=btc_price_at_trade,
                 )
 
             existing = self.position
@@ -425,6 +429,7 @@ def force_close_position(trader: Any, reason: str) -> None:
         return
 
     close_t0 = time.perf_counter()
+    btc_price_at_trade = self._get_latest_btc_price_snapshot()
     pos = self.position
     self.position = None
 
@@ -574,6 +579,7 @@ def force_close_position(trader: Any, reason: str) -> None:
                 exit_best_bid=exit_best_bid,
                 exit_avg_fill_price=exit_avg_fill_price,
                 exit_full_fill=exit_full_fill,
+                btc_price_at_trade=btc_price_at_trade,
                 order_id=None,
                 match_check_delay_sec=3,
                 balance_check_delay_sec=5,
@@ -600,6 +606,7 @@ def force_close_position(trader: Any, reason: str) -> None:
                 exit_best_bid=exit_best_bid,
                 exit_avg_fill_price=exit_avg_fill_price,
                 exit_full_fill=exit_full_fill,
+                btc_price_at_trade=btc_price_at_trade,
                 order_id=order_id,
                 match_check_delay_sec=3,
                 balance_check_delay_sec=5,
@@ -615,6 +622,7 @@ def force_close_position(trader: Any, reason: str) -> None:
             exit_best_bid=exit_best_bid,
             exit_avg_fill_price=exit_avg_fill_price,
             exit_full_fill=exit_full_fill,
+            btc_price_at_trade=btc_price_at_trade,
         )
 
     close_ms = (time.perf_counter() - close_t0) * 1000

@@ -47,6 +47,7 @@ from services.five_minute_trade.position_close_ops import (
     schedule_post_close_balance_check,
 )
 from services.five_minute_trade.reporting import build_pnl_report_content_and_subject
+from services.five_minute_trade.trade_db import TradeSQLiteStore
 from services.five_minute_trade.watchers import (
     ChainlinkKline1mWatcher,
     PolymarketAssetPriceWatcher,
@@ -84,6 +85,7 @@ class FiveMinuteUpDownTrader:
         take_profit_spread: float = TAKE_PROFIT_SPREAD,
         stop_loss_spread: float = STOP_LOSS_SPREAD,
         min_hold_before_close_sec: int = MIN_HOLD_BEFORE_CLOSE_SEC,
+        trade_db_path: Optional[str] = None,
         dry_run: bool = False,
     ) -> None:
         self.stake_usd = stake_usd
@@ -116,6 +118,8 @@ class FiveMinuteUpDownTrader:
         self.window_traded: bool = False
         self.preclose_entry_triggered: bool = False
         self.minute_closes: Dict[int, float] = {}
+        self.latest_btc_price: Optional[float] = None
+        self.latest_btc_price_event_ms: Optional[int] = None
 
         self.position: Optional[OpenPosition] = None
         self.trades: List[TradeRecord] = []
@@ -141,6 +145,15 @@ class FiveMinuteUpDownTrader:
             "sell_http": 0,
         }
         self._log_throttle_last_ts: Dict[str, float] = {}
+        self._trade_db: Optional[TradeSQLiteStore] = None
+        if trade_db_path:
+            try:
+                self._trade_db = TradeSQLiteStore(db_path=trade_db_path)
+                logger.info("交易记录SQLite已初始化: %s (WAL)", trade_db_path)
+            except Exception as e:
+                logger.error("交易记录SQLite初始化失败，将仅保留内存/日志记录: %s", e)
+        else:
+            logger.warning("未配置 --trade-db-path，交易记录仅保留内存/日志")
 
     def _should_emit_log(self, key: str, interval_sec: Optional[float] = None) -> bool:
         interval = (
@@ -244,6 +257,7 @@ class FiveMinuteUpDownTrader:
         exit_best_bid: Optional[float],
         exit_avg_fill_price: Optional[float],
         exit_full_fill: Optional[bool],
+        btc_price_at_trade: Optional[float] = None,
     ) -> None:
         if matched_size <= 0:
             return
@@ -282,6 +296,16 @@ class FiveMinuteUpDownTrader:
         )
         with self._lock:
             self.trades.append(record)
+
+        if self._trade_db is not None:
+            try:
+                self._trade_db.write_realized_trade(
+                    record=record,
+                    dry_run=self.dry_run,
+                    btc_price_at_trade=btc_price_at_trade,
+                )
+            except Exception as e:
+                logger.error("写入平仓记录到SQLite失败: %s", e)
 
         logger.info(
             "平仓真实记账: 市场=%s 方向=%s size=%.4f entry_avg=%.4f exit_avg=%.4f invested=%.4f recovered=%.4f pnl=%.4f reason=%s",
@@ -348,6 +372,31 @@ class FiveMinuteUpDownTrader:
         if self._poly_watcher:
             self._poly_watcher.stop()
             self._poly_watcher = None
+        if self._trade_db is not None:
+            self._trade_db.close()
+
+    def _persist_entry_event(
+        self,
+        position: OpenPosition,
+        order_id: Optional[str],
+    ) -> None:
+        if self._trade_db is None:
+            return
+        try:
+            self._trade_db.write_entry_event(
+                position=position,
+                order_id=order_id,
+                dry_run=self.dry_run,
+                btc_price_at_trade=self._get_latest_btc_price_snapshot(),
+            )
+        except Exception as e:
+            logger.error("写入建仓记录到SQLite失败: %s", e)
+
+    def _get_latest_btc_price_snapshot(self) -> Optional[float]:
+        with self._lock:
+            if self.latest_btc_price is None:
+                return None
+            return float(self.latest_btc_price)
 
     def _start_window_book_watcher(self, market_slug: str) -> None:
         try:
@@ -386,6 +435,11 @@ class FiveMinuteUpDownTrader:
             close_time_ms = kline["close_time"]
             event_time_ms = int(kline.get("event_time", int(time.time() * 1000)))
             is_closed = bool(kline.get("is_closed", False))
+
+            parsed_btc = self._to_positive_float(close_price)
+            if parsed_btc is not None:
+                self.latest_btc_price = parsed_btc
+                self.latest_btc_price_event_ms = event_time_ms
 
             window_start_ms = (
                 open_time_ms // self.WINDOW_MS
@@ -601,6 +655,7 @@ class FiveMinuteUpDownTrader:
         exit_best_bid: Optional[float] = None,
         exit_avg_fill_price: Optional[float] = None,
         exit_full_fill: Optional[bool] = None,
+        btc_price_at_trade: Optional[float] = None,
         order_id: Optional[str] = None,
         match_check_delay_sec: int = 3,
         balance_check_delay_sec: int = 5,
@@ -614,6 +669,7 @@ class FiveMinuteUpDownTrader:
             exit_best_bid=exit_best_bid,
             exit_avg_fill_price=exit_avg_fill_price,
             exit_full_fill=exit_full_fill,
+            btc_price_at_trade=btc_price_at_trade,
             order_id=order_id,
             match_check_delay_sec=match_check_delay_sec,
             balance_check_delay_sec=balance_check_delay_sec,

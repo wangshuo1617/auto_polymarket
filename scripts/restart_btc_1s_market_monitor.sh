@@ -6,8 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-DB_PATH="${1:-logs/btc_poly_1s.duckdb}"
-SYMBOL="${2:-btcusdt}"
+SYMBOL="${1:-btcusdt}"
 LOG_FILE="logs/btc_1s_market_monitor.log"
 PID_FILE="logs/btc_1s_market_monitor.pid"
 
@@ -17,7 +16,7 @@ echo "=========================================="
 echo "重启 btc_1s_market_monitor 服务"
 echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "工作目录: $PROJECT_ROOT"
-echo "数据库文件: $DB_PATH"
+echo "数据库文件: 使用 config.SQLITE_DB_PATH"
 echo "交易对: $SYMBOL"
 echo "=========================================="
 
@@ -33,7 +32,7 @@ if [ -n "$REMAINING" ]; then
 fi
 
 echo "[2/3] 启动新进程..."
-nohup uv run btc_1s_market_monitor.py --db-path "$DB_PATH" --symbol "$SYMBOL" > "$LOG_FILE" 2>&1 &
+nohup uv run btc_1s_market_monitor.py --symbol "$SYMBOL" > "$LOG_FILE" 2>&1 &
 NEW_PID=$!
 echo "$NEW_PID" > "$PID_FILE"
 sleep 2

@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-DB_PATH="${1:-logs/btc_poly_1s.duckdb}"
+DB_PATH="${1:-logs/trade.sqlite3}"
 CMD="${2:-latest}"
 ARG3="${3:-}"
 
@@ -20,12 +20,17 @@ run_sql() {
   local sql="$1"
   DB_PATH_ENV="$DB_PATH" SQL_ENV="$sql" uv run python - <<'PY'
 import os
-import duckdb
+import sqlite3
 
-conn = duckdb.connect(os.environ["DB_PATH_ENV"])
+conn = sqlite3.connect(os.environ["DB_PATH_ENV"])
 try:
-    result = conn.execute(os.environ["SQL_ENV"]).fetchdf()
-    print(result)
+  cur = conn.execute(os.environ["SQL_ENV"])
+  cols = [d[0] for d in (cur.description or [])]
+  rows = cur.fetchall()
+  if cols:
+    print("\t".join(cols))
+  for row in rows:
+    print("\t".join("" if v is None else str(v) for v in row))
 finally:
     conn.close()
 PY
@@ -39,6 +44,7 @@ usage() {
 command:
   tables                     查看所有表
   schema                     查看 btc_poly_1s_ticks 表结构
+  num                        查看总行数
   latest [N]                 查看最新 N 条 (默认 20)
   market <market_slug>       查看指定 5m 市场窗口
   last_hour                  查看最近 1 小时样本
@@ -48,19 +54,19 @@ command:
 
 示例:
   ./scripts/query_btc_poly_1s.sh
-  ./scripts/query_btc_poly_1s.sh logs/btc_poly_1s.duckdb latest 50
-  ./scripts/query_btc_poly_1s.sh logs/btc_poly_1s.duckdb market btc-updown-5m-1741032000
-  ./scripts/query_btc_poly_1s.sh logs/btc_poly_1s.duckdb corr
-  ./scripts/query_btc_poly_1s.sh logs/btc_poly_1s.duckdb sql "SELECT count(*) FROM btc_poly_1s_ticks"
+  ./scripts/query_btc_poly_1s.sh logs/trade.sqlite3 latest 50
+  ./scripts/query_btc_poly_1s.sh logs/trade.sqlite3 market btc-updown-5m-1741032000
+  ./scripts/query_btc_poly_1s.sh logs/trade.sqlite3 corr
+  ./scripts/query_btc_poly_1s.sh logs/trade.sqlite3 sql "SELECT count(*) FROM btc_poly_1s_ticks"
 EOF
 }
 
 case "$CMD" in
   tables)
-    run_sql "SHOW TABLES"
+    run_sql "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
     ;;
   schema)
-    run_sql "DESCRIBE btc_poly_1s_ticks"
+    run_sql "PRAGMA table_info(btc_poly_1s_ticks)"
     ;;
   num)
     run_sql "SELECT COUNT(*) FROM btc_poly_1s_ticks"
@@ -81,9 +87,9 @@ case "$CMD" in
     fi
     DB_PATH_ENV="$DB_PATH" MARKET_SLUG_ENV="$MARKET_SLUG" uv run python - <<'PY'
 import os
-import duckdb
+import sqlite3
 
-conn = duckdb.connect(os.environ["DB_PATH_ENV"])
+conn = sqlite3.connect(os.environ["DB_PATH_ENV"])
 try:
     sql = """
     SELECT ts_utc, market_slug, btc_price,
@@ -94,17 +100,69 @@ try:
     WHERE market_slug = ?
     ORDER BY ts_sec
     """
-    result = conn.execute(sql, [os.environ["MARKET_SLUG_ENV"]]).fetchdf()
-    print(result)
+    cur = conn.execute(sql, (os.environ["MARKET_SLUG_ENV"],))
+    cols = [d[0] for d in (cur.description or [])]
+    rows = cur.fetchall()
+    if cols:
+      print("\t".join(cols))
+    for row in rows:
+      print("\t".join("" if v is None else str(v) for v in row))
 finally:
     conn.close()
 PY
     ;;
   last_hour)
-    run_sql "SELECT ts_utc, market_slug, btc_price, up_best_ask, down_best_ask FROM btc_poly_1s_ticks WHERE ts_sec >= epoch(now()) - 3600 ORDER BY ts_sec"
+    run_sql "SELECT ts_utc, market_slug, btc_price, up_best_ask, down_best_ask FROM btc_poly_1s_ticks WHERE ts_sec >= CAST(strftime('%s','now') AS INTEGER) - 3600 ORDER BY ts_sec"
     ;;
   corr)
-    run_sql "WITH x AS ( SELECT ts_sec, btc_price - lag(btc_price) OVER (ORDER BY ts_sec) AS btc_ret_1s, ((up_best_bid + up_best_ask)/2.0) - lag((up_best_bid + up_best_ask)/2.0) OVER (ORDER BY ts_sec) AS up_mid_chg_1s, ((down_best_bid + down_best_ask)/2.0) - lag((down_best_bid + down_best_ask)/2.0) OVER (ORDER BY ts_sec) AS down_mid_chg_1s FROM btc_poly_1s_ticks ) SELECT corr(btc_ret_1s, up_mid_chg_1s) AS corr_btc_up, corr(btc_ret_1s, down_mid_chg_1s) AS corr_btc_down, count(*) AS samples FROM x WHERE btc_ret_1s IS NOT NULL"
+    DB_PATH_ENV="$DB_PATH" uv run python - <<'PY'
+import math
+import os
+import sqlite3
+
+conn = sqlite3.connect(os.environ["DB_PATH_ENV"])
+try:
+    sql = """
+    WITH x AS (
+      SELECT
+      ts_sec,
+      btc_price - lag(btc_price) OVER (ORDER BY ts_sec) AS btc_ret_1s,
+      ((up_best_bid + up_best_ask) / 2.0) - lag((up_best_bid + up_best_ask) / 2.0) OVER (ORDER BY ts_sec) AS up_mid_chg_1s,
+      ((down_best_bid + down_best_ask) / 2.0) - lag((down_best_bid + down_best_ask) / 2.0) OVER (ORDER BY ts_sec) AS down_mid_chg_1s
+      FROM btc_poly_1s_ticks
+    )
+    SELECT btc_ret_1s, up_mid_chg_1s, down_mid_chg_1s
+    FROM x
+    WHERE btc_ret_1s IS NOT NULL
+    """
+    rows = conn.execute(sql).fetchall()
+finally:
+    conn.close()
+
+def corr(a, b):
+    paired = [(x, y) for x, y in zip(a, b) if x is not None and y is not None]
+    n = len(paired)
+    if n < 2:
+        return None, n
+    xs = [p[0] for p in paired]
+    ys = [p[1] for p in paired]
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in paired)
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx <= 0 or vy <= 0:
+        return None, n
+    return cov / math.sqrt(vx * vy), n
+
+btc = [r[0] for r in rows]
+up = [r[1] for r in rows]
+down = [r[2] for r in rows]
+c_up, n_up = corr(btc, up)
+c_down, n_down = corr(btc, down)
+print("corr_btc_up\tcorr_btc_down\tsamples_up\tsamples_down")
+print(f"{c_up}\t{c_down}\t{n_up}\t{n_down}")
+PY
     ;;
   stale)
     AGE_MS="${ARG3:-3000}"

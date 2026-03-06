@@ -13,7 +13,7 @@
 - 通过 Binance WebSocket 实时监控 BTC/USDT 价格
 - 支持多种价格流类型（ticker、bookTicker、avgPrice）
 - 支持基于 `@aggTrade` 的 15 秒滑窗 Volume Delta 实时判定
-- 支持 BTC + Polymarket 5m 市场的逐秒对齐采样（写入 DuckDB）
+- 支持 BTC + Polymarket 5m 市场的逐秒对齐采样（写入 SQLite）
 - 可配置的价格预警系统（上涨/下跌预警）
 - 每小时自动发送价格报告邮件
 
@@ -208,14 +208,15 @@ uv run 5m_trade.py \
     --report-interval-sec 3600 \
     --max-entry-price 0.80 \
     --take-profit-spread 0.15 \
-    --stop-loss-spread -0.20
+    --stop-loss-spread -0.20 \
+    --trade-db-path logs/5m_trade.sqlite3
 ```
 
 推荐使用重启脚本：
 
 ```bash
 chmod +x scripts/restart_5m_trade.sh
-./scripts/restart_5m_trade.sh --dry-run 3 5 10 5.0 3600 0.80 0.15 -0.20 60
+./scripts/restart_5m_trade.sh --dry-run 3 5 10 5.0 3600 0.80 0.15 -0.20 60 logs/5m_trade.sqlite3
 ```
 
 参数说明：
@@ -229,11 +230,12 @@ chmod +x scripts/restart_5m_trade.sh
 - `--take-profit-spread`：止盈价差（相对买入价，默认 `0.15`）
 - `--stop-loss-spread`：止损价差（相对买入价，默认 `-0.20`）
 - `--min-hold-before-close-sec`：最短持仓保护时间（秒，默认 `5`，`0` 表示关闭保护）
+- `--trade-db-path`：交易事件 SQLite 文件路径（例如 `logs/5m_trade.sqlite3`）
 
 重启脚本参数顺序：
 
 ```bash
-./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec]
+./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path]
 ```
 
 说明：
@@ -257,21 +259,22 @@ chmod +x scripts/restart_5m_trade.sh
 
 `btc_1s_market_monitor.py` 已直接依赖 `services.five_minute_trade.watchers.PolymarketAssetPriceWatcher`，不再通过动态加载 `5m_trade.py` 获取 watcher 类。
 
-#### 运行 BTC + Polymarket 逐秒监控（DuckDB）
+#### 运行 BTC + Polymarket 逐秒监控（SQLite）
 
 ```bash
-uv run btc_1s_market_monitor.py --db-path logs/btc_poly_1s.duckdb --symbol btcusdt
+uv run btc_1s_market_monitor.py --symbol btcusdt
 ```
 
 说明：
 - Binance 使用 WS 维护 BTC 最新价格；
 - Polymarket 使用 WS 订阅当前 5m 市场 up/down 双边盘口；
-- 服务每秒写入一条对齐快照到 `btc_poly_1s_ticks` 表，便于后续分析。
+- 服务每秒写入一条对齐快照到 `btc_poly_1s_ticks` 表，便于后续分析；
+- 数据库路径由 `config.SQLITE_DB_PATH`（环境变量 `SQLITE_DB_PATH`）统一控制，默认 `logs/trade.sqlite3`。
 
 快速查询示例：
 
 ```bash
-uv run python -c "import duckdb; c=duckdb.connect('logs/btc_poly_1s.duckdb'); print(c.execute('SELECT * FROM btc_poly_1s_ticks ORDER BY ts_sec DESC LIMIT 5').fetchdf())"
+uv run python -c "import sqlite3; c=sqlite3.connect('logs/trade.sqlite3'); print(c.execute('SELECT * FROM btc_poly_1s_ticks ORDER BY ts_sec DESC LIMIT 5').fetchall())"
 ```
 
 #### 运行 Web Dashboard（支持外网访问）
