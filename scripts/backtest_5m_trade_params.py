@@ -23,6 +23,8 @@ import itertools
 import math
 import os
 import sqlite3
+import time
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -417,6 +419,29 @@ def _iter_window_rows(
         yield current_ws, bucket
 
 
+def _count_windows(
+    conn: sqlite3.Connection,
+    start_ts_sec: Optional[int],
+    end_ts_sec: Optional[int],
+) -> int:
+    where_clauses = ["market_slug LIKE 'btc-updown-5m-%'"]
+    args: List[object] = []
+    if start_ts_sec is not None:
+        where_clauses.append("ts_sec >= ?")
+        args.append(start_ts_sec)
+    if end_ts_sec is not None:
+        where_clauses.append("ts_sec <= ?")
+        args.append(end_ts_sec)
+
+    query = f"""
+        SELECT COUNT(DISTINCT window_start_ms)
+        FROM btc_poly_1s_ticks
+        WHERE {' AND '.join(where_clauses)}
+    """
+    row = conn.execute(query, args).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def _build_param_grid(args: argparse.Namespace) -> List[ParamSet]:
     entry_minute_grid = _parse_int_grid(args.entry_minute_grid)
     preclose_grid = _parse_int_grid(args.entry_preclose_sec_grid)
@@ -526,6 +551,14 @@ def _write_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def _build_timestamped_output_path(path: str) -> str:
+    base, ext = os.path.splitext(path)
+    if not ext:
+        ext = ".csv"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{base}_{timestamp}{ext}"
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Parameter grid backtest for 5m_trade using btc_poly_1s_ticks",
@@ -550,26 +583,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--entry-minute-grid", type=str, default="2,3,4")
     parser.add_argument("--entry-preclose-sec-grid", type=str, default="4,5,6")
-    parser.add_argument("--min-direction-diff-grid", type=str, default="5,10,15,20")
-    parser.add_argument("--max-entry-price-grid", type=str, default="0.75,0.8,0.85,0.9")
+    parser.add_argument("--min-direction-diff-grid", type=str, default="10,20,30,40,50")
+    parser.add_argument("--max-entry-price-grid", type=str, default="0.6,0.75,0.8,0.85,0.9")
     parser.add_argument("--stake-usd-grid", type=str, default="5")
-    parser.add_argument("--min-hold-before-close-sec-grid", type=str, default="0,5,60")
+    parser.add_argument("--min-hold-before-close-sec-grid", type=str, default="20,40,60,80")
     parser.add_argument(
         "--tp-price-cap-grid",
         type=str,
-        default=f"{DEFAULT_TP_PRICE_CAP:g}",
+        default="0.9,0.95,0.99 ",
         help="Dynamic TP cap price grid (default follows live strategy)",
     )
     parser.add_argument(
         "--tp-value-cap-grid",
         type=str,
-        default=f"{DEFAULT_TP_VALUE_CAP:g}",
+        default="0.1,0.15,0.2",
         help="Dynamic TP value-cap grid (default follows live strategy)",
     )
     parser.add_argument(
         "--sl-to-tp-ratio-grid",
         type=str,
-        default=f"{DEFAULT_SL_TO_TP_RATIO:g}",
+        default="1.0,1.333333,1.5",
         help="Dynamic SL/TP ratio grid (default follows live strategy)",
     )
     parser.add_argument(
@@ -577,13 +610,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["total_pnl", "win_rate", "profit_factor", "max_drawdown", "trades"],
         default="total_pnl",
     )
-    parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--min-trades", type=int, default=1)
+    parser.add_argument("--top-k", type=int, default=20, help="Number of top results to print")
+    parser.add_argument("--min-trades", type=int, default=1, help="Minimum trades filter for results (default 1)")
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=20,
+        help="Print progress every N windows (0 disables progress output)",
+    )
     parser.add_argument(
         "--output-csv",
         type=str,
         default="output/5m_param_backtest.csv",
         help="CSV output path",
+    )
+    parser.add_argument(
+        "--disable-output-timestamp",
+        action="store_true",
+        help="Do not append timestamp suffix to output CSV filename",
     )
     return parser
 
@@ -600,27 +644,48 @@ def main() -> None:
 
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
+    estimated_total_windows = _count_windows(conn, args.start_ts_sec, args.end_ts_sec)
 
-    windows_count = 0
+    windows_data: List[List[WindowRow]] = []
     try:
         for _, raw_rows in _iter_window_rows(conn, args.start_ts_sec, args.end_ts_sec):
             if not raw_rows:
                 continue
 
             # Forward-fill quote/BTC values within each window so sparse snapshots remain usable.
-            rows = _forward_fill_rows(raw_rows)
-            windows_count += 1
-
-            for p in params:
-                st = stats_map[p]
-                st.windows += 1
-                trade, skip_reason = _simulate_window(rows, p)
-                if trade is None:
-                    st.add_skip(skip_reason or "unknown")
-                else:
-                    st.add_trade(trade)
+            windows_data.append(_forward_fill_rows(raw_rows))
     finally:
         conn.close()
+
+    total_windows = len(windows_data)
+    total_combos = len(params)
+    total_units = total_windows * total_combos
+
+    started_at = time.time()
+    processed_units = 0
+
+    for combo_index, p in enumerate(params, start=1):
+        st = stats_map[p]
+        for window_index, rows in enumerate(windows_data, start=1):
+            st.windows += 1
+            trade, skip_reason = _simulate_window(rows, p)
+            if trade is None:
+                st.add_skip(skip_reason or "unknown")
+            else:
+                st.add_trade(trade)
+
+            processed_units += 1
+            if args.progress_every > 0 and (window_index % args.progress_every == 0):
+                elapsed = max(1e-9, time.time() - started_at)
+                unit_speed = processed_units / elapsed
+                overall_pct = (processed_units / total_units) * 100.0 if total_units > 0 else 0.0
+                remain_units = max(0, total_units - processed_units)
+                eta_sec = remain_units / max(unit_speed, 1e-9)
+                print(
+                    f"Progress: combo {combo_index}/{total_combos} | "
+                    f"window {window_index}/{total_windows} | "
+                    f"overall {overall_pct:.1f}% | {unit_speed:.2f} units/s | ETA {eta_sec:.1f}s"
+                )
 
     result_rows = [s.as_row() for s in stats_map.values() if s.trades >= args.min_trades]
 
@@ -632,13 +697,20 @@ def main() -> None:
         result_rows.sort(key=lambda r: _as_float(r[args.sort_by]), reverse=True)
 
     print(f"DB: {args.db_path}")
-    print(f"Windows processed: {windows_count}")
+    print(f"Total windows (filter): {total_windows} (estimated {estimated_total_windows})")
+    print(f"Windows processed: {total_windows}")
     print(f"Param combinations: {len(params)}")
     print(f"Rows after min_trades filter ({args.min_trades}): {len(result_rows)}")
 
+    output_csv_path = (
+        args.output_csv
+        if args.disable_output_timestamp
+        else _build_timestamped_output_path(args.output_csv)
+    )
+
     _print_top(result_rows, sort_by=args.sort_by, top_k=max(1, args.top_k))
-    _write_csv(args.output_csv, result_rows)
-    print(f"CSV written: {args.output_csv}")
+    _write_csv(output_csv_path, result_rows)
+    print(f"CSV written: {output_csv_path}")
 
 
 if __name__ == "__main__":

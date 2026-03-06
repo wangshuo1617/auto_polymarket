@@ -66,6 +66,9 @@ class FiveMinuteUpDownTrader:
     MAX_ENTRY_PRICE = 0.80
     TAKE_PROFIT_SPREAD = 0.15
     STOP_LOSS_SPREAD = -0.20
+    TP_PRICE_CAP = 0.95
+    TP_VALUE_CAP = 0.15
+    SL_TO_TP_RATIO = 4.0 / 3.0
     MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
     MAX_ENTRY_SLIPPAGE_BPS = 120.0
     MAX_EXIT_SLIPPAGE_BPS_WARN = 250.0
@@ -84,6 +87,9 @@ class FiveMinuteUpDownTrader:
         max_entry_price: float = MAX_ENTRY_PRICE,
         take_profit_spread: float = TAKE_PROFIT_SPREAD,
         stop_loss_spread: float = STOP_LOSS_SPREAD,
+        tp_price_cap: float = TP_PRICE_CAP,
+        tp_value_cap: float = TP_VALUE_CAP,
+        sl_to_tp_ratio: float = SL_TO_TP_RATIO,
         min_hold_before_close_sec: int = MIN_HOLD_BEFORE_CLOSE_SEC,
         trade_db_path: Optional[str] = None,
         dry_run: bool = False,
@@ -93,6 +99,9 @@ class FiveMinuteUpDownTrader:
         self.max_entry_price = max_entry_price
         self.take_profit_spread = take_profit_spread
         self.stop_loss_spread = stop_loss_spread
+        self.tp_price_cap = float(tp_price_cap)
+        self.tp_value_cap = float(tp_value_cap)
+        self.sl_to_tp_ratio = float(sl_to_tp_ratio)
         self.dry_run = dry_run
         if entry_decision_minute < 1 or entry_decision_minute > 4:
             raise ValueError("entry_decision_minute 必须在 1-4 之间")
@@ -100,6 +109,12 @@ class FiveMinuteUpDownTrader:
             raise ValueError("entry_preclose_seconds 必须在 1-59 之间")
         if min_direction_diff <= 0:
             raise ValueError("min_direction_diff 必须大于 0")
+        if self.tp_price_cap <= 0:
+            raise ValueError("tp_price_cap 必须大于 0")
+        if self.tp_value_cap < 0:
+            raise ValueError("tp_value_cap 必须大于等于 0")
+        if self.sl_to_tp_ratio <= 0:
+            raise ValueError("sl_to_tp_ratio 必须大于 0")
         if min_hold_before_close_sec < 0:
             raise ValueError("min_hold_before_close_sec 必须大于等于 0")
         self.entry_decision_minute = entry_decision_minute

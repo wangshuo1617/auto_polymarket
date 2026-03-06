@@ -17,11 +17,6 @@ from .watchers import PolymarketAssetPriceWatcher
 logger = logging.getLogger(__name__)
 
 
-TP_PRICE_CAP = 0.95
-TP_VALUE_CAP = 0.15
-SL_TO_TP_RATIO = 4.0 / 3.0
-
-
 def select_market_and_tokens(trader: Any, market_slug: str) -> Dict[str, Any]:
     self = trader
     cached = self._market_cache.get(market_slug)
@@ -205,12 +200,12 @@ def open_position(trader: Any, market_slug: str, direction: str) -> None:
         self.max_entry_price,
     )
 
-    # 动态风控:
-    # 1) 止盈值 = min(0.15, 0.95 - entry_price)
-    # 2) 止损值 = 止盈值 * 4/3
-    take_profit_value = min(TP_VALUE_CAP, max(0.0, TP_PRICE_CAP - entry_price))
-    take_profit_price = min(TP_PRICE_CAP, entry_price + take_profit_value)
-    stop_loss_value = take_profit_value * SL_TO_TP_RATIO
+    # 动态风控（由启动参数注入）:
+    # 1) 止盈值 = min(tp_value_cap, tp_price_cap - entry_price)
+    # 2) 止损值 = 止盈值 * sl_to_tp_ratio
+    take_profit_value = min(self.tp_value_cap, max(0.0, self.tp_price_cap - entry_price))
+    take_profit_price = min(self.tp_price_cap, entry_price + take_profit_value)
+    stop_loss_value = take_profit_value * self.sl_to_tp_ratio
     stop_loss_price = max(0.001, entry_price - stop_loss_value)
 
     logger.info(

@@ -109,6 +109,24 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         help="兼容保留参数：当前使用动态止损 SL值=TP值*4/3",
     )
     parser.add_argument(
+        "--tp-price-cap",
+        type=float,
+        default=0.95,
+        help="动态止盈价格上限（默认 0.95）",
+    )
+    parser.add_argument(
+        "--tp-value-cap",
+        type=float,
+        default=0.15,
+        help="动态止盈价差上限（默认 0.15）",
+    )
+    parser.add_argument(
+        "--sl-to-tp-ratio",
+        type=float,
+        default=(4.0 / 3.0),
+        help="动态止损与止盈价差倍率（默认 4/3）",
+    )
+    parser.add_argument(
         "--min-hold-before-close-sec",
         type=int,
         default=5,
@@ -133,6 +151,9 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         max_entry_price=args.max_entry_price,
         take_profit_spread=args.take_profit_spread,
         stop_loss_spread=args.stop_loss_spread,
+        tp_price_cap=args.tp_price_cap,
+        tp_value_cap=args.tp_value_cap,
+        sl_to_tp_ratio=args.sl_to_tp_ratio,
         min_hold_before_close_sec=args.min_hold_before_close_sec,
         trade_db_path=args.trade_db_path,
         dry_run=args.dry_run,

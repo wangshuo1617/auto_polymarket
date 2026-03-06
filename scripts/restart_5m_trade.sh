@@ -8,15 +8,18 @@ cd "$PROJECT_ROOT"
 
 MODE="${1:---dry-run}"
 ENTRY_MINUTE="${2:-2}"
-ENTRY_PRECLOSE_SEC="${3:-6}"
-MIN_DIRECTION_DIFF="${4:-20}"
+ENTRY_PRECLOSE_SEC="${3:-5}"
+MIN_DIRECTION_DIFF="${4:-50}"
 STAKE_USD="${5:-5.0}"
 REPORT_INTERVAL_SEC="${6:-3600}"
-MAX_ENTRY_PRICE="${7:-0.92}"
+MAX_ENTRY_PRICE="${7:-0.9}"
 TAKE_PROFIT_SPREAD="${8:-0.15}"
 STOP_LOSS_SPREAD="${9:--0.20}"
-MIN_HOLD_BEFORE_CLOSE_SEC="${10:-60}"
+MIN_HOLD_BEFORE_CLOSE_SEC="${10:-20}"
 TRADE_DB_PATH="${11:-}"
+TP_PRICE_CAP="${12:-0.99}"
+TP_VALUE_CAP="${13:-0.2}"
+SL_TO_TP_RATIO="${14:-1.333333}"
 LOG_FILE="logs/5m_trade.stdout.log"
 PID_FILE="logs/5m_trade.pid"
 
@@ -24,61 +27,79 @@ mkdir -p logs
 
 if [ "$MODE" != "--dry-run" ] && [ "$MODE" != "--live" ]; then
   echo "❌ 模式参数错误：仅支持 --dry-run 或 --live"
-  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path]"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
   exit 1
 fi
 
 if ! [[ "$ENTRY_MINUTE" =~ ^[1-4]$ ]]; then
   echo "❌ entry_minute 必须是 1-4"
-  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path]"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
   exit 1
 fi
 
 if ! [[ "$ENTRY_PRECLOSE_SEC" =~ ^[0-9]+$ ]] || [ "$ENTRY_PRECLOSE_SEC" -lt 1 ] || [ "$ENTRY_PRECLOSE_SEC" -gt 59 ]; then
   echo "❌ entry_preclose_sec 必须是 1-59 的整数"
-  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path]"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
   exit 1
 fi
 
 if ! [[ "$MIN_DIRECTION_DIFF" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($MIN_DIRECTION_DIFF > 0)}"; then
   echo "❌ min_direction_diff 必须是大于 0 的数字"
-  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path]"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
   exit 1
 fi
 
 if ! [[ "$STAKE_USD" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($STAKE_USD > 0)}"; then
   echo "❌ stake_usd 必须是大于 0 的数字"
-  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path]"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
   exit 1
 fi
 
 if ! [[ "$REPORT_INTERVAL_SEC" =~ ^[0-9]+$ ]] || [ "$REPORT_INTERVAL_SEC" -le 0 ]; then
   echo "❌ report_interval_sec 必须是大于 0 的整数"
-  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path]"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
   exit 1
 fi
 
 if ! [[ "$MAX_ENTRY_PRICE" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($MAX_ENTRY_PRICE > 0)}"; then
   echo "❌ max_entry_price 必须是大于 0 的数字"
-  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path]"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
   exit 1
 fi
 
 if ! [[ "$TAKE_PROFIT_SPREAD" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
   echo "❌ take_profit_spread 必须是数字"
-  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path]"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
   exit 1
 fi
 
 if ! [[ "$STOP_LOSS_SPREAD" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
   echo "❌ stop_loss_spread 必须是数字"
-  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path]"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
   exit 1
 fi
 
 if ! [[ "$MIN_HOLD_BEFORE_CLOSE_SEC" =~ ^[0-9]+$ ]]; then
   echo "❌ min_hold_before_close_sec 必须是大于等于 0 的整数"
-  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path]"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
+  exit 1
+fi
+
+if ! [[ "$TP_PRICE_CAP" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($TP_PRICE_CAP > 0)}"; then
+  echo "❌ tp_price_cap 必须是大于 0 的数字"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
+  exit 1
+fi
+
+if ! [[ "$TP_VALUE_CAP" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($TP_VALUE_CAP >= 0)}"; then
+  echo "❌ tp_value_cap 必须是大于等于 0 的数字"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
+  exit 1
+fi
+
+if ! [[ "$SL_TO_TP_RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($SL_TO_TP_RATIO > 0)}"; then
+  echo "❌ sl_to_tp_ratio 必须是大于 0 的数字"
+  echo "用法: ./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]"
   exit 1
 fi
 
@@ -93,8 +114,8 @@ echo "最小方向差值: $MIN_DIRECTION_DIFF"
 echo "单笔仓位金额(USDC): $STAKE_USD"
 echo "报告间隔(秒): $REPORT_INTERVAL_SEC"
 echo "允许最高开仓价: $MAX_ENTRY_PRICE"
-echo "动态止盈规则: TP值=min(0.15, 0.95-entry_price), TP上限=0.95"
-echo "动态止损规则: SL值=TP值*4/3, SL价=entry_price-SL值"
+echo "动态止盈参数: tp_price_cap=$TP_PRICE_CAP tp_value_cap=$TP_VALUE_CAP"
+echo "动态止损参数: sl_to_tp_ratio=$SL_TO_TP_RATIO (SL值=TP值*sl_to_tp_ratio)"
 echo "兼容参数(当前策略未使用): take_profit_spread=$TAKE_PROFIT_SPREAD stop_loss_spread=$STOP_LOSS_SPREAD"
 echo "最短持仓保护秒数: $MIN_HOLD_BEFORE_CLOSE_SEC"
 if [ -n "$TRADE_DB_PATH" ]; then
@@ -126,6 +147,9 @@ CMD=(
   --max-entry-price "$MAX_ENTRY_PRICE"
   --take-profit-spread "$TAKE_PROFIT_SPREAD"
   --stop-loss-spread "$STOP_LOSS_SPREAD"
+  --tp-price-cap "$TP_PRICE_CAP"
+  --tp-value-cap "$TP_VALUE_CAP"
+  --sl-to-tp-ratio "$SL_TO_TP_RATIO"
   --min-hold-before-close-sec "$MIN_HOLD_BEFORE_CLOSE_SEC"
 )
 
