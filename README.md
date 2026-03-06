@@ -277,6 +277,42 @@ uv run btc_1s_market_monitor.py --symbol btcusdt
 uv run python -c "import sqlite3; c=sqlite3.connect('logs/trade.sqlite3'); print(c.execute('SELECT * FROM btc_poly_1s_ticks ORDER BY ts_sec DESC LIMIT 5').fetchall())"
 ```
 
+#### 运行 5m_trade 参数回测（网格搜索）
+
+当 `btc_poly_1s_ticks` 已积累足够历史秒级数据后，可以离线回测不同参数组合：
+
+```bash
+uv run scripts/backtest_5m_trade_params.py \
+    --db-path logs/trade.sqlite3 \
+    --entry-minute-grid 2,3,4 \
+    --entry-preclose-sec-grid 4,5,6 \
+    --min-direction-diff-grid 5,10,15,20 \
+    --max-entry-price-grid 0.75,0.8,0.85,0.9 \
+    --stake-usd-grid 5 \
+    --min-hold-before-close-sec-grid 0,5,60 \
+    --tp-price-cap-grid 0.9,0.95,0.99 \
+    --tp-value-cap-grid 0.1,0.15,0.2 \
+    --sl-to-tp-ratio-grid 1.0,1.333333,1.5 \
+    --sort-by total_pnl \
+    --top-k 20 \
+    --output-csv output/5m_param_backtest.csv
+```
+
+可选时间范围筛选：
+
+```bash
+uv run scripts/backtest_5m_trade_params.py \
+    --db-path logs/trade.sqlite3 \
+    --start-ts-sec 1772700000 \
+    --end-ts-sec 1772775000
+```
+
+输出说明：
+- 终端打印按排序指标输出 Top K 参数组合（总收益、胜率、回撤、成交率等）；
+- 全量结果写入 `--output-csv` 对应文件；
+- 回测使用 best ask/bid 做报价级模拟，不包含深度滑点路径还原；
+- 动态止盈止损支持同时扫描 `TP价格上限`、`TP价差上限`、`SL/TP 倍率`。
+
 #### 运行 Web Dashboard（支持外网访问）
 
 ```bash

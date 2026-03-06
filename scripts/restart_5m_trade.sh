@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-MODE="${1:---live}"
+MODE="${1:---dry-run}"
 ENTRY_MINUTE="${2:-2}"
 ENTRY_PRECLOSE_SEC="${3:-6}"
 MIN_DIRECTION_DIFF="${4:-20}"
