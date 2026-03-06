@@ -162,10 +162,49 @@ def _extract_execution_price_from_order(order_payload: Dict[str, Any]) -> Option
     if not isinstance(order_payload, dict):
         return None
 
-    for key in ("avgPrice", "avg_price", "price"):
+    for key in ("avgPrice", "avg_price", "average_price"):
         price = _safe_positive_float(order_payload.get(key))
         if price is not None:
             return price
+
+    # 优先用逐笔成交计算真实均价，避免把挂单 price 当作成交价。
+    trades = order_payload.get("associate_trades")
+    if not isinstance(trades, list):
+        trades = order_payload.get("associated_trades")
+    if isinstance(trades, list):
+        total_size = 0.0
+        total_notional = 0.0
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+
+            trade_price = None
+            for price_key in ("price", "avg_price", "avgPrice", "trade_price"):
+                trade_price = _safe_positive_float(trade.get(price_key))
+                if trade_price is not None:
+                    break
+
+            trade_size = None
+            for size_key in (
+                "match_size",
+                "matched_size",
+                "size_matched",
+                "size",
+                "amount",
+                "maker_amount",
+                "makerAmount",
+            ):
+                trade_size = _safe_positive_float(trade.get(size_key))
+                if trade_size is not None:
+                    break
+
+            if trade_price is None or trade_size is None:
+                continue
+            total_size += trade_size
+            total_notional += trade_price * trade_size
+
+        if total_size > 0:
+            return total_notional / total_size
 
     taker = _safe_positive_float(
         order_payload.get("takerAmount")

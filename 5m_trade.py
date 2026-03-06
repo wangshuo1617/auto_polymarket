@@ -215,6 +215,33 @@ class FiveMinuteUpDownTrader:
             matched = self._to_positive_float(order_detail.get(key))
             if matched is not None:
                 return matched
+
+        # 部分接口不会返回顶层 size_matched，回退到逐笔成交累计。
+        trades = order_detail.get("associate_trades")
+        if not isinstance(trades, list):
+            trades = order_detail.get("associated_trades")
+        if isinstance(trades, list):
+            total_matched = 0.0
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    continue
+                trade_size = None
+                for size_key in (
+                    "match_size",
+                    "matched_size",
+                    "size_matched",
+                    "size",
+                    "amount",
+                    "maker_amount",
+                    "makerAmount",
+                ):
+                    trade_size = self._to_positive_float(trade.get(size_key))
+                    if trade_size is not None:
+                        break
+                if trade_size is not None:
+                    total_matched += trade_size
+            if total_matched > 0:
+                return total_matched
         return 0.0
 
     def _extract_execution_price_from_order(self, order_detail: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -225,6 +252,45 @@ class FiveMinuteUpDownTrader:
             price = self._to_positive_float(order_detail.get(key))
             if price is not None:
                 return price
+
+        # 以逐笔成交计算真实均价: sum(match_size * price) / sum(match_size)
+        trades = order_detail.get("associate_trades")
+        if not isinstance(trades, list):
+            trades = order_detail.get("associated_trades")
+        if isinstance(trades, list):
+            total_size = 0.0
+            total_notional = 0.0
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    continue
+
+                trade_price = None
+                for price_key in ("price", "avg_price", "avgPrice", "trade_price"):
+                    trade_price = self._to_positive_float(trade.get(price_key))
+                    if trade_price is not None:
+                        break
+
+                trade_size = None
+                for size_key in (
+                    "match_size",
+                    "matched_size",
+                    "size_matched",
+                    "size",
+                    "amount",
+                    "maker_amount",
+                    "makerAmount",
+                ):
+                    trade_size = self._to_positive_float(trade.get(size_key))
+                    if trade_size is not None:
+                        break
+
+                if trade_price is None or trade_size is None:
+                    continue
+                total_size += trade_size
+                total_notional += trade_price * trade_size
+
+            if total_size > 0:
+                return total_notional / total_size
             
         return None
 
@@ -258,6 +324,7 @@ class FiveMinuteUpDownTrader:
         exit_avg_fill_price: Optional[float],
         exit_full_fill: Optional[bool],
         btc_price_at_trade: Optional[float] = None,
+        order_id: Optional[str] = None,
     ) -> None:
         if matched_size <= 0:
             return
@@ -303,6 +370,7 @@ class FiveMinuteUpDownTrader:
                     record=record,
                     dry_run=self.dry_run,
                     btc_price_at_trade=btc_price_at_trade,
+                    order_id=order_id,
                 )
             except Exception as e:
                 logger.error("写入平仓记录到SQLite失败: %s", e)

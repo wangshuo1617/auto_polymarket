@@ -163,6 +163,30 @@ def schedule_position_balance_confirmation(
                         pos.total_invested_usdc = pos.actual_entry_price * pos.actual_entry_size
                     pos.balance_confirmed = True
                 else:
+                    if self._trade_db is not None:
+                        try:
+                            deleted = self._trade_db.delete_entry_event(
+                                market_slug=market_slug,
+                                token_id=token_id,
+                                entry_time=pos.entry_time,
+                                order_id=order_id,
+                                dry_run=self.dry_run,
+                            )
+                            logger.info(
+                                "建仓零成交清理SQLite entry记录: market=%s token=%s order_id=%s deleted=%s",
+                                market_slug,
+                                token_id,
+                                order_id,
+                                deleted,
+                            )
+                        except Exception as db_err:
+                            logger.warning(
+                                "建仓零成交清理SQLite entry记录失败: market=%s token=%s order_id=%s error=%s",
+                                market_slug,
+                                token_id,
+                                order_id,
+                                db_err,
+                            )
                     logger.info("建仓后余额确认为0且无撮合记录，清理本地持仓避免阻塞后续开仓: market=%s token=%s", market_slug, token_id)
                     self.position = None
                     if self._poly_watcher:
@@ -252,6 +276,7 @@ def schedule_post_close_balance_check(
                             ),
                             exit_full_fill=True,
                             btc_price_at_trade=btc_price_at_trade,
+                            order_id=order_id,
                         )
                         logger.info("⚡ 快通道确认: 订单已完全成交，已按真实成交价记账")
                         return
@@ -325,6 +350,7 @@ def schedule_post_close_balance_check(
                         ),
                         exit_full_fill=True,
                         btc_price_at_trade=btc_price_at_trade,
+                        order_id=order_id,
                     )
                 logger.info("慢通道确认: 残余份额不足 0.05 (实余 %.6f)，视为粉尘忽略，平仓彻底完成。", remaining_size)
                 return
@@ -344,6 +370,7 @@ def schedule_post_close_balance_check(
                     ),
                     exit_full_fill=False,
                     btc_price_at_trade=btc_price_at_trade,
+                    order_id=order_id,
                 )
 
             existing = self.position

@@ -147,6 +147,7 @@ class TradeSQLiteStore:
         record: TradeRecord,
         dry_run: bool,
         btc_price_at_trade: Optional[float],
+        order_id: Optional[str],
     ) -> None:
         with self._lock:
             self._conn.execute(
@@ -170,8 +171,9 @@ class TradeSQLiteStore:
                     expected_price,
                     slippage_leakage,
                     btc_price_at_trade,
+                    order_id,
                     mode
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._to_utc_iso(record.exit_time),
@@ -192,10 +194,59 @@ class TradeSQLiteStore:
                     record.exit_expected_price,
                     record.exit_slippage_leakage,
                     btc_price_at_trade,
+                    order_id,
                     "dry-run" if dry_run else "live",
                 ),
             )
             self._conn.commit()
+
+    def delete_entry_event(
+        self,
+        market_slug: str,
+        token_id: str,
+        entry_time: datetime,
+        order_id: Optional[str],
+        dry_run: bool,
+    ) -> int:
+        """Delete mis-recorded entry rows for orders confirmed as zero-fill.
+
+        Prefer precise deletion by order_id; fallback to entry timestamp + market/token.
+        Returns deleted row count.
+        """
+        mode = "dry-run" if dry_run else "live"
+        related_entry_time = self._to_utc_iso(entry_time)
+        with self._lock:
+            if order_id:
+                cur = self._conn.execute(
+                    """
+                    DELETE FROM trade_events
+                    WHERE side='buy'
+                      AND reason='entry'
+                      AND mode=?
+                      AND order_id=?
+                    """,
+                    (mode, order_id),
+                )
+                deleted = int(cur.rowcount or 0)
+                if deleted > 0:
+                    self._conn.commit()
+                    return deleted
+
+            cur = self._conn.execute(
+                """
+                DELETE FROM trade_events
+                WHERE side='buy'
+                  AND reason='entry'
+                  AND mode=?
+                  AND market_slug=?
+                  AND token_id=?
+                  AND related_entry_time=?
+                """,
+                (mode, market_slug, token_id, related_entry_time),
+            )
+            deleted = int(cur.rowcount or 0)
+            self._conn.commit()
+            return deleted
 
     def close(self) -> None:
         with self._lock:
