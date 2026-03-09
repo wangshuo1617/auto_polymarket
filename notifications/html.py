@@ -22,7 +22,10 @@ def generate_position_and_orders_section(items: list) -> str:
     for block in items:
         event_name = block.get("事件或合约", "")
         summary = block.get("仓位简述", "")
+        hold_condition = block.get("持有条件", "")
+        layered_exit_plan = block.get("分层离场计划", "")
         orders = block.get("挂单建议", [])
+        exit_risk = block.get("离场风控", {})
         order_rows = ""
         for o in orders:
             op_type = o.get("操作类型", "")
@@ -35,8 +38,28 @@ def generate_position_and_orders_section(items: list) -> str:
             order_rows += f"""
             <div class="ladder-step">
                 <div class="step-price">{icon} {op_type} {direction}{price_str} · {size or '-'}</div>
+                <div class="step-logic">触发条件：{o.get('触发条件', '-')}</div>
                 <div class="step-logic">{reason}</div>
             </div>
+            """
+
+        exit_risk_html = ""
+        if exit_risk:
+            exit_risk_html = f"""
+                <div class="action-box" style="margin-top: 10px; border-left: 3px solid #f59e0b;">
+                    🛡️ 离场风控：状态={exit_risk.get('市场状态', '-')}, ATR={exit_risk.get('ATR百分比', '-') }%,
+                    波动分位={exit_risk.get('波动分位', '-')},
+                    止盈={exit_risk.get('止盈阈值', '-')}, 止损={exit_risk.get('止损阈值', '-')}
+                </div>
+            """
+
+        hold_plan_html = ""
+        if hold_condition or layered_exit_plan:
+            hold_plan_html = f"""
+                <div class="action-box" style="margin-top: 10px; border-left: 3px solid #3b82f6;">
+                    ⏳ 持有条件：{hold_condition or '-'}<br>
+                    📚 分层离场计划：{layered_exit_plan or '-'}
+                </div>
             """
         html += f"""
         <div class="card action-card">
@@ -47,6 +70,8 @@ def generate_position_and_orders_section(items: list) -> str:
                 <div class="action-box" style="margin-bottom: 10px;">📋 仓位简述：{summary}</div>
                 <div class="muted" style="margin-bottom: 6px;">挂单建议：</div>
                 <div class="ladder-container">{order_rows}</div>
+                {exit_risk_html}
+                {hold_plan_html}
             </div>
         </div>
         """
@@ -63,7 +88,16 @@ def generate_new_position_section(items: list) -> str:
         direction = item.get("建议方向", "")
         price_range = item.get("建议价格区间", "")
         amount = item.get("建议投入金额或比例", "")
+        edge_hint = item.get("预估优势", "")
+        cap_hint = item.get("建议仓位上限", "")
         reason = item.get("理由", "")
+
+        extra_lines = ""
+        if edge_hint:
+            extra_lines += f"<div class='logic-text'>预估优势：{edge_hint}</div>"
+        if cap_hint:
+            extra_lines += f"<div class='logic-text'>建议仓位上限：{cap_hint}</div>"
+
         html += f"""
         <div class="card action-card">
             <div class="card-header" style="border-left: 4px solid #f59e0b;">
@@ -72,6 +106,7 @@ def generate_new_position_section(items: list) -> str:
             </div>
             <div class="card-body">
                 <div class="action-box">建议价格区间：<strong>{price_range}</strong> · 建议投入：{amount}</div>
+                {extra_lines}
                 <div class="logic-text">理由：{reason}</div>
             </div>
         </div>
@@ -94,6 +129,9 @@ def generate_alert_rows(items):
             </div>
             <div class="alert-action">
                 {item['操作建议']}
+            </div>
+            <div class="alert-action muted" style="margin-top: 4px;">
+                {item.get('关联止盈止损', '')}
             </div>
         </div>
         """

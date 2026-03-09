@@ -3,18 +3,21 @@ Polymarket 持仓分析主入口
 获取持仓、挂单、K线、市场情绪，经 AI 分析后发送邮件
 """
 import json
+import calendar
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from config import TO_EMAIL
 from data.polymarket import get_positions, get_open_orders, get_event_situation, get_balance_allowance
-from data.binance import get_btc_price, get_4h_klines_data
+from data.binance import get_btc_price, get_4h_klines_data, get_1d_klines_data
 from ai.researcher import analyze_market_with_grounding
 from notifications.email import EmailSender
 from notifications.html import generate_html_template
 from services.position import match_orders_with_positions, format_matched_data
 from services.market_sentiment import get_market_sentiment_and_funding
+from services.profit_optimizer import build_profit_optimization_context
+from services.volatility import build_daily_volatility_profile
 
 LAST_REPORT_PATH = Path(__file__).resolve().parent / "last_report.json"
 ET_TIMEZONE = ZoneInfo("America/New_York")
@@ -40,6 +43,82 @@ def _save_report(data: dict) -> None:
         pass
 
 
+def _build_future_possibility_context(
+    btc_1d_k_data: list,
+    current_btc_price: float,
+) -> dict:
+    """构建未来可能性上下文，避免模型只按单一路径急迫离场。"""
+    now = datetime.now(ET_TIMEZONE)
+    days_in_month = calendar.monthrange(now.year, now.month)[1]
+    days_left_in_month = max(0, days_in_month - now.day)
+
+    month_high = None
+    month_low = None
+    for k in btc_1d_k_data:
+        if len(k) < 5:
+            continue
+        candle_time = datetime.fromtimestamp(int(k[0]) / 1000, tz=ET_TIMEZONE)
+        if candle_time.year == now.year and candle_time.month == now.month:
+            high = float(k[2])
+            low = float(k[3])
+            month_high = high if month_high is None else max(month_high, high)
+            month_low = low if month_low is None else min(month_low, low)
+
+    if month_high is None or month_low is None:
+        highs = [float(k[2]) for k in btc_1d_k_data if len(k) > 2]
+        lows = [float(k[3]) for k in btc_1d_k_data if len(k) > 3]
+        month_high = max(highs) if highs else None
+        month_low = min(lows) if lows else None
+
+    recent_high_7d = None
+    if btc_1d_k_data:
+        last_7 = [k for k in btc_1d_k_data if len(k) > 2][-7:]
+        highs_7d = [float(k[2]) for k in last_7]
+        if highs_7d:
+            recent_high_7d = max(highs_7d)
+
+    dynamic_reclaim_target = recent_high_7d or month_high
+    space_to_reclaim_target_pct = None
+    if dynamic_reclaim_target and current_btc_price > 0:
+        space_to_reclaim_target_pct = round(
+            (dynamic_reclaim_target / current_btc_price - 1.0) * 100.0,
+            2,
+        )
+
+    drawdown_from_month_high_pct = None
+    if month_high and month_high > 0 and current_btc_price > 0:
+        drawdown_from_month_high_pct = round((current_btc_price / month_high - 1.0) * 100.0, 2)
+
+    scenario_bias = "neutral"
+    if drawdown_from_month_high_pct is not None and days_left_in_month >= 10:
+        if drawdown_from_month_high_pct <= -4.0 and (
+            space_to_reclaim_target_pct is not None and space_to_reclaim_target_pct <= 3.5
+        ):
+            scenario_bias = "retest_possible"
+        elif drawdown_from_month_high_pct <= -8.0:
+            scenario_bias = "high_volatility_two_way"
+
+    dynamic_key_levels: list[float] = []
+    if month_low is not None and month_high is not None:
+        month_mid = (month_high + month_low) / 2.0
+        dynamic_key_levels = [round(month_low, 2), round(month_mid, 2), round(month_high, 2)]
+    elif dynamic_reclaim_target is not None:
+        dynamic_key_levels = [round(dynamic_reclaim_target, 2)]
+
+    return {
+        "today_et": now.strftime("%Y-%m-%d"),
+        "days_left_in_month": days_left_in_month,
+        "month_high": month_high,
+        "month_low": month_low,
+        "current_btc_price": current_btc_price,
+        "drawdown_from_month_high_pct": drawdown_from_month_high_pct,
+        "dynamic_reclaim_target": dynamic_reclaim_target,
+        "space_to_reclaim_target_pct": space_to_reclaim_target_pct,
+        "dynamic_key_levels": dynamic_key_levels,
+        "scenario_bias": scenario_bias,
+    }
+
+
 if __name__ == "__main__":
     email_sender = EmailSender()
     time_now = datetime.now(ET_TIMEZONE).strftime("%m-%d %H:%M")
@@ -50,14 +129,45 @@ if __name__ == "__main__":
     formatted = format_matched_data(matched_results)
     print(f"{time_now} Polymarket持仓情况格式化完成")
 
-    klines_data = get_4h_klines_data()
-    print(f"{time_now} 比特币4h K线数据获取完成")
+    btc_4h_k_data = get_4h_klines_data(limit=42)
+    btc_1d_k_data = get_1d_klines_data(limit=30)
+    print(f"{time_now} 比特币4h(近7天)与1d(近30天) K线数据获取完成")
+
+    daily_volatility_profile = build_daily_volatility_profile(btc_1d_k_data)
+    print(
+        f"{time_now} 日线波动率画像完成: regime={daily_volatility_profile.get('market_regime')} "
+        f"ATR%={daily_volatility_profile.get('atr_pct')} "
+        f"TR分位={daily_volatility_profile.get('tr_percentile_30d')}"
+    )
 
     market_sentiment_and_funding = get_market_sentiment_and_funding()
     print(f"{time_now} 市场情绪与资金面获取完成")
 
+    current_btc_price = market_sentiment_and_funding.get("market_context", {}).get("btc_price")
+    if current_btc_price is None:
+        current_btc_price = get_btc_price()
+    future_possibility_context = _build_future_possibility_context(
+        btc_1d_k_data,
+        float(current_btc_price),
+    )
+    print(
+        f"{time_now} 未来可能性上下文完成: month_high={future_possibility_context.get('month_high')} "
+        f"drawdown={future_possibility_context.get('drawdown_from_month_high_pct')}% "
+        f"space_to_reclaim_target={future_possibility_context.get('space_to_reclaim_target_pct')}%"
+    )
+
     event_situation = get_event_situation()
     usdc_balance = get_balance_allowance()
+    profit_optimization_context = build_profit_optimization_context(
+        polymarket_event_situation=event_situation,
+        future_possibility_context=future_possibility_context,
+        daily_volatility_profile=daily_volatility_profile,
+        usdc_balance=usdc_balance,
+    )
+    print(
+        f"{time_now} 收益优化上下文完成: edge_count={profit_optimization_context.get('all_edge_count')} "
+        f"top_edges={len(profit_optimization_context.get('top_edge_opportunities', []))}"
+    )
     previous_report = _load_previous_report()
     if previous_report:
         print(f"{time_now} 已加载上一时间段报告作为参考")
@@ -65,7 +175,11 @@ if __name__ == "__main__":
 
     analyze_result = analyze_market_with_grounding(
         formatted,
-        klines_data,
+        btc_4h_k_data,
+        btc_1d_k_data,
+        daily_volatility_profile,
+        future_possibility_context,
+        profit_optimization_context,
         market_sentiment_and_funding,
         event_situation,
         usdc_balance,

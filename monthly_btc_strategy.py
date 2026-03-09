@@ -7,14 +7,18 @@ from datetime import datetime
 from typing import Dict, Any
 
 from config import TO_EMAIL
-from data.binance import get_btc_price, get_4h_klines_data
+from data.binance import get_btc_price, get_4h_klines_data, get_1d_klines_data
 from ai.researcher import analyze_monthly_strategy_with_grounding
 from notifications.email import EmailSender
 from notifications.html import generate_monthly_strategy_html
 from services.market_sentiment import get_market_sentiment_and_funding
 
 
-def _derive_summary(market_sentiment_and_funding: dict, btc_4h_k_data: list) -> Dict[str, Any]:
+def _derive_summary(
+    market_sentiment_and_funding: dict,
+    btc_4h_k_data: list,
+    btc_1d_k_data: list,
+) -> Dict[str, Any]:
     """从数据中提取简要摘要，供AI作为结构化输入"""
     sentiment = market_sentiment_and_funding.get("sentiment_data", {})
     liquidity = market_sentiment_and_funding.get("liquidity_data", {})
@@ -37,15 +41,25 @@ def _derive_summary(market_sentiment_and_funding: dict, btc_4h_k_data: list) -> 
     except Exception:
         pass
 
-    # 估算月内区间：使用近10根4h K线的高低点作为参考
+    # 估算月内区间：优先使用近30天1d K线，缺失时回退到4h K线。
     range_low = None
     range_high = None
+    range_basis = "N/A"
     try:
-        highs = [float(k[2]) for k in btc_4h_k_data if len(k) > 2]
-        lows = [float(k[3]) for k in btc_4h_k_data if len(k) > 3]
+        highs = [float(k[2]) for k in btc_1d_k_data if len(k) > 2]
+        lows = [float(k[3]) for k in btc_1d_k_data if len(k) > 3]
         if highs and lows:
             range_high = max(highs)
             range_low = min(lows)
+            range_basis = "近30天1d"
+        else:
+            highs = [float(k[2]) for k in btc_4h_k_data if len(k) > 2]
+            lows = [float(k[3]) for k in btc_4h_k_data if len(k) > 3]
+        if highs and lows:
+            range_high = max(highs)
+            range_low = min(lows)
+            if range_basis == "N/A":
+                range_basis = "近7天4h"
     except Exception:
         pass
 
@@ -61,6 +75,7 @@ def _derive_summary(market_sentiment_and_funding: dict, btc_4h_k_data: list) -> 
         "long_short_ratio": sentiment.get("ls_interpretation", "N/A"),
         "range_low": range_low,
         "range_high": range_high,
+        "range_basis": range_basis,
     }
 
 
@@ -74,12 +89,18 @@ def run_monthly_strategy():
     time_now = datetime.now().strftime("%m-%d %H:%M")
     target_month = _get_target_month_label()
 
-    btc_4h_k_data = get_4h_klines_data()
+    btc_4h_k_data = get_4h_klines_data(limit=42)
+    btc_1d_k_data = get_1d_klines_data(limit=30)
     market_sentiment_and_funding = get_market_sentiment_and_funding()
-    derived_summary = _derive_summary(market_sentiment_and_funding, btc_4h_k_data)
+    derived_summary = _derive_summary(
+        market_sentiment_and_funding,
+        btc_4h_k_data,
+        btc_1d_k_data,
+    )
 
     analyze_result = analyze_monthly_strategy_with_grounding(
         btc_4h_k_data=btc_4h_k_data,
+        btc_1d_k_data=btc_1d_k_data,
         market_sentiment_and_funding=market_sentiment_and_funding,
         derived_summary=derived_summary,
         target_month=target_month,
@@ -91,7 +112,11 @@ def run_monthly_strategy():
         analyze_result["月内BTC变动区间"]["下限"] = derived_summary.get("range_low")
     if analyze_result["月内BTC变动区间"].get("上限") is None:
         analyze_result["月内BTC变动区间"]["上限"] = derived_summary.get("range_high")
-    analyze_result["月内BTC变动区间"].setdefault("逻辑", "基于近10根4h K线高低点的保守区间估算")
+    fallback_basis = derived_summary.get("range_basis", "近7天4h")
+    analyze_result["月内BTC变动区间"].setdefault(
+        "逻辑",
+        f"基于{fallback_basis}K线高低点的保守区间估算",
+    )
 
     # 填充参考数据摘要（确保字段存在）
     analyze_result.setdefault("参考数据摘要", {})

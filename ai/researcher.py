@@ -35,6 +35,10 @@ def _get_client():
 def analyze_market_with_grounding(
     polymarket_status: list,
     btc_4h_k_data: list,
+    btc_1d_k_data: list,
+    daily_volatility_profile: dict,
+    future_possibility_context: dict,
+    profit_optimization_context: dict,
     market_sentiment_and_funding: dict,
     polymarket_event_situation: dict,
     usdc_balance: str,
@@ -68,6 +72,10 @@ def analyze_market_with_grounding(
     user_prompt = get_user_prompt(
         polymarket_status,
         btc_4h_k_data,
+        btc_1d_k_data,
+        daily_volatility_profile,
+        future_possibility_context,
+        profit_optimization_context,
         market_sentiment_and_funding,
         polymarket_event_situation,
         usdc_balance,
@@ -129,6 +137,7 @@ def analyze_market_with_grounding(
 
 def analyze_monthly_strategy_with_grounding(
     btc_4h_k_data: list,
+    btc_1d_k_data: list,
     market_sentiment_and_funding: dict,
     derived_summary: dict,
     target_month: str,
@@ -151,6 +160,7 @@ def analyze_monthly_strategy_with_grounding(
 
     user_prompt = get_monthly_user_prompt(
         btc_4h_k_data,
+        btc_1d_k_data,
         market_sentiment_and_funding,
         derived_summary,
     )

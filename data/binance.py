@@ -33,6 +33,16 @@ def get_4h_klines_data(limit: int = 10) -> list:
     return response.json()
 
 
+def get_1d_klines_data(limit: int = 30) -> list:
+    """获取 BTC 1d K 线数据，默认近30天。"""
+    url = "https://data-api.binance.vision"
+    klines_endpoint = "/api/v3/klines"
+    params = {"symbol": "BTCUSDT", "interval": "1d", "limit": limit}
+    response = requests.get(url + klines_endpoint, params=params)
+    response.raise_for_status()
+    return response.json()
+
+
 def get_binance_derivatives_data() -> dict:
     """获取币安衍生品数据：资金费率、持仓量、多空比"""
     base_url = "https://fapi.binance.com"
