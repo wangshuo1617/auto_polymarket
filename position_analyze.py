@@ -188,13 +188,13 @@ if __name__ == "__main__":
     warn_prices = analyze_result["预警信号"]
     for warn_price in warn_prices:
         warn_price["alert_status"] = False
-    with open("/root/auto_polymarket/price_warn_config.py", "w") as f:
+    with open("price_warn_config.py", "w") as f:
         f.write(f"WARN_PRICE = {warn_prices}")
     print(f"{time_now} AI分析完成,开始发送邮件")
 
     email_subject = f"{time_now} Polymarket持仓情况分析,当前BTC价格: {get_btc_price():,.2f}"
     email_content = generate_html_template(analyze_result)
-    with open(f"/root/auto_polymarket/output/{time_now}_email.html", "w") as f:
+    with open(f"output/{time_now}_email.html", "w") as f:
         f.write(email_content)
     if TO_EMAIL:
         email_sender.send_html_email(TO_EMAIL, email_subject, email_content)

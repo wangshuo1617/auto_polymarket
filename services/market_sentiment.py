@@ -11,7 +11,7 @@ from data.etf import ETFScraper
 from data.rsi import last_24h_rsi
 from data.defillama import StablecoinMonitor
 
-SENTIMENT_CACHE_FILE = "/root/auto_polymarket/last_market_sentiment_and_funding.json"
+SENTIMENT_CACHE_FILE = "last_market_sentiment_and_funding.json"
 
 
 def get_market_sentiment_and_funding() -> dict:
