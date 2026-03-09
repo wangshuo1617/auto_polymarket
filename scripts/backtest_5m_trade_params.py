@@ -585,7 +585,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--entry-preclose-sec-grid", type=str, default="4,5,6")
     parser.add_argument("--min-direction-diff-grid", type=str, default="10,20,30,40,50")
     parser.add_argument("--max-entry-price-grid", type=str, default="0.6,0.75,0.8,0.85,0.9")
-    parser.add_argument("--stake-usd-grid", type=str, default="5")
+    parser.add_argument("--stake-usd-grid", type=str, default="10")
     parser.add_argument("--min-hold-before-close-sec-grid", type=str, default="20,40,60,80")
     parser.add_argument(
         "--tp-price-cap-grid",

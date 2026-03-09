@@ -91,6 +91,7 @@ class FiveMinuteUpDownTrader:
         tp_value_cap: float = TP_VALUE_CAP,
         sl_to_tp_ratio: float = SL_TO_TP_RATIO,
         min_hold_before_close_sec: int = MIN_HOLD_BEFORE_CLOSE_SEC,
+        toxic_utc_hours: Optional[str] = None,
         trade_db_path: Optional[str] = None,
         dry_run: bool = False,
     ) -> None:
@@ -121,6 +122,7 @@ class FiveMinuteUpDownTrader:
         self.entry_preclose_seconds = entry_preclose_seconds
         self.min_direction_diff = min_direction_diff
         self.min_hold_before_close_sec = int(min_hold_before_close_sec)
+        self.toxic_utc_hours = self._parse_toxic_utc_hours(toxic_utc_hours)
 
         self._lock = threading.RLock()
         self._binance = ChainlinkKline1mWatcher(callback=self._on_kline)
@@ -404,9 +406,32 @@ class FiveMinuteUpDownTrader:
         )
 
     @classmethod
-    def _is_toxic_time_regime(cls) -> bool:
+    def _parse_toxic_utc_hours(cls, raw_value: Optional[str]) -> set[int]:
+        if raw_value is None:
+            return set(cls.TOXIC_UTC_HOURS)
+
+        value = str(raw_value).strip()
+        if value == "":
+            return set()
+
+        parsed: set[int] = set()
+        for part in value.split(","):
+            token = part.strip()
+            if token == "":
+                continue
+            if not token.isdigit():
+                raise ValueError(f"toxic_utc_hours 包含非法小时值: {token}")
+            hour = int(token)
+            if hour < 0 or hour > 23:
+                raise ValueError(f"toxic_utc_hours 小时必须在 0-23: {hour}")
+            parsed.add(hour)
+        return parsed
+
+    def _is_toxic_time_regime(self) -> bool:
+        if not self.toxic_utc_hours:
+            return False
         current_utc_hour = datetime.now(timezone.utc).hour
-        return current_utc_hour in cls.TOXIC_UTC_HOURS
+        return current_utc_hour in self.toxic_utc_hours
 
     def _fetch_orderbook_levels(self, token_id: str, side: str) -> Dict[str, Any]:
         return fetch_orderbook_levels(trader=self, token_id=token_id, side=side)
@@ -437,6 +462,10 @@ class FiveMinuteUpDownTrader:
 
     def start(self) -> None:
         logger.info("启动 FiveMinuteUpDownTrader，单笔仓位金额=%.2f USDC", self.stake_usd)
+        if self.toxic_utc_hours:
+            logger.info("有毒时段过滤已启用: UTC hours=%s", sorted(self.toxic_utc_hours))
+        else:
+            logger.info("有毒时段过滤已禁用: 不跳过任何 UTC 小时")
         ensure_http_keepalive(interval_sec=20)
         self._running = True
         self._binance.start()
@@ -596,12 +625,12 @@ class FiveMinuteUpDownTrader:
         ):
             return
 
-        current_utc_hour = datetime.now(timezone.utc).hour
         if self._is_toxic_time_regime():
+            current_utc_hour = datetime.now(timezone.utc).hour
             logger.info(
                 "Skip: Toxic Time Regime (UTC hour=%s in %s)",
                 current_utc_hour,
-                sorted(self.TOXIC_UTC_HOURS),
+                sorted(self.toxic_utc_hours),
             )
             self.window_traded = True
             return
@@ -715,9 +744,9 @@ class FiveMinuteUpDownTrader:
         market_slug: str,
         token_id: str,
         order_id: Optional[str] = None,
-        match_check_delay_sec: int = 3,
-        first_balance_delay_sec: int = 5,
-        retry_balance_delay_sec: int = 7,
+        match_check_delay_sec: int = 7,
+        first_balance_delay_sec: int = 10,
+        retry_balance_delay_sec: int = 12,
     ) -> None:
         schedule_position_balance_confirmation(
             trader=self,

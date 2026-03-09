@@ -133,6 +133,12 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         help="最短持仓保护时间（秒，默认 5；0 表示关闭保护）",
     )
     parser.add_argument(
+        "--toxic-utc-hours",
+        type=str,
+        default="16,19,20",
+        help="UTC 小时黑名单，逗号分隔（例如 16,19,20）；传空字符串表示不跳过任何小时",
+    )
+    parser.add_argument(
         "--trade-db-path",
         type=str,
         default=SQLITE_DB_PATH,
@@ -155,6 +161,7 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         tp_value_cap=args.tp_value_cap,
         sl_to_tp_ratio=args.sl_to_tp_ratio,
         min_hold_before_close_sec=args.min_hold_before_close_sec,
+        toxic_utc_hours=args.toxic_utc_hours,
         trade_db_path=args.trade_db_path,
         dry_run=args.dry_run,
     )
