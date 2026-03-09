@@ -15,4 +15,4 @@ FROM_EMAIL_PASSWORD = os.getenv("FROM_EMAIL_PASSWORD")
 SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "logs/trade.sqlite3")
 
 REPORT_INTERVAL = 3600
-GEMINI_MODEL_ID = "gemini-3-flash-preview"#"gemini-3.1-pro-preview"
+GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID")
