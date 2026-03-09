@@ -46,7 +46,7 @@ _temp_client = ClobClient(
     host,
     key=private_key,
     chain_id=chain_id,
-    signature_type=2,
+    signature_type=1,
     funder=funder_address,
 )
 creds = _temp_client.create_or_derive_api_creds()
@@ -55,7 +55,7 @@ client = ClobClient(
     host,
     key=private_key,
     chain_id=chain_id,
-    signature_type=2,
+    signature_type=1,
     funder=funder_address,
     creds=creds,
 )
