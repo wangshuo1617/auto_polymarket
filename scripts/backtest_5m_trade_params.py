@@ -64,6 +64,10 @@ HTTP_QUOTE_MAX_AGE_MS = 5000
 DEFAULT_ENTRY_QUEUE_FILL_RATIO = 0.9
 DEFAULT_EXIT_QUEUE_FILL_RATIO = 0.85
 DEFAULT_UNFILLED_PENALTY_BPS = 800.0
+DEFAULT_ENTRY_SUBMIT_LATENCY_MS = 350
+DEFAULT_EXIT_SUBMIT_LATENCY_MS = 450
+DEFAULT_MIN_WINDOW_QUALITY = 0.0
+WINDOW_SECONDS_EXPECTED = WINDOW_SECONDS
 
 
 @dataclass(frozen=True)
@@ -114,6 +118,35 @@ class WindowTrade:
     pnl: float
     reason: str
     direction: str
+    entry_fee: float = 0.0
+    exit_fee: float = 0.0
+    entry_slippage_bps: float = 0.0
+    exit_slippage_bps: float = 0.0
+    entry_fill_ratio: float = 0.0
+    exit_fill_ratio: float = 0.0
+    submit_fail_count: int = 0
+    residual_unfilled: bool = False
+    window_quality_score: float = 0.0
+    entry_latency_ms: int = 0
+    exit_latency_ms: int = 0
+
+
+@dataclass(frozen=True)
+class WindowQuality:
+    score: float
+    second_coverage: float
+    top5_coverage: float
+    freshness_coverage: float
+
+
+@dataclass(frozen=True)
+class CloseSimulationResult:
+    effective_exit_price: float
+    realized_reason: str
+    fill_ratio: float
+    slippage_bps: float
+    submit_fail_count: int
+    residual_unfilled: bool
 
 
 @dataclass(frozen=True)
@@ -141,6 +174,17 @@ class ComboStats:
         self.max_drawdown = 0.0
         self.reason_counts: Dict[str, int] = {}
         self.skip_counts: Dict[str, int] = {}
+        self.total_entry_fee = 0.0
+        self.total_exit_fee = 0.0
+        self.total_entry_slippage_bps = 0.0
+        self.total_exit_slippage_bps = 0.0
+        self.total_entry_fill_ratio = 0.0
+        self.total_exit_fill_ratio = 0.0
+        self.total_submit_fail_count = 0
+        self.residual_unfilled_count = 0
+        self.total_window_quality_score = 0.0
+        self.total_entry_latency_ms = 0
+        self.total_exit_latency_ms = 0
 
     def add_skip(self, reason: str) -> None:
         self.skip_counts[reason] = self.skip_counts.get(reason, 0) + 1
@@ -155,6 +199,19 @@ class ComboStats:
         elif trade.pnl < 0:
             self.losses += 1
             self.gross_loss += trade.pnl
+
+        self.total_entry_fee += float(trade.entry_fee)
+        self.total_exit_fee += float(trade.exit_fee)
+        self.total_entry_slippage_bps += float(trade.entry_slippage_bps)
+        self.total_exit_slippage_bps += float(trade.exit_slippage_bps)
+        self.total_entry_fill_ratio += float(trade.entry_fill_ratio)
+        self.total_exit_fill_ratio += float(trade.exit_fill_ratio)
+        self.total_submit_fail_count += int(trade.submit_fail_count)
+        self.total_window_quality_score += float(trade.window_quality_score)
+        self.total_entry_latency_ms += int(trade.entry_latency_ms)
+        self.total_exit_latency_ms += int(trade.exit_latency_ms)
+        if trade.residual_unfilled:
+            self.residual_unfilled_count += 1
 
         self.equity += trade.pnl
         if self.equity > self.peak_equity:
@@ -174,6 +231,16 @@ class ComboStats:
         else:
             profit_factor = 0.0
 
+        avg_entry_slippage_bps = (self.total_entry_slippage_bps / self.trades) if self.trades else 0.0
+        avg_exit_slippage_bps = (self.total_exit_slippage_bps / self.trades) if self.trades else 0.0
+        avg_entry_fill_ratio = (self.total_entry_fill_ratio / self.trades) if self.trades else 0.0
+        avg_exit_fill_ratio = (self.total_exit_fill_ratio / self.trades) if self.trades else 0.0
+        avg_submit_fail_count = (self.total_submit_fail_count / self.trades) if self.trades else 0.0
+        residual_unfilled_rate = (self.residual_unfilled_count / self.trades) if self.trades else 0.0
+        avg_window_quality = (self.total_window_quality_score / self.trades) if self.trades else 0.0
+        avg_entry_latency_ms = (self.total_entry_latency_ms / self.trades) if self.trades else 0.0
+        avg_exit_latency_ms = (self.total_exit_latency_ms / self.trades) if self.trades else 0.0
+
         return {
             "params": self.params.key(),
             "windows": self.windows,
@@ -186,6 +253,18 @@ class ComboStats:
             "avg_pnl": avg_pnl,
             "profit_factor": profit_factor,
             "max_drawdown": self.max_drawdown,
+            "entry_fee_total": self.total_entry_fee,
+            "exit_fee_total": self.total_exit_fee,
+            "fee_total": self.total_entry_fee + self.total_exit_fee,
+            "avg_entry_slippage_bps": avg_entry_slippage_bps,
+            "avg_exit_slippage_bps": avg_exit_slippage_bps,
+            "avg_entry_fill_ratio": avg_entry_fill_ratio,
+            "avg_exit_fill_ratio": avg_exit_fill_ratio,
+            "avg_submit_fail_count": avg_submit_fail_count,
+            "residual_unfilled_rate": residual_unfilled_rate,
+            "avg_window_quality": avg_window_quality,
+            "avg_entry_latency_ms": avg_entry_latency_ms,
+            "avg_exit_latency_ms": avg_exit_latency_ms,
             "reason_counts": _format_counts(self.reason_counts),
             "skip_counts": _format_counts(self.skip_counts),
         }
@@ -651,6 +730,60 @@ def _find_row_at_or_after(
     return None
 
 
+def _find_row_after_latency(
+    rows: Sequence[WindowRow],
+    base_row: WindowRow,
+    latency_ms: int,
+    require_btc: bool = False,
+) -> Optional[WindowRow]:
+    latency_sec = int(math.ceil(max(0, int(latency_ms)) / 1000.0))
+    target_rel = base_row.rel_sec + latency_sec
+    for r in rows:
+        if r.rel_sec < target_rel:
+            continue
+        if require_btc and r.btc_price is None:
+            continue
+        return r
+    return None
+
+
+def _compute_window_quality(
+    rows: Sequence[WindowRow],
+    max_btc_age_ms: int,
+    max_quote_age_ms: int,
+) -> WindowQuality:
+    if not rows:
+        return WindowQuality(score=0.0, second_coverage=0.0, top5_coverage=0.0, freshness_coverage=0.0)
+
+    sec_set = {int(r.rel_sec) for r in rows if 0 <= int(r.rel_sec) < WINDOW_SECONDS_EXPECTED}
+    second_coverage = min(1.0, len(sec_set) / max(1, WINDOW_SECONDS_EXPECTED))
+
+    top5_ok = 0
+    fresh_ok = 0
+    for r in rows:
+        has_top5 = bool(r.up_bids_5 and r.up_asks_5 and r.down_bids_5 and r.down_asks_5)
+        if has_top5:
+            top5_ok += 1
+
+        btc_age = _age_ms_at_row(r.ts_sec, r.btc_event_ms)
+        up_age = _age_ms_at_row(r.ts_sec, r.up_event_ms)
+        down_age = _age_ms_at_row(r.ts_sec, r.down_event_ms)
+        if _is_fresh(btc_age, max_btc_age_ms) and _is_fresh(up_age, max_quote_age_ms) and _is_fresh(down_age, max_quote_age_ms):
+            fresh_ok += 1
+
+    n = max(1, len(rows))
+    top5_coverage = top5_ok / n
+    freshness_coverage = fresh_ok / n
+
+    score = 0.35 * second_coverage + 0.35 * top5_coverage + 0.30 * freshness_coverage
+    return WindowQuality(
+        score=max(0.0, min(1.0, score)),
+        second_coverage=second_coverage,
+        top5_coverage=top5_coverage,
+        freshness_coverage=freshness_coverage,
+    )
+
+
 def _eligible_sell_levels(levels: List[Dict[str, float]], sweep_price: float) -> List[Dict[str, float]]:
     eligible: List[Dict[str, float]] = []
     for lvl in levels:
@@ -676,14 +809,22 @@ def _simulate_close_state_machine(
     max_http_quote_age_ms: int,
     queue_fill_ratio_exit: float,
     unfilled_penalty_bps: float,
-) -> Tuple[float, str]:
+) -> CloseSimulationResult:
     remaining = max(0.0, float(target_size))
     if remaining <= 0:
-        return 0.0, initial_reason
+        return CloseSimulationResult(
+            effective_exit_price=0.0,
+            realized_reason=initial_reason,
+            fill_ratio=1.0,
+            slippage_bps=0.0,
+            submit_fail_count=0,
+            residual_unfilled=False,
+        )
 
     total_notional = 0.0
     current_reason = initial_reason
     submit_fail_count = 0
+    residual_unfilled = False
     first_trigger_bid = trigger_row.up_bid if direction == "up" else trigger_row.down_bid
     fallback_bid = _to_positive_float(first_trigger_bid) or 0.01
 
@@ -767,11 +908,23 @@ def _simulate_close_state_machine(
         total_notional += remaining * sweep_price
         remaining = 0.0
         current_reason = f"{initial_reason}_residual_unfilled"
+        residual_unfilled = True
 
     final_reason = current_reason
     if submit_fail_count > 0 and not final_reason.startswith(initial_reason):
         final_reason = f"{initial_reason}_submit_fail"
-    return total_notional / max(target_size, 1e-12), final_reason
+    effective_exit_price = total_notional / max(target_size, 1e-12)
+    first_bid = max(1e-12, fallback_bid)
+    slippage_bps = max(0.0, (first_bid - effective_exit_price) / first_bid * 10000.0)
+    fill_ratio = max(0.0, min(1.0, (target_size - remaining) / max(target_size, 1e-12)))
+    return CloseSimulationResult(
+        effective_exit_price=effective_exit_price,
+        realized_reason=final_reason,
+        fill_ratio=fill_ratio,
+        slippage_bps=slippage_bps,
+        submit_fail_count=submit_fail_count,
+        residual_unfilled=residual_unfilled,
+    )
 
 
 def _parse_toxic_utc_hours(raw_value: str) -> set[int]:
@@ -806,12 +959,18 @@ def _simulate_window(
     queue_fill_ratio_entry: float,
     queue_fill_ratio_exit: float,
     unfilled_penalty_bps: float,
+    entry_submit_latency_ms: int,
+    exit_submit_latency_ms: int,
+    window_quality: WindowQuality,
+    min_window_quality: float,
 ) -> Tuple[Optional[WindowTrade], Optional[str]]:
     if not rows:
         return None, "empty_window"
 
     if _is_toxic_window(rows, toxic_utc_hours):
         return None, "toxic_time_regime"
+    if window_quality.score < float(min_window_quality):
+        return None, "window_quality_too_low"
 
     open_row = _first_row_in_range(rows, start_sec=0, end_sec_exclusive=WINDOW_SECONDS, require_btc=True)
     if open_row is None or open_row.btc_price is None:
@@ -831,6 +990,15 @@ def _simulate_window(
     )
     if entry_row is None or entry_row.btc_price is None:
         return None, "missing_entry_signal_price"
+
+    entry_exec_row = _find_row_after_latency(
+        rows=rows,
+        base_row=entry_row,
+        latency_ms=entry_submit_latency_ms,
+        require_btc=True,
+    )
+    if entry_exec_row is None:
+        return None, "missing_entry_exec_row"
     entry_btc_age = _age_ms_at_row(entry_row.ts_sec, entry_row.btc_event_ms)
     if not _is_fresh(entry_btc_age, max_btc_age_ms):
         return None, "stale_entry_btc"
@@ -842,15 +1010,15 @@ def _simulate_window(
 
     direction = "up" if diff > 0 else "down"
     market_ctx = _get_market_context(
-        row=entry_row,
+        row=entry_exec_row,
         default_size_tick=default_size_tick,
         metadata_cache=metadata_cache,
         default_fee_bps=default_fee_bps,
     )
     fee_bps = market_ctx.up_fee_bps if direction == "up" else market_ctx.down_fee_bps
-    ask = entry_row.up_ask if direction == "up" else entry_row.down_ask
-    ask_event_ms = entry_row.up_event_ms if direction == "up" else entry_row.down_event_ms
-    ask_age = _age_ms_at_row(entry_row.ts_sec, ask_event_ms)
+    ask = entry_exec_row.up_ask if direction == "up" else entry_exec_row.down_ask
+    ask_event_ms = entry_exec_row.up_event_ms if direction == "up" else entry_exec_row.down_event_ms
+    ask_age = _age_ms_at_row(entry_exec_row.ts_sec, ask_event_ms)
     if ask is None or ask <= 0:
         return None, "missing_entry_ask"
     if not _is_fresh(ask_age, max_quote_age_ms):
@@ -867,7 +1035,7 @@ def _simulate_window(
         return None, "normalized_entry_size_zero"
 
     entry_levels = _row_levels_for_side(
-        entry_row,
+        entry_exec_row,
         direction=direction,
         side="buy",
         max_ws_book_age_ms=max_ws_book_age_ms,
@@ -886,6 +1054,8 @@ def _simulate_window(
     entry_cost = float(entry_plan["executed_notional"])
     entry_fee = entry_cost * max(0.0, fee_bps) / 10000.0
     entry_price_for_risk = float(entry_plan["worst_price"])
+    entry_slippage_bps = float(entry_plan.get("slippage_bps") or 0.0)
+    entry_fill_ratio = float(entry_plan.get("fill_ratio") or 0.0)
 
     take_profit_price, stop_loss_price = _dynamic_tp_sl(entry_price_for_risk, params=params)
 
@@ -900,7 +1070,6 @@ def _simulate_window(
     entry_ts = entry_row.ts_sec
     exit_reason = "window_end"
     exit_price: Optional[float] = None
-    expected_exit_price: Optional[float] = None
     exit_row: Optional[WindowRow] = None
 
     for r in rows:
@@ -954,11 +1123,20 @@ def _simulate_window(
     if exit_price is None or exit_price <= 0:
         return None, "missing_exit_bid"
 
-    close_row = exit_row or entry_row
-    effective_exit_price, realized_reason = _simulate_close_state_machine(
+    close_row = exit_row or entry_exec_row
+    close_submit_row = _find_row_after_latency(
         rows=rows,
-        entry_row=entry_row,
-        trigger_row=close_row,
+        base_row=close_row,
+        latency_ms=exit_submit_latency_ms,
+        require_btc=False,
+    )
+    if close_submit_row is None:
+        return None, "missing_exit_submit_row"
+
+    close_result = _simulate_close_state_machine(
+        rows=rows,
+        entry_row=entry_exec_row,
+        trigger_row=close_submit_row,
         direction=direction,
         initial_reason=exit_reason,
         target_size=size,
@@ -969,10 +1147,30 @@ def _simulate_window(
         unfilled_penalty_bps=unfilled_penalty_bps,
     )
 
+    effective_exit_price = close_result.effective_exit_price
+    realized_reason = close_result.realized_reason
     exit_notional = size * effective_exit_price
     exit_fee = exit_notional * max(0.0, fee_bps) / 10000.0
     pnl = (exit_notional - exit_fee) - (entry_cost + entry_fee)
-    return WindowTrade(pnl=pnl, reason=realized_reason, direction=direction), None
+    return (
+        WindowTrade(
+            pnl=pnl,
+            reason=realized_reason,
+            direction=direction,
+            entry_fee=entry_fee,
+            exit_fee=exit_fee,
+            entry_slippage_bps=entry_slippage_bps,
+            exit_slippage_bps=float(close_result.slippage_bps),
+            entry_fill_ratio=entry_fill_ratio,
+            exit_fill_ratio=float(close_result.fill_ratio),
+            submit_fail_count=int(close_result.submit_fail_count),
+            residual_unfilled=bool(close_result.residual_unfilled),
+            window_quality_score=float(window_quality.score),
+            entry_latency_ms=max(0, int(entry_submit_latency_ms)),
+            exit_latency_ms=max(0, int(exit_submit_latency_ms)),
+        ),
+        None,
+    )
 
 
 def _iter_window_rows(
@@ -1189,6 +1387,18 @@ def _write_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
         "avg_pnl",
         "profit_factor",
         "max_drawdown",
+        "entry_fee_total",
+        "exit_fee_total",
+        "fee_total",
+        "avg_entry_slippage_bps",
+        "avg_exit_slippage_bps",
+        "avg_entry_fill_ratio",
+        "avg_exit_fill_ratio",
+        "avg_submit_fail_count",
+        "residual_unfilled_rate",
+        "avg_window_quality",
+        "avg_entry_latency_ms",
+        "avg_exit_latency_ms",
         "reason_counts",
         "skip_counts",
     ]
@@ -1313,6 +1523,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Extra bps penalty applied to unresolved residual when close retries exhaust.",
     )
     parser.add_argument(
+        "--entry-submit-latency-ms",
+        type=int,
+        default=DEFAULT_ENTRY_SUBMIT_LATENCY_MS,
+        help="Simulated delay from entry trigger to orderbook-based entry execution.",
+    )
+    parser.add_argument(
+        "--exit-submit-latency-ms",
+        type=int,
+        default=DEFAULT_EXIT_SUBMIT_LATENCY_MS,
+        help="Simulated delay from exit trigger to first close attempt.",
+    )
+    parser.add_argument(
+        "--min-window-quality",
+        type=float,
+        default=DEFAULT_MIN_WINDOW_QUALITY,
+        help="Skip windows with quality score below threshold (0-1).",
+    )
+    parser.add_argument(
         "--sort-by",
         choices=["total_pnl", "win_rate", "profit_factor", "max_drawdown", "trades"],
         default="total_pnl",
@@ -1357,13 +1585,22 @@ def main() -> None:
     estimated_total_windows = _count_windows(conn, args.start_ts_sec, args.end_ts_sec)
 
     windows_data: List[List[WindowRow]] = []
+    window_quality_map: List[WindowQuality] = []
     try:
         for _, raw_rows in _iter_window_rows(conn, args.start_ts_sec, args.end_ts_sec):
             if not raw_rows:
                 continue
 
             # Forward-fill quote/BTC values within each window so sparse snapshots remain usable.
-            windows_data.append(_forward_fill_rows(raw_rows))
+            filled_rows = _forward_fill_rows(raw_rows)
+            windows_data.append(filled_rows)
+            window_quality_map.append(
+                _compute_window_quality(
+                    filled_rows,
+                    max_btc_age_ms=int(args.max_btc_age_ms),
+                    max_quote_age_ms=int(args.max_quote_age_ms),
+                )
+            )
     finally:
         conn.close()
 
@@ -1378,6 +1615,7 @@ def main() -> None:
         st = stats_map[p]
         for window_index, rows in enumerate(windows_data, start=1):
             st.windows += 1
+            window_quality = window_quality_map[window_index - 1]
             trade, skip_reason = _simulate_window(
                 rows,
                 p,
@@ -1392,6 +1630,10 @@ def main() -> None:
                 queue_fill_ratio_entry=float(args.entry_queue_fill_ratio),
                 queue_fill_ratio_exit=float(args.exit_queue_fill_ratio),
                 unfilled_penalty_bps=float(args.unfilled_penalty_bps),
+                entry_submit_latency_ms=int(args.entry_submit_latency_ms),
+                exit_submit_latency_ms=int(args.exit_submit_latency_ms),
+                window_quality=window_quality,
+                min_window_quality=float(args.min_window_quality),
             )
             if trade is None:
                 st.add_skip(skip_reason or "unknown")
