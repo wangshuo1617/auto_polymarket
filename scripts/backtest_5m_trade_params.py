@@ -6,9 +6,9 @@ applies a simplified version of the 5m strategy logic, and evaluates many parame
 combinations in one run.
 
 Notes:
-- Uses quote-level simulation (best ask for entry, best bid for exit).
-- Simulates live-like sweep exits: SL-like reasons use bid-0.05, others bid-0.01.
-- Does not simulate full depth/VWAP partial-fill execution plan from execution_plans.py.
+- Reuses live execution plan core (services/five_minute_trade/execution_plans.py).
+- Simulates live-like sweep exits and close retries with residual handling.
+- Supports fee deduction, queue-position fill haircut, and WS/HTTP source-age routing.
 - Matches key decision points used in 5m_trade:
   1) pre-close entry at configured minute/seconds,
   2) dynamic TP/SL derived from entry price,
@@ -25,11 +25,25 @@ import json
 import math
 import os
 import sqlite3
+import sys
 import time
 from datetime import datetime
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from services.five_minute_trade.execution_plans import build_execution_plan as live_build_execution_plan
+from data.polymarket import (
+    get_event_token_id,
+    get_market_metadata,
+    prefetch_order_metadata_for_tokens,
+)
 
 
 DEFAULT_TP_PRICE_CAP = 0.95
@@ -42,6 +56,14 @@ MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
 MAX_ENTRY_SLIPPAGE_BPS = 120.0
 FALLBACK_LEVEL_SIZE = 1_000_000.0
 DEFAULT_SIZE_TICK = "0.01"
+MIN_DUST_SIZE = 0.02
+CLOSE_RETRY_DELAY_SEC = 5
+MAX_CLOSE_RETRIES = 3
+WS_BOOK_MAX_AGE_MS = 1200
+HTTP_QUOTE_MAX_AGE_MS = 5000
+DEFAULT_ENTRY_QUEUE_FILL_RATIO = 0.9
+DEFAULT_EXIT_QUEUE_FILL_RATIO = 0.85
+DEFAULT_UNFILLED_PENALTY_BPS = 800.0
 
 
 @dataclass(frozen=True)
@@ -82,6 +104,9 @@ class WindowRow:
     down_event_ms: Optional[int]
     down_bids_5: Optional[List[Dict[str, float]]]
     down_asks_5: Optional[List[Dict[str, float]]]
+    market_slug: Optional[str] = None
+    up_token: Optional[str] = None
+    down_token: Optional[str] = None
 
 
 @dataclass
@@ -89,6 +114,16 @@ class WindowTrade:
     pnl: float
     reason: str
     direction: str
+
+
+@dataclass(frozen=True)
+class WindowMarketContext:
+    market_slug: str
+    up_token: Optional[str]
+    down_token: Optional[str]
+    size_tick: str
+    up_fee_bps: float
+    down_fee_bps: float
 
 
 class ComboStats:
@@ -249,6 +284,9 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
     down_event_ms: Optional[int] = None
     down_bids_5: Optional[List[Dict[str, float]]] = None
     down_asks_5: Optional[List[Dict[str, float]]] = None
+    market_slug: Optional[str] = None
+    up_token: Optional[str] = None
+    down_token: Optional[str] = None
 
     for r in rows:
         if r.btc_price is not None:
@@ -274,6 +312,12 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
             down_bids_5 = [dict(item) for item in r.down_bids_5]
         if r.down_asks_5:
             down_asks_5 = [dict(item) for item in r.down_asks_5]
+        if r.market_slug:
+            market_slug = str(r.market_slug)
+        if r.up_token:
+            up_token = str(r.up_token)
+        if r.down_token:
+            down_token = str(r.down_token)
         out.append(
             WindowRow(
                 ts_sec=r.ts_sec,
@@ -290,6 +334,9 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
                 down_event_ms=down_event_ms,
                 down_bids_5=([dict(item) for item in down_bids_5] if down_bids_5 else None),
                 down_asks_5=([dict(item) for item in down_asks_5] if down_asks_5 else None),
+                market_slug=market_slug,
+                up_token=up_token,
+                down_token=down_token,
             )
         )
     return out
@@ -333,94 +380,157 @@ def _normalize_levels(levels: Optional[List[Dict[str, float]]], side: str) -> Li
     return sorted(cleaned, key=lambda x: float(x["price"]), reverse=True)
 
 
-def _row_levels_for_side(row: WindowRow, direction: str, side: str) -> List[Dict[str, float]]:
+def _apply_queue_fill_ratio(levels: List[Dict[str, float]], fill_ratio: float) -> List[Dict[str, float]]:
+    ratio = min(1.0, max(0.0, float(fill_ratio)))
+    adjusted: List[Dict[str, float]] = []
+    for lvl in levels:
+        size = _to_positive_float(lvl.get("size"))
+        price = _to_positive_float(lvl.get("price"))
+        if size is None or price is None:
+            continue
+        adjusted_size = size * ratio
+        if adjusted_size <= 1e-12:
+            continue
+        adjusted.append({"price": price, "size": adjusted_size})
+    return adjusted
+
+
+def _get_market_context(
+    row: WindowRow,
+    default_size_tick: str,
+    metadata_cache: Dict[str, WindowMarketContext],
+    default_fee_bps: float,
+) -> WindowMarketContext:
+    market_slug = str(row.market_slug or "")
+    up_token = str(row.up_token or "") or None
+    down_token = str(row.down_token or "") or None
+    if market_slug and market_slug in metadata_cache:
+        return metadata_cache[market_slug]
+
+    size_tick = str(default_size_tick)
+    up_fee_bps = float(default_fee_bps)
+    down_fee_bps = float(default_fee_bps)
+
+    try:
+        info = get_event_token_id(market_slug) if market_slug else None
+        markets = info.get("markets") if isinstance(info, dict) else None
+        first_market = markets[0] if isinstance(markets, list) and markets else None
+        market_id = first_market.get("market_id") if isinstance(first_market, dict) else None
+        if isinstance(first_market, dict):
+            token_ids = first_market.get("token_id") or []
+            outcomes = [str(v).lower() for v in (first_market.get("outcomes") or [])]
+            if len(token_ids) >= 2 and len(outcomes) == len(token_ids):
+                up_idx = next((i for i, o in enumerate(outcomes) if "up" in o), 0)
+                down_idx = next((i for i, o in enumerate(outcomes) if "down" in o), 1)
+                up_token = up_token or str(token_ids[up_idx])
+                down_token = down_token or str(token_ids[down_idx])
+
+        if market_id:
+            meta = get_market_metadata(str(market_id)) or {}
+            tick = meta.get("minimum_tick_size")
+            if tick is not None:
+                size_tick = str(tick)
+
+            token_list = [tok for tok in [up_token, down_token] if tok]
+            if token_list:
+                fee_meta = prefetch_order_metadata_for_tokens(
+                    token_ids=token_list,
+                    market_meta=meta,
+                    refresh_fee_rate=False,
+                )
+                if up_token and isinstance(fee_meta.get(up_token), dict):
+                    up_fee_bps = float(fee_meta[up_token].get("fee_rate_bps") or default_fee_bps)
+                if down_token and isinstance(fee_meta.get(down_token), dict):
+                    down_fee_bps = float(fee_meta[down_token].get("fee_rate_bps") or default_fee_bps)
+    except Exception:
+        pass
+
+    ctx = WindowMarketContext(
+        market_slug=market_slug,
+        up_token=up_token,
+        down_token=down_token,
+        size_tick=size_tick,
+        up_fee_bps=up_fee_bps,
+        down_fee_bps=down_fee_bps,
+    )
+    if market_slug:
+        metadata_cache[market_slug] = ctx
+    return ctx
+
+
+def _row_levels_for_side(
+    row: WindowRow,
+    direction: str,
+    side: str,
+    max_ws_book_age_ms: int,
+    max_http_quote_age_ms: int,
+) -> List[Dict[str, float]]:
     if direction == "up":
         best_ask = row.up_ask
         best_bid = row.up_bid
         asks_5 = row.up_asks_5
         bids_5 = row.up_bids_5
+        event_ms = row.up_event_ms
     else:
         best_ask = row.down_ask
         best_bid = row.down_bid
         asks_5 = row.down_asks_5
         bids_5 = row.down_bids_5
+        event_ms = row.down_event_ms
+
+    age_ms = _age_ms_at_row(row.ts_sec, event_ms)
+    ws_fresh = _is_fresh(age_ms, max_ws_book_age_ms)
+    http_fresh = _is_fresh(age_ms, max_http_quote_age_ms)
 
     if side == "buy":
         levels = _normalize_levels(asks_5, side="buy")
-        if levels:
+        if levels and ws_fresh:
             return levels
         ask = _to_positive_float(best_ask)
-        if ask is None:
+        if ask is None or not http_fresh:
             return []
         return [{"price": ask, "size": FALLBACK_LEVEL_SIZE}]
 
     levels = _normalize_levels(bids_5, side="sell")
-    if levels:
+    if levels and ws_fresh:
         return levels
     bid = _to_positive_float(best_bid)
-    if bid is None:
+    if bid is None or not http_fresh:
         return []
     return [{"price": bid, "size": FALLBACK_LEVEL_SIZE}]
 
 
+class _PlanAdapter:
+    @staticmethod
+    def _to_positive_float(value: object) -> Optional[float]:
+        return _to_positive_float(value)
+
+
 def _build_execution_plan(levels: List[Dict[str, float]], target_size: float, side: str) -> Optional[Dict[str, float]]:
-    if target_size <= 0:
-        return None
-    if not levels:
+    if target_size <= 0 or not levels:
         return None
 
-    remaining = target_size
-    executed_size = 0.0
-    executed_notional = 0.0
-    best_price: Optional[float] = None
-    worst_price: Optional[float] = None
-    available_size = 0.0
-
-    for lvl in levels:
-        size = _to_positive_float(lvl.get("size"))
-        if size is None:
-            continue
-        available_size += size
-
-    for lvl in levels:
-        price = _to_positive_float(lvl.get("price"))
-        size = _to_positive_float(lvl.get("size"))
-        if price is None or size is None:
-            continue
-        if remaining <= 1e-12:
-            break
-        take = min(remaining, size)
-        if take <= 0:
-            continue
-        if best_price is None:
-            best_price = price
-        worst_price = price
-        executed_size += take
-        executed_notional += take * price
-        remaining -= take
-
-    if executed_size <= 0 or best_price is None or worst_price is None:
-        return None
-
-    vwap = executed_notional / executed_size
-    fill_ratio = executed_size / target_size
-    if side == "buy":
-        slippage_abs = max(0.0, vwap - best_price)
-    else:
-        slippage_abs = max(0.0, best_price - vwap)
-    slippage_bps = (slippage_abs / best_price * 10000.0) if best_price > 0 else 0.0
-
-    return {
-        "target_size": target_size,
-        "executed_size": executed_size,
-        "available_size": available_size,
-        "executed_notional": executed_notional,
-        "best_price": best_price,
-        "worst_price": worst_price,
-        "vwap_price": vwap,
-        "fill_ratio": fill_ratio,
-        "slippage_bps": slippage_bps,
+    best_price = _to_positive_float(levels[0].get("price"))
+    payload: Dict[str, Any] = {
+        "source": "backtest",
+        "levels": levels,
+        "best_ask": best_price if side == "buy" else None,
+        "best_bid": best_price if side == "sell" else None,
     }
+    try:
+        plan = live_build_execution_plan(
+            trader=_PlanAdapter(),
+            token_id="backtest-token",
+            side=side,
+            target_size=target_size,
+            levels_payload=payload,
+        )
+    except Exception:
+        return None
+
+    if not isinstance(plan, dict):
+        return None
+    return plan
 
 
 def _first_row_in_range(
@@ -521,6 +631,149 @@ def _apply_sweep_exit_price(reason: str, best_bid: float) -> float:
     return max(0.01, float(best_bid) - 0.01)
 
 
+def _find_row_at_or_after(
+    rows: Sequence[WindowRow],
+    start_rel_sec: int,
+    direction: str,
+    max_quote_age_ms: int,
+) -> Optional[WindowRow]:
+    for r in rows:
+        if r.rel_sec < start_rel_sec:
+            continue
+        bid_event_ms = r.up_event_ms if direction == "up" else r.down_event_ms
+        bid = r.up_bid if direction == "up" else r.down_bid
+        bid_age = _age_ms_at_row(r.ts_sec, bid_event_ms)
+        if bid is None or bid <= 0:
+            continue
+        if not _is_fresh(bid_age, max_quote_age_ms):
+            continue
+        return r
+    return None
+
+
+def _eligible_sell_levels(levels: List[Dict[str, float]], sweep_price: float) -> List[Dict[str, float]]:
+    eligible: List[Dict[str, float]] = []
+    for lvl in levels:
+        price = _to_positive_float(lvl.get("price"))
+        size = _to_positive_float(lvl.get("size"))
+        if price is None or size is None:
+            continue
+        if price + 1e-12 < sweep_price:
+            continue
+        eligible.append({"price": price, "size": size})
+    return eligible
+
+
+def _simulate_close_state_machine(
+    rows: Sequence[WindowRow],
+    entry_row: WindowRow,
+    trigger_row: WindowRow,
+    direction: str,
+    initial_reason: str,
+    target_size: float,
+    max_quote_age_ms: int,
+    max_ws_book_age_ms: int,
+    max_http_quote_age_ms: int,
+    queue_fill_ratio_exit: float,
+    unfilled_penalty_bps: float,
+) -> Tuple[float, str]:
+    remaining = max(0.0, float(target_size))
+    if remaining <= 0:
+        return 0.0, initial_reason
+
+    total_notional = 0.0
+    current_reason = initial_reason
+    submit_fail_count = 0
+    first_trigger_bid = trigger_row.up_bid if direction == "up" else trigger_row.down_bid
+    fallback_bid = _to_positive_float(first_trigger_bid) or 0.01
+
+    attempt_start_rel = trigger_row.rel_sec
+    for attempt in range(MAX_CLOSE_RETRIES):
+        row = _find_row_at_or_after(
+            rows,
+            start_rel_sec=attempt_start_rel,
+            direction=direction,
+            max_quote_age_ms=max_quote_age_ms,
+        )
+        if row is None:
+            break
+
+        row_best_bid = row.up_bid if direction == "up" else row.down_bid
+        row_best_bid_f = _to_positive_float(row_best_bid)
+        if row_best_bid_f is None:
+            attempt_start_rel = row.rel_sec + CLOSE_RETRY_DELAY_SEC
+            continue
+
+        raw_levels = _row_levels_for_side(
+            row,
+            direction=direction,
+            side="sell",
+            max_ws_book_age_ms=max_ws_book_age_ms,
+            max_http_quote_age_ms=max_http_quote_age_ms,
+        )
+        if not raw_levels:
+            submit_fail_count += 1
+            attempt_start_rel = row.rel_sec + CLOSE_RETRY_DELAY_SEC
+            current_reason = f"{initial_reason}_submit_fail"
+            continue
+
+        plan_all = _build_execution_plan(raw_levels, target_size=remaining, side="sell")
+        expected_exit_price = (
+            float(plan_all["worst_price"]) if plan_all is not None else row_best_bid_f
+        )
+
+        if _is_sl_like_reason(current_reason):
+            current_bid = min(row_best_bid_f, expected_exit_price)
+        else:
+            current_bid = expected_exit_price
+        sweep_price = _apply_sweep_exit_price(current_reason, current_bid)
+
+        executable_levels = _eligible_sell_levels(raw_levels, sweep_price=sweep_price)
+        executable_levels = _apply_queue_fill_ratio(executable_levels, fill_ratio=queue_fill_ratio_exit)
+        executable_plan = _build_execution_plan(executable_levels, target_size=remaining, side="sell")
+        if executable_plan is None:
+            submit_fail_count += 1
+            attempt_start_rel = row.rel_sec + CLOSE_RETRY_DELAY_SEC
+            current_reason = f"{initial_reason}_submit_fail"
+            continue
+
+        matched = float(executable_plan["executed_size"])
+        notional = float(executable_plan["executed_notional"])
+        if matched <= 0:
+            submit_fail_count += 1
+            attempt_start_rel = row.rel_sec + CLOSE_RETRY_DELAY_SEC
+            current_reason = f"{initial_reason}_submit_fail"
+            continue
+
+        total_notional += notional
+        remaining = max(0.0, remaining - matched)
+        fallback_bid = row_best_bid_f
+        if remaining <= MIN_DUST_SIZE:
+            remaining = 0.0
+            break
+
+        current_reason = (
+            f"{initial_reason}_residual"
+            if not initial_reason.endswith("_residual")
+            else initial_reason
+        )
+        attempt_start_rel = row.rel_sec + CLOSE_RETRY_DELAY_SEC
+
+    if remaining > 0:
+        # Final degradation path: no more book evidence, penalize unresolved residual.
+        sweep_price = _apply_sweep_exit_price(current_reason, fallback_bid)
+        penalty = max(0.0, float(unfilled_penalty_bps)) / 10000.0
+        sweep_price = max(0.01, sweep_price * (1.0 - penalty))
+        total_notional += remaining * sweep_price
+        remaining = 0.0
+        current_reason = f"{initial_reason}_residual_unfilled"
+
+    final_reason = current_reason
+    if submit_fail_count > 0 and not final_reason.startswith(initial_reason):
+        final_reason = f"{initial_reason}_submit_fail"
+    return total_notional / max(target_size, 1e-12), final_reason
+
+
 def _parse_toxic_utc_hours(raw_value: str) -> set[int]:
     value = (raw_value or "").strip()
     if not value:
@@ -545,7 +798,14 @@ def _simulate_window(
     toxic_utc_hours: set[int],
     max_btc_age_ms: int,
     max_quote_age_ms: int,
-    size_tick: str,
+    default_size_tick: str,
+    metadata_cache: Dict[str, WindowMarketContext],
+    default_fee_bps: float,
+    max_ws_book_age_ms: int,
+    max_http_quote_age_ms: int,
+    queue_fill_ratio_entry: float,
+    queue_fill_ratio_exit: float,
+    unfilled_penalty_bps: float,
 ) -> Tuple[Optional[WindowTrade], Optional[str]]:
     if not rows:
         return None, "empty_window"
@@ -581,6 +841,13 @@ def _simulate_window(
         return None, "diff_below_threshold"
 
     direction = "up" if diff > 0 else "down"
+    market_ctx = _get_market_context(
+        row=entry_row,
+        default_size_tick=default_size_tick,
+        metadata_cache=metadata_cache,
+        default_fee_bps=default_fee_bps,
+    )
+    fee_bps = market_ctx.up_fee_bps if direction == "up" else market_ctx.down_fee_bps
     ask = entry_row.up_ask if direction == "up" else entry_row.down_ask
     ask_event_ms = entry_row.up_event_ms if direction == "up" else entry_row.down_event_ms
     ask_age = _age_ms_at_row(entry_row.ts_sec, ask_event_ms)
@@ -595,11 +862,18 @@ def _simulate_window(
     raw_target_size = params.stake_usd / rough_entry_price
     if raw_target_size <= 0:
         return None, "invalid_entry_size"
-    target_size = _normalize_order_size(raw_target_size, tick_size=size_tick)
+    target_size = _normalize_order_size(raw_target_size, tick_size=market_ctx.size_tick)
     if target_size <= 0:
         return None, "normalized_entry_size_zero"
 
-    entry_levels = _row_levels_for_side(entry_row, direction=direction, side="buy")
+    entry_levels = _row_levels_for_side(
+        entry_row,
+        direction=direction,
+        side="buy",
+        max_ws_book_age_ms=max_ws_book_age_ms,
+        max_http_quote_age_ms=max_http_quote_age_ms,
+    )
+    entry_levels = _apply_queue_fill_ratio(entry_levels, fill_ratio=queue_fill_ratio_entry)
     entry_plan = _build_execution_plan(entry_levels, target_size=target_size, side="buy")
     if entry_plan is None:
         return None, "missing_entry_orderbook"
@@ -610,6 +884,7 @@ def _simulate_window(
 
     size = float(entry_plan["executed_size"])
     entry_cost = float(entry_plan["executed_notional"])
+    entry_fee = entry_cost * max(0.0, fee_bps) / 10000.0
     entry_price_for_risk = float(entry_plan["worst_price"])
 
     take_profit_price, stop_loss_price = _dynamic_tp_sl(entry_price_for_risk, params=params)
@@ -679,34 +954,25 @@ def _simulate_window(
     if exit_price is None or exit_price <= 0:
         return None, "missing_exit_bid"
 
-    exit_trigger_best_bid = float(exit_price)
     close_row = exit_row or entry_row
-    sell_levels = _row_levels_for_side(close_row, direction=direction, side="sell")
-    sell_plan = _build_execution_plan(sell_levels, target_size=size, side="sell")
+    effective_exit_price, realized_reason = _simulate_close_state_machine(
+        rows=rows,
+        entry_row=entry_row,
+        trigger_row=close_row,
+        direction=direction,
+        initial_reason=exit_reason,
+        target_size=size,
+        max_quote_age_ms=max_quote_age_ms,
+        max_ws_book_age_ms=max_ws_book_age_ms,
+        max_http_quote_age_ms=max_http_quote_age_ms,
+        queue_fill_ratio_exit=queue_fill_ratio_exit,
+        unfilled_penalty_bps=unfilled_penalty_bps,
+    )
 
-    if sell_plan is not None:
-        expected_exit_price = float(sell_plan["worst_price"])
-    else:
-        expected_exit_price = exit_trigger_best_bid
-
-    if _is_sl_like_reason(exit_reason):
-        current_bid = min(exit_trigger_best_bid, expected_exit_price)
-    else:
-        current_bid = expected_exit_price
-    sweep_price = _apply_sweep_exit_price(exit_reason, current_bid)
-
-    if sell_plan is None:
-        effective_exit_price = sweep_price
-    else:
-        executed_size = float(sell_plan["executed_size"])
-        executed_notional = float(sell_plan["executed_notional"])
-        remaining_size = max(0.0, size - executed_size)
-        # Top5 depth covers immediate fills; residual uses aggressive sweep price.
-        total_exit_notional = executed_notional + remaining_size * sweep_price
-        effective_exit_price = total_exit_notional / size if size > 0 else sweep_price
-
-    pnl = size * effective_exit_price - entry_cost
-    return WindowTrade(pnl=pnl, reason=exit_reason, direction=direction), None
+    exit_notional = size * effective_exit_price
+    exit_fee = exit_notional * max(0.0, fee_bps) / 10000.0
+    pnl = (exit_notional - exit_fee) - (entry_cost + entry_fee)
+    return WindowTrade(pnl=pnl, reason=realized_reason, direction=direction), None
 
 
 def _iter_window_rows(
@@ -737,6 +1003,9 @@ def _iter_window_rows(
         SELECT
             window_start_ms,
             ts_sec,
+            market_slug,
+            {_col_or_null('up_token')},
+            {_col_or_null('down_token')},
             btc_price,
             btc_event_ms,
             up_best_bid,
@@ -775,18 +1044,21 @@ def _iter_window_rows(
             WindowRow(
                 ts_sec=ts_sec,
                 rel_sec=rel_sec,
-                btc_price=_to_float(row[2]),
-                btc_event_ms=(int(row[3]) if row[3] is not None else None),
-                up_bid=_to_float(row[4]),
-                up_ask=_to_float(row[5]),
-                up_event_ms=(int(row[6]) if row[6] is not None else None),
-                up_bids_5=_parse_levels_json(row[7]),
-                up_asks_5=_parse_levels_json(row[8]),
-                down_bid=_to_float(row[9]),
-                down_ask=_to_float(row[10]),
-                down_event_ms=(int(row[11]) if row[11] is not None else None),
-                down_bids_5=_parse_levels_json(row[12]),
-                down_asks_5=_parse_levels_json(row[13]),
+                market_slug=(str(row[2]) if row[2] is not None else None),
+                up_token=(str(row[3]) if row[3] is not None else None),
+                down_token=(str(row[4]) if row[4] is not None else None),
+                btc_price=_to_float(row[5]),
+                btc_event_ms=(int(row[6]) if row[6] is not None else None),
+                up_bid=_to_float(row[7]),
+                up_ask=_to_float(row[8]),
+                up_event_ms=(int(row[9]) if row[9] is not None else None),
+                up_bids_5=_parse_levels_json(row[10]),
+                up_asks_5=_parse_levels_json(row[11]),
+                down_bid=_to_float(row[12]),
+                down_ask=_to_float(row[13]),
+                down_event_ms=(int(row[14]) if row[14] is not None else None),
+                down_bids_5=_parse_levels_json(row[15]),
+                down_asks_5=_parse_levels_json(row[16]),
             )
         )
 
@@ -1005,6 +1277,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Max allowed Polymarket quote age for entry/exit pricing (<=0 disables freshness filter)",
     )
     parser.add_argument(
+        "--ws-book-max-age-ms",
+        type=int,
+        default=WS_BOOK_MAX_AGE_MS,
+        help="Max age for using top5 WS orderbook levels; stale levels fall back to HTTP-style best quote.",
+    )
+    parser.add_argument(
+        "--http-quote-max-age-ms",
+        type=int,
+        default=HTTP_QUOTE_MAX_AGE_MS,
+        help="Max age for using best quote fallback when WS levels are stale/missing.",
+    )
+    parser.add_argument(
+        "--entry-queue-fill-ratio",
+        type=float,
+        default=DEFAULT_ENTRY_QUEUE_FILL_RATIO,
+        help="Queue-position fill ratio applied to entry-side available size (0-1).",
+    )
+    parser.add_argument(
+        "--exit-queue-fill-ratio",
+        type=float,
+        default=DEFAULT_EXIT_QUEUE_FILL_RATIO,
+        help="Queue-position fill ratio applied to exit-side available size (0-1).",
+    )
+    parser.add_argument(
+        "--default-fee-bps",
+        type=float,
+        default=0.0,
+        help="Fallback fee bps when market/token fee metadata is unavailable.",
+    )
+    parser.add_argument(
+        "--unfilled-penalty-bps",
+        type=float,
+        default=DEFAULT_UNFILLED_PENALTY_BPS,
+        help="Extra bps penalty applied to unresolved residual when close retries exhaust.",
+    )
+    parser.add_argument(
         "--sort-by",
         choices=["total_pnl", "win_rate", "profit_factor", "max_drawdown", "trades"],
         default="total_pnl",
@@ -1042,6 +1350,7 @@ def main() -> None:
 
     params = _build_param_grid(args)
     stats_map: Dict[ParamSet, ComboStats] = {p: ComboStats(p) for p in params}
+    metadata_cache: Dict[str, WindowMarketContext] = {}
 
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
@@ -1075,7 +1384,14 @@ def main() -> None:
                 toxic_utc_hours=toxic_utc_hours,
                 max_btc_age_ms=args.max_btc_age_ms,
                 max_quote_age_ms=args.max_quote_age_ms,
-                size_tick=str(args.size_tick),
+                default_size_tick=str(args.size_tick),
+                metadata_cache=metadata_cache,
+                default_fee_bps=float(args.default_fee_bps),
+                max_ws_book_age_ms=int(args.ws_book_max_age_ms),
+                max_http_quote_age_ms=int(args.http_quote_max_age_ms),
+                queue_fill_ratio_entry=float(args.entry_queue_fill_ratio),
+                queue_fill_ratio_exit=float(args.exit_queue_fill_ratio),
+                unfilled_penalty_bps=float(args.unfilled_penalty_bps),
             )
             if trade is None:
                 st.add_skip(skip_reason or "unknown")
