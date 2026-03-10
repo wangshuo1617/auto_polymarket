@@ -21,7 +21,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from config import SQLITE_DB_PATH
 
-from data.polymarket import get_event_token_id, get_order_book
+from data.polymarket import (
+	get_event_token_id,
+	get_market_metadata,
+	get_order_book,
+	prefetch_order_metadata_for_tokens,
+)
 from services.five_minute_trade.watchers import (
 	ChainlinkBTCPriceWatcher,
 	PolymarketAssetPriceWatcher,
@@ -97,6 +102,10 @@ class SQLiteBatchWriter:
 				btc_age_ms INTEGER,
 				up_token TEXT,
 				down_token TEXT,
+				market_id TEXT,
+				minimum_tick_size TEXT,
+				up_fee_rate_bps REAL,
+				down_fee_rate_bps REAL,
 				up_best_bid REAL,
 				up_best_ask REAL,
 				up_event_ms INTEGER,
@@ -125,6 +134,10 @@ class SQLiteBatchWriter:
 	def _ensure_table_columns(self, conn: sqlite3.Connection) -> None:
 		# Backward compatibility for existing databases created before top-5 book columns.
 		required_columns = {
+			"market_id": "TEXT",
+			"minimum_tick_size": "TEXT",
+			"up_fee_rate_bps": "REAL",
+			"down_fee_rate_bps": "REAL",
 			"up_bids_5": "TEXT",
 			"up_asks_5": "TEXT",
 			"down_bids_5": "TEXT",
@@ -168,6 +181,10 @@ class SQLiteBatchWriter:
 				btc_age_ms,
 				up_token,
 				down_token,
+				market_id,
+				minimum_tick_size,
+				up_fee_rate_bps,
+				down_fee_rate_bps,
 				up_best_bid,
 				up_best_ask,
 				up_event_ms,
@@ -181,7 +198,7 @@ class SQLiteBatchWriter:
 				down_bids_5,
 				down_asks_5,
 				created_at_utc
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			""",
 			rows_with_created,
 		)
@@ -262,7 +279,8 @@ class BTC1sMarketMonitor:
 		self._current_window_start_ms: Optional[int] = None
 		self._current_market_slug: Optional[str] = None
 		self._current_tokens: Dict[str, Optional[str]] = {"up_token": None, "down_token": None}
-		self._market_cache: Dict[str, Dict[str, Optional[str]]] = {}
+		self._current_market_meta: Dict[str, Any] = {}
+		self._market_cache: Dict[str, Dict[str, Any]] = {}
 
 		self._token_books: Dict[str, PriceBookState] = {}
 		self._http_book_cache: Dict[str, Dict[str, Any]] = {}
@@ -521,6 +539,12 @@ class BTC1sMarketMonitor:
 		market_tokens = self._select_market_and_tokens(market_slug)
 		with self._lock:
 			self._current_tokens = market_tokens
+			self._current_market_meta = {
+				"market_id": market_tokens.get("market_id"),
+				"minimum_tick_size": market_tokens.get("minimum_tick_size"),
+				"up_fee_rate_bps": market_tokens.get("up_fee_rate_bps"),
+				"down_fee_rate_bps": market_tokens.get("down_fee_rate_bps"),
+			}
 			self._token_books = {}
 
 		self._restart_polymarket_watcher(
@@ -535,7 +559,7 @@ class BTC1sMarketMonitor:
 			market_tokens.get("down_token"),
 		)
 
-	def _select_market_and_tokens(self, market_slug: str) -> Dict[str, Optional[str]]:
+	def _select_market_and_tokens(self, market_slug: str) -> Dict[str, Any]:
 		cached = self._market_cache.get(market_slug)
 		if cached is not None:
 			return cached
@@ -546,6 +570,7 @@ class BTC1sMarketMonitor:
 			if not markets:
 				raise RuntimeError("未找到 markets")
 			market = markets[0]
+			market_id = str(market.get("market_id") or "")
 			outcomes = [str(o).lower() for o in (market.get("outcomes") or [])]
 			token_ids = market.get("token_id") or []
 			if len(outcomes) != len(token_ids) or len(token_ids) < 2:
@@ -554,15 +579,44 @@ class BTC1sMarketMonitor:
 			up_idx = next((i for i, x in enumerate(outcomes) if "up" in x), 0)
 			down_idx = next((i for i, x in enumerate(outcomes) if "down" in x), 1)
 
-			result: Dict[str, Optional[str]] = {
+			result: Dict[str, Any] = {
 				"up_token": str(token_ids[up_idx]),
 				"down_token": str(token_ids[down_idx]),
+				"market_id": market_id or None,
+				"minimum_tick_size": None,
+				"up_fee_rate_bps": None,
+				"down_fee_rate_bps": None,
 			}
+
+			if market_id:
+				meta = get_market_metadata(market_id) or {}
+				tick = meta.get("minimum_tick_size")
+				if tick is not None:
+					result["minimum_tick_size"] = str(tick)
+
+				fee_meta = prefetch_order_metadata_for_tokens(
+					token_ids=[result["up_token"], result["down_token"]],
+					market_meta=meta,
+					refresh_fee_rate=False,
+				)
+				if isinstance(fee_meta, dict):
+					up_meta = fee_meta.get(result["up_token"]) or {}
+					down_meta = fee_meta.get(result["down_token"]) or {}
+					result["up_fee_rate_bps"] = up_meta.get("fee_rate_bps")
+					result["down_fee_rate_bps"] = down_meta.get("fee_rate_bps")
+
 			self._market_cache[market_slug] = result
 			return result
 		except Exception as e:
 			logger.warning("获取市场 token 失败: slug=%s error=%s", market_slug, e)
-			return {"up_token": None, "down_token": None}
+			return {
+				"up_token": None,
+				"down_token": None,
+				"market_id": None,
+				"minimum_tick_size": None,
+				"up_fee_rate_bps": None,
+				"down_fee_rate_bps": None,
+			}
 
 	def _restart_polymarket_watcher(
 		self,
@@ -616,6 +670,7 @@ class BTC1sMarketMonitor:
 			btc_event_ms = self._latest_btc_event_ms
 			up_token = self._current_tokens.get("up_token")
 			down_token = self._current_tokens.get("down_token")
+			market_meta = dict(self._current_market_meta)
 			up_state = self._token_books.get(str(up_token)) if up_token else None
 			down_state = self._token_books.get(str(down_token)) if down_token else None
 
@@ -669,6 +724,10 @@ class BTC1sMarketMonitor:
 			_age_ms(btc_event_ms),
 			up_token,
 			down_token,
+			market_meta.get("market_id"),
+			market_meta.get("minimum_tick_size"),
+			self._to_positive_float(market_meta.get("up_fee_rate_bps")),
+			self._to_positive_float(market_meta.get("down_fee_rate_bps")),
 			up_state.best_bid if up_state else None,
 			up_state.best_ask if up_state else None,
 			up_state.event_ms if up_state else None,

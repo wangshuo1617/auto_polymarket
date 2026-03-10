@@ -19,6 +19,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import itertools
 import json
@@ -109,8 +110,12 @@ class WindowRow:
     down_bids_5: Optional[List[Dict[str, float]]]
     down_asks_5: Optional[List[Dict[str, float]]]
     market_slug: Optional[str] = None
+    market_id: Optional[str] = None
     up_token: Optional[str] = None
     down_token: Optional[str] = None
+    minimum_tick_size: Optional[str] = None
+    up_fee_rate_bps: Optional[float] = None
+    down_fee_rate_bps: Optional[float] = None
 
 
 @dataclass
@@ -157,6 +162,38 @@ class WindowMarketContext:
     size_tick: str
     up_fee_bps: float
     down_fee_bps: float
+
+
+@dataclass(frozen=True)
+class WindowPrepared:
+    rows: Sequence[WindowRow]
+    open_row: Optional[WindowRow]
+    close3_row: Optional[WindowRow]
+    close4_row: Optional[WindowRow]
+    decision_row_map: Dict[Tuple[int, int], Optional[WindowRow]]
+    is_toxic: bool
+
+
+@dataclass(frozen=True)
+class SimulationConfig:
+    max_btc_age_ms: int
+    max_quote_age_ms: int
+    default_size_tick: str
+    default_fee_bps: float
+    resolve_market_metadata: bool
+    max_ws_book_age_ms: int
+    max_http_quote_age_ms: int
+    queue_fill_ratio_entry: float
+    queue_fill_ratio_exit: float
+    unfilled_penalty_bps: float
+    entry_submit_latency_ms: int
+    exit_submit_latency_ms: int
+    min_window_quality: float
+
+
+_WORKER_WINDOWS_DATA: Optional[Sequence[WindowPrepared]] = None
+_WORKER_WINDOW_QUALITY_MAP: Optional[Sequence[WindowQuality]] = None
+_WORKER_SIM_CONFIG: Optional[SimulationConfig] = None
 
 
 class ComboStats:
@@ -364,8 +401,12 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
     down_bids_5: Optional[List[Dict[str, float]]] = None
     down_asks_5: Optional[List[Dict[str, float]]] = None
     market_slug: Optional[str] = None
+    market_id: Optional[str] = None
     up_token: Optional[str] = None
     down_token: Optional[str] = None
+    minimum_tick_size: Optional[str] = None
+    up_fee_rate_bps: Optional[float] = None
+    down_fee_rate_bps: Optional[float] = None
 
     for r in rows:
         if r.btc_price is not None:
@@ -378,9 +419,9 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
         if r.up_event_ms is not None:
             up_event_ms = r.up_event_ms
         if r.up_bids_5:
-            up_bids_5 = [dict(item) for item in r.up_bids_5]
+            up_bids_5 = r.up_bids_5
         if r.up_asks_5:
-            up_asks_5 = [dict(item) for item in r.up_asks_5]
+            up_asks_5 = r.up_asks_5
         if r.down_bid is not None:
             down_bid = r.down_bid
         if r.down_ask is not None:
@@ -388,15 +429,23 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
         if r.down_event_ms is not None:
             down_event_ms = r.down_event_ms
         if r.down_bids_5:
-            down_bids_5 = [dict(item) for item in r.down_bids_5]
+            down_bids_5 = r.down_bids_5
         if r.down_asks_5:
-            down_asks_5 = [dict(item) for item in r.down_asks_5]
+            down_asks_5 = r.down_asks_5
         if r.market_slug:
             market_slug = str(r.market_slug)
+        if r.market_id:
+            market_id = str(r.market_id)
         if r.up_token:
             up_token = str(r.up_token)
         if r.down_token:
             down_token = str(r.down_token)
+        if r.minimum_tick_size:
+            minimum_tick_size = str(r.minimum_tick_size)
+        if r.up_fee_rate_bps is not None:
+            up_fee_rate_bps = float(r.up_fee_rate_bps)
+        if r.down_fee_rate_bps is not None:
+            down_fee_rate_bps = float(r.down_fee_rate_bps)
         out.append(
             WindowRow(
                 ts_sec=r.ts_sec,
@@ -406,16 +455,20 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
                 up_bid=up_bid,
                 up_ask=up_ask,
                 up_event_ms=up_event_ms,
-                up_bids_5=([dict(item) for item in up_bids_5] if up_bids_5 else None),
-                up_asks_5=([dict(item) for item in up_asks_5] if up_asks_5 else None),
+                up_bids_5=up_bids_5,
+                up_asks_5=up_asks_5,
                 down_bid=down_bid,
                 down_ask=down_ask,
                 down_event_ms=down_event_ms,
-                down_bids_5=([dict(item) for item in down_bids_5] if down_bids_5 else None),
-                down_asks_5=([dict(item) for item in down_asks_5] if down_asks_5 else None),
+                down_bids_5=down_bids_5,
+                down_asks_5=down_asks_5,
                 market_slug=market_slug,
+                market_id=market_id,
                 up_token=up_token,
                 down_token=down_token,
+                minimum_tick_size=minimum_tick_size,
+                up_fee_rate_bps=up_fee_rate_bps,
+                down_fee_rate_bps=down_fee_rate_bps,
             )
         )
     return out
@@ -479,6 +532,7 @@ def _get_market_context(
     default_size_tick: str,
     metadata_cache: Dict[str, WindowMarketContext],
     default_fee_bps: float,
+    resolve_metadata: bool,
 ) -> WindowMarketContext:
     market_slug = str(row.market_slug or "")
     up_token = str(row.up_token or "") or None
@@ -486,9 +540,36 @@ def _get_market_context(
     if market_slug and market_slug in metadata_cache:
         return metadata_cache[market_slug]
 
-    size_tick = str(default_size_tick)
-    up_fee_bps = float(default_fee_bps)
-    down_fee_bps = float(default_fee_bps)
+    size_tick = str(row.minimum_tick_size or default_size_tick)
+    up_fee_bps = float(_to_float(row.up_fee_rate_bps) or default_fee_bps)
+    down_fee_bps = float(_to_float(row.down_fee_rate_bps) or default_fee_bps)
+
+    has_db_metadata = bool(row.minimum_tick_size) or row.up_fee_rate_bps is not None or row.down_fee_rate_bps is not None
+    if has_db_metadata:
+        ctx = WindowMarketContext(
+            market_slug=market_slug,
+            up_token=up_token,
+            down_token=down_token,
+            size_tick=size_tick,
+            up_fee_bps=up_fee_bps,
+            down_fee_bps=down_fee_bps,
+        )
+        if market_slug:
+            metadata_cache[market_slug] = ctx
+        return ctx
+
+    if not resolve_metadata:
+        ctx = WindowMarketContext(
+            market_slug=market_slug,
+            up_token=up_token,
+            down_token=down_token,
+            size_tick=size_tick,
+            up_fee_bps=up_fee_bps,
+            down_fee_bps=down_fee_bps,
+        )
+        if market_slug:
+            metadata_cache[market_slug] = ctx
+        return ctx
 
     try:
         info = get_event_token_id(market_slug) if market_slug else None
@@ -946,14 +1027,14 @@ def _parse_toxic_utc_hours(raw_value: str) -> set[int]:
 
 
 def _simulate_window(
-    rows: Sequence[WindowRow],
+    prepared: WindowPrepared,
     params: ParamSet,
-    toxic_utc_hours: set[int],
     max_btc_age_ms: int,
     max_quote_age_ms: int,
     default_size_tick: str,
     metadata_cache: Dict[str, WindowMarketContext],
     default_fee_bps: float,
+    resolve_market_metadata: bool,
     max_ws_book_age_ms: int,
     max_http_quote_age_ms: int,
     queue_fill_ratio_entry: float,
@@ -964,15 +1045,16 @@ def _simulate_window(
     window_quality: WindowQuality,
     min_window_quality: float,
 ) -> Tuple[Optional[WindowTrade], Optional[str]]:
+    rows = prepared.rows
     if not rows:
         return None, "empty_window"
 
-    if _is_toxic_window(rows, toxic_utc_hours):
+    if prepared.is_toxic:
         return None, "toxic_time_regime"
     if window_quality.score < float(min_window_quality):
         return None, "window_quality_too_low"
 
-    open_row = _first_row_in_range(rows, start_sec=0, end_sec_exclusive=WINDOW_SECONDS, require_btc=True)
+    open_row = prepared.open_row
     if open_row is None or open_row.btc_price is None:
         return None, "missing_open_price"
 
@@ -982,12 +1064,7 @@ def _simulate_window(
         return None, "invalid_entry_timing"
 
     # Live-like entry decision: use the latest snapshot before minute close.
-    entry_row = _last_row_in_range(
-        rows,
-        start_sec=decision_start_sec,
-        end_sec_exclusive=decision_end_sec,
-        require_btc=True,
-    )
+    entry_row = prepared.decision_row_map.get((params.entry_minute, params.entry_preclose_sec))
     if entry_row is None or entry_row.btc_price is None:
         return None, "missing_entry_signal_price"
 
@@ -1014,6 +1091,7 @@ def _simulate_window(
         default_size_tick=default_size_tick,
         metadata_cache=metadata_cache,
         default_fee_bps=default_fee_bps,
+        resolve_metadata=resolve_market_metadata,
     )
     fee_bps = market_ctx.up_fee_bps if direction == "up" else market_ctx.down_fee_bps
     ask = entry_exec_row.up_ask if direction == "up" else entry_exec_row.down_ask
@@ -1059,8 +1137,8 @@ def _simulate_window(
 
     take_profit_price, stop_loss_price = _dynamic_tp_sl(entry_price_for_risk, params=params)
 
-    close3 = _first_row_at_or_after(rows, sec=3 * 60, require_btc=True)
-    close4 = _first_row_at_or_after(rows, sec=4 * 60, require_btc=True)
+    close3 = prepared.close3_row
+    close4 = prepared.close4_row
     dir_change_active = False
     if close3 is not None and close4 is not None and close3.btc_price is not None and close4.btc_price is not None:
         dir3 = "up" if close3.btc_price > open_row.btc_price else "down"
@@ -1202,8 +1280,12 @@ def _iter_window_rows(
             window_start_ms,
             ts_sec,
             market_slug,
+            {_col_or_null('market_id')},
             {_col_or_null('up_token')},
             {_col_or_null('down_token')},
+            {_col_or_null('minimum_tick_size')},
+            {_col_or_null('up_fee_rate_bps')},
+            {_col_or_null('down_fee_rate_bps')},
             btc_price,
             btc_event_ms,
             up_best_bid,
@@ -1243,20 +1325,24 @@ def _iter_window_rows(
                 ts_sec=ts_sec,
                 rel_sec=rel_sec,
                 market_slug=(str(row[2]) if row[2] is not None else None),
-                up_token=(str(row[3]) if row[3] is not None else None),
-                down_token=(str(row[4]) if row[4] is not None else None),
-                btc_price=_to_float(row[5]),
-                btc_event_ms=(int(row[6]) if row[6] is not None else None),
-                up_bid=_to_float(row[7]),
-                up_ask=_to_float(row[8]),
-                up_event_ms=(int(row[9]) if row[9] is not None else None),
-                up_bids_5=_parse_levels_json(row[10]),
-                up_asks_5=_parse_levels_json(row[11]),
-                down_bid=_to_float(row[12]),
-                down_ask=_to_float(row[13]),
-                down_event_ms=(int(row[14]) if row[14] is not None else None),
-                down_bids_5=_parse_levels_json(row[15]),
-                down_asks_5=_parse_levels_json(row[16]),
+                market_id=(str(row[3]) if row[3] is not None else None),
+                up_token=(str(row[4]) if row[4] is not None else None),
+                down_token=(str(row[5]) if row[5] is not None else None),
+                minimum_tick_size=(str(row[6]) if row[6] is not None else None),
+                up_fee_rate_bps=_to_float(row[7]),
+                down_fee_rate_bps=_to_float(row[8]),
+                btc_price=_to_float(row[9]),
+                btc_event_ms=(int(row[10]) if row[10] is not None else None),
+                up_bid=_to_float(row[11]),
+                up_ask=_to_float(row[12]),
+                up_event_ms=(int(row[13]) if row[13] is not None else None),
+                up_bids_5=_parse_levels_json(row[14]),
+                up_asks_5=_parse_levels_json(row[15]),
+                down_bid=_to_float(row[16]),
+                down_ask=_to_float(row[17]),
+                down_event_ms=(int(row[18]) if row[18] is not None else None),
+                down_bids_5=_parse_levels_json(row[19]),
+                down_asks_5=_parse_levels_json(row[20]),
             )
         )
 
@@ -1408,6 +1494,67 @@ def _write_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def _worker_init(
+    windows_data: Sequence[WindowPrepared],
+    window_quality_map: Sequence[WindowQuality],
+    sim_config: SimulationConfig,
+) -> None:
+    global _WORKER_WINDOWS_DATA
+    global _WORKER_WINDOW_QUALITY_MAP
+    global _WORKER_SIM_CONFIG
+    _WORKER_WINDOWS_DATA = windows_data
+    _WORKER_WINDOW_QUALITY_MAP = window_quality_map
+    _WORKER_SIM_CONFIG = sim_config
+
+
+def _evaluate_one_param(
+    param: ParamSet,
+    windows_data: Sequence[WindowPrepared],
+    window_quality_map: Sequence[WindowQuality],
+    sim_config: SimulationConfig,
+) -> Dict[str, object]:
+    st = ComboStats(param)
+    metadata_cache: Dict[str, WindowMarketContext] = {}
+    for window_index, prepared in enumerate(windows_data, start=1):
+        st.windows += 1
+        window_quality = window_quality_map[window_index - 1]
+        trade, skip_reason = _simulate_window(
+            prepared=prepared,
+            params=param,
+            max_btc_age_ms=sim_config.max_btc_age_ms,
+            max_quote_age_ms=sim_config.max_quote_age_ms,
+            default_size_tick=sim_config.default_size_tick,
+            metadata_cache=metadata_cache,
+            default_fee_bps=sim_config.default_fee_bps,
+            resolve_market_metadata=sim_config.resolve_market_metadata,
+            max_ws_book_age_ms=sim_config.max_ws_book_age_ms,
+            max_http_quote_age_ms=sim_config.max_http_quote_age_ms,
+            queue_fill_ratio_entry=sim_config.queue_fill_ratio_entry,
+            queue_fill_ratio_exit=sim_config.queue_fill_ratio_exit,
+            unfilled_penalty_bps=sim_config.unfilled_penalty_bps,
+            entry_submit_latency_ms=sim_config.entry_submit_latency_ms,
+            exit_submit_latency_ms=sim_config.exit_submit_latency_ms,
+            window_quality=window_quality,
+            min_window_quality=sim_config.min_window_quality,
+        )
+        if trade is None:
+            st.add_skip(skip_reason or "unknown")
+        else:
+            st.add_trade(trade)
+    return st.as_row()
+
+
+def _evaluate_one_param_in_worker(param: ParamSet) -> Dict[str, object]:
+    if _WORKER_WINDOWS_DATA is None or _WORKER_WINDOW_QUALITY_MAP is None or _WORKER_SIM_CONFIG is None:
+        raise RuntimeError("worker context is not initialized")
+    return _evaluate_one_param(
+        param=param,
+        windows_data=_WORKER_WINDOWS_DATA,
+        window_quality_map=_WORKER_WINDOW_QUALITY_MAP,
+        sim_config=_WORKER_SIM_CONFIG,
+    )
+
+
 def _build_timestamped_output_path(path: str) -> str:
     base, ext = os.path.splitext(path)
     if not ext:
@@ -1517,6 +1664,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fallback fee bps when market/token fee metadata is unavailable.",
     )
     parser.add_argument(
+        "--disable-market-metadata",
+        action="store_true",
+        help="Skip per-window HTTP market metadata resolution for faster backtests.",
+    )
+    parser.add_argument(
         "--unfilled-penalty-bps",
         type=float,
         default=DEFAULT_UNFILLED_PENALTY_BPS,
@@ -1554,6 +1706,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Print progress every N windows (0 disables progress output)",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes for parameter combinations (default 1).",
+    )
+    parser.add_argument(
         "--output-csv",
         type=str,
         default="output/5m_param_backtest.csv",
@@ -1577,15 +1735,14 @@ def main() -> None:
     toxic_utc_hours = _parse_toxic_utc_hours(args.toxic_utc_hours)
 
     params = _build_param_grid(args)
-    stats_map: Dict[ParamSet, ComboStats] = {p: ComboStats(p) for p in params}
-    metadata_cache: Dict[str, WindowMarketContext] = {}
 
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
     estimated_total_windows = _count_windows(conn, args.start_ts_sec, args.end_ts_sec)
 
-    windows_data: List[List[WindowRow]] = []
+    windows_data: List[WindowPrepared] = []
     window_quality_map: List[WindowQuality] = []
+    decision_keys = {(p.entry_minute, p.entry_preclose_sec) for p in params}
     try:
         for _, raw_rows in _iter_window_rows(conn, args.start_ts_sec, args.end_ts_sec):
             if not raw_rows:
@@ -1593,7 +1750,35 @@ def main() -> None:
 
             # Forward-fill quote/BTC values within each window so sparse snapshots remain usable.
             filled_rows = _forward_fill_rows(raw_rows)
-            windows_data.append(filled_rows)
+            decision_row_map: Dict[Tuple[int, int], Optional[WindowRow]] = {}
+            for minute, preclose_sec in decision_keys:
+                start_sec = minute * 60 - preclose_sec
+                end_sec = minute * 60
+                if start_sec < 0 or start_sec >= end_sec:
+                    decision_row_map[(minute, preclose_sec)] = None
+                else:
+                    decision_row_map[(minute, preclose_sec)] = _last_row_in_range(
+                        filled_rows,
+                        start_sec=start_sec,
+                        end_sec_exclusive=end_sec,
+                        require_btc=True,
+                    )
+
+            windows_data.append(
+                WindowPrepared(
+                    rows=filled_rows,
+                    open_row=_first_row_in_range(
+                        filled_rows,
+                        start_sec=0,
+                        end_sec_exclusive=WINDOW_SECONDS,
+                        require_btc=True,
+                    ),
+                    close3_row=_first_row_at_or_after(filled_rows, sec=3 * 60, require_btc=True),
+                    close4_row=_first_row_at_or_after(filled_rows, sec=4 * 60, require_btc=True),
+                    decision_row_map=decision_row_map,
+                    is_toxic=_is_toxic_window(filled_rows, toxic_utc_hours),
+                )
+            )
             window_quality_map.append(
                 _compute_window_quality(
                     filled_rows,
@@ -1607,41 +1792,39 @@ def main() -> None:
     total_windows = len(windows_data)
     total_combos = len(params)
     total_units = total_windows * total_combos
+    workers = max(1, int(args.workers))
+
+    sim_config = SimulationConfig(
+        max_btc_age_ms=int(args.max_btc_age_ms),
+        max_quote_age_ms=int(args.max_quote_age_ms),
+        default_size_tick=str(args.size_tick),
+        default_fee_bps=float(args.default_fee_bps),
+        resolve_market_metadata=not bool(args.disable_market_metadata),
+        max_ws_book_age_ms=int(args.ws_book_max_age_ms),
+        max_http_quote_age_ms=int(args.http_quote_max_age_ms),
+        queue_fill_ratio_entry=float(args.entry_queue_fill_ratio),
+        queue_fill_ratio_exit=float(args.exit_queue_fill_ratio),
+        unfilled_penalty_bps=float(args.unfilled_penalty_bps),
+        entry_submit_latency_ms=int(args.entry_submit_latency_ms),
+        exit_submit_latency_ms=int(args.exit_submit_latency_ms),
+        min_window_quality=float(args.min_window_quality),
+    )
 
     started_at = time.time()
-    processed_units = 0
-
-    for combo_index, p in enumerate(params, start=1):
-        st = stats_map[p]
-        for window_index, rows in enumerate(windows_data, start=1):
-            st.windows += 1
-            window_quality = window_quality_map[window_index - 1]
-            trade, skip_reason = _simulate_window(
-                rows,
-                p,
-                toxic_utc_hours=toxic_utc_hours,
-                max_btc_age_ms=args.max_btc_age_ms,
-                max_quote_age_ms=args.max_quote_age_ms,
-                default_size_tick=str(args.size_tick),
-                metadata_cache=metadata_cache,
-                default_fee_bps=float(args.default_fee_bps),
-                max_ws_book_age_ms=int(args.ws_book_max_age_ms),
-                max_http_quote_age_ms=int(args.http_quote_max_age_ms),
-                queue_fill_ratio_entry=float(args.entry_queue_fill_ratio),
-                queue_fill_ratio_exit=float(args.exit_queue_fill_ratio),
-                unfilled_penalty_bps=float(args.unfilled_penalty_bps),
-                entry_submit_latency_ms=int(args.entry_submit_latency_ms),
-                exit_submit_latency_ms=int(args.exit_submit_latency_ms),
-                window_quality=window_quality,
-                min_window_quality=float(args.min_window_quality),
+    result_rows: List[Dict[str, object]] = []
+    if workers == 1:
+        processed_units = 0
+        for combo_index, p in enumerate(params, start=1):
+            row = _evaluate_one_param(
+                param=p,
+                windows_data=windows_data,
+                window_quality_map=window_quality_map,
+                sim_config=sim_config,
             )
-            if trade is None:
-                st.add_skip(skip_reason or "unknown")
-            else:
-                st.add_trade(trade)
+            result_rows.append(row)
 
-            processed_units += 1
-            if args.progress_every > 0 and (window_index % args.progress_every == 0):
+            processed_units += total_windows
+            if args.progress_every > 0:
                 elapsed = max(1e-9, time.time() - started_at)
                 unit_speed = processed_units / elapsed
                 overall_pct = (processed_units / total_units) * 100.0 if total_units > 0 else 0.0
@@ -1649,11 +1832,35 @@ def main() -> None:
                 eta_sec = remain_units / max(unit_speed, 1e-9)
                 print(
                     f"Progress: combo {combo_index}/{total_combos} | "
-                    f"window {window_index}/{total_windows} | "
+                    f"window {total_windows}/{total_windows} | "
                     f"overall {overall_pct:.1f}% | {unit_speed:.2f} units/s | ETA {eta_sec:.1f}s"
                 )
+    else:
+        completed = 0
+        max_workers = min(workers, max(1, os.cpu_count() or 1), max(1, len(params)))
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_worker_init,
+            initargs=(windows_data, window_quality_map, sim_config),
+        ) as pool:
+            future_to_param = {pool.submit(_evaluate_one_param_in_worker, p): p for p in params}
+            for future in concurrent.futures.as_completed(future_to_param):
+                result_rows.append(future.result())
+                completed += 1
+                if args.progress_every > 0:
+                    elapsed = max(1e-9, time.time() - started_at)
+                    processed_units = completed * total_windows
+                    unit_speed = processed_units / elapsed
+                    overall_pct = (completed / total_combos) * 100.0 if total_combos > 0 else 0.0
+                    remain_units = max(0, total_units - processed_units)
+                    eta_sec = remain_units / max(unit_speed, 1e-9)
+                    print(
+                        f"Progress: combo {completed}/{total_combos} | "
+                        f"window {total_windows}/{total_windows} | "
+                        f"overall {overall_pct:.1f}% | {unit_speed:.2f} units/s | ETA {eta_sec:.1f}s"
+                    )
 
-    result_rows = [s.as_row() for s in stats_map.values() if s.trades >= args.min_trades]
+    result_rows = [row for row in result_rows if _as_int(row["trades"]) >= args.min_trades]
 
     if args.sort_by == "max_drawdown":
         result_rows.sort(key=lambda r: _as_float(r["max_drawdown"]))
