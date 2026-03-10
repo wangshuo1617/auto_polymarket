@@ -8,6 +8,7 @@ BTC 与 Polymarket 5m 市场逐秒监控服务。
 """
 
 import argparse
+import json
 import logging
 import os
 import queue
@@ -20,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from config import SQLITE_DB_PATH
 
-from data.polymarket import get_event_token_id
+from data.polymarket import get_event_token_id, get_order_book
 from services.five_minute_trade.watchers import (
 	ChainlinkBTCPriceWatcher,
 	PolymarketAssetPriceWatcher,
@@ -35,6 +36,8 @@ class PriceBookState:
 	best_ask: Optional[float] = None
 	event_ms: Optional[int] = None
 	received_ms: Optional[int] = None
+	bids: Optional[List[Dict[str, float]]] = None
+	asks: Optional[List[Dict[str, float]]] = None
 
 
 class SQLiteBatchWriter:
@@ -102,6 +105,10 @@ class SQLiteBatchWriter:
 				down_best_ask REAL,
 				down_event_ms INTEGER,
 				down_age_ms INTEGER,
+				up_bids_5 TEXT,
+				up_asks_5 TEXT,
+				down_bids_5 TEXT,
+				down_asks_5 TEXT,
 				created_at_utc TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 			)
 			"""
@@ -112,7 +119,32 @@ class SQLiteBatchWriter:
 		conn.execute(
 			"CREATE INDEX IF NOT EXISTS idx_btc_poly_1s_ticks_market ON btc_poly_1s_ticks(market_slug)"
 		)
+		self._ensure_table_columns(conn)
 		conn.commit()
+
+	def _ensure_table_columns(self, conn: sqlite3.Connection) -> None:
+		# Backward compatibility for existing databases created before top-5 book columns.
+		required_columns = {
+			"up_bids_5": "TEXT",
+			"up_asks_5": "TEXT",
+			"down_bids_5": "TEXT",
+			"down_asks_5": "TEXT",
+		}
+		existing = {
+			str(row[1])
+			for row in conn.execute("PRAGMA table_info(btc_poly_1s_ticks)")
+		}
+		added: List[str] = []
+		for col_name, col_type in required_columns.items():
+			if col_name in existing:
+				continue
+			conn.execute(
+				f"ALTER TABLE btc_poly_1s_ticks ADD COLUMN {col_name} {col_type}"
+			)
+			added.append(col_name)
+		if added:
+			logger.info("btc_poly_1s_ticks 自动补齐列: %s", ",".join(added))
+			conn.commit()
 
 	def _flush_rows(
 		self,
@@ -144,8 +176,12 @@ class SQLiteBatchWriter:
 				down_best_ask,
 				down_event_ms,
 				down_age_ms,
+				up_bids_5,
+				up_asks_5,
+				down_bids_5,
+				down_asks_5,
 				created_at_utc
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			""",
 			rows_with_created,
 		)
@@ -198,6 +234,8 @@ class SQLiteBatchWriter:
 
 class BTC1sMarketMonitor:
 	WINDOW_MS = 5 * 60 * 1000
+	BOOK_LEVELS_TO_STORE = 5
+	HTTP_BOOK_MAX_AGE_MS = 2000
 
 	def __init__(
 		self,
@@ -227,6 +265,7 @@ class BTC1sMarketMonitor:
 		self._market_cache: Dict[str, Dict[str, Optional[str]]] = {}
 
 		self._token_books: Dict[str, PriceBookState] = {}
+		self._http_book_cache: Dict[str, Dict[str, Any]] = {}
 
 	def start(self) -> None:
 		if self._running:
@@ -313,13 +352,144 @@ class BTC1sMarketMonitor:
 
 		with self._lock:
 			state = self._token_books.get(token_id) or PriceBookState()
-			if best_bid is not None:
-				state.best_bid = best_bid
-			if best_ask is not None:
-				state.best_ask = best_ask
+
+			if payload.get("price_change_only"):
+				if best_bid is not None:
+					state.best_bid = best_bid
+				if best_ask is not None:
+					state.best_ask = best_ask
+
+				# Align with 5m_trade behavior: mutate top level price in cached book when only best changes.
+				if best_ask is not None and state.asks and len(state.asks) > 0:
+					state.asks[0]["price"] = best_ask
+				if best_bid is not None and state.bids and len(state.bids) > 0:
+					state.bids[-1]["price"] = best_bid
+			else:
+				raw_bids = payload.get("bids")
+				raw_asks = payload.get("asks")
+				normalized_bids = self._normalize_levels(raw_bids)
+				normalized_asks = self._normalize_levels(raw_asks)
+
+				if normalized_bids:
+					state.bids = normalized_bids
+				if normalized_asks:
+					state.asks = normalized_asks
+
+				if best_bid is None and state.bids:
+					best_bid = state.bids[-1]["price"]
+				if best_ask is None and state.asks:
+					best_ask = state.asks[0]["price"]
+
+				if best_bid is not None:
+					state.best_bid = best_bid
+				if best_ask is not None:
+					state.best_ask = best_ask
+
 			state.event_ms = event_ms
 			state.received_ms = received_ms_int
 			self._token_books[token_id] = state
+
+	@staticmethod
+	def _to_positive_float(value: Any) -> Optional[float]:
+		try:
+			if value is None:
+				return None
+			parsed = float(value)
+			if parsed <= 0:
+				return None
+			return parsed
+		except Exception:
+			return None
+
+	@classmethod
+	def _normalize_levels(cls, raw_levels: Any) -> List[Dict[str, float]]:
+		levels: List[Dict[str, float]] = []
+		if not isinstance(raw_levels, list):
+			return levels
+		for lvl in raw_levels:
+			if not isinstance(lvl, dict):
+				continue
+			price = cls._to_positive_float(lvl.get("price"))
+			size = cls._to_positive_float(lvl.get("size"))
+			if price is None or size is None:
+				continue
+			levels.append({"price": price, "size": size})
+		return levels
+
+	@staticmethod
+	def _top_asks(levels: Optional[List[Dict[str, float]]], max_levels: int) -> List[Dict[str, float]]:
+		if not levels or max_levels <= 0:
+			return []
+		return [dict(item) for item in levels[:max_levels] if isinstance(item, dict)]
+
+	@staticmethod
+	def _top_bids(levels: Optional[List[Dict[str, float]]], max_levels: int) -> List[Dict[str, float]]:
+		if not levels or max_levels <= 0:
+			return []
+		# ws book convention in watcher: best bid is the last level.
+		tail = levels[-max_levels:]
+		return [dict(item) for item in reversed(tail) if isinstance(item, dict)]
+
+	@staticmethod
+	def _encode_levels(levels: List[Dict[str, float]]) -> Optional[str]:
+		if not levels:
+			return None
+		return json.dumps(levels, separators=(",", ":"), ensure_ascii=False)
+
+	def _fetch_http_book_snapshot(self, token_id: Optional[str], now_ms: int) -> Optional[Dict[str, Any]]:
+		token = str(token_id or "")
+		if not token:
+			return None
+
+		cached = self._http_book_cache.get(token)
+		if cached is not None:
+			cached_ts = int(cached.get("fetched_ms") or 0)
+			if now_ms - cached_ts <= self.HTTP_BOOK_MAX_AGE_MS:
+				return cached
+
+		try:
+			book = get_order_book(token)
+		except Exception as e:
+			logger.debug("HTTP订单簿回退失败: token=%s error=%s", token, e)
+			return cached
+
+		if book is None:
+			return cached
+
+		raw_asks = getattr(book, "asks", None) or []
+		raw_bids = getattr(book, "bids", None) or []
+
+		asks: List[Dict[str, float]] = []
+		for lvl in raw_asks:
+			price = self._to_positive_float(getattr(lvl, "price", None))
+			size = self._to_positive_float(getattr(lvl, "size", None))
+			if price is None or size is None:
+				continue
+			asks.append({"price": price, "size": size})
+		asks = sorted(asks, key=lambda x: float(x["price"]))
+
+		bids: List[Dict[str, float]] = []
+		for lvl in raw_bids:
+			price = self._to_positive_float(getattr(lvl, "price", None))
+			size = self._to_positive_float(getattr(lvl, "size", None))
+			if price is None or size is None:
+				continue
+			bids.append({"price": price, "size": size})
+		# Keep ascending order to match WS convention used by 5m_trade (best bid at the tail).
+		bids = sorted(bids, key=lambda x: float(x["price"]))
+
+		snapshot = {
+			"bids": bids,
+			"asks": asks,
+			"best_bid": bids[-1]["price"] if bids else None,
+			"best_ask": asks[0]["price"] if asks else None,
+			"event_ms": now_ms,
+			"received_ms": now_ms,
+			"fetched_ms": now_ms,
+			"source": "http",
+		}
+		self._http_book_cache[token] = snapshot
+		return snapshot
 
 	def _sampling_loop(self) -> None:
 		next_second = int(time.time()) + 1
@@ -449,6 +619,40 @@ class BTC1sMarketMonitor:
 			up_state = self._token_books.get(str(up_token)) if up_token else None
 			down_state = self._token_books.get(str(down_token)) if down_token else None
 
+		# Match 5m_trade execution path: fall back to HTTP orderbook when WS does not have full book levels.
+		if up_token and (up_state is None or not up_state.bids or not up_state.asks):
+			up_http_snapshot = self._fetch_http_book_snapshot(up_token, now_ms)
+			if up_http_snapshot is not None:
+				if up_state is None:
+					up_state = PriceBookState()
+				up_state.bids = list(up_http_snapshot.get("bids") or [])
+				up_state.asks = list(up_http_snapshot.get("asks") or [])
+				up_state.best_bid = self._to_positive_float(up_http_snapshot.get("best_bid"))
+				up_state.best_ask = self._to_positive_float(up_http_snapshot.get("best_ask"))
+				up_state.event_ms = int(up_http_snapshot.get("event_ms") or now_ms)
+				up_state.received_ms = int(up_http_snapshot.get("received_ms") or now_ms)
+				with self._lock:
+					self._token_books[str(up_token)] = up_state
+
+		if down_token and (down_state is None or not down_state.bids or not down_state.asks):
+			down_http_snapshot = self._fetch_http_book_snapshot(down_token, now_ms)
+			if down_http_snapshot is not None:
+				if down_state is None:
+					down_state = PriceBookState()
+				down_state.bids = list(down_http_snapshot.get("bids") or [])
+				down_state.asks = list(down_http_snapshot.get("asks") or [])
+				down_state.best_bid = self._to_positive_float(down_http_snapshot.get("best_bid"))
+				down_state.best_ask = self._to_positive_float(down_http_snapshot.get("best_ask"))
+				down_state.event_ms = int(down_http_snapshot.get("event_ms") or now_ms)
+				down_state.received_ms = int(down_http_snapshot.get("received_ms") or now_ms)
+				with self._lock:
+					self._token_books[str(down_token)] = down_state
+
+		up_bids_5 = self._top_bids(up_state.bids if up_state else None, self.BOOK_LEVELS_TO_STORE)
+		up_asks_5 = self._top_asks(up_state.asks if up_state else None, self.BOOK_LEVELS_TO_STORE)
+		down_bids_5 = self._top_bids(down_state.bids if down_state else None, self.BOOK_LEVELS_TO_STORE)
+		down_asks_5 = self._top_asks(down_state.asks if down_state else None, self.BOOK_LEVELS_TO_STORE)
+
 		def _age_ms(event_ms: Optional[int]) -> Optional[int]:
 			if event_ms is None:
 				return None
@@ -473,6 +677,10 @@ class BTC1sMarketMonitor:
 			down_state.best_ask if down_state else None,
 			down_state.event_ms if down_state else None,
 			_age_ms(down_state.event_ms) if down_state else None,
+			self._encode_levels(up_bids_5),
+			self._encode_levels(up_asks_5),
+			self._encode_levels(down_bids_5),
+			self._encode_levels(down_asks_5),
 		)
 
 
