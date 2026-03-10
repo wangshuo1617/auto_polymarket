@@ -115,25 +115,14 @@ def get_market_sentiment_and_funding() -> dict:
         print(f"RSI获取失败: {e}")
 
     # 7. ETF 流入
-    etf_inflow_num = None
+    etf_flow_2w: list[dict[str, str]] = []
     try:
         etf_data = ETFScraper().get_etf_inflow()
         if etf_data:
-            etf_inflow_num = etf_data.get("net_inflow_num")
-            print(f"ETF流入数据: {etf_inflow_num}")
+            etf_flow_2w = etf_data.get("etf_flow_2w") or []
+            print(f"ETF最近两周流动数据条目: {len(etf_flow_2w)}")
     except Exception as e:
         print(f"ETF抓取失败: {e}")
-
-    etf_net_inflow = "N/A"
-    if etf_inflow_num is not None:
-        if abs(etf_inflow_num) >= 1e9:
-            etf_net_inflow = f"${etf_inflow_num / 1e9:.2f}B"
-        elif abs(etf_inflow_num) >= 1e6:
-            etf_net_inflow = f"${etf_inflow_num / 1e6:.2f}M"
-        elif abs(etf_inflow_num) >= 1e3:
-            etf_net_inflow = f"${etf_inflow_num / 1e3:.2f}K"
-        else:
-            etf_net_inflow = f"${etf_inflow_num:.2f}"
 
     # 8. 稳定币流动性
     stablecoin_mcap = 0
@@ -177,7 +166,7 @@ def get_market_sentiment_and_funding() -> dict:
             "funding_rate_pct": funding_rate_pct,
             "open_interest": oi_formatted,
             "oi_change_trend": oi_change_trend,
-            "etf_net_inflow": etf_net_inflow,
+            "etf_net_inflow_2w": etf_flow_2w,
             "stablecoin_macro_liquidity": stablecoin_macro_liquidity
         }
     }
@@ -186,7 +175,7 @@ def get_market_sentiment_and_funding() -> dict:
     save_data = {
         "btc_current_price": current_price,
         "open_interest_usdt": open_interest_usdt,
-        "etf_inflow_num": etf_inflow_num,
+        "etf_flow_2w": etf_flow_2w,
         "timestamp": current_timestamp.timestamp()
     }
     with open(SENTIMENT_CACHE_FILE, "w") as f:

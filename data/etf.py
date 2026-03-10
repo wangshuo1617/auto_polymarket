@@ -70,23 +70,59 @@ class ETFScraper:
                 print("ETF 数据行列数不足，页面结构可能已变更。")
                 return None
 
-            raw_total = latest_row[-1]
-            num_match = re.search(r"\(?\s*([0-9.,]+)\s*\)?", raw_total)
-            if not num_match:
+            def parse_total_flow_num(raw_total: str) -> float | None:
+                num_match = re.search(r"\(?\s*([0-9.,]+)\s*\)?", raw_total)
+                if not num_match:
+                    return None
+                value_str = num_match.group(1).replace(",", "")
+                value_m = float(value_str)
+                if "(" in raw_total and ")" in raw_total:
+                    value_m = -value_m
+                return value_m * 1_000_000
+
+            def normalize_date(raw_date: str) -> str:
+                try:
+                    return datetime.strptime(raw_date.strip(), "%d %b %Y").strftime("%Y-%m-%d")
+                except ValueError:
+                    return raw_date.strip()
+
+            def format_usd_flow(value: float) -> str:
+                abs_value = abs(value)
+                sign = "-" if value < 0 else "+"
+                if abs_value >= 1e9:
+                    body = f"${abs_value / 1e9:.2f}B"
+                elif abs_value >= 1e6:
+                    body = f"${abs_value / 1e6:.2f}M"
+                elif abs_value >= 1e3:
+                    body = f"${abs_value / 1e3:.2f}K"
+                else:
+                    body = f"${abs_value:.2f}"
+                return f"{sign}{body}"
+
+            latest_total_num = parse_total_flow_num(latest_row[-1])
+            if latest_total_num is None:
                 self._save_html_snapshot(html, "total_parse_failed")
                 print("未能解析 ETF 总净流动。")
                 return None
 
-            value_str = num_match.group(1).replace(",", "")
-            value_m = float(value_str)
-            if "(" in raw_total and ")" in raw_total:
-                value_m = -value_m
+            two_week_rows = date_rows[-14:]
+            etf_flow_2w: list[dict[str, str]] = []
+            for row in two_week_rows:
+                if len(row) < 2:
+                    continue
+                date_key = normalize_date(row[0])
+                total_num = parse_total_flow_num(row[-1])
+                if total_num is None:
+                    continue
+                etf_flow_2w.append({date_key: format_usd_flow(total_num)})
 
-            value_num = value_m * 1_000_000
             print(
-                f"-> 原始抓取数据: ${value_num:,.0f}" if value_num >= 0 else f"-> 原始抓取数据: -${abs(value_num):,.0f}"
+                f"-> 原始抓取数据: ${latest_total_num:,.0f}"
+                if latest_total_num >= 0
+                else f"-> 原始抓取数据: -${abs(latest_total_num):,.0f}"
             )
-            return {"net_inflow_num": value_num}
+            print(f"-> 最近两周ETF流动条目数: {len(etf_flow_2w)}")
+            return {"etf_flow_2w": etf_flow_2w}
         except Exception as e:
             print(f"Farside 抓取失败: {e}")
             return None
