@@ -7,7 +7,8 @@ combinations in one run.
 
 Notes:
 - Uses quote-level simulation (best ask for entry, best bid for exit).
-- Does not simulate orderbook depth/slippage plan from execution_plans.py.
+- Simulates live-like sweep exits: SL-like reasons use bid-0.05, others bid-0.01.
+- Does not simulate full depth/VWAP partial-fill execution plan from execution_plans.py.
 - Matches key decision points used in 5m_trade:
   1) pre-close entry at configured minute/seconds,
   2) dynamic TP/SL derived from entry price,
@@ -64,10 +65,13 @@ class WindowRow:
     ts_sec: int
     rel_sec: int
     btc_price: Optional[float]
+    btc_event_ms: Optional[int]
     up_bid: Optional[float]
     up_ask: Optional[float]
+    up_event_ms: Optional[int]
     down_bid: Optional[float]
     down_ask: Optional[float]
+    down_event_ms: Optional[int]
 
 
 @dataclass
@@ -196,31 +200,42 @@ def _as_int(v: Any) -> int:
 def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
     out: List[WindowRow] = []
     btc: Optional[float] = None
+    btc_event_ms: Optional[int] = None
     up_bid: Optional[float] = None
     up_ask: Optional[float] = None
+    up_event_ms: Optional[int] = None
     down_bid: Optional[float] = None
     down_ask: Optional[float] = None
+    down_event_ms: Optional[int] = None
 
     for r in rows:
         if r.btc_price is not None:
             btc = r.btc_price
+            btc_event_ms = r.btc_event_ms
         if r.up_bid is not None:
             up_bid = r.up_bid
         if r.up_ask is not None:
             up_ask = r.up_ask
+        if r.up_event_ms is not None:
+            up_event_ms = r.up_event_ms
         if r.down_bid is not None:
             down_bid = r.down_bid
         if r.down_ask is not None:
             down_ask = r.down_ask
+        if r.down_event_ms is not None:
+            down_event_ms = r.down_event_ms
         out.append(
             WindowRow(
                 ts_sec=r.ts_sec,
                 rel_sec=r.rel_sec,
                 btc_price=btc,
+                btc_event_ms=btc_event_ms,
                 up_bid=up_bid,
                 up_ask=up_ask,
+                up_event_ms=up_event_ms,
                 down_bid=down_bid,
                 down_ask=down_ask,
+                down_event_ms=down_event_ms,
             )
         )
     return out
@@ -241,6 +256,24 @@ def _first_row_in_range(
             continue
         return r
     return None
+
+
+def _last_row_in_range(
+    rows: Sequence[WindowRow],
+    start_sec: int,
+    end_sec_exclusive: int,
+    require_btc: bool = False,
+) -> Optional[WindowRow]:
+    selected: Optional[WindowRow] = None
+    for r in rows:
+        if r.rel_sec < start_sec:
+            continue
+        if r.rel_sec >= end_sec_exclusive:
+            break
+        if require_btc and r.btc_price is None:
+            continue
+        selected = r
+    return selected
 
 
 def _first_row_at_or_after(
@@ -265,9 +298,77 @@ def _dynamic_tp_sl(entry_price: float, params: ParamSet) -> Tuple[float, float]:
     return take_profit_price, stop_loss_price
 
 
-def _simulate_window(rows: Sequence[WindowRow], params: ParamSet) -> Tuple[Optional[WindowTrade], Optional[str]]:
+def _age_ms_at_row(row_ts_sec: int, event_ms: Optional[int]) -> Optional[int]:
+    if event_ms is None:
+        return None
+    return max(0, row_ts_sec * 1000 - int(event_ms))
+
+
+def _is_fresh(event_age_ms: Optional[int], max_age_ms: int) -> bool:
+    if max_age_ms <= 0:
+        return True
+    if event_age_ms is None:
+        return False
+    return event_age_ms <= max_age_ms
+
+
+def _window_start_sec(rows: Sequence[WindowRow]) -> Optional[int]:
+    if not rows:
+        return None
+    first = rows[0]
+    return int(first.ts_sec - first.rel_sec)
+
+
+def _is_toxic_window(rows: Sequence[WindowRow], toxic_hours: set[int]) -> bool:
+    if not toxic_hours:
+        return False
+    ws_sec = _window_start_sec(rows)
+    if ws_sec is None:
+        return False
+    hour = datetime.utcfromtimestamp(ws_sec).hour
+    return hour in toxic_hours
+
+
+def _is_sl_like_reason(reason: str) -> bool:
+    return reason.startswith("sl")
+
+
+def _apply_sweep_exit_price(reason: str, best_bid: float) -> float:
+    if _is_sl_like_reason(reason):
+        return max(0.01, float(best_bid) - 0.05)
+    return max(0.01, float(best_bid) - 0.01)
+
+
+def _parse_toxic_utc_hours(raw_value: str) -> set[int]:
+    value = (raw_value or "").strip()
+    if not value:
+        return set()
+    out: set[int] = set()
+    for part in value.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if not token.isdigit():
+            raise ValueError(f"toxic_utc_hours contains invalid hour: {token}")
+        hour = int(token)
+        if hour < 0 or hour > 23:
+            raise ValueError(f"toxic_utc_hours hour out of range 0-23: {hour}")
+        out.add(hour)
+    return out
+
+
+def _simulate_window(
+    rows: Sequence[WindowRow],
+    params: ParamSet,
+    toxic_utc_hours: set[int],
+    max_btc_age_ms: int,
+    max_quote_age_ms: int,
+) -> Tuple[Optional[WindowTrade], Optional[str]]:
     if not rows:
         return None, "empty_window"
+
+    if _is_toxic_window(rows, toxic_utc_hours):
+        return None, "toxic_time_regime"
 
     open_row = _first_row_in_range(rows, start_sec=0, end_sec_exclusive=WINDOW_SECONDS, require_btc=True)
     if open_row is None or open_row.btc_price is None:
@@ -278,7 +379,8 @@ def _simulate_window(rows: Sequence[WindowRow], params: ParamSet) -> Tuple[Optio
     if decision_start_sec < 0 or decision_start_sec >= decision_end_sec:
         return None, "invalid_entry_timing"
 
-    entry_row = _first_row_in_range(
+    # Live-like entry decision: use the latest snapshot before minute close.
+    entry_row = _last_row_in_range(
         rows,
         start_sec=decision_start_sec,
         end_sec_exclusive=decision_end_sec,
@@ -286,6 +388,9 @@ def _simulate_window(rows: Sequence[WindowRow], params: ParamSet) -> Tuple[Optio
     )
     if entry_row is None or entry_row.btc_price is None:
         return None, "missing_entry_signal_price"
+    entry_btc_age = _age_ms_at_row(entry_row.ts_sec, entry_row.btc_event_ms)
+    if not _is_fresh(entry_btc_age, max_btc_age_ms):
+        return None, "stale_entry_btc"
 
     diff = entry_row.btc_price - open_row.btc_price
     abs_diff = abs(diff)
@@ -294,8 +399,12 @@ def _simulate_window(rows: Sequence[WindowRow], params: ParamSet) -> Tuple[Optio
 
     direction = "up" if diff > 0 else "down"
     ask = entry_row.up_ask if direction == "up" else entry_row.down_ask
+    ask_event_ms = entry_row.up_event_ms if direction == "up" else entry_row.down_event_ms
+    ask_age = _age_ms_at_row(entry_row.ts_sec, ask_event_ms)
     if ask is None or ask <= 0:
         return None, "missing_entry_ask"
+    if not _is_fresh(ask_age, max_quote_age_ms):
+        return None, "stale_entry_ask"
     if ask > params.max_entry_price:
         return None, "entry_price_too_high"
 
@@ -322,34 +431,41 @@ def _simulate_window(rows: Sequence[WindowRow], params: ParamSet) -> Tuple[Optio
             continue
 
         bid = r.up_bid if direction == "up" else r.down_bid
+        bid_event_ms = r.up_event_ms if direction == "up" else r.down_event_ms
+        bid_age = _age_ms_at_row(r.ts_sec, bid_event_ms)
+        bid_is_fresh = _is_fresh(bid_age, max_quote_age_ms)
 
         if dir_change_active and r.rel_sec >= MINUTE4_CLOSE_SEC:
             exit_reason = "sl_direction_change"
-            exit_price = bid
+            if bid is not None and bid > 0 and bid_is_fresh:
+                exit_price = _apply_sweep_exit_price(exit_reason, bid)
             break
 
-        if bid is not None and bid > 0:
+        if bid is not None and bid > 0 and bid_is_fresh:
             hold_sec = r.ts_sec - entry_ts
             if hold_sec >= params.min_hold_before_close_sec and bid <= stop_loss_price:
                 exit_reason = "sl"
-                exit_price = bid
+                exit_price = _apply_sweep_exit_price(exit_reason, bid)
                 break
             if bid > take_profit_price:
                 exit_reason = "tp"
-                exit_price = bid
+                exit_price = _apply_sweep_exit_price(exit_reason, bid)
                 break
 
         if r.rel_sec >= EXPIRY_TRIGGER_SEC:
             exit_reason = "expiry"
-            exit_price = bid
+            if bid is not None and bid > 0 and bid_is_fresh:
+                exit_price = _apply_sweep_exit_price(exit_reason, bid)
             break
 
     if exit_price is None or exit_price <= 0:
         # Final fallback: use latest available bid in this window; if still missing, no trade.
         for r in reversed(rows):
             bid = r.up_bid if direction == "up" else r.down_bid
-            if bid is not None and bid > 0:
-                exit_price = bid
+            bid_event_ms = r.up_event_ms if direction == "up" else r.down_event_ms
+            bid_age = _age_ms_at_row(r.ts_sec, bid_event_ms)
+            if bid is not None and bid > 0 and _is_fresh(bid_age, max_quote_age_ms):
+                exit_price = _apply_sweep_exit_price(exit_reason, bid)
                 break
     if exit_price is None or exit_price <= 0:
         return None, "missing_exit_bid"
@@ -377,10 +493,13 @@ def _iter_window_rows(
             window_start_ms,
             ts_sec,
             btc_price,
+            btc_event_ms,
             up_best_bid,
             up_best_ask,
+            up_event_ms,
             down_best_bid,
-            down_best_ask
+            down_best_ask,
+            down_event_ms
         FROM btc_poly_1s_ticks
         WHERE {' AND '.join(where_clauses)}
         ORDER BY window_start_ms ASC, ts_sec ASC
@@ -408,10 +527,13 @@ def _iter_window_rows(
                 ts_sec=ts_sec,
                 rel_sec=rel_sec,
                 btc_price=_to_float(row[2]),
-                up_bid=_to_float(row[3]),
-                up_ask=_to_float(row[4]),
-                down_bid=_to_float(row[5]),
-                down_ask=_to_float(row[6]),
+                btc_event_ms=(int(row[3]) if row[3] is not None else None),
+                up_bid=_to_float(row[4]),
+                up_ask=_to_float(row[5]),
+                up_event_ms=(int(row[6]) if row[6] is not None else None),
+                down_bid=_to_float(row[7]),
+                down_ask=_to_float(row[8]),
+                down_event_ms=(int(row[9]) if row[9] is not None else None),
             )
         )
 
@@ -581,29 +703,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Inclusive end ts_sec filter",
     )
-    parser.add_argument("--entry-minute-grid", type=str, default="2,3,4")
-    parser.add_argument("--entry-preclose-sec-grid", type=str, default="4,5,6")
-    parser.add_argument("--min-direction-diff-grid", type=str, default="10,20,30,40,50")
-    parser.add_argument("--max-entry-price-grid", type=str, default="0.6,0.75,0.8,0.85,0.9")
+    parser.add_argument("--entry-minute-grid", type=str, default="2")
+    parser.add_argument("--entry-preclose-sec-grid", type=str, default="5")
+    parser.add_argument("--min-direction-diff-grid", type=str, default="50")
+    parser.add_argument("--max-entry-price-grid", type=str, default="0.85")
     parser.add_argument("--stake-usd-grid", type=str, default="10")
-    parser.add_argument("--min-hold-before-close-sec-grid", type=str, default="20,40,60,80")
+    parser.add_argument("--min-hold-before-close-sec-grid", type=str, default="40")
     parser.add_argument(
         "--tp-price-cap-grid",
         type=str,
-        default="0.9,0.95,0.99 ",
+        default="0.99",
         help="Dynamic TP cap price grid (default follows live strategy)",
     )
     parser.add_argument(
         "--tp-value-cap-grid",
         type=str,
-        default="0.1,0.15,0.2",
+        default="0.2",
         help="Dynamic TP value-cap grid (default follows live strategy)",
     )
     parser.add_argument(
         "--sl-to-tp-ratio-grid",
         type=str,
-        default="1.0,1.333333,1.5",
+        default="1.33333",
         help="Dynamic SL/TP ratio grid (default follows live strategy)",
+    )
+    parser.add_argument(
+        "--toxic-utc-hours",
+        type=str,
+        default="",
+        help="UTC toxic hours CSV, e.g. 16,19,20. Empty means disabled (restart_5m_trade default).",
+    )
+    parser.add_argument(
+        "--max-btc-age-ms",
+        type=int,
+        default=2000,
+        help="Max allowed BTC snapshot age at entry/decision checks (<=0 disables freshness filter)",
+    )
+    parser.add_argument(
+        "--max-quote-age-ms",
+        type=int,
+        default=1200,
+        help="Max allowed Polymarket quote age for entry/exit pricing (<=0 disables freshness filter)",
     )
     parser.add_argument(
         "--sort-by",
@@ -639,6 +779,8 @@ def main() -> None:
         if args.start_ts_sec > args.end_ts_sec:
             raise ValueError("start-ts-sec must be <= end-ts-sec")
 
+    toxic_utc_hours = _parse_toxic_utc_hours(args.toxic_utc_hours)
+
     params = _build_param_grid(args)
     stats_map: Dict[ParamSet, ComboStats] = {p: ComboStats(p) for p in params}
 
@@ -668,7 +810,13 @@ def main() -> None:
         st = stats_map[p]
         for window_index, rows in enumerate(windows_data, start=1):
             st.windows += 1
-            trade, skip_reason = _simulate_window(rows, p)
+            trade, skip_reason = _simulate_window(
+                rows,
+                p,
+                toxic_utc_hours=toxic_utc_hours,
+                max_btc_age_ms=args.max_btc_age_ms,
+                max_quote_age_ms=args.max_quote_age_ms,
+            )
             if trade is None:
                 st.add_skip(skip_reason or "unknown")
             else:
