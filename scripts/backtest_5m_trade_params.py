@@ -21,12 +21,14 @@ from __future__ import annotations
 import argparse
 import csv
 import itertools
+import json
 import math
 import os
 import sqlite3
 import time
 from datetime import datetime
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
@@ -36,6 +38,10 @@ DEFAULT_SL_TO_TP_RATIO = 4.0 / 3.0
 WINDOW_SECONDS = 5 * 60
 MINUTE4_CLOSE_SEC = 4 * 60
 EXPIRY_TRIGGER_SEC = WINDOW_SECONDS - 10
+MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
+MAX_ENTRY_SLIPPAGE_BPS = 120.0
+FALLBACK_LEVEL_SIZE = 1_000_000.0
+DEFAULT_SIZE_TICK = "0.01"
 
 
 @dataclass(frozen=True)
@@ -69,9 +75,13 @@ class WindowRow:
     up_bid: Optional[float]
     up_ask: Optional[float]
     up_event_ms: Optional[int]
+    up_bids_5: Optional[List[Dict[str, float]]]
+    up_asks_5: Optional[List[Dict[str, float]]]
     down_bid: Optional[float]
     down_ask: Optional[float]
     down_event_ms: Optional[int]
+    down_bids_5: Optional[List[Dict[str, float]]]
+    down_asks_5: Optional[List[Dict[str, float]]]
 
 
 @dataclass
@@ -189,6 +199,34 @@ def _to_float(v: Any) -> Optional[float]:
     return parsed
 
 
+def _to_positive_float(v: Any) -> Optional[float]:
+    parsed = _to_float(v)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
+def _normalize_order_size(size: float, tick_size: str) -> float:
+    parsed_size = _to_positive_float(size)
+    if parsed_size is None:
+        return 0.0
+
+    try:
+        tick = Decimal(str(tick_size))
+        if tick <= 0:
+            tick = Decimal("0.01")
+    except (InvalidOperation, ValueError):
+        tick = Decimal("0.01")
+
+    size_dec = Decimal(str(parsed_size))
+    steps = (size_dec / tick).to_integral_value(rounding=ROUND_DOWN)
+    normalized = steps * tick
+    try:
+        return max(0.0, float(normalized))
+    except Exception:
+        return 0.0
+
+
 def _as_float(v: Any) -> float:
     return float(v)
 
@@ -204,9 +242,13 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
     up_bid: Optional[float] = None
     up_ask: Optional[float] = None
     up_event_ms: Optional[int] = None
+    up_bids_5: Optional[List[Dict[str, float]]] = None
+    up_asks_5: Optional[List[Dict[str, float]]] = None
     down_bid: Optional[float] = None
     down_ask: Optional[float] = None
     down_event_ms: Optional[int] = None
+    down_bids_5: Optional[List[Dict[str, float]]] = None
+    down_asks_5: Optional[List[Dict[str, float]]] = None
 
     for r in rows:
         if r.btc_price is not None:
@@ -218,12 +260,20 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
             up_ask = r.up_ask
         if r.up_event_ms is not None:
             up_event_ms = r.up_event_ms
+        if r.up_bids_5:
+            up_bids_5 = [dict(item) for item in r.up_bids_5]
+        if r.up_asks_5:
+            up_asks_5 = [dict(item) for item in r.up_asks_5]
         if r.down_bid is not None:
             down_bid = r.down_bid
         if r.down_ask is not None:
             down_ask = r.down_ask
         if r.down_event_ms is not None:
             down_event_ms = r.down_event_ms
+        if r.down_bids_5:
+            down_bids_5 = [dict(item) for item in r.down_bids_5]
+        if r.down_asks_5:
+            down_asks_5 = [dict(item) for item in r.down_asks_5]
         out.append(
             WindowRow(
                 ts_sec=r.ts_sec,
@@ -233,12 +283,144 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
                 up_bid=up_bid,
                 up_ask=up_ask,
                 up_event_ms=up_event_ms,
+                up_bids_5=([dict(item) for item in up_bids_5] if up_bids_5 else None),
+                up_asks_5=([dict(item) for item in up_asks_5] if up_asks_5 else None),
                 down_bid=down_bid,
                 down_ask=down_ask,
                 down_event_ms=down_event_ms,
+                down_bids_5=([dict(item) for item in down_bids_5] if down_bids_5 else None),
+                down_asks_5=([dict(item) for item in down_asks_5] if down_asks_5 else None),
             )
         )
     return out
+
+
+def _parse_levels_json(raw: Any) -> Optional[List[Dict[str, float]]]:
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(str(raw))
+    except Exception:
+        return None
+    if not isinstance(payload, list):
+        return None
+    levels: List[Dict[str, float]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        price = _to_positive_float(item.get("price"))
+        size = _to_positive_float(item.get("size"))
+        if price is None or size is None:
+            continue
+        levels.append({"price": price, "size": size})
+    return levels or None
+
+
+def _normalize_levels(levels: Optional[List[Dict[str, float]]], side: str) -> List[Dict[str, float]]:
+    if not levels:
+        return []
+    cleaned: List[Dict[str, float]] = []
+    for lvl in levels:
+        if not isinstance(lvl, dict):
+            continue
+        price = _to_positive_float(lvl.get("price"))
+        size = _to_positive_float(lvl.get("size"))
+        if price is None or size is None:
+            continue
+        cleaned.append({"price": price, "size": size})
+    if side == "buy":
+        return sorted(cleaned, key=lambda x: float(x["price"]))
+    return sorted(cleaned, key=lambda x: float(x["price"]), reverse=True)
+
+
+def _row_levels_for_side(row: WindowRow, direction: str, side: str) -> List[Dict[str, float]]:
+    if direction == "up":
+        best_ask = row.up_ask
+        best_bid = row.up_bid
+        asks_5 = row.up_asks_5
+        bids_5 = row.up_bids_5
+    else:
+        best_ask = row.down_ask
+        best_bid = row.down_bid
+        asks_5 = row.down_asks_5
+        bids_5 = row.down_bids_5
+
+    if side == "buy":
+        levels = _normalize_levels(asks_5, side="buy")
+        if levels:
+            return levels
+        ask = _to_positive_float(best_ask)
+        if ask is None:
+            return []
+        return [{"price": ask, "size": FALLBACK_LEVEL_SIZE}]
+
+    levels = _normalize_levels(bids_5, side="sell")
+    if levels:
+        return levels
+    bid = _to_positive_float(best_bid)
+    if bid is None:
+        return []
+    return [{"price": bid, "size": FALLBACK_LEVEL_SIZE}]
+
+
+def _build_execution_plan(levels: List[Dict[str, float]], target_size: float, side: str) -> Optional[Dict[str, float]]:
+    if target_size <= 0:
+        return None
+    if not levels:
+        return None
+
+    remaining = target_size
+    executed_size = 0.0
+    executed_notional = 0.0
+    best_price: Optional[float] = None
+    worst_price: Optional[float] = None
+    available_size = 0.0
+
+    for lvl in levels:
+        size = _to_positive_float(lvl.get("size"))
+        if size is None:
+            continue
+        available_size += size
+
+    for lvl in levels:
+        price = _to_positive_float(lvl.get("price"))
+        size = _to_positive_float(lvl.get("size"))
+        if price is None or size is None:
+            continue
+        if remaining <= 1e-12:
+            break
+        take = min(remaining, size)
+        if take <= 0:
+            continue
+        if best_price is None:
+            best_price = price
+        worst_price = price
+        executed_size += take
+        executed_notional += take * price
+        remaining -= take
+
+    if executed_size <= 0 or best_price is None or worst_price is None:
+        return None
+
+    vwap = executed_notional / executed_size
+    fill_ratio = executed_size / target_size
+    if side == "buy":
+        slippage_abs = max(0.0, vwap - best_price)
+    else:
+        slippage_abs = max(0.0, best_price - vwap)
+    slippage_bps = (slippage_abs / best_price * 10000.0) if best_price > 0 else 0.0
+
+    return {
+        "target_size": target_size,
+        "executed_size": executed_size,
+        "available_size": available_size,
+        "executed_notional": executed_notional,
+        "best_price": best_price,
+        "worst_price": worst_price,
+        "vwap_price": vwap,
+        "fill_ratio": fill_ratio,
+        "slippage_bps": slippage_bps,
+    }
 
 
 def _first_row_in_range(
@@ -363,6 +545,7 @@ def _simulate_window(
     toxic_utc_hours: set[int],
     max_btc_age_ms: int,
     max_quote_age_ms: int,
+    size_tick: str,
 ) -> Tuple[Optional[WindowTrade], Optional[str]]:
     if not rows:
         return None, "empty_window"
@@ -408,11 +591,28 @@ def _simulate_window(
     if ask > params.max_entry_price:
         return None, "entry_price_too_high"
 
-    size = params.stake_usd / ask
-    if size <= 0:
+    rough_entry_price = float(ask)
+    raw_target_size = params.stake_usd / rough_entry_price
+    if raw_target_size <= 0:
         return None, "invalid_entry_size"
+    target_size = _normalize_order_size(raw_target_size, tick_size=size_tick)
+    if target_size <= 0:
+        return None, "normalized_entry_size_zero"
 
-    take_profit_price, stop_loss_price = _dynamic_tp_sl(ask, params=params)
+    entry_levels = _row_levels_for_side(entry_row, direction=direction, side="buy")
+    entry_plan = _build_execution_plan(entry_levels, target_size=target_size, side="buy")
+    if entry_plan is None:
+        return None, "missing_entry_orderbook"
+    if entry_plan["fill_ratio"] < MIN_ENTRY_LIQUIDITY_FILL_RATIO:
+        return None, "entry_fill_ratio_too_low"
+    if entry_plan["slippage_bps"] > MAX_ENTRY_SLIPPAGE_BPS:
+        return None, "entry_slippage_too_high"
+
+    size = float(entry_plan["executed_size"])
+    entry_cost = float(entry_plan["executed_notional"])
+    entry_price_for_risk = float(entry_plan["worst_price"])
+
+    take_profit_price, stop_loss_price = _dynamic_tp_sl(entry_price_for_risk, params=params)
 
     close3 = _first_row_at_or_after(rows, sec=3 * 60, require_btc=True)
     close4 = _first_row_at_or_after(rows, sec=4 * 60, require_btc=True)
@@ -425,6 +625,8 @@ def _simulate_window(
     entry_ts = entry_row.ts_sec
     exit_reason = "window_end"
     exit_price: Optional[float] = None
+    expected_exit_price: Optional[float] = None
+    exit_row: Optional[WindowRow] = None
 
     for r in rows:
         if r.ts_sec <= entry_ts:
@@ -438,24 +640,30 @@ def _simulate_window(
         if dir_change_active and r.rel_sec >= MINUTE4_CLOSE_SEC:
             exit_reason = "sl_direction_change"
             if bid is not None and bid > 0 and bid_is_fresh:
-                exit_price = _apply_sweep_exit_price(exit_reason, bid)
+                exit_price = float(bid)
+                exit_row = r
+                break
             break
 
         if bid is not None and bid > 0 and bid_is_fresh:
             hold_sec = r.ts_sec - entry_ts
             if hold_sec >= params.min_hold_before_close_sec and bid <= stop_loss_price:
                 exit_reason = "sl"
-                exit_price = _apply_sweep_exit_price(exit_reason, bid)
+                exit_price = float(bid)
+                exit_row = r
                 break
             if bid > take_profit_price:
                 exit_reason = "tp"
-                exit_price = _apply_sweep_exit_price(exit_reason, bid)
+                exit_price = float(bid)
+                exit_row = r
                 break
 
         if r.rel_sec >= EXPIRY_TRIGGER_SEC:
             exit_reason = "expiry"
             if bid is not None and bid > 0 and bid_is_fresh:
-                exit_price = _apply_sweep_exit_price(exit_reason, bid)
+                exit_price = float(bid)
+                exit_row = r
+                break
             break
 
     if exit_price is None or exit_price <= 0:
@@ -465,12 +673,39 @@ def _simulate_window(
             bid_event_ms = r.up_event_ms if direction == "up" else r.down_event_ms
             bid_age = _age_ms_at_row(r.ts_sec, bid_event_ms)
             if bid is not None and bid > 0 and _is_fresh(bid_age, max_quote_age_ms):
-                exit_price = _apply_sweep_exit_price(exit_reason, bid)
+                exit_price = float(bid)
+                exit_row = r
                 break
     if exit_price is None or exit_price <= 0:
         return None, "missing_exit_bid"
 
-    pnl = size * (exit_price - ask)
+    exit_trigger_best_bid = float(exit_price)
+    close_row = exit_row or entry_row
+    sell_levels = _row_levels_for_side(close_row, direction=direction, side="sell")
+    sell_plan = _build_execution_plan(sell_levels, target_size=size, side="sell")
+
+    if sell_plan is not None:
+        expected_exit_price = float(sell_plan["worst_price"])
+    else:
+        expected_exit_price = exit_trigger_best_bid
+
+    if _is_sl_like_reason(exit_reason):
+        current_bid = min(exit_trigger_best_bid, expected_exit_price)
+    else:
+        current_bid = expected_exit_price
+    sweep_price = _apply_sweep_exit_price(exit_reason, current_bid)
+
+    if sell_plan is None:
+        effective_exit_price = sweep_price
+    else:
+        executed_size = float(sell_plan["executed_size"])
+        executed_notional = float(sell_plan["executed_notional"])
+        remaining_size = max(0.0, size - executed_size)
+        # Top5 depth covers immediate fills; residual uses aggressive sweep price.
+        total_exit_notional = executed_notional + remaining_size * sweep_price
+        effective_exit_price = total_exit_notional / size if size > 0 else sweep_price
+
+    pnl = size * effective_exit_price - entry_cost
     return WindowTrade(pnl=pnl, reason=exit_reason, direction=direction), None
 
 
@@ -479,6 +714,16 @@ def _iter_window_rows(
     start_ts_sec: Optional[int],
     end_ts_sec: Optional[int],
 ) -> Iterable[Tuple[int, List[WindowRow]]]:
+    table_cols = {
+        str(item[1])
+        for item in conn.execute("PRAGMA table_info(btc_poly_1s_ticks)")
+    }
+
+    def _col_or_null(column_name: str) -> str:
+        if column_name in table_cols:
+            return column_name
+        return f"NULL AS {column_name}"
+
     where_clauses = ["market_slug LIKE 'btc-updown-5m-%'"]
     args: List[object] = []
     if start_ts_sec is not None:
@@ -497,9 +742,13 @@ def _iter_window_rows(
             up_best_bid,
             up_best_ask,
             up_event_ms,
+            {_col_or_null('up_bids_5')},
+            {_col_or_null('up_asks_5')},
             down_best_bid,
             down_best_ask,
-            down_event_ms
+            down_event_ms,
+            {_col_or_null('down_bids_5')},
+            {_col_or_null('down_asks_5')}
         FROM btc_poly_1s_ticks
         WHERE {' AND '.join(where_clauses)}
         ORDER BY window_start_ms ASC, ts_sec ASC
@@ -531,9 +780,13 @@ def _iter_window_rows(
                 up_bid=_to_float(row[4]),
                 up_ask=_to_float(row[5]),
                 up_event_ms=(int(row[6]) if row[6] is not None else None),
-                down_bid=_to_float(row[7]),
-                down_ask=_to_float(row[8]),
-                down_event_ms=(int(row[9]) if row[9] is not None else None),
+                up_bids_5=_parse_levels_json(row[7]),
+                up_asks_5=_parse_levels_json(row[8]),
+                down_bid=_to_float(row[9]),
+                down_ask=_to_float(row[10]),
+                down_event_ms=(int(row[11]) if row[11] is not None else None),
+                down_bids_5=_parse_levels_json(row[12]),
+                down_asks_5=_parse_levels_json(row[13]),
             )
         )
 
@@ -728,6 +981,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Dynamic SL/TP ratio grid (default follows live strategy)",
     )
     parser.add_argument(
+        "--size-tick",
+        type=str,
+        default=DEFAULT_SIZE_TICK,
+        help="Order size tick used by normalize_order_size (default 0.01).",
+    )
+    parser.add_argument(
         "--toxic-utc-hours",
         type=str,
         default="",
@@ -816,6 +1075,7 @@ def main() -> None:
                 toxic_utc_hours=toxic_utc_hours,
                 max_btc_age_ms=args.max_btc_age_ms,
                 max_quote_age_ms=args.max_quote_age_ms,
+                size_tick=str(args.size_tick),
             )
             if trade is None:
                 st.add_skip(skip_reason or "unknown")
