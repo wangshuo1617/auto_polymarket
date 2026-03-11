@@ -28,7 +28,7 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from pathlib import Path
@@ -137,6 +137,12 @@ class WindowTrade:
 
 
 @dataclass(frozen=True)
+class TradeEventPair:
+    entry_event: Dict[str, object]
+    exit_event: Dict[str, object]
+
+
+@dataclass(frozen=True)
 class WindowQuality:
     score: float
     second_coverage: float
@@ -189,6 +195,8 @@ class SimulationConfig:
     entry_submit_latency_ms: int
     exit_submit_latency_ms: int
     min_window_quality: float
+    entry_price_gate_source: str
+    entry_signal_row_source: str
 
 
 _WORKER_WINDOWS_DATA: Optional[Sequence[WindowPrepared]] = None
@@ -312,6 +320,10 @@ def _format_counts(counts: Dict[str, int]) -> str:
         return ""
     parts = [f"{k}:{v}" for k, v in sorted(counts.items(), key=lambda x: (-x[1], x[0]))]
     return "|".join(parts)
+
+
+def _ts_sec_to_utc_iso(ts_sec: int) -> str:
+    return datetime.fromtimestamp(int(ts_sec), timezone.utc).isoformat()
 
 
 def _parse_int_grid(value: str) -> List[int]:
@@ -777,7 +789,7 @@ def _is_toxic_window(rows: Sequence[WindowRow], toxic_hours: set[int]) -> bool:
     ws_sec = _window_start_sec(rows)
     if ws_sec is None:
         return False
-    hour = datetime.utcfromtimestamp(ws_sec).hour
+    hour = datetime.fromtimestamp(ws_sec, timezone.utc).hour
     return hour in toxic_hours
 
 
@@ -1044,29 +1056,30 @@ def _simulate_window(
     exit_submit_latency_ms: int,
     window_quality: WindowQuality,
     min_window_quality: float,
-) -> Tuple[Optional[WindowTrade], Optional[str]]:
+    entry_price_gate_source: str,
+) -> Tuple[Optional[WindowTrade], Optional[str], Optional[TradeEventPair]]:
     rows = prepared.rows
     if not rows:
-        return None, "empty_window"
+        return None, "empty_window", None
 
     if prepared.is_toxic:
-        return None, "toxic_time_regime"
+        return None, "toxic_time_regime", None
     if window_quality.score < float(min_window_quality):
-        return None, "window_quality_too_low"
+        return None, "window_quality_too_low", None
 
     open_row = prepared.open_row
     if open_row is None or open_row.btc_price is None:
-        return None, "missing_open_price"
+        return None, "missing_open_price", None
 
     decision_start_sec = params.entry_minute * 60 - params.entry_preclose_sec
     decision_end_sec = params.entry_minute * 60
     if decision_start_sec < 0 or decision_start_sec >= decision_end_sec:
-        return None, "invalid_entry_timing"
+        return None, "invalid_entry_timing", None
 
     # Live-like entry decision: use the latest snapshot before minute close.
     entry_row = prepared.decision_row_map.get((params.entry_minute, params.entry_preclose_sec))
     if entry_row is None or entry_row.btc_price is None:
-        return None, "missing_entry_signal_price"
+        return None, "missing_entry_signal_price", None
 
     entry_exec_row = _find_row_after_latency(
         rows=rows,
@@ -1075,17 +1088,29 @@ def _simulate_window(
         require_btc=True,
     )
     if entry_exec_row is None:
-        return None, "missing_entry_exec_row"
+        return None, "missing_entry_exec_row", None
     entry_btc_age = _age_ms_at_row(entry_row.ts_sec, entry_row.btc_event_ms)
     if not _is_fresh(entry_btc_age, max_btc_age_ms):
-        return None, "stale_entry_btc"
+        return None, "stale_entry_btc", None
 
     diff = entry_row.btc_price - open_row.btc_price
     abs_diff = abs(diff)
     if abs_diff <= params.min_direction_diff:
-        return None, "diff_below_threshold"
+        return None, "diff_below_threshold", None
 
     direction = "up" if diff > 0 else "down"
+
+    gate_row = entry_row if entry_price_gate_source == "decision" else entry_exec_row
+    gate_ask = gate_row.up_ask if direction == "up" else gate_row.down_ask
+    gate_ask_event_ms = gate_row.up_event_ms if direction == "up" else gate_row.down_event_ms
+    gate_ask_age = _age_ms_at_row(gate_row.ts_sec, gate_ask_event_ms)
+    if gate_ask is None or gate_ask <= 0:
+        return None, "missing_entry_ask", None
+    if not _is_fresh(gate_ask_age, max_quote_age_ms):
+        return None, "stale_entry_ask", None
+    if gate_ask > params.max_entry_price:
+        return None, "entry_price_too_high", None
+
     market_ctx = _get_market_context(
         row=entry_exec_row,
         default_size_tick=default_size_tick,
@@ -1094,23 +1119,21 @@ def _simulate_window(
         resolve_metadata=resolve_market_metadata,
     )
     fee_bps = market_ctx.up_fee_bps if direction == "up" else market_ctx.down_fee_bps
-    ask = entry_exec_row.up_ask if direction == "up" else entry_exec_row.down_ask
-    ask_event_ms = entry_exec_row.up_event_ms if direction == "up" else entry_exec_row.down_event_ms
-    ask_age = _age_ms_at_row(entry_exec_row.ts_sec, ask_event_ms)
-    if ask is None or ask <= 0:
-        return None, "missing_entry_ask"
-    if not _is_fresh(ask_age, max_quote_age_ms):
-        return None, "stale_entry_ask"
-    if ask > params.max_entry_price:
-        return None, "entry_price_too_high"
+    exec_ask = entry_exec_row.up_ask if direction == "up" else entry_exec_row.down_ask
+    exec_ask_event_ms = entry_exec_row.up_event_ms if direction == "up" else entry_exec_row.down_event_ms
+    exec_ask_age = _age_ms_at_row(entry_exec_row.ts_sec, exec_ask_event_ms)
+    if exec_ask is None or exec_ask <= 0:
+        return None, "missing_entry_ask", None
+    if not _is_fresh(exec_ask_age, max_quote_age_ms):
+        return None, "stale_entry_ask", None
 
-    rough_entry_price = float(ask)
+    rough_entry_price = float(exec_ask)
     raw_target_size = params.stake_usd / rough_entry_price
     if raw_target_size <= 0:
-        return None, "invalid_entry_size"
+        return None, "invalid_entry_size", None
     target_size = _normalize_order_size(raw_target_size, tick_size=market_ctx.size_tick)
     if target_size <= 0:
-        return None, "normalized_entry_size_zero"
+        return None, "normalized_entry_size_zero", None
 
     entry_levels = _row_levels_for_side(
         entry_exec_row,
@@ -1122,11 +1145,11 @@ def _simulate_window(
     entry_levels = _apply_queue_fill_ratio(entry_levels, fill_ratio=queue_fill_ratio_entry)
     entry_plan = _build_execution_plan(entry_levels, target_size=target_size, side="buy")
     if entry_plan is None:
-        return None, "missing_entry_orderbook"
+        return None, "missing_entry_orderbook", None
     if entry_plan["fill_ratio"] < MIN_ENTRY_LIQUIDITY_FILL_RATIO:
-        return None, "entry_fill_ratio_too_low"
+        return None, "entry_fill_ratio_too_low", None
     if entry_plan["slippage_bps"] > MAX_ENTRY_SLIPPAGE_BPS:
-        return None, "entry_slippage_too_high"
+        return None, "entry_slippage_too_high", None
 
     size = float(entry_plan["executed_size"])
     entry_cost = float(entry_plan["executed_notional"])
@@ -1199,7 +1222,7 @@ def _simulate_window(
                 exit_row = r
                 break
     if exit_price is None or exit_price <= 0:
-        return None, "missing_exit_bid"
+        return None, "missing_exit_bid", None
 
     close_row = exit_row or entry_exec_row
     close_submit_row = _find_row_after_latency(
@@ -1209,7 +1232,7 @@ def _simulate_window(
         require_btc=False,
     )
     if close_submit_row is None:
-        return None, "missing_exit_submit_row"
+        return None, "missing_exit_submit_row", None
 
     close_result = _simulate_close_state_machine(
         rows=rows,
@@ -1230,6 +1253,65 @@ def _simulate_window(
     exit_notional = size * effective_exit_price
     exit_fee = exit_notional * max(0.0, fee_bps) / 10000.0
     pnl = (exit_notional - exit_fee) - (entry_cost + entry_fee)
+    entry_event_time = _ts_sec_to_utc_iso(entry_exec_row.ts_sec)
+    exit_event_time = _ts_sec_to_utc_iso(close_submit_row.ts_sec)
+    related_entry_time = entry_event_time
+    token_id = market_ctx.up_token if direction == "up" else market_ctx.down_token
+
+    entry_event: Dict[str, object] = {
+        "id": None,
+        "created_at": None,
+        "event_time": entry_event_time,
+        "side": "buy",
+        "market_slug": str(entry_exec_row.market_slug or ""),
+        "market_id": str(entry_exec_row.market_id or ""),
+        "token_id": str(token_id or ""),
+        "direction": direction,
+        "reason": "entry",
+        "trade_size": size,
+        "trade_price": float(entry_plan["worst_price"]),
+        "pnl": None,
+        "related_entry_time": related_entry_time,
+        "stop_loss_price": float(stop_loss_price),
+        "take_profit_price": float(take_profit_price),
+        "best_quote": float(entry_plan["best_price"]),
+        "avg_fill_price": float(entry_plan["vwap_price"]),
+        "full_fill": int(bool(entry_plan.get("full_fill"))),
+        "notional_usdc": entry_cost,
+        "expected_price": None,
+        "slippage_leakage": None,
+        "btc_price_at_trade": entry_exec_row.btc_price,
+        "order_id": None,
+        "mode": "backtest",
+    }
+
+    exit_event: Dict[str, object] = {
+        "id": None,
+        "created_at": None,
+        "event_time": exit_event_time,
+        "side": "sell",
+        "market_slug": str(close_submit_row.market_slug or entry_exec_row.market_slug or ""),
+        "market_id": str(close_submit_row.market_id or entry_exec_row.market_id or ""),
+        "token_id": str(token_id or ""),
+        "direction": direction,
+        "reason": realized_reason,
+        "trade_size": size,
+        "trade_price": float(effective_exit_price),
+        "pnl": pnl,
+        "related_entry_time": related_entry_time,
+        "stop_loss_price": None,
+        "take_profit_price": None,
+        "best_quote": float(exit_price),
+        "avg_fill_price": float(effective_exit_price),
+        "full_fill": int(bool(close_result.fill_ratio >= 0.999999)),
+        "notional_usdc": exit_notional,
+        "expected_price": float(exit_price),
+        "slippage_leakage": max(0.0, (float(exit_price) - float(effective_exit_price)) * size),
+        "btc_price_at_trade": close_submit_row.btc_price,
+        "order_id": None,
+        "mode": "backtest",
+    }
+
     return (
         WindowTrade(
             pnl=pnl,
@@ -1248,6 +1330,7 @@ def _simulate_window(
             exit_latency_ms=max(0, int(exit_submit_latency_ms)),
         ),
         None,
+        TradeEventPair(entry_event=entry_event, exit_event=exit_event),
     )
 
 
@@ -1494,6 +1577,40 @@ def _write_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def _write_trade_events_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fieldnames = [
+        "id",
+        "created_at",
+        "event_time",
+        "side",
+        "market_slug",
+        "market_id",
+        "token_id",
+        "direction",
+        "reason",
+        "trade_size",
+        "trade_price",
+        "pnl",
+        "related_entry_time",
+        "stop_loss_price",
+        "take_profit_price",
+        "best_quote",
+        "avg_fill_price",
+        "full_fill",
+        "notional_usdc",
+        "expected_price",
+        "slippage_leakage",
+        "btc_price_at_trade",
+        "order_id",
+        "mode",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def _worker_init(
     windows_data: Sequence[WindowPrepared],
     window_quality_map: Sequence[WindowQuality],
@@ -1512,13 +1629,14 @@ def _evaluate_one_param(
     windows_data: Sequence[WindowPrepared],
     window_quality_map: Sequence[WindowQuality],
     sim_config: SimulationConfig,
-) -> Dict[str, object]:
+) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
     st = ComboStats(param)
     metadata_cache: Dict[str, WindowMarketContext] = {}
+    trade_events: List[Dict[str, object]] = []
     for window_index, prepared in enumerate(windows_data, start=1):
         st.windows += 1
         window_quality = window_quality_map[window_index - 1]
-        trade, skip_reason = _simulate_window(
+        trade, skip_reason, trade_pair = _simulate_window(
             prepared=prepared,
             params=param,
             max_btc_age_ms=sim_config.max_btc_age_ms,
@@ -1536,23 +1654,28 @@ def _evaluate_one_param(
             exit_submit_latency_ms=sim_config.exit_submit_latency_ms,
             window_quality=window_quality,
             min_window_quality=sim_config.min_window_quality,
+            entry_price_gate_source=sim_config.entry_price_gate_source,
         )
         if trade is None:
             st.add_skip(skip_reason or "unknown")
         else:
             st.add_trade(trade)
-    return st.as_row()
+            if trade_pair is not None:
+                trade_events.append(trade_pair.entry_event)
+                trade_events.append(trade_pair.exit_event)
+    return st.as_row(), trade_events
 
 
 def _evaluate_one_param_in_worker(param: ParamSet) -> Dict[str, object]:
     if _WORKER_WINDOWS_DATA is None or _WORKER_WINDOW_QUALITY_MAP is None or _WORKER_SIM_CONFIG is None:
         raise RuntimeError("worker context is not initialized")
-    return _evaluate_one_param(
+    result, _ = _evaluate_one_param(
         param=param,
         windows_data=_WORKER_WINDOWS_DATA,
         window_quality_map=_WORKER_WINDOW_QUALITY_MAP,
         sim_config=_WORKER_SIM_CONFIG,
     )
+    return result
 
 
 def _build_timestamped_output_path(path: str) -> str:
@@ -1566,6 +1689,11 @@ def _build_timestamped_output_path(path: str) -> str:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Parameter grid backtest for 5m_trade using btc_poly_1s_ticks",
+    )
+    parser.add_argument(
+        "--live-like",
+        action="store_true",
+        help="Apply a practical live-like preset (currently enforces execution-based entry price gate).",
     )
     parser.add_argument(
         "--db-path",
@@ -1681,6 +1809,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Simulated delay from entry trigger to orderbook-based entry execution.",
     )
     parser.add_argument(
+        "--entry-price-gate-source",
+        type=str,
+        choices=["decision", "execution"],
+        default="execution",
+        help="Which snapshot to use for max-entry-price gate: decision or execution (default: execution for better live alignment).",
+    )
+    parser.add_argument(
+        "--entry-signal-row-source",
+        type=str,
+        choices=["first", "last"],
+        default="first",
+        help="Which snapshot inside pre-close window to use for signal diff: first or last.",
+    )
+    parser.add_argument(
         "--exit-submit-latency-ms",
         type=int,
         default=DEFAULT_EXIT_SUBMIT_LATENCY_MS,
@@ -1718,6 +1860,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="CSV output path",
     )
     parser.add_argument(
+        "--trades-output-csv",
+        type=str,
+        default="",
+        help="Optional detailed trade-events CSV path (aligned with trade_events table schema)",
+    )
+    parser.add_argument(
         "--disable-output-timestamp",
         action="store_true",
         help="Do not append timestamp suffix to output CSV filename",
@@ -1727,6 +1875,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+
+    if bool(args.live_like):
+        # Practical live-like preset:
+        # 1) entry gate checked near submit/execution snapshot,
+        # 2) pre-close signal uses latest snapshot inside trigger window.
+        args.entry_price_gate_source = "execution"
+        args.entry_signal_row_source = "last"
 
     if args.start_ts_sec is not None and args.end_ts_sec is not None:
         if args.start_ts_sec > args.end_ts_sec:
@@ -1757,12 +1912,21 @@ def main() -> None:
                 if start_sec < 0 or start_sec >= end_sec:
                     decision_row_map[(minute, preclose_sec)] = None
                 else:
-                    decision_row_map[(minute, preclose_sec)] = _last_row_in_range(
-                        filled_rows,
-                        start_sec=start_sec,
-                        end_sec_exclusive=end_sec,
-                        require_btc=True,
-                    )
+                    if str(args.entry_signal_row_source) == "last":
+                        decision_row_map[(minute, preclose_sec)] = _last_row_in_range(
+                            filled_rows,
+                            start_sec=start_sec,
+                            end_sec_exclusive=end_sec,
+                            require_btc=True,
+                        )
+                    else:
+                        # This uses the first snapshot entering the pre-close window.
+                        decision_row_map[(minute, preclose_sec)] = _first_row_in_range(
+                            filled_rows,
+                            start_sec=start_sec,
+                            end_sec_exclusive=end_sec,
+                            require_btc=True,
+                        )
 
             windows_data.append(
                 WindowPrepared(
@@ -1808,20 +1972,24 @@ def main() -> None:
         entry_submit_latency_ms=int(args.entry_submit_latency_ms),
         exit_submit_latency_ms=int(args.exit_submit_latency_ms),
         min_window_quality=float(args.min_window_quality),
+        entry_price_gate_source=str(args.entry_price_gate_source),
+        entry_signal_row_source=str(args.entry_signal_row_source),
     )
 
     started_at = time.time()
     result_rows: List[Dict[str, object]] = []
+    all_trade_events: List[Dict[str, object]] = []
     if workers == 1:
         processed_units = 0
         for combo_index, p in enumerate(params, start=1):
-            row = _evaluate_one_param(
+            row, trade_events = _evaluate_one_param(
                 param=p,
                 windows_data=windows_data,
                 window_quality_map=window_quality_map,
                 sim_config=sim_config,
             )
             result_rows.append(row)
+            all_trade_events.extend(trade_events)
 
             processed_units += total_windows
             if args.progress_every > 0:
@@ -1836,6 +2004,8 @@ def main() -> None:
                     f"overall {overall_pct:.1f}% | {unit_speed:.2f} units/s | ETA {eta_sec:.1f}s"
                 )
     else:
+        if args.trades_output_csv:
+            raise ValueError("--trades-output-csv currently requires --workers 1")
         completed = 0
         max_workers = min(workers, max(1, os.cpu_count() or 1), max(1, len(params)))
         with concurrent.futures.ProcessPoolExecutor(
@@ -1884,6 +2054,15 @@ def main() -> None:
     _print_top(result_rows, sort_by=args.sort_by, top_k=max(1, args.top_k))
     _write_csv(output_csv_path, result_rows)
     print(f"CSV written: {output_csv_path}")
+
+    if args.trades_output_csv:
+        trades_output_csv_path = (
+            args.trades_output_csv
+            if args.disable_output_timestamp
+            else _build_timestamped_output_path(args.trades_output_csv)
+        )
+        _write_trade_events_csv(trades_output_csv_path, all_trade_events)
+        print(f"Trade events CSV written: {trades_output_csv_path}")
 
 
 if __name__ == "__main__":
