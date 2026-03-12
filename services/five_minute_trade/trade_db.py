@@ -248,6 +248,54 @@ class TradeSQLiteStore:
             self._conn.commit()
             return deleted
 
+    def mark_entry_event_try_fail(
+        self,
+        market_slug: str,
+        token_id: str,
+        entry_time: datetime,
+        order_id: Optional[str],
+        dry_run: bool,
+    ) -> int:
+        """Mark submitted entry attempt as failed while keeping DB trace.
+
+        Used when buy submission happened but post-check confirms zero position.
+        Returns updated row count.
+        """
+        mode = "dry-run" if dry_run else "live"
+        related_entry_time = self._to_utc_iso(entry_time)
+        with self._lock:
+            if order_id:
+                cur = self._conn.execute(
+                    """
+                    UPDATE trade_events
+                    SET reason='entry_try_fail'
+                    WHERE side='buy'
+                      AND mode=?
+                      AND order_id=?
+                    """,
+                    (mode, order_id),
+                )
+                updated = int(cur.rowcount or 0)
+                if updated > 0:
+                    self._conn.commit()
+                    return updated
+
+            cur = self._conn.execute(
+                """
+                UPDATE trade_events
+                SET reason='entry_try_fail'
+                WHERE side='buy'
+                  AND mode=?
+                  AND market_slug=?
+                  AND token_id=?
+                  AND related_entry_time=?
+                """,
+                (mode, market_slug, token_id, related_entry_time),
+            )
+            updated = int(cur.rowcount or 0)
+            self._conn.commit()
+            return updated
+
     def close(self) -> None:
         with self._lock:
             try:

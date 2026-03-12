@@ -165,7 +165,7 @@ def schedule_position_balance_confirmation(
                 else:
                     if self._trade_db is not None:
                         try:
-                            deleted = self._trade_db.delete_entry_event(
+                            updated = self._trade_db.mark_entry_event_try_fail(
                                 market_slug=market_slug,
                                 token_id=token_id,
                                 entry_time=pos.entry_time,
@@ -173,15 +173,15 @@ def schedule_position_balance_confirmation(
                                 dry_run=self.dry_run,
                             )
                             logger.info(
-                                "建仓零成交清理SQLite entry记录: market=%s token=%s order_id=%s deleted=%s",
+                                "建仓零成交保留SQLite entry记录并标记失败: market=%s token=%s order_id=%s updated=%s reason=entry_try_fail",
                                 market_slug,
                                 token_id,
                                 order_id,
-                                deleted,
+                                updated,
                             )
                         except Exception as db_err:
                             logger.warning(
-                                "建仓零成交清理SQLite entry记录失败: market=%s token=%s order_id=%s error=%s",
+                                "建仓零成交标记entry_try_fail失败: market=%s token=%s order_id=%s error=%s",
                                 market_slug,
                                 token_id,
                                 order_id,

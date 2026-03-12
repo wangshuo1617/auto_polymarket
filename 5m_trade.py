@@ -932,8 +932,9 @@ def main() -> None:
     configure_trade_logging()
     strategy_signature = _build_startup_strategy_signature(args)
     logger.info(
-        "新5m_trade服务启动 | ET时间=%s | 本次启动策略=%s",
+        "新5m_trade服务启动 | ET时间=%s | 秒级时间戳=%s | 本次启动策略=%s",
         _current_et_time_str(),
+        int(time.time()),
         strategy_signature,
     )
     trader = create_trader_from_args(args=args, trader_cls=FiveMinuteUpDownTrader)

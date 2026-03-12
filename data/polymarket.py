@@ -3,6 +3,7 @@ Polymarket 持仓与订单 API
 """
 import json
 import logging
+import sqlite3
 import sys
 import threading
 import time
@@ -33,7 +34,7 @@ from py_clob_client.clob_types import (
 from py_clob_client.order_builder.builder import ROUNDING_CONFIG
 from py_clob_client.order_builder.helpers import round_down
 from py_clob_client.order_builder.constants import BUY, SELL
-from datetime import datetime
+from datetime import datetime, timezone
 from config import POLYMARKET_KEY, WALLET_ADDRESS
 
 
@@ -651,6 +652,156 @@ def get_balance_allowance() -> str:
     balance = int(response.get("balance", 0)) / 10**6
     return f"${balance:.2f}"
 
+def get_activity_history(market_id: str) -> List[Dict[str, Any]]:
+    url = "https://data-api.polymarket.com/activity"
+    params = {"market": str(market_id), "user": WALLET_ADDRESS}
+    
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        result = response.json()
+        return result if isinstance(result, list) else []
+    except Exception as e:
+        logger.warning("get_activity_history failed: market_id=%s error=%s", market_id, e)
+        return []
+
+
+def _event_time_to_epoch(event_time: str) -> int:
+    raw = str(event_time or "").strip()
+    if not raw:
+        return 0
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return 0
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _round2(value: float) -> float:
+    return round(float(value), 2)
+
+
+def calculate_activity_pnl_from_trade_events(
+    since_ts: int,
+    until_ts: Optional[int] = None,
+    db_path: str = "logs/trade.sqlite3",
+    sleep_sec: float = 0.2,
+) -> Dict[str, Any]:
+    """统计给定时间区间内相关 market 的 activity USDC 收益。
+
+    规则：
+    - 收入: type=TRADE 且 side=SELL，以及 type=REDEEM
+    - 支出: type=TRADE 且 side=BUY
+    - 仅统计 usdcSize
+    """
+    since_ts = int(since_ts)
+    until_ts_int = int(until_ts) if until_ts is not None else None
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT market_id, event_time
+            FROM trade_events
+            WHERE market_id IS NOT NULL
+              AND market_id != ''
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    market_id_set = set()
+    for market_id, event_time in rows:
+        event_ts = _event_time_to_epoch(event_time)
+        if event_ts < since_ts:
+            continue
+        if until_ts_int is not None and event_ts > until_ts_int:
+            continue
+        if str(market_id):
+            market_id_set.add(str(market_id))
+    market_ids = sorted(market_id_set)
+
+    income_trade_sell = 0.0
+    income_redeem = 0.0
+    expense_trade_buy = 0.0
+    count_trade_sell = 0
+    count_redeem = 0
+    count_trade_buy = 0
+    activity_count = 0
+
+    if market_ids:
+        print(market_ids)
+        for market_id in market_ids:
+            batch = get_activity_history(market_id)
+            if not isinstance(batch, list):
+                batch = []
+
+            for item in batch:
+                if not isinstance(item, dict):
+                    continue
+
+                condition_id = str(item.get("conditionId") or "")
+                if condition_id not in market_id_set:
+                    continue
+
+                ts = int(item.get("timestamp") or 0)
+                if ts < since_ts:
+                    continue
+                if until_ts_int is not None and ts > until_ts_int:
+                    continue
+
+                usdc_size = _safe_float(item.get("usdcSize"))
+                if usdc_size <= 0:
+                    continue
+
+                event_type = str(item.get("type") or "").upper()
+                side = str(item.get("side") or "").upper()
+
+                if event_type == "TRADE" and side == "SELL":
+                    income_trade_sell += usdc_size
+                    count_trade_sell += 1
+                    activity_count += 1
+                elif event_type == "REDEEM":
+                    income_redeem += usdc_size
+                    count_redeem += 1
+                    activity_count += 1
+                elif event_type == "TRADE" and side == "BUY":
+                    expense_trade_buy += usdc_size
+                    count_trade_buy += 1
+                    activity_count += 1
+
+            if sleep_sec > 0:
+                time.sleep(max(0.0, float(sleep_sec)))
+
+    total_income = income_trade_sell + income_redeem
+    net_pnl = total_income - expense_trade_buy
+    return {
+        "since_ts": since_ts,
+        "until_ts": until_ts_int,
+        "db_path": db_path,
+        "market_id_count": len(market_ids),
+        "activity_count": activity_count,
+        "income_trade_sell": _round2(income_trade_sell),
+        "income_redeem": _round2(income_redeem),
+        "expense_trade_buy": _round2(expense_trade_buy),
+        "total_income": _round2(total_income),
+        "net_pnl": _round2(net_pnl),
+        "count_trade_sell": count_trade_sell,
+        "count_redeem": count_redeem,
+        "count_trade_buy": count_trade_buy,
+    }
+
 if __name__ == "__main__":
-    result = get_conditional_token_balance("83582917465492104783167246373060788120751252963368969711566208606542081356292")
+    result = calculate_activity_pnl_from_trade_events(since_ts=1773208500, until_ts=1773279300)
     print(result)
