@@ -22,6 +22,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 from config import TO_EMAIL
@@ -54,6 +55,28 @@ from services.five_minute_trade.watchers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _fmt_num(value: float) -> str:
+    return f"{value:g}"
+
+
+def _build_startup_strategy_signature(args: Any) -> str:
+    return (
+        f"m={args.entry_minute},"
+        f"pre={args.entry_preclose_sec},"
+        f"diff={_fmt_num(args.min_direction_diff)},"
+        f"max={_fmt_num(args.max_entry_price)},"
+        f"stake={_fmt_num(args.stake_usd)},"
+        f"hold={args.min_hold_before_close_sec},"
+        f"tp_cap={_fmt_num(args.tp_price_cap)},"
+        f"tp_val_cap={_fmt_num(args.tp_value_cap)},"
+        f"sl_ratio={_fmt_num(args.sl_to_tp_ratio)}"
+    )
+
+
+def _current_et_time_str() -> str:
+    return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 class FiveMinuteUpDownTrader:
@@ -907,6 +930,12 @@ class FiveMinuteUpDownTrader:
 def main() -> None:
     args = build_trade_arg_parser().parse_args()
     configure_trade_logging()
+    strategy_signature = _build_startup_strategy_signature(args)
+    logger.info(
+        "新5m_trade服务启动 | ET时间=%s | 本次启动策略=%s",
+        _current_et_time_str(),
+        strategy_signature,
+    )
     trader = create_trader_from_args(args=args, trader_cls=FiveMinuteUpDownTrader)
     try:
         trader.start()
