@@ -620,7 +620,9 @@ class FiveMinuteUpDownTrader:
                 and not is_closed
             ):
                 ms_to_close = close_time_ms - event_time_ms
-                if 0 < ms_to_close <= self.entry_preclose_seconds * 1000:
+                tolerance_ms = 1500 
+                target_trigger_ms = self.entry_preclose_seconds * 1000
+                if 0 < ms_to_close <= (target_trigger_ms + tolerance_ms):
                     self._handle_entry_minute(
                         projected_close=close_price,
                         ms_to_close=ms_to_close,

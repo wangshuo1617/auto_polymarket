@@ -65,8 +65,8 @@ HTTP_QUOTE_MAX_AGE_MS = 5000
 DEFAULT_ENTRY_QUEUE_FILL_RATIO = 0.9
 DEFAULT_EXIT_QUEUE_FILL_RATIO = 0.85
 DEFAULT_UNFILLED_PENALTY_BPS = 800.0
-DEFAULT_ENTRY_SUBMIT_LATENCY_MS = 350
-DEFAULT_EXIT_SUBMIT_LATENCY_MS = 450
+DEFAULT_ENTRY_SUBMIT_LATENCY_MS = 800
+DEFAULT_EXIT_SUBMIT_LATENCY_MS = 1000
 DEFAULT_MIN_WINDOW_QUALITY = 0.0
 WINDOW_SECONDS_EXPECTED = WINDOW_SECONDS
 
@@ -100,11 +100,15 @@ class WindowRow:
     btc_price: Optional[float]
     btc_event_ms: Optional[int]
     up_bid: Optional[float]
+    up_bid_high: Optional[float]
+    up_bid_low: Optional[float]
     up_ask: Optional[float]
     up_event_ms: Optional[int]
     up_bids_5: Optional[List[Dict[str, float]]]
     up_asks_5: Optional[List[Dict[str, float]]]
     down_bid: Optional[float]
+    down_bid_high: Optional[float]
+    down_bid_low: Optional[float]
     down_ask: Optional[float]
     down_event_ms: Optional[int]
     down_bids_5: Optional[List[Dict[str, float]]]
@@ -168,6 +172,7 @@ class WindowMarketContext:
     size_tick: str
     up_fee_bps: float
     down_fee_bps: float
+    winning_direction: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -465,11 +470,15 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
                 btc_price=btc,
                 btc_event_ms=btc_event_ms,
                 up_bid=up_bid,
+                up_bid_high=r.up_bid_high,
+                up_bid_low=r.up_bid_low,
                 up_ask=up_ask,
                 up_event_ms=up_event_ms,
                 up_bids_5=up_bids_5,
                 up_asks_5=up_asks_5,
                 down_bid=down_bid,
+                down_bid_high=r.down_bid_high,
+                down_bid_low=r.down_bid_low,
                 down_ask=down_ask,
                 down_event_ms=down_event_ms,
                 down_bids_5=down_bids_5,
@@ -555,6 +564,55 @@ def _get_market_context(
     size_tick = str(row.minimum_tick_size or default_size_tick)
     up_fee_bps = float(_to_float(row.up_fee_rate_bps) or default_fee_bps)
     down_fee_bps = float(_to_float(row.down_fee_rate_bps) or default_fee_bps)
+    winning_direction: Optional[str] = None
+
+    def _extract_winning_direction(market_payload: Dict[str, Any]) -> Optional[str]:
+        token_ids = market_payload.get("token_id") or []
+        outcomes = [str(v).lower() for v in (market_payload.get("outcomes") or [])]
+        prices_raw = market_payload.get("outcomePrices")
+        prices: List[float] = []
+        if isinstance(prices_raw, list):
+            for value in prices_raw:
+                parsed = _to_float(value)
+                if parsed is None:
+                    prices.append(float("nan"))
+                else:
+                    prices.append(parsed)
+
+        up_idx: Optional[int] = None
+        down_idx: Optional[int] = None
+        if len(token_ids) >= 2 and len(outcomes) == len(token_ids):
+            up_idx = next((i for i, o in enumerate(outcomes) if "up" in o), 0)
+            down_idx = next((i for i, o in enumerate(outcomes) if "down" in o), 1)
+
+        if prices and len(prices) == len(token_ids):
+            for idx, price in enumerate(prices):
+                if math.isnan(price):
+                    continue
+                if price < 0.999:
+                    continue
+                others = [p for j, p in enumerate(prices) if j != idx and not math.isnan(p)]
+                if others and any(p > 0.001 for p in others):
+                    continue
+                if up_idx is not None and idx == up_idx:
+                    return "up"
+                if down_idx is not None and idx == down_idx:
+                    return "down"
+
+        tokens = market_payload.get("tokens")
+        if isinstance(tokens, list):
+            for token in tokens:
+                if not isinstance(token, dict):
+                    continue
+                winner = token.get("winner")
+                if winner is not True:
+                    continue
+                winner_token = str(token.get("token_id") or token.get("tokenId") or "")
+                if up_token and winner_token == up_token:
+                    return "up"
+                if down_token and winner_token == down_token:
+                    return "down"
+        return None
 
     has_db_metadata = bool(row.minimum_tick_size) or row.up_fee_rate_bps is not None or row.down_fee_rate_bps is not None
     if has_db_metadata:
@@ -565,6 +623,7 @@ def _get_market_context(
             size_tick=size_tick,
             up_fee_bps=up_fee_bps,
             down_fee_bps=down_fee_bps,
+            winning_direction=winning_direction,
         )
         if market_slug:
             metadata_cache[market_slug] = ctx
@@ -578,6 +637,7 @@ def _get_market_context(
             size_tick=size_tick,
             up_fee_bps=up_fee_bps,
             down_fee_bps=down_fee_bps,
+            winning_direction=winning_direction,
         )
         if market_slug:
             metadata_cache[market_slug] = ctx
@@ -596,6 +656,7 @@ def _get_market_context(
                 down_idx = next((i for i, o in enumerate(outcomes) if "down" in o), 1)
                 up_token = up_token or str(token_ids[up_idx])
                 down_token = down_token or str(token_ids[down_idx])
+            winning_direction = _extract_winning_direction(first_market)
 
         if market_id:
             meta = get_market_metadata(str(market_id)) or {}
@@ -624,10 +685,17 @@ def _get_market_context(
         size_tick=size_tick,
         up_fee_bps=up_fee_bps,
         down_fee_bps=down_fee_bps,
+        winning_direction=winning_direction,
     )
     if market_slug:
         metadata_cache[market_slug] = ctx
     return ctx
+
+
+def _resolution_price_from_winner(position_direction: str, winning_direction: Optional[str]) -> Optional[float]:
+    if winning_direction not in {"up", "down"}:
+        return None
+    return 1.0 if position_direction == winning_direction else 0.0
 
 
 def _row_levels_for_side(
@@ -1178,9 +1246,17 @@ def _simulate_window(
             continue
 
         bid = r.up_bid if direction == "up" else r.down_bid
+        bid_high = r.up_bid_high if direction == "up" else r.down_bid_high
+        bid_low = r.up_bid_low if direction == "up" else r.down_bid_low
         bid_event_ms = r.up_event_ms if direction == "up" else r.down_event_ms
         bid_age = _age_ms_at_row(r.ts_sec, bid_event_ms)
         bid_is_fresh = _is_fresh(bid_age, max_quote_age_ms)
+        trigger_high = _to_positive_float(bid_high)
+        trigger_low = _to_positive_float(bid_low)
+        if trigger_high is None:
+            trigger_high = _to_positive_float(bid)
+        if trigger_low is None:
+            trigger_low = _to_positive_float(bid)
 
         if dir_change_active and r.rel_sec >= MINUTE4_CLOSE_SEC:
             exit_reason = "sl_direction_change"
@@ -1192,23 +1268,27 @@ def _simulate_window(
 
         if bid is not None and bid > 0 and bid_is_fresh:
             hold_sec = r.ts_sec - entry_ts
-            if hold_sec >= params.min_hold_before_close_sec and bid <= stop_loss_price:
+            if hold_sec >= params.min_hold_before_close_sec and trigger_low is not None and trigger_low <= stop_loss_price:
                 exit_reason = "sl"
                 exit_price = float(bid)
                 exit_row = r
                 break
-            if bid > take_profit_price:
+            if trigger_high is not None and trigger_high > take_profit_price:
                 exit_reason = "tp"
                 exit_price = float(bid)
                 exit_row = r
                 break
 
         if r.rel_sec >= EXPIRY_TRIGGER_SEC:
-            exit_reason = "expiry"
-            if bid is not None and bid > 0 and bid_is_fresh:
-                exit_price = float(bid)
-                exit_row = r
-                break
+            resolution_price = _resolution_price_from_winner(
+                position_direction=direction,
+                winning_direction=market_ctx.winning_direction,
+            )
+            if resolution_price is None:
+                return None, "missing_expiry_resolution", None
+            exit_reason = "expiry_resolution"
+            exit_price = float(resolution_price)
+            exit_row = r
             break
 
     if exit_price is None or exit_price <= 0:
@@ -1224,34 +1304,52 @@ def _simulate_window(
     if exit_price is None or exit_price <= 0:
         return None, "missing_exit_bid", None
 
-    close_row = exit_row or entry_exec_row
-    close_submit_row = _find_row_after_latency(
-        rows=rows,
-        base_row=close_row,
-        latency_ms=exit_submit_latency_ms,
-        require_btc=False,
-    )
-    if close_submit_row is None:
-        return None, "missing_exit_submit_row", None
+    if exit_reason == "expiry_resolution":
+        close_submit_row = exit_row or rows[-1]
+        effective_exit_price = float(exit_price)
+        realized_reason = exit_reason
+        exit_notional = size * effective_exit_price
+        exit_fee = 0.0
+        exit_slippage_bps = 0.0
+        exit_fill_ratio = 1.0
+        submit_fail_count = 0
+        residual_unfilled = False
+        slippage_leakage = 0.0
+    else:
+        close_row = exit_row or entry_exec_row
+        close_submit_row = _find_row_after_latency(
+            rows=rows,
+            base_row=close_row,
+            latency_ms=exit_submit_latency_ms,
+            require_btc=False,
+        )
+        if close_submit_row is None:
+            return None, "missing_exit_submit_row", None
 
-    close_result = _simulate_close_state_machine(
-        rows=rows,
-        entry_row=entry_exec_row,
-        trigger_row=close_submit_row,
-        direction=direction,
-        initial_reason=exit_reason,
-        target_size=size,
-        max_quote_age_ms=max_quote_age_ms,
-        max_ws_book_age_ms=max_ws_book_age_ms,
-        max_http_quote_age_ms=max_http_quote_age_ms,
-        queue_fill_ratio_exit=queue_fill_ratio_exit,
-        unfilled_penalty_bps=unfilled_penalty_bps,
-    )
+        close_result = _simulate_close_state_machine(
+            rows=rows,
+            entry_row=entry_exec_row,
+            trigger_row=close_submit_row,
+            direction=direction,
+            initial_reason=exit_reason,
+            target_size=size,
+            max_quote_age_ms=max_quote_age_ms,
+            max_ws_book_age_ms=max_ws_book_age_ms,
+            max_http_quote_age_ms=max_http_quote_age_ms,
+            queue_fill_ratio_exit=queue_fill_ratio_exit,
+            unfilled_penalty_bps=unfilled_penalty_bps,
+        )
 
-    effective_exit_price = close_result.effective_exit_price
-    realized_reason = close_result.realized_reason
-    exit_notional = size * effective_exit_price
-    exit_fee = exit_notional * max(0.0, fee_bps) / 10000.0
+        effective_exit_price = close_result.effective_exit_price
+        realized_reason = close_result.realized_reason
+        exit_notional = size * effective_exit_price
+        exit_fee = exit_notional * max(0.0, fee_bps) / 10000.0
+        exit_slippage_bps = float(close_result.slippage_bps)
+        exit_fill_ratio = float(close_result.fill_ratio)
+        submit_fail_count = int(close_result.submit_fail_count)
+        residual_unfilled = bool(close_result.residual_unfilled)
+        slippage_leakage = max(0.0, (float(exit_price) - float(effective_exit_price)) * size)
+
     pnl = (exit_notional - exit_fee) - (entry_cost + entry_fee)
     entry_event_time = _ts_sec_to_utc_iso(entry_exec_row.ts_sec)
     exit_event_time = _ts_sec_to_utc_iso(close_submit_row.ts_sec)
@@ -1303,10 +1401,10 @@ def _simulate_window(
         "take_profit_price": None,
         "best_quote": float(exit_price),
         "avg_fill_price": float(effective_exit_price),
-        "full_fill": int(bool(close_result.fill_ratio >= 0.999999)),
+        "full_fill": int(bool(exit_fill_ratio >= 0.999999)),
         "notional_usdc": exit_notional,
         "expected_price": float(exit_price),
-        "slippage_leakage": max(0.0, (float(exit_price) - float(effective_exit_price)) * size),
+        "slippage_leakage": slippage_leakage,
         "btc_price_at_trade": close_submit_row.btc_price,
         "order_id": None,
         "mode": "backtest",
@@ -1320,11 +1418,11 @@ def _simulate_window(
             entry_fee=entry_fee,
             exit_fee=exit_fee,
             entry_slippage_bps=entry_slippage_bps,
-            exit_slippage_bps=float(close_result.slippage_bps),
+            exit_slippage_bps=exit_slippage_bps,
             entry_fill_ratio=entry_fill_ratio,
-            exit_fill_ratio=float(close_result.fill_ratio),
-            submit_fail_count=int(close_result.submit_fail_count),
-            residual_unfilled=bool(close_result.residual_unfilled),
+            exit_fill_ratio=exit_fill_ratio,
+            submit_fail_count=submit_fail_count,
+            residual_unfilled=residual_unfilled,
             window_quality_score=float(window_quality.score),
             entry_latency_ms=max(0, int(entry_submit_latency_ms)),
             exit_latency_ms=max(0, int(exit_submit_latency_ms)),
@@ -1372,11 +1470,15 @@ def _iter_window_rows(
             btc_price,
             btc_event_ms,
             up_best_bid,
+            {_col_or_null('up_best_bid_high')},
+            {_col_or_null('up_best_bid_low')},
             up_best_ask,
             up_event_ms,
             {_col_or_null('up_bids_5')},
             {_col_or_null('up_asks_5')},
             down_best_bid,
+            {_col_or_null('down_best_bid_high')},
+            {_col_or_null('down_best_bid_low')},
             down_best_ask,
             down_event_ms,
             {_col_or_null('down_bids_5')},
@@ -1417,15 +1519,19 @@ def _iter_window_rows(
                 btc_price=_to_float(row[9]),
                 btc_event_ms=(int(row[10]) if row[10] is not None else None),
                 up_bid=_to_float(row[11]),
-                up_ask=_to_float(row[12]),
-                up_event_ms=(int(row[13]) if row[13] is not None else None),
-                up_bids_5=_parse_levels_json(row[14]),
-                up_asks_5=_parse_levels_json(row[15]),
-                down_bid=_to_float(row[16]),
-                down_ask=_to_float(row[17]),
-                down_event_ms=(int(row[18]) if row[18] is not None else None),
-                down_bids_5=_parse_levels_json(row[19]),
-                down_asks_5=_parse_levels_json(row[20]),
+                up_bid_high=_to_float(row[12]),
+                up_bid_low=_to_float(row[13]),
+                up_ask=_to_float(row[14]),
+                up_event_ms=(int(row[15]) if row[15] is not None else None),
+                up_bids_5=_parse_levels_json(row[16]),
+                up_asks_5=_parse_levels_json(row[17]),
+                down_bid=_to_float(row[18]),
+                down_bid_high=_to_float(row[19]),
+                down_bid_low=_to_float(row[20]),
+                down_ask=_to_float(row[21]),
+                down_event_ms=(int(row[22]) if row[22] is not None else None),
+                down_bids_5=_parse_levels_json(row[23]),
+                down_asks_5=_parse_levels_json(row[24]),
             )
         )
 

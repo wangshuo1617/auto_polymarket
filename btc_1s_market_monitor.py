@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 class PriceBookState:
 	best_bid: Optional[float] = None
 	best_ask: Optional[float] = None
+	best_bid_high: Optional[float] = None
+	best_bid_low: Optional[float] = None
 	event_ms: Optional[int] = None
 	received_ms: Optional[int] = None
 	bids: Optional[List[Dict[str, float]]] = None
@@ -107,10 +109,14 @@ class SQLiteBatchWriter:
 				up_fee_rate_bps REAL,
 				down_fee_rate_bps REAL,
 				up_best_bid REAL,
+				up_best_bid_high REAL,
+				up_best_bid_low REAL,
 				up_best_ask REAL,
 				up_event_ms INTEGER,
 				up_age_ms INTEGER,
 				down_best_bid REAL,
+				down_best_bid_high REAL,
+				down_best_bid_low REAL,
 				down_best_ask REAL,
 				down_event_ms INTEGER,
 				down_age_ms INTEGER,
@@ -138,6 +144,10 @@ class SQLiteBatchWriter:
 			"minimum_tick_size": "TEXT",
 			"up_fee_rate_bps": "REAL",
 			"down_fee_rate_bps": "REAL",
+			"up_best_bid_high": "REAL",
+			"up_best_bid_low": "REAL",
+			"down_best_bid_high": "REAL",
+			"down_best_bid_low": "REAL",
 			"up_bids_5": "TEXT",
 			"up_asks_5": "TEXT",
 			"down_bids_5": "TEXT",
@@ -186,10 +196,14 @@ class SQLiteBatchWriter:
 				up_fee_rate_bps,
 				down_fee_rate_bps,
 				up_best_bid,
+				up_best_bid_high,
+				up_best_bid_low,
 				up_best_ask,
 				up_event_ms,
 				up_age_ms,
 				down_best_bid,
+				down_best_bid_high,
+				down_best_bid_low,
 				down_best_ask,
 				down_event_ms,
 				down_age_ms,
@@ -198,11 +212,20 @@ class SQLiteBatchWriter:
 				down_bids_5,
 				down_asks_5,
 				created_at_utc
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			""",
 			rows_with_created,
 		)
 		conn.commit()
+
+	@staticmethod
+	def _update_bid_extrema(state: PriceBookState, best_bid: Optional[float]) -> None:
+		if best_bid is None:
+			return
+		if state.best_bid_high is None or best_bid > state.best_bid_high:
+			state.best_bid_high = best_bid
+		if state.best_bid_low is None or best_bid < state.best_bid_low:
+			state.best_bid_low = best_bid
 
 	def _run(self) -> None:
 		conn = sqlite3.connect(
@@ -405,6 +428,7 @@ class BTC1sMarketMonitor:
 
 			state.event_ms = event_ms
 			state.received_ms = received_ms_int
+			self._update_bid_extrema(state, state.best_bid)
 			self._token_books[token_id] = state
 
 	@staticmethod
@@ -673,6 +697,16 @@ class BTC1sMarketMonitor:
 			market_meta = dict(self._current_market_meta)
 			up_state = self._token_books.get(str(up_token)) if up_token else None
 			down_state = self._token_books.get(str(down_token)) if down_token else None
+			up_best_bid_high = up_state.best_bid_high if up_state else None
+			up_best_bid_low = up_state.best_bid_low if up_state else None
+			down_best_bid_high = down_state.best_bid_high if down_state else None
+			down_best_bid_low = down_state.best_bid_low if down_state else None
+			if up_state is not None:
+				up_state.best_bid_high = None
+				up_state.best_bid_low = None
+			if down_state is not None:
+				down_state.best_bid_high = None
+				down_state.best_bid_low = None
 
 		# Match 5m_trade execution path: fall back to HTTP orderbook when WS does not have full book levels.
 		if up_token and (up_state is None or not up_state.bids or not up_state.asks):
@@ -684,6 +718,7 @@ class BTC1sMarketMonitor:
 				up_state.asks = list(up_http_snapshot.get("asks") or [])
 				up_state.best_bid = self._to_positive_float(up_http_snapshot.get("best_bid"))
 				up_state.best_ask = self._to_positive_float(up_http_snapshot.get("best_ask"))
+				self._update_bid_extrema(up_state, up_state.best_bid)
 				up_state.event_ms = int(up_http_snapshot.get("event_ms") or now_ms)
 				up_state.received_ms = int(up_http_snapshot.get("received_ms") or now_ms)
 				with self._lock:
@@ -698,10 +733,20 @@ class BTC1sMarketMonitor:
 				down_state.asks = list(down_http_snapshot.get("asks") or [])
 				down_state.best_bid = self._to_positive_float(down_http_snapshot.get("best_bid"))
 				down_state.best_ask = self._to_positive_float(down_http_snapshot.get("best_ask"))
+				self._update_bid_extrema(down_state, down_state.best_bid)
 				down_state.event_ms = int(down_http_snapshot.get("event_ms") or now_ms)
 				down_state.received_ms = int(down_http_snapshot.get("received_ms") or now_ms)
 				with self._lock:
 					self._token_books[str(down_token)] = down_state
+
+		if up_best_bid_high is None and up_state is not None:
+			up_best_bid_high = up_state.best_bid
+		if up_best_bid_low is None and up_state is not None:
+			up_best_bid_low = up_state.best_bid
+		if down_best_bid_high is None and down_state is not None:
+			down_best_bid_high = down_state.best_bid
+		if down_best_bid_low is None and down_state is not None:
+			down_best_bid_low = down_state.best_bid
 
 		up_bids_5 = self._top_bids(up_state.bids if up_state else None, self.BOOK_LEVELS_TO_STORE)
 		up_asks_5 = self._top_asks(up_state.asks if up_state else None, self.BOOK_LEVELS_TO_STORE)
@@ -729,10 +774,14 @@ class BTC1sMarketMonitor:
 			self._to_positive_float(market_meta.get("up_fee_rate_bps")),
 			self._to_positive_float(market_meta.get("down_fee_rate_bps")),
 			up_state.best_bid if up_state else None,
+			up_best_bid_high,
+			up_best_bid_low,
 			up_state.best_ask if up_state else None,
 			up_state.event_ms if up_state else None,
 			_age_ms(up_state.event_ms) if up_state else None,
 			down_state.best_bid if down_state else None,
+			down_best_bid_high,
+			down_best_bid_low,
 			down_state.best_ask if down_state else None,
 			down_state.event_ms if down_state else None,
 			_age_ms(down_state.event_ms) if down_state else None,
