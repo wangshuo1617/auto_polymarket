@@ -52,6 +52,7 @@ DEFAULT_TP_VALUE_CAP = 0.15
 DEFAULT_SL_TO_TP_RATIO = 4.0 / 3.0
 WINDOW_SECONDS = 5 * 60
 MINUTE4_CLOSE_SEC = 4 * 60
+LAST_NO_FILL_SETTLEMENT_SEC = WINDOW_SECONDS - 10
 EXPIRY_TRIGGER_SEC = WINDOW_SECONDS - 10
 MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
 MAX_ENTRY_SLIPPAGE_BPS = 120.0
@@ -1245,6 +1246,19 @@ def _simulate_window(
         if r.ts_sec <= entry_ts:
             continue
 
+        # In the final 10s, assume no executable liquidity. Force binary settlement by market outcome.
+        if r.rel_sec >= LAST_NO_FILL_SETTLEMENT_SEC:
+            resolution_price = _resolution_price_from_winner(
+                position_direction=direction,
+                winning_direction=market_ctx.winning_direction,
+            )
+            if resolution_price is None:
+                return None, "missing_expiry_resolution", None
+            exit_reason = "expiry_resolution_last10s"
+            exit_price = float(resolution_price)
+            exit_row = r
+            break
+
         bid = r.up_bid if direction == "up" else r.down_bid
         bid_high = r.up_bid_high if direction == "up" else r.down_bid_high
         bid_low = r.up_bid_low if direction == "up" else r.down_bid_low
@@ -1304,7 +1318,7 @@ def _simulate_window(
     if exit_price is None or exit_price <= 0:
         return None, "missing_exit_bid", None
 
-    if exit_reason == "expiry_resolution":
+    if exit_reason.startswith("expiry_resolution"):
         close_submit_row = exit_row or rows[-1]
         effective_exit_price = float(exit_price)
         realized_reason = exit_reason

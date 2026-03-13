@@ -61,6 +61,7 @@ STAKE_USD="${STAKE_USD:-10.0}"
 DB_PATH="${DB_PATH:-${SQLITE_DB_PATH:-logs/trade.sqlite3}}"
 TOXIC_UTC_HOURS="${TOXIC_UTC_HOURS:-}"
 LIVE_LIKE="${LIVE_LIKE:-1}"
+DISABLE_MARKET_METADATA="${DISABLE_MARKET_METADATA:-1}"
 
 OUTPUT_JSON="${OUTPUT_JSON:-output/5m_optuna_best.json}"
 TRIALS_CSV="${TRIALS_CSV:-output/5m_optuna_trials.csv}"
@@ -145,6 +146,10 @@ if [ "$LIVE_LIKE" = "1" ]; then
   CMD+=(--live-like)
 fi
 
+if [ "$DISABLE_MARKET_METADATA" = "1" ]; then
+  CMD+=(--disable-market-metadata)
+fi
+
 if [ "$DISABLE_OUTPUT_TIMESTAMP" = "1" ]; then
   CMD+=(--disable-output-timestamp)
 fi
@@ -170,6 +175,11 @@ if [ "$WALK_FORWARD" = "1" ]; then
   echo "Walk-forward: 开启 (train=${WF_TRAIN_DAYS}d test=${WF_TEST_DAYS}d step=${WF_STEP_DAYS}d max_folds=${WF_MAX_FOLDS})"
 else
   echo "Walk-forward: 关闭"
+fi
+if [ "$DISABLE_MARKET_METADATA" = "1" ]; then
+  echo "Metadata解析: 关闭 (--disable-market-metadata)"
+else
+  echo "Metadata解析: 开启"
 fi
 echo "DB: $DB_PATH"
 echo "=========================================="
