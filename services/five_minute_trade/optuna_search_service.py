@@ -196,6 +196,20 @@ def _study_best_param(study: optuna.Study, args: argparse.Namespace) -> ParamSet
     )
 
 
+def _param_from_trial_params(params: Dict[str, Any], args: argparse.Namespace) -> ParamSet:
+    return ParamSet(
+        entry_minute=int(params["entry_minute"]),
+        entry_preclose_sec=int(params["preclose_sec"]),
+        min_direction_diff=float(params["diff"]),
+        max_entry_price=float(params["max_entry"]),
+        stake_usd=float(args.stake_usd),
+        min_hold_before_close_sec=int(params["hold"]),
+        tp_price_cap=float(params["tp_cap"]),
+        tp_value_cap=float(params["tp_val"]),
+        sl_to_tp_ratio=float(params["sl_ratio"]),
+    )
+
+
 def _meets_multi_objective_constraints(stats_row: Dict[str, object], args: argparse.Namespace) -> bool:
     win_rate = _to_float(stats_row.get("win_rate"), 0.0)
     profit_factor = _to_float(stats_row.get("profit_factor"), 0.0)
@@ -259,6 +273,25 @@ def _build_plateau_neighbors(param: ParamSet, args: argparse.Namespace) -> List[
                 tp_price_cap=param.tp_price_cap,
                 tp_value_cap=param.tp_value_cap,
                 sl_to_tp_ratio=param.sl_to_tp_ratio,
+            )
+        )
+        
+    sl_delta = float(args.plateau_sl_delta)
+    for sl_shift in (-sl_delta, sl_delta):
+        new_sl = _clamp_float(param.sl_to_tp_ratio + sl_shift, args.sl_ratio_min, args.sl_ratio_max)
+        if abs(new_sl - param.sl_to_tp_ratio) <= 1e-6:
+            continue
+        candidates.append(
+            ParamSet(
+                entry_minute=param.entry_minute,
+                entry_preclose_sec=param.entry_preclose_sec,
+                min_direction_diff=param.min_direction_diff,
+                max_entry_price=param.max_entry_price,
+                stake_usd=param.stake_usd,
+                min_hold_before_close_sec=param.min_hold_before_close_sec,
+                tp_price_cap=param.tp_price_cap,
+                tp_value_cap=param.tp_value_cap,
+                sl_to_tp_ratio=new_sl,
             )
         )
 
@@ -341,33 +374,51 @@ def _build_walkforward_candidates(fold_results: Sequence[Dict[str, object]], arg
     for fold in fold_results:
         if fold.get("status") != "ok":
             continue
-        signature = str(fold.get("best_param_signature") or "").strip()
-        if not signature:
-            continue
-        item = grouped.get(signature)
-        if item is None:
-            item = {
-                "signature": signature,
-                "fold_count": 0,
-                "test_constraints_ok_count": 0,
-                "sum_test_score": 0.0,
-                "sum_test_pnl": 0.0,
-                "sum_test_win_rate": 0.0,
-                "sum_test_profit_factor": 0.0,
-                "sum_test_max_drawdown": 0.0,
-            }
-            grouped[signature] = item
 
-        test_stats_obj = fold.get("test_stats")
-        test_stats: Dict[str, object] = test_stats_obj if isinstance(test_stats_obj, dict) else {}
-        item["fold_count"] = _to_int(item.get("fold_count"), 0) + 1
-        if bool(fold.get("test_constraints_ok")):
-            item["test_constraints_ok_count"] = _to_int(item.get("test_constraints_ok_count"), 0) + 1
-        item["sum_test_score"] = _to_float(item.get("sum_test_score"), 0.0) + _to_float(fold.get("test_score"), 0.0)
-        item["sum_test_pnl"] = _to_float(item.get("sum_test_pnl"), 0.0) + _to_float(test_stats.get("total_pnl"), 0.0)
-        item["sum_test_win_rate"] = _to_float(item.get("sum_test_win_rate"), 0.0) + _to_float(test_stats.get("win_rate"), 0.0)
-        item["sum_test_profit_factor"] = _to_float(item.get("sum_test_profit_factor"), 0.0) + _to_float(test_stats.get("profit_factor"), 0.0)
-        item["sum_test_max_drawdown"] = _to_float(item.get("sum_test_max_drawdown"), 0.0) + _to_float(test_stats.get("max_drawdown"), 0.0)
+        candidate_results_obj = fold.get("candidate_test_results")
+        candidate_results = candidate_results_obj if isinstance(candidate_results_obj, list) else []
+        if not candidate_results:
+            candidate_results = [
+                {
+                    "signature": fold.get("best_param_signature"),
+                    "test_stats": fold.get("test_stats"),
+                    "test_score": fold.get("test_score"),
+                    "test_constraints_ok": fold.get("test_constraints_ok"),
+                }
+            ]
+
+        for candidate in candidate_results:
+            if not isinstance(candidate, dict):
+                continue
+
+            signature = str(candidate.get("signature") or "").strip()
+            if not signature:
+                continue
+
+            item = grouped.get(signature)
+            if item is None:
+                item = {
+                    "signature": signature,
+                    "fold_count": 0,
+                    "test_constraints_ok_count": 0,
+                    "sum_test_score": 0.0,
+                    "sum_test_pnl": 0.0,
+                    "sum_test_win_rate": 0.0,
+                    "sum_test_profit_factor": 0.0,
+                    "sum_test_max_drawdown": 0.0,
+                }
+                grouped[signature] = item
+
+            test_stats_obj = candidate.get("test_stats")
+            test_stats: Dict[str, object] = test_stats_obj if isinstance(test_stats_obj, dict) else {}
+            item["fold_count"] = _to_int(item.get("fold_count"), 0) + 1
+            if bool(candidate.get("test_constraints_ok")):
+                item["test_constraints_ok_count"] = _to_int(item.get("test_constraints_ok_count"), 0) + 1
+            item["sum_test_score"] = _to_float(item.get("sum_test_score"), 0.0) + _to_float(candidate.get("test_score"), 0.0)
+            item["sum_test_pnl"] = _to_float(item.get("sum_test_pnl"), 0.0) + _to_float(test_stats.get("total_pnl"), 0.0)
+            item["sum_test_win_rate"] = _to_float(item.get("sum_test_win_rate"), 0.0) + _to_float(test_stats.get("win_rate"), 0.0)
+            item["sum_test_profit_factor"] = _to_float(item.get("sum_test_profit_factor"), 0.0) + _to_float(test_stats.get("profit_factor"), 0.0)
+            item["sum_test_max_drawdown"] = _to_float(item.get("sum_test_max_drawdown"), 0.0) + _to_float(test_stats.get("max_drawdown"), 0.0)
 
     candidates: List[Dict[str, object]] = []
     for signature, item in grouped.items():
@@ -567,6 +618,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plateau-diff-delta", type=float, default=5.0, help="Neighbor perturbation for diff")
     parser.add_argument("--plateau-hold-delta", type=int, default=10, help="Neighbor perturbation for hold")
     parser.add_argument("--plateau-weight", type=float, default=0.35, help="Weight of neighborhood worst-case score in final robust score")
+    parser.add_argument("--plateau-sl-delta", type=float, default=0.2, help="Neighbor perturbation for stop-loss to take-profit ratio")
 
     parser.add_argument("--entry-minute-min", type=int, default=2)
     parser.add_argument("--entry-minute-max", type=int, default=4)
@@ -621,6 +673,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wf-test-days", type=float, default=3.0, help="Validation window size in days")
     parser.add_argument("--wf-step-days", type=float, default=3.0, help="Fold step size in days")
     parser.add_argument("--wf-max-folds", type=int, default=0, help="Max folds to run (0 means all possible)")
+    parser.add_argument("--wf-top-test-candidates", type=int, default=3, help="Top-N train candidates to evaluate on test set per fold")
+    parser.add_argument("--wf-cluster-min-profitable", type=int, default=2, help="Minimum profitable test candidates per fold to mark parameter cluster as alive")
     return parser
 
 
@@ -646,12 +700,20 @@ def main() -> None:
         raise ValueError("max-max-drawdown must be > 0")
     if args.plateau_diff_delta < 0:
         raise ValueError("plateau-diff-delta must be >= 0")
+    if args.plateau_sl_delta < 0:
+        raise ValueError("plateau-sl-delta must be >= 0")
     if args.plateau_hold_delta < 0:
         raise ValueError("plateau-hold-delta must be >= 0")
     if args.min_plateau_pass_rate < 0 or args.min_plateau_pass_rate > 1:
         raise ValueError("min-plateau-pass-rate must be in [0, 1]")
     if args.top_candidates <= 0:
         raise ValueError("top-candidates must be > 0")
+    if args.wf_top_test_candidates <= 0:
+        raise ValueError("wf-top-test-candidates must be > 0")
+    if args.wf_cluster_min_profitable <= 0:
+        raise ValueError("wf-cluster-min-profitable must be > 0")
+    if args.wf_cluster_min_profitable > args.wf_top_test_candidates:
+        raise ValueError("wf-cluster-min-profitable must be <= wf-top-test-candidates")
 
     toxic_hours = _parse_toxic_utc_hours(args.toxic_utc_hours)
 
@@ -714,6 +776,7 @@ def main() -> None:
             "plateau": {
                 "enabled": bool(args.plateau_check),
                 "diff_delta": float(args.plateau_diff_delta),
+                "sl_delta": float(args.plateau_sl_delta),
                 "hold_delta": int(args.plateau_hold_delta),
                 "weight": float(args.plateau_weight),
             },
@@ -839,10 +902,79 @@ def main() -> None:
         )
 
         study = _run_study(args, train_windows, train_quality, sim_config)
-        best_param = _study_best_param(study, args)
-        train_stats = _evaluate_param_stats(best_param, train_windows, train_quality, sim_config)
-        test_stats = _evaluate_param_stats(best_param, test_windows, test_quality, sim_config)
-        test_score = _score_from_stats(test_stats, args)
+
+        top_candidates = _build_single_mode_candidates(study, args)
+        selected_candidates = top_candidates[: max(1, int(args.wf_top_test_candidates))]
+        if not selected_candidates:
+            print(f"Fold {fold_index} has no valid train candidates after constraints; skip test.")
+            fold_results.append(
+                {
+                    "fold_index": fold_index,
+                    "status": "skipped_no_valid_train_strategy",
+                    "train": {"start_ts_sec": train_start, "end_ts_sec": train_end, "windows": len(train_windows), "estimated_windows": train_estimated},
+                    "test": {"start_ts_sec": test_start, "end_ts_sec": test_end, "windows": len(test_windows), "estimated_windows": test_estimated},
+                }
+            )
+            continue
+
+        trial_by_number = {trial.number: trial for trial in study.trials}
+        candidate_test_results: List[Dict[str, object]] = []
+        for train_rank, candidate in enumerate(selected_candidates, start=1):
+            trial_number = _to_int(candidate.get("trial_number"), -1)
+            trial_obj = trial_by_number.get(trial_number)
+            if trial_obj is None:
+                continue
+
+            param = _param_from_trial_params(dict(trial_obj.params), args)
+            train_stats = _evaluate_param_stats(param, train_windows, train_quality, sim_config)
+            test_stats = _evaluate_param_stats(param, test_windows, test_quality, sim_config)
+            test_score = _score_from_stats(test_stats, args)
+            test_total_pnl = _to_float(test_stats.get("total_pnl"), 0.0)
+
+            candidate_test_results.append(
+                {
+                    "train_rank": train_rank,
+                    "trial_number": trial_number,
+                    "signature": param.key(),
+                    "params": dict(trial_obj.params),
+                    "train_score": _to_float(candidate.get("score"), 0.0),
+                    "train_stats": train_stats,
+                    "test_score": float(test_score),
+                    "test_stats": test_stats,
+                    "train_constraints_ok": _meets_multi_objective_constraints(train_stats, args),
+                    "test_constraints_ok": _meets_multi_objective_constraints(test_stats, args),
+                    "test_total_pnl": test_total_pnl,
+                    "test_profitable": test_total_pnl > 0.0,
+                }
+            )
+
+        if not candidate_test_results:
+            fold_results.append(
+                {
+                    "fold_index": fold_index,
+                    "status": "skipped_no_valid_train_strategy",
+                    "train": {"start_ts_sec": train_start, "end_ts_sec": train_end, "windows": len(train_windows), "estimated_windows": train_estimated},
+                    "test": {"start_ts_sec": test_start, "end_ts_sec": test_end, "windows": len(test_windows), "estimated_windows": test_estimated},
+                }
+            )
+            continue
+
+        primary = candidate_test_results[0]
+        primary_train_stats_obj = primary.get("train_stats")
+        primary_test_stats_obj = primary.get("test_stats")
+        primary_params_obj = primary.get("params")
+        primary_train_stats: Dict[str, object] = primary_train_stats_obj if isinstance(primary_train_stats_obj, dict) else {}
+        primary_test_stats: Dict[str, object] = primary_test_stats_obj if isinstance(primary_test_stats_obj, dict) else {}
+        primary_params: Dict[str, object] = primary_params_obj if isinstance(primary_params_obj, dict) else {}
+
+        profitable_count = sum(1 for row in candidate_test_results if bool(row.get("test_profitable")))
+        cluster_min_profitable = int(args.wf_cluster_min_profitable)
+        cluster_alive = profitable_count >= cluster_min_profitable
+
+        print(
+            f"Fold {fold_index} top-{len(candidate_test_results)} test results: "
+            f"profitable={profitable_count}, cluster_alive={cluster_alive}"
+        )
 
         fold_results.append(
             {
@@ -851,14 +983,19 @@ def main() -> None:
                 "test": {"start_ts_sec": test_start, "end_ts_sec": test_end, "windows": len(test_windows), "estimated_windows": test_estimated},
                 "status": "ok",
                 "best_value_train": float(study.best_value),
-                "best_params": dict(study.best_params),
-                "best_param_signature": best_param.key(),
-                "train_stats": train_stats,
-                "test_stats": test_stats,
-                "test_score": float(test_score),
+                "best_params": primary_params,
+                "best_param_signature": str(primary.get("signature") or ""),
+                "train_stats": primary_train_stats,
+                "test_stats": primary_test_stats,
+                "test_score": _to_float(primary.get("test_score"), 0.0),
                 "trials": len(study.trials),
-                "train_constraints_ok": _meets_multi_objective_constraints(train_stats, args),
-                "test_constraints_ok": _meets_multi_objective_constraints(test_stats, args),
+                "train_constraints_ok": bool(primary.get("train_constraints_ok")),
+                "test_constraints_ok": bool(primary.get("test_constraints_ok")),
+                "candidate_test_results": candidate_test_results,
+                "cluster_candidate_count": len(candidate_test_results),
+                "cluster_profitable_count": profitable_count,
+                "cluster_min_profitable": cluster_min_profitable,
+                "cluster_alive": cluster_alive,
             }
         )
 
@@ -870,20 +1007,24 @@ def main() -> None:
                 "test_start_ts_sec": test_start,
                 "test_end_ts_sec": test_end,
                 "best_value_train": float(study.best_value),
-                "test_score": float(test_score),
-                "train_total_pnl": _to_float(train_stats.get("total_pnl"), 0.0),
-                "test_total_pnl": _to_float(test_stats.get("total_pnl"), 0.0),
-                "train_profit_factor": _to_float(train_stats.get("profit_factor"), 0.0),
-                "test_profit_factor": _to_float(test_stats.get("profit_factor"), 0.0),
-                "train_max_drawdown": _to_float(train_stats.get("max_drawdown"), 0.0),
-                "test_max_drawdown": _to_float(test_stats.get("max_drawdown"), 0.0),
-                "train_trades": _to_int(train_stats.get("trades"), 0),
-                "test_trades": _to_int(test_stats.get("trades"), 0),
-                "train_win_rate": _to_float(train_stats.get("win_rate"), 0.0),
-                "test_win_rate": _to_float(test_stats.get("win_rate"), 0.0),
-                "train_constraints_ok": _meets_multi_objective_constraints(train_stats, args),
-                "test_constraints_ok": _meets_multi_objective_constraints(test_stats, args),
-                "best_param_signature": best_param.key(),
+                "test_score": _to_float(primary.get("test_score"), 0.0),
+                "train_total_pnl": _to_float(primary_train_stats.get("total_pnl"), 0.0),
+                "test_total_pnl": _to_float(primary_test_stats.get("total_pnl"), 0.0),
+                "train_profit_factor": _to_float(primary_train_stats.get("profit_factor"), 0.0),
+                "test_profit_factor": _to_float(primary_test_stats.get("profit_factor"), 0.0),
+                "train_max_drawdown": _to_float(primary_train_stats.get("max_drawdown"), 0.0),
+                "test_max_drawdown": _to_float(primary_test_stats.get("max_drawdown"), 0.0),
+                "train_trades": _to_int(primary_train_stats.get("trades"), 0),
+                "test_trades": _to_int(primary_test_stats.get("trades"), 0),
+                "train_win_rate": _to_float(primary_train_stats.get("win_rate"), 0.0),
+                "test_win_rate": _to_float(primary_test_stats.get("win_rate"), 0.0),
+                "train_constraints_ok": bool(primary.get("train_constraints_ok")),
+                "test_constraints_ok": bool(primary.get("test_constraints_ok")),
+                "best_param_signature": str(primary.get("signature") or ""),
+                "primary_train_rank": _to_int(primary.get("train_rank"), 0),
+                "cluster_candidate_count": len(candidate_test_results),
+                "cluster_profitable_count": profitable_count,
+                "cluster_alive": cluster_alive,
             }
         )
 
@@ -900,6 +1041,10 @@ def main() -> None:
         test_pnls.append(_to_float(test_stats.get("total_pnl"), 0.0))
         test_trades.append(_to_int(test_stats.get("trades"), 0))
 
+    cluster_alive_folds = sum(1 for fold_result in ok_folds if bool(fold_result.get("cluster_alive")))
+    cluster_total_candidates = sum(_to_int(fold_result.get("cluster_candidate_count"), 0) for fold_result in ok_folds)
+    cluster_total_profitable = sum(_to_int(fold_result.get("cluster_profitable_count"), 0) for fold_result in ok_folds)
+
     summary = {
         "mode": "walk_forward",
         "score_mode": args.score_mode,
@@ -909,6 +1054,8 @@ def main() -> None:
             "test_days": args.wf_test_days,
             "step_days": args.wf_step_days,
             "max_folds": args.wf_max_folds,
+            "top_test_candidates": int(args.wf_top_test_candidates),
+            "cluster_min_profitable": int(args.wf_cluster_min_profitable),
             "folds_total": len(folds),
             "folds_ok": len(ok_folds),
         },
@@ -921,6 +1068,7 @@ def main() -> None:
         "plateau": {
             "enabled": bool(args.plateau_check),
             "diff_delta": float(args.plateau_diff_delta),
+            "sl_delta": float(args.plateau_sl_delta),
             "hold_delta": int(args.plateau_hold_delta),
             "weight": float(args.plateau_weight),
         },
@@ -934,6 +1082,15 @@ def main() -> None:
             "sum_test_total_pnl": sum(test_pnls),
             "sum_test_trades": sum(test_trades),
             "test_constraints_ok_folds": sum(1 for x in ok_folds if bool(x.get("test_constraints_ok"))),
+            "cluster_alive_folds": cluster_alive_folds,
+            "cluster_alive_rate": (float(cluster_alive_folds) / float(len(ok_folds))) if ok_folds else 0.0,
+            "cluster_total_candidates": cluster_total_candidates,
+            "cluster_total_profitable": cluster_total_profitable,
+            "cluster_profitable_rate": (
+                float(cluster_total_profitable) / float(cluster_total_candidates)
+                if cluster_total_candidates > 0
+                else 0.0
+            ),
         },
         "fold_results": fold_results,
     }
@@ -967,6 +1124,10 @@ def main() -> None:
             "train_constraints_ok",
             "test_constraints_ok",
             "best_param_signature",
+            "primary_train_rank",
+            "cluster_candidate_count",
+            "cluster_profitable_count",
+            "cluster_alive",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()

@@ -98,6 +98,8 @@ class FiveMinuteUpDownTrader:
     TOXIC_UTC_HOURS = {16, 19, 20}
     WS_BOOK_MAX_AGE_MS = 1200
     MIN_HOLD_BEFORE_CLOSE_SEC = 5
+    EXPIRY_FORCE_CLOSE_HIGH_PRICE = 0.99
+    EXPIRY_WAIT_SETTLE_MIN_PRICE = 0.60
     REPEATED_LOG_THROTTLE_SEC = 10.0
 
     def __init__(
@@ -749,12 +751,40 @@ class FiveMinuteUpDownTrader:
             != str(self.current_window_start_ms // 1000)
         ):
             return
+        expiry_price = self.position.last_best_bid
+        if expiry_price is None or expiry_price <= 0:
+            if self._should_emit_log(
+                key=f"minute5_expiry:{self.position.market_slug}:{self.position.token_id}:missing_price",
+                interval_sec=2.0,
+            ):
+                logger.info("第 5 分钟收盘，缺少有效平仓价格，按保守策略强制平仓")
+            self._force_close_position(reason="expiry")
+            return
+
+        if expiry_price > self.EXPIRY_FORCE_CLOSE_HIGH_PRICE or expiry_price < self.EXPIRY_WAIT_SETTLE_MIN_PRICE:
+            if self._should_emit_log(
+                key=f"minute5_expiry:{self.position.market_slug}:{self.position.token_id}:force_close",
+                interval_sec=2.0,
+            ):
+                logger.info(
+                    "第 5 分钟收盘，触发到期平仓: best_bid=%.4f 规则: >%.2f 或 <%.2f",
+                    expiry_price,
+                    self.EXPIRY_FORCE_CLOSE_HIGH_PRICE,
+                    self.EXPIRY_WAIT_SETTLE_MIN_PRICE,
+                )
+            self._force_close_position(reason="expiry")
+            return
+
         if self._should_emit_log(
-            key=f"minute5_expiry:{self.position.market_slug}:{self.position.token_id}",
+            key=f"minute5_expiry:{self.position.market_slug}:{self.position.token_id}:wait_settle",
             interval_sec=2.0,
         ):
-            logger.info("第 5 分钟收盘，强制平仓当前持仓")
-        self._force_close_position(reason="expiry")
+            logger.info(
+                "第 5 分钟收盘，价格位于 %.2f-%.2f 区间(best_bid=%.4f)，不手动平仓，等待机器结算",
+                self.EXPIRY_WAIT_SETTLE_MIN_PRICE,
+                self.EXPIRY_FORCE_CLOSE_HIGH_PRICE,
+                expiry_price,
+            )
 
     def _select_market_and_tokens(
         self, market_slug: str
