@@ -432,6 +432,15 @@ class BTC1sMarketMonitor:
 			self._token_books[token_id] = state
 
 	@staticmethod
+	def _update_bid_extrema(state: PriceBookState, best_bid: Optional[float]) -> None:
+		if best_bid is None:
+			return
+		if state.best_bid_high is None or best_bid > state.best_bid_high:
+			state.best_bid_high = best_bid
+		if state.best_bid_low is None or best_bid < state.best_bid_low:
+			state.best_bid_low = best_bid
+
+	@staticmethod
 	def _to_positive_float(value: Any) -> Optional[float]:
 		try:
 			if value is None:

@@ -721,6 +721,7 @@ def calculate_activity_pnl_from_trade_events(
     说明：
     - 直接使用 get_5m_updown_activity_history 的返回数据，不再依赖 SQLite 中的 market_id。
     - db_path/sleep_sec 参数保留用于兼容旧调用。
+    - 新增 slug 维度聚合：返回每个 slug 的净盈亏，以及盈利/亏损/持平次数统计。
     """
     since_ts = int(since_ts)
     until_ts_int = int(until_ts) if until_ts is not None else None
@@ -735,6 +736,21 @@ def calculate_activity_pnl_from_trade_events(
     count_redeem = 0
     count_trade_buy = 0
     activity_count = 0
+    slug_stats: Dict[str, Dict[str, Any]] = {}
+
+    def _get_slug_stats(slug_value: str) -> Dict[str, Any]:
+        if slug_value not in slug_stats:
+            slug_stats[slug_value] = {
+                "slug": slug_value,
+                "activity_count": 0,
+                "income_trade_sell": 0.0,
+                "income_redeem": 0.0,
+                "expense_trade_buy": 0.0,
+                "count_trade_sell": 0,
+                "count_redeem": 0,
+                "count_trade_buy": 0,
+            }
+        return slug_stats[slug_value]
 
     for item in batch:
         if not isinstance(item, dict):
@@ -752,22 +768,67 @@ def calculate_activity_pnl_from_trade_events(
 
         event_type = str(item.get("type") or "").upper()
         side = str(item.get("side") or "").upper()
+        event_slug = str(item.get("eventSlug") or item.get("slug") or "unknown").strip().lower() or "unknown"
+        slug_bucket = _get_slug_stats(event_slug)
 
         if event_type == "TRADE" and side == "SELL":
             income_trade_sell += usdc_size
             count_trade_sell += 1
             activity_count += 1
+            slug_bucket["income_trade_sell"] += usdc_size
+            slug_bucket["count_trade_sell"] += 1
+            slug_bucket["activity_count"] += 1
         elif event_type == "REDEEM":
             income_redeem += usdc_size
             count_redeem += 1
             activity_count += 1
+            slug_bucket["income_redeem"] += usdc_size
+            slug_bucket["count_redeem"] += 1
+            slug_bucket["activity_count"] += 1
         elif event_type == "TRADE" and side == "BUY":
             expense_trade_buy += usdc_size
             count_trade_buy += 1
             activity_count += 1
+            slug_bucket["expense_trade_buy"] += usdc_size
+            slug_bucket["count_trade_buy"] += 1
+            slug_bucket["activity_count"] += 1
 
     total_income = income_trade_sell + income_redeem
     net_pnl = total_income - expense_trade_buy
+
+    slug_pnl_summary: List[Dict[str, Any]] = []
+    slug_profit_count = 0
+    slug_loss_count = 0
+    slug_flat_count = 0
+
+    for stats in slug_stats.values():
+        slug_total_income = float(stats["income_trade_sell"]) + float(stats["income_redeem"])
+        slug_net_pnl = slug_total_income - float(stats["expense_trade_buy"])
+
+        if slug_net_pnl > 0:
+            slug_profit_count += 1
+        elif slug_net_pnl < 0:
+            slug_loss_count += 1
+        else:
+            slug_flat_count += 1
+
+        slug_pnl_summary.append(
+            {
+                "slug": stats["slug"],
+                "activity_count": int(stats["activity_count"]),
+                "income_trade_sell": _round2(stats["income_trade_sell"]),
+                "income_redeem": _round2(stats["income_redeem"]),
+                "expense_trade_buy": _round2(stats["expense_trade_buy"]),
+                "total_income": _round2(slug_total_income),
+                "net_pnl": _round2(slug_net_pnl),
+                "count_trade_sell": int(stats["count_trade_sell"]),
+                "count_redeem": int(stats["count_redeem"]),
+                "count_trade_buy": int(stats["count_trade_buy"]),
+            }
+        )
+
+    slug_pnl_summary.sort(key=lambda x: (x["net_pnl"], x["slug"]), reverse=True)
+
     return {
         "since_ts": since_ts,
         "until_ts": until_ts_int,
@@ -780,8 +841,13 @@ def calculate_activity_pnl_from_trade_events(
         "count_trade_sell": count_trade_sell,
         "count_redeem": count_redeem,
         "count_trade_buy": count_trade_buy,
+        "slug_summary": slug_pnl_summary,
+        "slug_profit_count": slug_profit_count,
+        "slug_loss_count": slug_loss_count,
+        "slug_flat_count": slug_flat_count,
+        "slug_total_count": len(slug_pnl_summary),
     }
 
 if __name__ == "__main__":
-    result = calculate_activity_pnl_from_trade_events(since_ts=1773282445)
+    result = calculate_activity_pnl_from_trade_events(since_ts=1773390285)
     print(result)
