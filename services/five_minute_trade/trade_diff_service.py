@@ -495,6 +495,7 @@ def compare_events(
 
     keys = sorted(set(backtest_grouped.keys()) | set(live_grouped.keys()))
     matched: List[Dict[str, Any]] = []
+    matched_backtest_events: List[NormalizedTradeEvent] = []
     matched_live_events: List[NormalizedTradeEvent] = []
     only_backtest: List[Dict[str, Any]] = []
     only_backtest_events: List[NormalizedTradeEvent] = []
@@ -523,6 +524,7 @@ def compare_events(
         for idx in range(match_count):
             bt = bt_list[idx]
             lv = lv_list[idx]
+            matched_backtest_events.append(bt)
             matched_live_events.append(lv)
             price_delta = lv.price - bt.price
             size_delta = lv.size - bt.size
@@ -589,9 +591,10 @@ def compare_events(
 
     backtest_total_profit = _total_profit(backtest_events)
     live_total_profit = _total_profit(live_events)
-    matched_live_profit = _total_profit(matched_live_events)
-    only_backtest_profit_backtest = _total_profit(only_backtest_events)
-    only_live_profit_live = _total_profit(only_live_events)
+    backtest_matched_profit = _total_profit(matched_backtest_events)
+    live_matched_profit = _total_profit(matched_live_events)
+    backtest_only_backtest_profit = _total_profit(only_backtest_events)
+    live_only_live_profit = _total_profit(only_live_events)
 
     return {
         "summary": {
@@ -602,9 +605,10 @@ def compare_events(
             "only_live_count": len(only_live),
             "backtest_total_profit": _round6(backtest_total_profit),
             "live_total_profit": _round6(live_total_profit),
-            "matched_live_profit": _round6(matched_live_profit),
-            "only_backtest_profit_backtest": _round6(only_backtest_profit_backtest),
-            "only_live_profit_live": _round6(only_live_profit_live),
+            "backtest_matched_profit": _round6(backtest_matched_profit),
+            "live_matched_profit": _round6(live_matched_profit),
+            "backtest_only_backtest_profit": _round6(backtest_only_backtest_profit),
+            "live_only_live_profit": _round6(live_only_live_profit),
             "total_profit_gap_live_minus_backtest": _round6(live_total_profit - backtest_total_profit),
             "avg_abs_price_delta": _round6(_avg(price_abs)),
             "avg_abs_size_delta": _round6(_avg(size_abs)),
@@ -819,9 +823,10 @@ def _print_console_summary(report: Dict[str, Any], top_n: int) -> None:
         "only_live_count",
         "backtest_total_profit",
         "live_total_profit",
-        "matched_live_profit",
-        "only_backtest_profit_backtest",
-        "only_live_profit_live",
+        "backtest_matched_profit",
+        "live_matched_profit",
+        "backtest_only_backtest_profit",
+        "live_only_live_profit",
         "total_profit_gap_live_minus_backtest",
         "avg_abs_price_delta",
         "avg_abs_size_delta",
