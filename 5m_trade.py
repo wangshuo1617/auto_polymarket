@@ -21,6 +21,7 @@ BTC 5m up/down 策略交易服务
 import logging
 import os
 import socket
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
@@ -202,6 +203,22 @@ class FiveMinuteUpDownTrader:
                 logger.error("交易记录SQLite初始化失败，将仅保留内存/日志记录: %s", e)
         else:
             logger.warning("未配置 --trade-db-path，交易记录仅保留内存/日志")
+
+        # 与回测对齐的 DB tick 交叉验证读连接
+        self._tick_reader_conn: Optional[sqlite3.Connection] = None
+        if trade_db_path:
+            try:
+                self._tick_reader_conn = sqlite3.connect(
+                    trade_db_path,
+                    timeout=2.0,
+                    check_same_thread=False,
+                    isolation_level=None,
+                )
+                self._tick_reader_conn.execute("PRAGMA journal_mode=WAL;")
+                self._tick_reader_conn.execute("PRAGMA query_only=ON;")
+                logger.info("tick交叉验证读连接已初始化: %s", trade_db_path)
+            except Exception as e:
+                logger.warning("tick交叉验证读连接初始化失败，将跳过入场交叉验证: %s", e)
 
     def _should_emit_log(self, key: str, interval_sec: Optional[float] = None) -> bool:
         interval = (
@@ -517,6 +534,12 @@ class FiveMinuteUpDownTrader:
         if self._poly_watcher:
             self._poly_watcher.stop()
             self._poly_watcher = None
+        if self._tick_reader_conn is not None:
+            try:
+                self._tick_reader_conn.close()
+            except Exception:
+                pass
+            self._tick_reader_conn = None
         if self._trade_db is not None:
             self._trade_db.close()
 
@@ -729,6 +752,11 @@ class FiveMinuteUpDownTrader:
             self.window_traded = True
             return
 
+        # DB tick 交叉验证：确保回测使用同一 DB 数据也会入场，避免误入
+        if not self._validate_entry_with_db_ticks(direction):
+            self.window_traded = True
+            return
+
         # 优先使用窗口开始时预热好的 market_slug
         if self.current_market_slug:
             market_slug = self.current_market_slug
@@ -749,6 +777,80 @@ class FiveMinuteUpDownTrader:
         except Exception as e:
             logger.error("开仓失败: %s", e)
             self.window_traded = True
+
+    def _validate_entry_with_db_ticks(self, direction: str) -> bool:
+        """与回测对齐：读取 btc_poly_1s_ticks 中同窗口的快照，验证 BTC 价差和方向也满足入场条件。
+
+        返回 True 表示 DB 数据也支持入场；False 表示回测不会入场，应跳过。
+        DB 不可用或缺少数据时回退为 True（不拦截）。
+        """
+        conn = self._tick_reader_conn
+        if conn is None or self.current_window_start_ms is None:
+            return True
+
+        window_start_sec = self.current_window_start_ms // 1000
+        market_slug = f"btc-updown-5m-{window_start_sec}"
+        trigger_sec = self.entry_decision_minute * 60 - self.entry_preclose_seconds
+        deadline_sec = self.entry_decision_minute * 60
+
+        try:
+            # open_price：窗口首条含 btc_price 的行（对齐回测 open_row）
+            row = conn.execute(
+                "SELECT btc_price FROM btc_poly_1s_ticks "
+                "WHERE market_slug = ? AND btc_price IS NOT NULL AND btc_price > 0 "
+                "ORDER BY ts_sec ASC LIMIT 1",
+                (market_slug,),
+            ).fetchone()
+            if row is None:
+                return True
+            db_open_price = float(row[0])
+
+            # decision_price：决策区间 [trigger, deadline) 的首条行（对齐回测 entry_signal_row_source=first）
+            trigger_ts = window_start_sec + trigger_sec
+            deadline_ts = window_start_sec + deadline_sec
+            row = conn.execute(
+                "SELECT btc_price FROM btc_poly_1s_ticks "
+                "WHERE market_slug = ? AND ts_sec >= ? AND ts_sec < ? "
+                "AND btc_price IS NOT NULL AND btc_price > 0 "
+                "ORDER BY ts_sec ASC LIMIT 1",
+                (market_slug, trigger_ts, deadline_ts),
+            ).fetchone()
+            if row is None:
+                # DB 可能还未写入决策秒的 tick，向前扩展 2 秒回退
+                row = conn.execute(
+                    "SELECT btc_price FROM btc_poly_1s_ticks "
+                    "WHERE market_slug = ? AND ts_sec >= ? AND ts_sec < ? "
+                    "AND btc_price IS NOT NULL AND btc_price > 0 "
+                    "ORDER BY ts_sec DESC LIMIT 1",
+                    (market_slug, trigger_ts - 2, trigger_ts),
+                ).fetchone()
+            if row is None:
+                logger.info("DB交叉验证: 决策区间无tick数据，跳过验证 slug=%s", market_slug)
+                return True
+            db_decision_price = float(row[0])
+
+            db_diff = db_decision_price - db_open_price
+            db_abs_diff = abs(db_diff)
+            db_direction = "up" if db_diff > 0 else "down"
+
+            if db_abs_diff <= self.min_direction_diff:
+                logger.info(
+                    "DB交叉验证拦截: DB价差不足 |%.2f - %.2f| = %.2f <= 阈值%.2f，回测不会入场",
+                    db_decision_price, db_open_price, db_abs_diff, self.min_direction_diff,
+                )
+                return False
+
+            if db_direction != direction:
+                logger.info(
+                    "DB交叉验证拦截: 方向不一致 live=%s db=%s (db_open=%.2f db_decision=%.2f)",
+                    direction, db_direction, db_open_price, db_decision_price,
+                )
+                return False
+
+            return True
+        except Exception as e:
+            logger.warning("DB交叉验证异常，跳过验证: %s", e)
+            return True
 
     def _handle_minute4_direction_change(self) -> None:
         if (
