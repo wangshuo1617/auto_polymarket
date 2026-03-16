@@ -12,7 +12,8 @@ BTC 5m up/down 策略交易服务
     - 动态止盈：止盈值=min(0.15, 0.95-买入价)，止盈线上限 0.95；
     - 动态止损：止损值=止盈值*4/3，止损线=买入价-止损值；
    - 特殊止损：如果第 4 分钟收盘价相对开盘价方向与第 3 分钟相反，则立即止损；
-   - 特殊止盈：由 min(买入价 * 1.2, 0.99) 实现（当 1.2 * 买入价 > 1 时，在 0.99 止盈）。
+   - 特殊止盈：由 min(买入价 * 1.2, 0.99) 实现（当 1.2 * 买入价 > 1 时，在 0.99 止盈）；
+   - 第 5 分钟强制平仓：仅当当前卖价（best_bid）<= 0.7 时才平仓，高于 0.7 则不平仓，避免回吐已满期获利盘。
 3. 通过 Polymarket WebSocket（ws-subscriptions-clob）订阅当前持仓 token 的价格；
 4. 每笔交易记录盈亏；每 1 小时邮件推送本小时与服务启动以来的盈亏汇总；
 5. 服务持续运行直到手动终止（Ctrl+C）。
@@ -76,6 +77,8 @@ class FiveMinuteUpDownTrader:
     WS_BOOK_MAX_AGE_MS = 1200
     MIN_HOLD_BEFORE_CLOSE_SEC = 5
     REPEATED_LOG_THROTTLE_SEC = 10.0
+    # 第 5 分钟强制平仓时，若当前卖价高于此阈值则不平仓，避免回吐已满期获利盘
+    MINUTE5_FORCE_CLOSE_MAX_BID = 0.7
 
     def __init__(
         self,
@@ -724,6 +727,18 @@ class FiveMinuteUpDownTrader:
             != str(self.current_window_start_ms // 1000)
         ):
             return
+        best_bid = self.position.last_best_bid
+        if best_bid is not None and best_bid > self.MINUTE5_FORCE_CLOSE_MAX_BID:
+            if self._should_emit_log(
+                key=f"minute5_skip:{self.position.market_slug}:{self.position.token_id}",
+                interval_sec=2.0,
+            ):
+                logger.info(
+                    "第 5 分钟收盘跳过强制平仓: 当前卖价=%.4f > %.2f，保留持仓避免回吐获利",
+                    best_bid,
+                    self.MINUTE5_FORCE_CLOSE_MAX_BID,
+                )
+            return
         if self._should_emit_log(
             key=f"minute5_expiry:{self.position.market_slug}:{self.position.token_id}",
             interval_sec=2.0,
@@ -745,8 +760,8 @@ class FiveMinuteUpDownTrader:
         token_id: str,
         order_id: Optional[str] = None,
         match_check_delay_sec: int = 7,
-        first_balance_delay_sec: int = 10,
-        retry_balance_delay_sec: int = 12,
+        first_balance_delay_sec: int = 20,
+        retry_balance_delay_sec: int = 25,
     ) -> None:
         schedule_position_balance_confirmation(
             trader=self,

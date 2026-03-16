@@ -1,6 +1,7 @@
 """
-Polymarket 持仓分析主入口
-获取持仓、挂单、K线、市场情绪，经 AI 分析后发送邮件
+Polymarket 持仓分析主入口（仅 BTC）
+获取 BTC 类持仓与挂单、BTC K 线、市场情绪，经 AI 分析后发送邮件。
+原油类分析请使用 position_analyze_oil.py。
 """
 import json
 import calendar
@@ -9,7 +10,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from config import TO_EMAIL
-from data.polymarket import get_positions, get_open_orders, get_event_situation, get_balance_allowance
+from data.polymarket import (
+    get_positions,
+    get_open_orders,
+    get_event_situation,
+    get_event_token_id,
+    get_balance_allowance,
+)
 from data.binance import get_btc_price, get_4h_klines_data, get_1d_klines_data
 from ai.researcher import analyze_market_with_grounding
 from notifications.email import EmailSender
@@ -119,15 +126,42 @@ def _build_future_possibility_context(
     }
 
 
+def _filter_btc_only_positions_and_orders(
+    positions: list,
+    orders: list,
+    btc_condition_ids: set,
+) -> tuple[list, list]:
+    """只保留属于指定 BTC event 的持仓与挂单，排除原油等其它类别。"""
+    btc_positions = [p for p in positions if p.get("conditionId") in btc_condition_ids]
+    btc_orders = [o for o in orders if o.get("market") in btc_condition_ids]
+    return btc_positions, btc_orders
+
+
 if __name__ == "__main__":
     email_sender = EmailSender()
     time_now = datetime.now(ET_TIMEZONE).strftime("%m-%d %H:%M")
 
+    # 仅分析 BTC 类 event，排除原油等
+    btc_condition_ids = set()
+    try:
+        btc_event_info = get_event_token_id()  # 默认 BTC 月价 event slug
+        for m in btc_event_info.get("markets") or []:
+            cid = m.get("market_id") or m.get("conditionId")
+            if cid:
+                btc_condition_ids.add(cid)
+    except Exception as e:
+        print(f"{time_now} 获取 BTC event 失败: {e}，将使用全部持仓")
+        btc_condition_ids = set()
+
     positions = get_positions()
     orders = get_open_orders()
+    if btc_condition_ids:
+        positions, orders = _filter_btc_only_positions_and_orders(
+            positions, orders, btc_condition_ids
+        )
     matched_results = match_orders_with_positions(orders, positions)
     formatted = format_matched_data(matched_results)
-    print(f"{time_now} Polymarket持仓情况格式化完成")
+    print(f"{time_now} Polymarket BTC 持仓/挂单格式化完成（已排除原油等非 BTC）")
 
     btc_4h_k_data = get_4h_klines_data(limit=42)
     btc_1d_k_data = get_1d_klines_data(limit=30)

@@ -23,6 +23,12 @@
 - 结合 BTC 4小时 K 线数据进行综合分析
 - 生成 HTML 格式的详细分析报告
 
+### 🛢️ 原油类 event 持仓分析（可选）
+- 针对 Polymarket 原油（WTI/CL）预测市场（如月度结算价、涨跌等）
+- 使用 WTI 价格与 K 线（yfinance `CL=F`）做波动率与情景分析
+- 可配置事件 slug（默认当月：`will-crude-oil-cl-hit-by-end-of-{month}`），环境变量 `POLYMARKET_OIL_EVENT_SLUG` 可覆盖
+- 运行：`python position_analyze_oil.py`
+
 ### 📅 月初建仓建议
 - 月初自动汇总宏观流动性与技术面数据
 - 生成新一月 BTC 价格预测市场的趋势判断与建仓方案
@@ -45,7 +51,8 @@
 auto_polymarket/
 ├── 5m_trade.py              # BTC 5m up/down 策略交易服务（入口）
 ├── btc_1s_market_monitor.py  # BTC + Polymarket 5m 逐秒采样监控（入口）
-├── position_analyze.py      # 持仓分析主程序（入口）
+├── position_analyze.py      # 持仓分析主程序（BTC 月度）（入口）
+├── position_analyze_oil.py  # 原油类 event 持仓分析（WTI）（入口）
 ├── btc_price_watcher.py     # BTC 价格监控服务（入口）
 ├── btc_volume_delta_service.py # BTC 15秒滑窗 Volume Delta 服务（入口）
 ├── monthly_btc_strategy.py  # 月初建仓建议（入口）
@@ -55,6 +62,7 @@ auto_polymarket/
 ├── data/                    # 数据源层
 │   ├── polymarket.py        # Polymarket 持仓与订单
 │   ├── binance.py           # Binance 现货与衍生品
+│   ├── oil.py               # WTI 原油价格与 K 线（yfinance CL=F）
 │   ├── etf.py               # SoSoValue ETF 流入
 │   ├── rsi.py               # RSI 指标
 │   └── defillama.py         # DefiLlama 稳定币流动性
@@ -171,6 +179,19 @@ uv run position_analyze.py
 - 生成价格预警配置
 - 发送 HTML 格式的分析报告邮件
 
+#### 运行原油类 event 持仓分析
+
+```bash
+uv run position_analyze_oil.py
+```
+
+- 仅分析 Polymarket 原油（WTI）相关持仓与挂单
+- WTI 价格与 K 线来自 Yahoo Finance（`CL=F`），无需 API Key
+- 可选环境变量：`POLYMARKET_OIL_EVENT_SLUG` 指定事件 slug（默认当月：will-crude-oil-cl-hit-by-end-of-{month}）
+- 报告输出：`output/{时间}_oil_email.html`，上期报告缓存：`last_report_oil.json`
+
+**原油价格数据源**：`data/oil.py` 使用 yfinance `CL=F`（CME WTI 期货），免费、无需 Key。
+
 #### 每 4 小时定时运行持仓分析
 
 使用调度器在后台每 4 小时执行一次 `position_analyze.py`：
@@ -192,6 +213,28 @@ uv run scripts/run_position_analyze_every_4h.py
 ```
 
 日志目录：`logs/position_analyze_4h.log`。
+
+#### 每 2 小时定时运行原油持仓分析
+
+使用调度器在后台每 2 小时执行一次 `position_analyze_oil.py`：
+
+**Windows (PowerShell)：**
+```powershell
+.\scripts\run_position_analyze_oil_2h.ps1
+```
+
+**Linux / macOS：**
+```bash
+chmod +x scripts/run_position_analyze_oil_2h.sh
+./scripts/run_position_analyze_oil_2h.sh
+```
+
+或直接运行 Python 调度脚本（会立即执行一次，之后每 2 小时执行）：
+```bash
+uv run scripts/run_position_analyze_oil_every_2h.py
+```
+
+日志：`logs/position_analyze_oil_2h.log`。
 
 #### 运行价格监控
 

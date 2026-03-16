@@ -17,6 +17,9 @@ from ai.prompts import (
     MONTHLY_STRATEGY_SCHEMA,
     get_monthly_system_instruction,
     get_monthly_user_prompt,
+    OIL_RESPONSE_SCHEMA,
+    get_oil_system_instruction,
+    get_oil_user_prompt,
 )
 
 ET_TIMEZONE = ZoneInfo("America/New_York")
@@ -133,6 +136,67 @@ def analyze_market_with_grounding(
         
     except Exception as e:
         raise Exception(f"Error calling Gemini API: {str(e)}") from e
+
+
+def analyze_oil_market_with_grounding(
+    polymarket_status: list,
+    oil_4h_k_data: list,
+    oil_1d_k_data: list,
+    daily_volatility_profile: dict,
+    future_possibility_context: dict,
+    profit_optimization_context: dict,
+    oil_market_context: dict,
+    polymarket_event_situation: dict,
+    usdc_balance: str,
+    previous_report: dict | None = None,
+) -> Dict[str, Any]:
+    """
+    针对 Polymarket 原油类 event 的持仓与市场分析（WTI K 线、波动率、收益优化等）。
+    """
+    current_date = datetime.now(ET_TIMEZONE).strftime("%Y-%m-%d")
+    client = _get_client()
+    model = GEMINI_MODEL_ID
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+    config = types.GenerateContentConfig(
+        system_instruction=get_oil_system_instruction(current_date),
+        tools=[grounding_tool],
+        response_schema=OIL_RESPONSE_SCHEMA,
+        temperature=0.7,
+    )
+    user_prompt = get_oil_user_prompt(
+        polymarket_status,
+        oil_4h_k_data,
+        oil_1d_k_data,
+        daily_volatility_profile,
+        future_possibility_context,
+        profit_optimization_context,
+        oil_market_context,
+        polymarket_event_situation,
+        usdc_balance,
+        previous_report=previous_report,
+    )
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config=config,
+        )
+        response_text = response.text
+        try:
+            result = json.loads(response_text)
+        except json.JSONDecodeError:
+            if "```json" in response_text:
+                json_start = response_text.find("```json") + 7
+                json_end = response_text.find("```", json_start)
+                response_text = response_text[json_start:json_end].strip()
+            elif "```" in response_text:
+                json_start = response_text.find("```") + 3
+                json_end = response_text.find("```", json_start)
+                response_text = response_text[json_start:json_end].strip()
+            result = json.loads(response_text)
+        return result
+    except Exception as e:
+        raise Exception(f"Error calling Gemini API (oil): {str(e)}") from e
 
 
 def analyze_monthly_strategy_with_grounding(

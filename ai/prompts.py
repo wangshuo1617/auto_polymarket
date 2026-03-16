@@ -59,9 +59,17 @@ RESPONSE_SCHEMA = {
                             "止盈阈值": {"type": "string", "description": "例如 +3.2% 或 +1.8xATR"},
                             "止损阈值": {"type": "string", "description": "例如 -1.8% 或 -1.0xATR"}
                         }
+                    },
+                    "挂单结论": {
+                        "type": "string",
+                        "description": "针对该合约现有挂单的一句话结论：明确说明是否需要调整、以及如何调整（如「无需调整」「建议撤销 45¢ 卖单改挂 42¢」「建议新增 40¢ 买单」等）。禁止仅写「见下方」或「对照第二部分」。"
+                    },
+                    "补仓建议": {
+                        "type": "string",
+                        "description": "针对该合约（原有单）是否需要补仓的一句话结论：如需补仓则写价位/条件与建议补仓量；如不需要则写「无需补仓」或「暂不补仓」及理由。"
                     }
                 },
-                "required": ["事件或合约", "仓位简述", "挂单建议"]
+                "required": ["事件或合约", "仓位简述", "挂单建议", "挂单结论", "补仓建议"]
             }
         },
         "建仓建议": {
@@ -246,6 +254,8 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 **Part 1 - 整体分析**：一段话概括市场环境、对持仓的影响、未来 24h 与月内波动预期。
 
 **Part 2 - 当前持仓与挂单分析与建议**：仅针对**已参与的 event**（有持仓或挂单的）。按事件/合约逐条：先写仓位简述（盈亏、风险、是否持有），再给出该合约的**挂买单、挂卖单**具体建议（方向、价格¢、数量或比例、理由）。价格要具体可执行。
+**每条必须给出 `补仓建议`**：明确该合约（原有单）**是否需要补仓**；如需补仓则写价位/条件与建议补仓量；如不需要则写「无需补仓」或「暂不补仓」及理由。不得省略。
+**每条必须给出 `挂单结论`**：一句话明确说明该合约现有挂单**是否需要调整**以及**如何调整**（例如「无需调整」「建议撤销 45¢ 卖单改挂 42¢」「建议新增 40¢ 买单」）。禁止仅写「见下方」或「对照第二部分」。
 其中 `离场风控` 需包含：市场状态、ATR百分比、波动分位、止盈阈值、止损阈值。
 并补充 `持有条件` 与 `分层离场计划`，避免全有或全无式建议。
 
@@ -375,4 +385,210 @@ def get_monthly_user_prompt(
         btc_1d_k_data=btc_1d_k_data,
         market_sentiment_and_funding=market_sentiment_and_funding,
         derived_summary=derived_summary,
+    )
+
+
+# ---------- 原油 (WTI) Polymarket 分析 ----------
+OIL_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "整体分析": {
+            "type": "string",
+            "description": "一段话概括原油市场环境：供需、地缘、WTI K 线等。简述对持仓影响、未来 24h 与月内 WTI 波动预期。"
+        },
+        "当前持仓与挂单分析与建议": {
+            "type": "array",
+            "description": "针对已参与的原油 event（有持仓或挂单的），按 event/合约逐条给出仓位简述与挂单建议",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "事件或合约": {"type": "string"},
+                    "仓位简述": {"type": "string"},
+                    "持有条件": {"type": "string"},
+                    "分层离场计划": {"type": "string"},
+                    "挂单建议": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "操作类型": {"type": "string", "enum": ["挂买单", "挂卖单"]},
+                                "方向": {"type": "string", "enum": ["Yes", "No"]},
+                                "建议价格": {"type": "number"},
+                                "建议数量或比例": {"type": "string"},
+                                "触发条件": {"type": "string", "description": "例如 WTI 上破/下破某价位后执行"},
+                                "理由": {"type": "string"}
+                            },
+                            "required": ["操作类型", "方向", "建议价格", "理由"]
+                        }
+                    },
+                    "离场风控": {
+                        "type": "object",
+                        "properties": {
+                            "市场状态": {"type": "string", "enum": ["trend_up", "trend_down", "range", "unknown"]},
+                            "ATR百分比": {"type": "number"},
+                            "波动分位": {"type": "number"},
+                            "止盈阈值": {"type": "string"},
+                            "止损阈值": {"type": "string"}
+                        }
+                    },
+                    "挂单结论": {"type": "string"},
+                    "补仓建议": {
+                        "type": "string",
+                        "description": "针对该合约（原有单）是否需要补仓的一句话结论：如需补仓则写价位/条件与建议补仓量；如不需要则写「无需补仓」或「暂不补仓」及理由。"
+                    }
+                },
+                "required": ["事件或合约", "仓位简述", "挂单建议", "挂单结论", "补仓建议"]
+            }
+        },
+        "建仓建议": {
+            "type": "array",
+            "description": "针对当前原油事件中用户尚未参与的 market/问题，结合 USDC 余额与各 outcome 现价给出建仓建议",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "事件或问题": {"type": "string"},
+                    "建议方向": {"type": "string", "enum": ["Yes", "No"]},
+                    "建议价格区间": {"type": "string"},
+                    "建议投入金额或比例": {"type": "string"},
+                    "预估优势": {"type": "string"},
+                    "建议仓位上限": {"type": "string"},
+                    "理由": {"type": "string"}
+                },
+                "required": ["事件或问题", "建议方向", "建议价格区间", "建议投入金额或比例", "理由"]
+            }
+        },
+        "预警信号": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "预警方向": {"type": "string", "enum": ["up_to", "down_to"]},
+                    "价格": {"type": "number", "description": "WTI 原油价格，美元/桶"},
+                    "操作建议": {"type": "string"},
+                    "关联止盈止损": {"type": "string"}
+                }
+            }
+        },
+        "报告解读附录": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "标的": {"type": "string"},
+                    "执行优先级": {"type": "string", "enum": ["立即执行", "挂单等待", "仅观察"]},
+                    "一句话结论": {"type": "string"},
+                    "执行要点": {"type": "string"}
+                },
+                "required": ["标的", "执行优先级", "一句话结论", "执行要点"]
+            }
+        }
+    },
+    "required": ["整体分析", "当前持仓与挂单分析与建议", "建仓建议", "预警信号"]
+}
+
+OIL_SYSTEM_INSTRUCTION_TEMPLATE = """# Role
+你是资深原油与预测市场（Prediction Market）分析师，熟悉 WTI 期货、CME 结算价与 Polymarket 原油类事件的规则。
+
+# Goal
+根据【Polymarket 原油持仓】、【挂单】、【WTI K 线及价格数据】，对账户进行风险敞口分析，并给出可执行的限价单管理策略。
+
+# Context
+* 当前时间：{current_date}
+* K 线格式与 Binance 一致： [open_time(ms), Open, High, Low, Close, Volume, ...]。
+
+# Resolution Rules（必须严格按此规则理解「Hit」与结算）
+本类市场采用以下 CME 官方规则，分析时须据此判断 Yes/No 概率与建议：
+
+1. **结算条件**：若在到期月（如 March 2026）的**最后一个交易日之前**的**任意一个交易日**，CME 公布的 **Active Month（ front month）原油 CL 期货的官方结算价** 达到或超过该市场所标价格，则结算为 **Yes**；否则为 **No**。即：只要月内有一天结算价 ≥ 目标价即 Yes，不必等到月末。
+
+2. **Active Month 定义**：Active Month 为 CME 所列合约月份中**最近月**。在 spot month 到期日**前两个交易日**起，下一列出的合约视为新的 Active Month（例如 spot 周五到期，则周三起下一合约为 Active Month）。
+
+3. **仅计官方结算价**：只采用 CME Group 公布的 **Active Month 官方日结算价（Settlement）**。盘中成交价、最高/最低价、买卖盘、中间价或任何指示性价格**均不计入**。结算价可能与当日最后一笔成交价不同；CME 的结算价方法论因品种/合约可能不同。
+
+4. **计日规则**：仅当 CME 当日发布了该 Active Month 的官方结算价时，该日才计入。周末、节假日或市场休市日（无结算价发布）**不计算**。
+
+5. **裁决来源**：以 CME Group 官网该交易日**首次发布**的 Active Month 原油 CL 期货「Settlement」价格为准；之后任何修正或更新不影响本市场结算。
+
+分析时请据此理解：例如「Will CL hit $80 by end of March?」表示三月内**任一日**官方结算价 ≥ 80 即 Yes，因此概率评估应基于「月内是否会出现至少一天结算 ≥ 目标价」，而非仅看月末一日。
+
+# Input Data
+1. 持仓与挂单（仅原油相关 event）。
+2. 原油市场简要背景：`wti_price_usd_per_bbl` 来自 Yahoo Finance (CL=F)。
+3. Polymarket 原油事件与各市场当前价格。
+4. 当前可用 USDC 余额。
+5. WTI 过去 7 天 4h K 线 + 过去 30 天 1d K 线。
+6. 日线波动率画像（ATR%、波动分位、自适应止盈止损模板）。
+7. 未来可能性上下文（月高/月低、回撤、关键价位）。
+8. 收益优化上下文（edge、Kelly 等）。
+9. 上一时间段报告（若有）。
+
+# 实时新闻与地缘政治（必须检索并纳入分析）
+* **必须使用检索工具** 查询近期伊朗与原油相关的实时新闻与动态（如：伊朗石油产量/出口、制裁与豁免、中东局势、OPEC+ 与伊朗表态等），并将检索结果纳入整体分析与建议。
+* 在 **Part 1 整体分析** 中须包含一段「地缘与新闻」：概括当前伊朗/中东等地缘与原油供需相关的最新动态，以及对 WTI 与 Polymarket 原油市场的影响（上行/下行/震荡风险）。
+* 建仓与持仓建议须结合上述新闻与地缘变化，避免仅依赖技术面。
+
+# Analysis
+* 结合 WTI 趋势与波动率，评估各 outcome 的隐含概率与模型概率偏差。
+* 离场与挂单建议需参考 daily_volatility_profile，避免固定百分比止盈止损。
+* 预警信号中的「价格」为 WTI 美元/桶。
+
+# Output
+Part 1 整体分析（须含地缘与新闻小结）；Part 2 持仓与挂单分析与建议（每条须含**补仓建议**：该合约是否需要补仓、价位/条件与建议补仓量或「无需补仓」及理由；含挂单结论、离场风控）；Part 3 建仓建议；Part 4 预警信号（WTI 价格）；Part 5 报告解读附录。输出必须符合 JSON Schema。
+"""
+
+OIL_USER_PROMPT_TEMPLATE = """
+以下是当前要分析的具体信息（Polymarket 原油类 event）：
+
+Polymarket 持仓情况和挂单情况: {polymarket_status}
+
+Polymarket 原油事件与各市场当前价格: {polymarket_event_situation}
+
+当前可用 USDC 余额: {usdc_balance}
+
+WTI 过去7天 4h K线数据: {oil_4h_k_data}
+
+WTI 过去30天 1d K线数据: {oil_1d_k_data}
+
+原油市场简要背景: {oil_market_context}
+
+日线波动率画像: {daily_volatility_profile}
+
+未来可能性上下文: {future_possibility_context}
+
+收益优化上下文: {profit_optimization_context}
+
+上一时间段报告:
+{previous_report}
+"""
+
+
+def get_oil_system_instruction(current_date: str) -> str:
+    return OIL_SYSTEM_INSTRUCTION_TEMPLATE.format(current_date=current_date)
+
+
+def get_oil_user_prompt(
+    polymarket_status: list,
+    oil_4h_k_data: list,
+    oil_1d_k_data: list,
+    daily_volatility_profile: dict,
+    future_possibility_context: dict,
+    profit_optimization_context: dict,
+    oil_market_context: dict,
+    polymarket_event_situation: dict,
+    usdc_balance: str,
+    previous_report: dict | None = None,
+) -> str:
+    event_situation_str = json.dumps(polymarket_event_situation, ensure_ascii=False, indent=2)
+    previous_report_str = json.dumps(previous_report, ensure_ascii=False, indent=2) if previous_report else "（无）"
+    return OIL_USER_PROMPT_TEMPLATE.format(
+        polymarket_status=polymarket_status,
+        polymarket_event_situation=event_situation_str,
+        usdc_balance=usdc_balance,
+        oil_4h_k_data=oil_4h_k_data,
+        oil_1d_k_data=oil_1d_k_data,
+        daily_volatility_profile=daily_volatility_profile,
+        future_possibility_context=future_possibility_context,
+        profit_optimization_context=profit_optimization_context,
+        oil_market_context=oil_market_context,
+        previous_report=previous_report_str,
     )

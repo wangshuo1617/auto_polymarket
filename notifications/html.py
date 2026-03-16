@@ -2,6 +2,155 @@ import json
 
 # --- 1. 生成内部 HTML 片段的辅助函数 ---
 
+
+def generate_position_analysis_section(data: dict) -> str:
+    """最前章节：仓位分析。突出原有单是否需要补仓，以及挂单是否需调整（不仅是挂单调整）。"""
+    positions = data.get("当前持仓与挂单分析与建议", []) or []
+    if not positions:
+        return ""
+
+    cards_html = ""
+    for block in positions:
+        event_name = (block.get("事件或合约", "") or "").strip()
+        summary = (block.get("仓位简述", "") or "").strip()
+        # 补仓结论：优先用报告给出的「补仓建议」或「是否需要补仓」等字段
+        add_pos_raw = (
+            (block.get("补仓建议", "")
+             or block.get("是否需要补仓", "")
+             or block.get("补仓结论", "")
+             or "")
+            .strip()
+        )
+        if add_pos_raw:
+            add_pos_tip = add_pos_raw
+        else:
+            add_pos_tip = "【须报告给出】本合约是否需要补仓暂无结论，请在报告数据中为该条持仓补充「补仓建议」字段。"
+        # 挂单结论
+        order_raw = (
+            (block.get("挂单结论", "")
+             or block.get("挂单需调整", "")
+             or block.get("挂单调整建议", "")
+             or block.get("是否需要调整挂单", "")
+             or "")
+            .strip()
+        )
+        if order_raw:
+            order_tip = order_raw
+        else:
+            order_tip = "【须报告给出结论】本合约挂单是否需调整暂无具体结论，请补充「挂单结论」字段。"
+
+        lines = []
+        if event_name:
+            lines.append(f'<div class="position-analysis-contract-name">{event_name}</div>')
+        if summary:
+            lines.append(f'<div class="position-analysis-detail">仓位简述：{summary}</div>')
+        lines.append(f'<div class="position-analysis-add">📦 是否需要补仓：{add_pos_tip}</div>')
+        lines.append(f'<div class="position-analysis-order">📌 挂单是否需调整：{order_tip}</div>')
+        cards_html += f'<div class="position-analysis-card">{("".join(lines))}</div>'
+
+    return f"""
+    <section class="position-analysis-section">
+        <h2 class="position-analysis-title">仓位分析（原有单：补仓与挂单）</h2>
+        <div class="position-analysis-body">
+            {cards_html}
+        </div>
+    </section>
+    """
+
+
+def generate_action_priority_section(data: dict) -> str:
+    """最前章节：当前行动要求优先级。当前持有单与建仓调整用大字体与着重色突出。"""
+    positions = data.get("当前持仓与挂单分析与建议", []) or []
+    entries = data.get("建仓建议", []) or []
+    if not positions and not entries:
+        return ""
+
+    items_html = ""
+    # 当前持有单：每个合约名单独一行，并提示对照下方内容看挂单是否需调整
+    if positions:
+        pos_cards = []
+        for block in positions:
+            event_name = (block.get("事件或合约", "") or "").strip()
+            summary = (block.get("仓位简述", "") or "").strip()
+            orders = block.get("挂单建议", []) or []
+            hold = (block.get("持有条件", "") or "").strip()
+            # 必须展示具体结论：优先用报告给出的「挂单结论」或「挂单需调整」等字段；若无则明确提示须由报告补充
+            raw_conclusion = (
+                (block.get("挂单结论", "")
+                 or block.get("挂单需调整", "")
+                 or block.get("挂单调整建议", "")
+                 or block.get("是否需要调整挂单", "")
+                 or "")
+                .strip()
+            )
+            if raw_conclusion:
+                adjust_tip = raw_conclusion
+            else:
+                adjust_tip = "【须报告给出结论】本合约挂单是否需调整暂无具体结论，请在报告数据中为该条持仓补充「挂单结论」或「挂单需调整」字段。"
+            lines = []
+            if event_name:
+                lines.append(f'<div class="action-priority-contract-name">{event_name}</div>')
+            if summary:
+                lines.append(f'<div class="action-priority-detail">仓位简述：{summary}</div>')
+            if hold:
+                lines.append(f'<div class="action-priority-detail">持有条件：{hold}</div>')
+            lines.append(f'<div class="action-priority-adjust">📌 {adjust_tip}</div>')
+            pos_cards.append("".join(lines))
+        if pos_cards:
+            items_html += """
+            <div class="action-priority-block action-priority-hold">
+                <div class="action-priority-label">当前持有单</div>
+                <div class="action-priority-hold-list">
+            """
+            for card in pos_cards:
+                items_html += f'<div class="action-priority-hold-item">{card}</div>'
+            items_html += """
+                </div>
+            </div>
+            """
+
+    # 建仓/调整要求：大字体、着重色
+    if entries:
+        entry_lines = []
+        for item in entries:
+            event_or_q = (item.get("事件或问题", "") or "").strip()
+            direction = (item.get("建议方向", "") or "").strip()
+            price_range = (item.get("建议价格区间", "") or "").strip()
+            amount = (item.get("建议投入金额或比例", "") or "").strip()
+            line = event_or_q
+            if direction:
+                line += f" — {direction}"
+            if price_range:
+                line += f"，区间 {price_range}"
+            if amount:
+                line += f"，投入 {amount}"
+            if line:
+                entry_lines.append(line)
+        if entry_lines:
+            items_html += """
+            <div class="action-priority-block action-priority-entry">
+                <div class="action-priority-label">建仓与调整要求</div>
+                <ul class="action-priority-list">
+            """
+            for line in entry_lines:
+                items_html += f"<li>{line}</li>"
+            items_html += """
+                </ul>
+            </div>
+            """
+
+    if not items_html:
+        return ""
+    return f"""
+    <section class="action-priority-section">
+        <h2 class="action-priority-title">当前行动要求优先级</h2>
+        <div class="action-priority-body">
+            {items_html}
+        </div>
+    </section>
+    """
+
+
 def generate_overview_section(text: str) -> str:
     """Part 1: 整体分析"""
     if not text:
@@ -458,11 +607,148 @@ def generate_html_template(data):
             word-wrap: break-word;
         }}
 
+        /* 仓位分析：原有单补仓与挂单，放在最前；深绿+红色 */
+        .position-analysis-section {{
+            margin-bottom: 28px;
+            border: 2px solid #047857;
+            border-radius: 10px;
+            background: linear-gradient(135deg, rgba(4, 120, 87, 0.15) 0%, rgba(220, 38, 38, 0.06) 100%);
+            padding: 18px 20px;
+        }}
+        .position-analysis-title {{
+            font-size: 20px;
+            font-weight: 700;
+            color: #fff;
+            margin: 0 0 14px 0;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #047857;
+        }}
+        .position-analysis-body {{
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }}
+        .position-analysis-card {{
+            padding: 14px 16px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+            border-left: 4px solid #047857;
+        }}
+        .position-analysis-contract-name {{
+            font-size: 16px;
+            font-weight: 700;
+            color: #059669;
+            margin-bottom: 8px;
+            display: block;
+        }}
+        .position-analysis-detail {{
+            font-size: 14px;
+            color: var(--text-main);
+            margin-bottom: 8px;
+        }}
+        .position-analysis-add {{
+            font-size: 14px;
+            font-weight: 600;
+            color: #047857;
+            margin-bottom: 6px;
+        }}
+        .position-analysis-order {{
+            font-size: 14px;
+            color: #ef4444;
+        }}
+
+        /* 当前行动要求优先级：大字体与着重色 */
+        .action-priority-section {{
+            margin-bottom: 28px;
+            border: 2px solid var(--accent-orange);
+            border-radius: 10px;
+            background: linear-gradient(135deg, rgba(245, 158, 11, 0.12) 0%, rgba(239, 68, 68, 0.06) 100%);
+            padding: 18px 20px;
+        }}
+        .action-priority-title {{
+            font-size: 20px;
+            font-weight: 700;
+            color: #fff;
+            margin: 0 0 14px 0;
+            padding-bottom: 10px;
+            border-bottom: 2px solid rgba(245, 158, 11, 0.5);
+        }}
+        .action-priority-body {{
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }}
+        .action-priority-block {{
+            padding: 14px 16px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            line-height: 1.5;
+        }}
+        .action-priority-hold {{
+            background: rgba(239, 68, 68, 0.15);
+            border-left: 4px solid var(--accent-red);
+        }}
+        .action-priority-hold .action-priority-label {{
+            color: #f87171;
+            font-size: 17px;
+        }}
+        .action-priority-hold-list {{
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }}
+        .action-priority-hold-item {{
+            padding: 10px 12px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 6px;
+            border-left: 3px solid rgba(239, 68, 68, 0.6);
+        }}
+        .action-priority-contract-name {{
+            font-size: 16px;
+            font-weight: 700;
+            color: #fca5a5;
+            margin-bottom: 6px;
+            display: block;
+        }}
+        .action-priority-detail {{
+            font-size: 14px;
+            color: var(--text-main);
+            margin-bottom: 4px;
+        }}
+        .action-priority-adjust {{
+            font-size: 14px;
+            color: #fbbf24;
+            margin-top: 8px;
+        }}
+        .action-priority-entry {{
+            background: rgba(245, 158, 11, 0.2);
+            border-left: 4px solid var(--accent-orange);
+        }}
+        .action-priority-entry .action-priority-label {{
+            color: #fbbf24;
+            font-size: 17px;
+        }}
+        .action-priority-label {{
+            font-weight: 700;
+            margin-bottom: 8px;
+        }}
+        .action-priority-list {{
+            margin: 0;
+            padding-left: 22px;
+        }}
+        .action-priority-list li {{
+            margin-bottom: 6px;
+        }}
+
     </style>
 </head>
 <body>
     <div class="container">
         <h1>📊 Polymarket 仓位分析报告</h1>
+
+        {generate_position_analysis_section(data)}
+        {generate_action_priority_section(data)}
 
         {generate_overview_section(data.get("整体分析", "") or data.get("市场与持仓快照", ""))}
 

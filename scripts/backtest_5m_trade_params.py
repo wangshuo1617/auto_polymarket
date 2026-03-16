@@ -23,6 +23,7 @@ import itertools
 import math
 import os
 import sqlite3
+import sys
 import time
 from datetime import datetime
 from dataclasses import dataclass
@@ -45,17 +46,27 @@ class ParamSet:
     max_entry_price: float
     stake_usd: float
     min_hold_before_close_sec: int
+    tp_sl_mode: str  # "dynamic" | "spread"
     tp_price_cap: float
     tp_value_cap: float
     sl_to_tp_ratio: float
+    take_profit_spread: float  # used when tp_sl_mode=="spread"
+    stop_loss_spread: float  # used when tp_sl_mode=="spread" (negative, e.g. -0.2)
 
     def key(self) -> str:
-        return (
+        base = (
             f"m={self.entry_minute},pre={self.entry_preclose_sec},"
             f"diff={self.min_direction_diff:g},max={self.max_entry_price:g},"
             f"stake={self.stake_usd:g},hold={self.min_hold_before_close_sec},"
-            f"tp_cap={self.tp_price_cap:g},tp_val_cap={self.tp_value_cap:g},"
-            f"sl_ratio={self.sl_to_tp_ratio:g}"
+        )
+        if self.tp_sl_mode == "dynamic":
+            return base + (
+                f"tp_sl=dynamic,tp_cap={self.tp_price_cap:g},"
+                f"tp_val_cap={self.tp_value_cap:g},sl_ratio={self.sl_to_tp_ratio:g}"
+            )
+        return base + (
+            f"tp_sl=spread,tp_cap={self.tp_price_cap:g},"
+            f"tp_spread={self.take_profit_spread:g},sl_spread={self.stop_loss_spread:g}"
         )
 
 
@@ -173,6 +184,20 @@ def _parse_float_grid(value: str) -> List[float]:
     return out
 
 
+def _parse_tp_sl_mode_grid(value: str) -> List[str]:
+    out: List[str] = []
+    for part in value.split(","):
+        p = part.strip().lower()
+        if not p:
+            continue
+        if p not in ("dynamic", "spread"):
+            raise ValueError(f"tp_sl_mode must be 'dynamic' or 'spread', got {p!r}")
+        out.append(p)
+    if not out:
+        raise ValueError("empty tp_sl_mode grid")
+    return out
+
+
 def _to_float(v: Any) -> Optional[float]:
     if v is None:
         return None
@@ -257,7 +282,13 @@ def _first_row_at_or_after(
     return None
 
 
-def _dynamic_tp_sl(entry_price: float, params: ParamSet) -> Tuple[float, float]:
+def _compute_tp_sl(entry_price: float, params: ParamSet) -> Tuple[float, float]:
+    """Compute TP/SL prices: dynamic (value + ratio) or spread (fixed spread from entry)."""
+    if params.tp_sl_mode == "spread":
+        take_profit_price = min(params.tp_price_cap, entry_price + params.take_profit_spread)
+        stop_loss_price = max(0.001, entry_price + params.stop_loss_spread)
+        return take_profit_price, stop_loss_price
+    # dynamic
     take_profit_value = min(params.tp_value_cap, max(0.0, params.tp_price_cap - entry_price))
     take_profit_price = min(params.tp_price_cap, entry_price + take_profit_value)
     stop_loss_value = take_profit_value * params.sl_to_tp_ratio
@@ -303,7 +334,7 @@ def _simulate_window(rows: Sequence[WindowRow], params: ParamSet) -> Tuple[Optio
     if size <= 0:
         return None, "invalid_entry_size"
 
-    take_profit_price, stop_loss_price = _dynamic_tp_sl(ask, params=params)
+    take_profit_price, stop_loss_price = _compute_tp_sl(ask, params=params)
 
     close3 = _first_row_at_or_after(rows, sec=3 * 60, require_btc=True)
     close4 = _first_row_at_or_after(rows, sec=4 * 60, require_btc=True)
@@ -449,21 +480,39 @@ def _build_param_grid(args: argparse.Namespace) -> List[ParamSet]:
     max_entry_grid = _parse_float_grid(args.max_entry_price_grid)
     stake_grid = _parse_float_grid(args.stake_usd_grid)
     hold_grid = _parse_int_grid(args.min_hold_before_close_sec_grid)
+    tp_sl_mode_grid = _parse_tp_sl_mode_grid(args.tp_sl_mode_grid)
     tp_price_cap_grid = _parse_float_grid(args.tp_price_cap_grid)
     tp_value_cap_grid = _parse_float_grid(args.tp_value_cap_grid)
     sl_to_tp_ratio_grid = _parse_float_grid(args.sl_to_tp_ratio_grid)
+    take_profit_spread_grid = _parse_float_grid(args.take_profit_spread_grid)
+    stop_loss_spread_grid = _parse_float_grid(args.stop_loss_spread_grid)
+
+    # Build TP/SL option tuples: (mode, tp_cap, tp_value_cap, sl_ratio, take_profit_spread, stop_loss_spread)
+    tp_sl_options: List[Tuple[str, float, float, float, float, float]] = []
+    for mode in tp_sl_mode_grid:
+        if mode == "dynamic":
+            for tp_cap, tp_val, sl_r in itertools.product(
+                tp_price_cap_grid, tp_value_cap_grid, sl_to_tp_ratio_grid
+            ):
+                if tp_cap <= 0 or tp_val < 0 or sl_r <= 0:
+                    continue
+                tp_sl_options.append((mode, tp_cap, tp_val, sl_r, 0.0, -0.2))
+        else:
+            for tp_cap, tp_sp, sl_sp in itertools.product(
+                tp_price_cap_grid, take_profit_spread_grid, stop_loss_spread_grid
+            ):
+                if tp_cap <= 0 or sl_sp >= 0:
+                    continue
+                tp_sl_options.append((mode, tp_cap, 0.15, 1.333, tp_sp, sl_sp))
 
     params: List[ParamSet] = []
-    for m, pre, diff, max_entry, stake, hold, tp_cap, tp_value_cap, sl_ratio in itertools.product(
+    for m, pre, diff, max_entry, stake, hold in itertools.product(
         entry_minute_grid,
         preclose_grid,
         diff_grid,
         max_entry_grid,
         stake_grid,
         hold_grid,
-        tp_price_cap_grid,
-        tp_value_cap_grid,
-        sl_to_tp_ratio_grid,
     ):
         if m < 1 or m > 4:
             continue
@@ -477,25 +526,23 @@ def _build_param_grid(args: argparse.Namespace) -> List[ParamSet]:
             continue
         if hold < 0:
             continue
-        if tp_cap <= 0:
-            continue
-        if tp_value_cap < 0:
-            continue
-        if sl_ratio <= 0:
-            continue
-        params.append(
-            ParamSet(
-                entry_minute=m,
-                entry_preclose_sec=pre,
-                min_direction_diff=diff,
-                max_entry_price=max_entry,
-                stake_usd=stake,
-                min_hold_before_close_sec=hold,
-                tp_price_cap=tp_cap,
-                tp_value_cap=tp_value_cap,
-                sl_to_tp_ratio=sl_ratio,
+        for mode, tp_cap, tp_val_cap, sl_ratio, tp_spread, sl_spread in tp_sl_options:
+            params.append(
+                ParamSet(
+                    entry_minute=m,
+                    entry_preclose_sec=pre,
+                    min_direction_diff=diff,
+                    max_entry_price=max_entry,
+                    stake_usd=stake,
+                    min_hold_before_close_sec=hold,
+                    tp_sl_mode=mode,
+                    tp_price_cap=tp_cap,
+                    tp_value_cap=tp_val_cap,
+                    sl_to_tp_ratio=sl_ratio,
+                    take_profit_spread=tp_spread,
+                    stop_loss_spread=sl_spread,
+                )
             )
-        )
 
     if not params:
         raise ValueError("parameter grid is empty after validation")
@@ -559,6 +606,20 @@ def _build_timestamped_output_path(path: str) -> str:
     return f"{base}_{timestamp}{ext}"
 
 
+def _abort_corrupted_db(db_path: str, err: BaseException) -> None:
+    """Print clear message and exit when DB is corrupted (e.g. disk image malformed)."""
+    alt = "output/trade.sqlite3" if "logs" in db_path else "logs/trade.sqlite3"
+    print(f"Database error: {err}", file=sys.stderr)
+    print(
+        f"\nThe database may be corrupted (e.g. 'database disk image is malformed').\n"
+        f"  - Try the other DB: --db-path {alt}\n"
+        f"  - Check integrity: sqlite3 \"{db_path}\" \"PRAGMA integrity_check;\"\n"
+        f"  - Restore from backup if needed.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Parameter grid backtest for 5m_trade using btc_poly_1s_ticks",
@@ -587,6 +648,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-entry-price-grid", type=str, default="0.6,0.75,0.8,0.85,0.9")
     parser.add_argument("--stake-usd-grid", type=str, default="10")
     parser.add_argument("--min-hold-before-close-sec-grid", type=str, default="20,40,60,80")
+    parser.add_argument(
+        "--tp-sl-mode-grid",
+        type=str,
+        default="dynamic,spread",
+        help="TP/SL mode: 'dynamic' (tp_value_cap + sl_to_tp_ratio) or 'spread' (take_profit_spread + stop_loss_spread)",
+    )
+    parser.add_argument(
+        "--take-profit-spread-grid",
+        type=str,
+        default="0.1,0.15,0.2",
+        help="Grid for take_profit_spread when tp_sl_mode=spread (e.g. 0.15 = +15c from entry)",
+    )
+    parser.add_argument(
+        "--stop-loss-spread-grid",
+        type=str,
+        default="-0.15,-0.2,-0.25",
+        help="Grid for stop_loss_spread when tp_sl_mode=spread (negative, e.g. -0.2 = -20c from entry)",
+    )
     parser.add_argument(
         "--tp-price-cap-grid",
         type=str,
@@ -644,7 +723,12 @@ def main() -> None:
 
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
-    estimated_total_windows = _count_windows(conn, args.start_ts_sec, args.end_ts_sec)
+
+    try:
+        estimated_total_windows = _count_windows(conn, args.start_ts_sec, args.end_ts_sec)
+    except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
+        conn.close()
+        _abort_corrupted_db(args.db_path, e)
 
     windows_data: List[List[WindowRow]] = []
     try:
@@ -654,6 +738,8 @@ def main() -> None:
 
             # Forward-fill quote/BTC values within each window so sparse snapshots remain usable.
             windows_data.append(_forward_fill_rows(raw_rows))
+    except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
+        _abort_corrupted_db(args.db_path, e)
     finally:
         conn.close()
 
