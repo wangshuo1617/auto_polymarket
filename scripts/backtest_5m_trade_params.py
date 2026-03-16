@@ -1232,7 +1232,7 @@ def _simulate_window(
     close3 = prepared.close3_row
     close4 = prepared.close4_row
     dir_change_active = False
-    if close3 is not None and close4 is not None and close3.btc_price is not None and close4.btc_price is not None:
+    if params.entry_minute <= 3 and close3 is not None and close4 is not None and close3.btc_price is not None and close4.btc_price is not None:
         dir3 = "up" if close3.btc_price > open_row.btc_price else "down"
         dir4 = "up" if close4.btc_price > open_row.btc_price else "down"
         dir_change_active = dir3 != dir4

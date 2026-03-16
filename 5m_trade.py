@@ -749,6 +749,9 @@ class FiveMinuteUpDownTrader:
         ):
             return
 
+        if self.entry_decision_minute >= 4:
+            return
+
         open_price = self.window_open_price
         close3 = self.minute_closes.get(3)
         close4 = self.minute_closes.get(4)
