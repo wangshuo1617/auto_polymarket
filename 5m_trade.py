@@ -50,7 +50,7 @@ from services.five_minute_trade.position_close_ops import (
 from services.five_minute_trade.reporting import build_pnl_report_content_and_subject
 from services.five_minute_trade.trade_db import TradeSQLiteStore
 from services.five_minute_trade.watchers import (
-    ChainlinkKline1mWatcher,
+    ChainlinkBTCPriceWatcher,
     PolymarketAssetPriceWatcher,
 )
 
@@ -150,9 +150,10 @@ class FiveMinuteUpDownTrader:
         self.toxic_utc_hours = self._parse_toxic_utc_hours(toxic_utc_hours)
 
         self._lock = threading.RLock()
-        self._binance = ChainlinkKline1mWatcher(callback=self._on_kline)
+        self._price_watcher = ChainlinkBTCPriceWatcher(callback=self._on_price_update)
         self._poly_watcher: Optional[PolymarketAssetPriceWatcher] = None
         self._window_book_watcher: Optional[PolymarketAssetPriceWatcher] = None
+        self._clock_thread: Optional[threading.Thread] = None
 
         self.current_window_start_ms: Optional[int] = None
         self.current_market_slug: Optional[str] = None
@@ -162,6 +163,8 @@ class FiveMinuteUpDownTrader:
         self.minute_closes: Dict[int, float] = {}
         self.latest_btc_price: Optional[float] = None
         self.latest_btc_price_event_ms: Optional[int] = None
+        self._minute3_recorded: bool = False
+        self._minute4_recorded: bool = False
 
         self.position: Optional[OpenPosition] = None
         self.trades: List[TradeRecord] = []
@@ -493,7 +496,9 @@ class FiveMinuteUpDownTrader:
             logger.info("有毒时段过滤已禁用: 不跳过任何 UTC 小时")
         ensure_http_keepalive(interval_sec=20)
         self._running = True
-        self._binance.start()
+        self._price_watcher.start()
+        self._clock_thread = threading.Thread(target=self._clock_loop, daemon=True)
+        self._clock_thread.start()
         self._report_thread = threading.Thread(
             target=self._report_loop, daemon=True
         )
@@ -502,7 +507,7 @@ class FiveMinuteUpDownTrader:
     def stop(self) -> None:
         logger.info("停止 FiveMinuteUpDownTrader")
         self._running = False
-        self._binance.stop()
+        self._price_watcher.stop()
         if self._window_book_watcher:
             self._window_book_watcher.stop()
             self._window_book_watcher = None
@@ -564,37 +569,56 @@ class FiveMinuteUpDownTrader:
         except Exception as e:
             logger.warning("窗口book预订阅启动失败: slug=%s error=%s", market_slug, e)
 
-    def _on_kline(self, kline: Dict) -> None:
+    def _on_price_update(self, payload: Dict[str, Any]) -> None:
+        """由 ChainlinkBTCPriceWatcher 在每次价格跳动时回调，仅更新最新 BTC 价格。"""
+        price = payload.get("mid_price") or payload.get("last_price")
+        if price is None:
+            return
+        try:
+            parsed = float(price)
+        except (TypeError, ValueError):
+            return
+        if parsed <= 0:
+            return
+        event_ms = int(payload.get("timestamp") or int(time.time() * 1000))
         with self._lock:
-            open_time_ms = kline["open_time"]
-            close_price = kline["close"]
-            minute_open_price = kline["open"]
-            close_time_ms = kline["close_time"]
-            event_time_ms = int(kline.get("event_time", int(time.time() * 1000)))
-            is_closed = bool(kline.get("is_closed", False))
+            self.latest_btc_price = parsed
+            self.latest_btc_price_event_ms = event_ms
 
-            parsed_btc = self._to_positive_float(close_price)
-            if parsed_btc is not None:
-                self.latest_btc_price = parsed_btc
-                self.latest_btc_price_event_ms = event_time_ms
+    def _clock_loop(self) -> None:
+        """时间驱动主循环，每 500ms 检查一次系统时钟，对齐回测的逐秒快照逻辑。"""
+        while self._running:
+            try:
+                self._clock_tick()
+            except Exception as e:
+                logger.error("clock_tick 异常: %s", e)
+            time.sleep(0.5)
 
-            window_start_ms = (
-                open_time_ms // self.WINDOW_MS
-            ) * self.WINDOW_MS
-            minute_index = (
-                (open_time_ms - window_start_ms) // self.MINUTE_MS
-            ) + 1
+    def _clock_tick(self) -> None:
+        """基于系统绝对时间驱动所有窗口管理和开仓判定，取代原有的事件驱动 _on_kline。"""
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            btc_price = self.latest_btc_price
+            if btc_price is None:
+                return
 
+            window_start_ms = (now_ms // self.WINDOW_MS) * self.WINDOW_MS
+            rel_sec = (now_ms - window_start_ms) / 1000.0
+
+            # --- 检测新 5m 窗口，用当前最新价格锁定开盘价（对齐回测 open_row） ---
             if self.current_window_start_ms != window_start_ms:
                 logger.info(
-                    "进入新 5m 窗口: start_ms=%s", window_start_ms
+                    "进入新 5m 窗口: start_ms=%s (clock-driven, open_price=%.2f)",
+                    window_start_ms,
+                    btc_price,
                 )
                 self.current_window_start_ms = window_start_ms
-                self.window_open_price = minute_open_price
+                self.window_open_price = btc_price
                 self.window_traded = False
                 self.preclose_entry_triggered = False
                 self.minute_closes = {}
-                # 预先计算本窗口对应的市场 slug，并预热获取 market_id 与 token_id
+                self._minute3_recorded = False
+                self._minute4_recorded = False
                 slug_ts = window_start_ms // 1000
                 self.current_market_slug = f"btc-updown-5m-{slug_ts}"
                 try:
@@ -615,35 +639,35 @@ class FiveMinuteUpDownTrader:
                         e,
                     )
 
+            # --- 时钟驱动入场判定（对齐回测 decision_row 时间窗口）---
+            entry_trigger_sec = self.entry_decision_minute * 60 - self.entry_preclose_seconds
+            entry_deadline_sec = self.entry_decision_minute * 60
             if (
-                minute_index == self.entry_decision_minute
-                and not self.window_traded
+                not self.window_traded
                 and not self.preclose_entry_triggered
-                and not is_closed
+                and entry_trigger_sec <= rel_sec < entry_deadline_sec
             ):
-                ms_to_close = close_time_ms - event_time_ms
-                tolerance_ms = 1500 
-                target_trigger_ms = self.entry_preclose_seconds * 1000
-                if 0 < ms_to_close <= (target_trigger_ms + tolerance_ms):
-                    self._handle_entry_minute(
-                        projected_close=close_price,
-                        ms_to_close=ms_to_close,
-                    )
-                    self.preclose_entry_triggered = True
-                    
-            if minute_index == 5 and not is_closed:
-                # 在第 5 分钟即将结束前 10 秒，提前出局，防止 Polymarket 冻结市场导致单子发不出去
-                ms_to_close = close_time_ms - event_time_ms
-                if 0 < ms_to_close <= 10000:
-                    self._handle_minute5_expiry()
+                ms_to_close = int((entry_deadline_sec - rel_sec) * 1000)
+                self._handle_entry_minute(
+                    projected_close=btc_price,
+                    ms_to_close=ms_to_close,
+                )
+                self.preclose_entry_triggered = True
 
-            if not is_closed:
-                return
+            # --- 第 3 分钟收盘价记录（对齐回测 close3_row at rel_sec >= 180）---
+            if rel_sec >= 180 and not self._minute3_recorded:
+                self.minute_closes[3] = btc_price
+                self._minute3_recorded = True
 
-            self.minute_closes[minute_index] = close_price
-
-            if minute_index == 4:
+            # --- 第 4 分钟收盘价记录 + 方向变化止损检查（对齐回测 close4_row at rel_sec >= 240）---
+            if rel_sec >= 240 and not self._minute4_recorded:
+                self.minute_closes[4] = btc_price
+                self._minute4_recorded = True
                 self._handle_minute4_direction_change()
+
+            # --- 第 5 分钟到期前 10 秒强制平仓（rel_sec >= 290）---
+            if rel_sec >= 290:
+                self._handle_minute5_expiry()
 
     def _handle_entry_minute(self, projected_close: float, ms_to_close: int) -> None:
         if (
