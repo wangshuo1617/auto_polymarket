@@ -3,7 +3,9 @@
 支持通过 SMTP 服务器向特定邮箱发送邮件
 """
 
+import socket
 import smtplib
+import ssl
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -12,6 +14,32 @@ from config import TO_EMAIL, SMTP_SERVER, SMTP_PORT, FROM_EMAIL, FROM_EMAIL_PASS
 
 # 获取日志记录器（日志配置由主程序统一管理）
 logger = logging.getLogger(__name__)
+
+
+def _connect_smtp_ssl(host: str, port: int, timeout: float = 10.0) -> smtplib.SMTP_SSL:
+    """
+    使用 IPv4 连接 SMTP_SSL，避免 Windows 上 [Errno -8] Servname not supported for ai_socktype。
+    """
+    port = int(port)
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    except socket.gaierror:
+        return smtplib.SMTP_SSL(host, port, timeout=timeout)
+    if not infos:
+        return smtplib.SMTP_SSL(host, port, timeout=timeout)
+    sockaddr = infos[0][4]
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect(sockaddr)
+    context = ssl.create_default_context()
+    ssock = context.wrap_socket(sock, server_hostname=host)
+    server = smtplib.SMTP_SSL(context=context)
+    server.sock = ssock
+    server.file = None
+    (code, msg) = server.getreply()
+    if code != 220:
+        raise smtplib.SMTPConnectError(code, msg)
+    return server
 
 
 class EmailSender:
@@ -64,11 +92,13 @@ class EmailSender:
             # 构建收件人列表
             recipients = [to_email]
             
-            # 连接 SMTP 服务器并发送邮件
+            # 连接 SMTP 服务器并发送邮件（IPv4 连接避免 Windows 上 Servname not supported）
+            host = self.config['smtp_server']
+            port = int(self.config['smtp_port'])
             if self.config['use_ssl']:
-                server = smtplib.SMTP_SSL(self.config['smtp_server'], self.config['smtp_port'])
+                server = _connect_smtp_ssl(host, port)
             else:
-                server = smtplib.SMTP(self.config['smtp_server'], self.config['smtp_port'])
+                server = smtplib.SMTP(host, port)
                 if self.config['use_tls']:
                     server.starttls()
             

@@ -171,6 +171,28 @@ uv run position_analyze.py
 - 生成价格预警配置
 - 发送 HTML 格式的分析报告邮件
 
+#### 每 4 小时定时运行持仓分析
+
+使用调度器在后台每 4 小时执行一次 `position_analyze.py`：
+
+**Windows (PowerShell)：**
+```powershell
+cd d:\auto_polymarket
+.\scripts\run_position_analyze_4h.ps1
+```
+
+**Linux / macOS：**
+```bash
+./scripts/run_position_analyze_4h.sh
+```
+
+或直接运行 Python 调度脚本（会立即执行一次，之后每 4 小时执行）：
+```bash
+uv run scripts/run_position_analyze_every_4h.py
+```
+
+日志目录：`logs/position_analyze_4h.log`。
+
 #### 运行价格监控
 
 ```bash
