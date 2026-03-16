@@ -99,6 +99,7 @@ class FiveMinuteUpDownTrader:
     MAX_EXIT_SLIPPAGE_BPS_WARN = 250.0
     TOXIC_UTC_HOURS = {16, 19, 20}
     WS_BOOK_MAX_AGE_MS = 1200
+    MAX_BTC_AGE_MS = 2000
     MIN_HOLD_BEFORE_CLOSE_SEC = 5
     EXPIRY_FORCE_CLOSE_HIGH_PRICE = 0.99
     EXPIRY_WAIT_SETTLE_MIN_PRICE = 0.60
@@ -649,6 +650,16 @@ class FiveMinuteUpDownTrader:
                 and not self.preclose_entry_triggered
                 and entry_trigger_sec <= rel_sec < entry_deadline_sec
             ):
+                # BTC 价格新鲜度检查（对齐回测 max_btc_age_ms）
+                btc_age_ms = now_ms - (self.latest_btc_price_event_ms or 0)
+                if btc_age_ms > self.MAX_BTC_AGE_MS:
+                    logger.warning(
+                        "Skip entry: BTC price stale (age=%dms > %dms)",
+                        btc_age_ms,
+                        self.MAX_BTC_AGE_MS,
+                    )
+                    self.preclose_entry_triggered = True
+                    return
                 ms_to_close = int((entry_deadline_sec - rel_sec) * 1000)
                 self._handle_entry_minute(
                     projected_close=btc_price,

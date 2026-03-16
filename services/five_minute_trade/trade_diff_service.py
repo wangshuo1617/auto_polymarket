@@ -202,21 +202,6 @@ def run_backtest_for_signature(
         str(strategy.tp_value_cap),
         "--sl-to-tp-ratio-grid",
         str(strategy.sl_to_tp_ratio),
-        # 对齐实盘行为：实盘不检查 BTC/报价新鲜度，禁用回测的新鲜度过滤
-        "--max-btc-age-ms",
-        "0",
-        "--max-quote-age-ms",
-        "0",
-        # 对齐实盘行为：实盘不对 orderbook 做队列填充折扣
-        "--entry-queue-fill-ratio",
-        "1.0",
-        "--exit-queue-fill-ratio",
-        "1.0",
-        # 模拟实盘真实下单延迟（market lookup + orderbook fetch + plan + submit）
-        "--entry-submit-latency-ms",
-        "2000",
-        "--exit-submit-latency-ms",
-        "1000",
         "--workers",
         "1",
         "--min-trades",
