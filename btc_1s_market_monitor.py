@@ -124,6 +124,7 @@ class SQLiteBatchWriter:
 				up_asks_5 TEXT,
 				down_bids_5 TEXT,
 				down_asks_5 TEXT,
+				winning_direction TEXT,
 				created_at_utc TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 			)
 			"""
@@ -152,6 +153,7 @@ class SQLiteBatchWriter:
 			"up_asks_5": "TEXT",
 			"down_bids_5": "TEXT",
 			"down_asks_5": "TEXT",
+			"winning_direction": "TEXT",
 		}
 		existing = {
 			str(row[1])
@@ -211,8 +213,9 @@ class SQLiteBatchWriter:
 				up_asks_5,
 				down_bids_5,
 				down_asks_5,
+				winning_direction,
 				created_at_utc
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			""",
 			rows_with_created,
 		)
@@ -558,12 +561,53 @@ class BTC1sMarketMonitor:
 			if row is not None:
 				self._writer.put(row)
 
+	def _resolve_previous_window(self, prev_window_start_ms: int) -> None:
+		"""Compute winning_direction for the previous window and UPDATE its rows."""
+		try:
+			conn = sqlite3.connect(self.db_path)
+			cur = conn.execute(
+				"SELECT btc_price FROM btc_poly_1s_ticks "
+				"WHERE window_start_ms = ? AND btc_price IS NOT NULL "
+				"ORDER BY ts_sec ASC LIMIT 1",
+				(prev_window_start_ms,),
+			)
+			open_row = cur.fetchone()
+			cur = conn.execute(
+				"SELECT btc_price FROM btc_poly_1s_ticks "
+				"WHERE window_start_ms = ? AND btc_price IS NOT NULL "
+				"ORDER BY ts_sec DESC LIMIT 1",
+				(prev_window_start_ms,),
+			)
+			close_row = cur.fetchone()
+			if open_row and close_row:
+				open_price = float(open_row[0])
+				close_price = float(close_row[0])
+				winner = "up" if close_price > open_price else "down"
+				conn.execute(
+					"UPDATE btc_poly_1s_ticks SET winning_direction = ? "
+					"WHERE window_start_ms = ? AND winning_direction IS NULL",
+					(winner, prev_window_start_ms),
+				)
+				conn.commit()
+				logger.info(
+					"回填 winning_direction=%s window_start_ms=%d (open=%.2f close=%.2f)",
+					winner, prev_window_start_ms, open_price, close_price,
+				)
+			conn.close()
+		except Exception:
+			logger.exception("回填 winning_direction 失败 window_start_ms=%d", prev_window_start_ms)
+
 	def _ensure_window_and_market(self, now_ms: int) -> None:
 		window_start_ms = (now_ms // self.WINDOW_MS) * self.WINDOW_MS
 		if self._current_window_start_ms == window_start_ms and self._current_market_slug:
 			return
 
+		prev_window_start_ms = self._current_window_start_ms
 		self._current_window_start_ms = window_start_ms
+
+		# Resolve the previous window's winning_direction
+		if prev_window_start_ms is not None:
+			self._resolve_previous_window(prev_window_start_ms)
 		slug_ts = window_start_ms // 1000
 		market_slug = f"btc-updown-5m-{slug_ts}"
 		self._current_market_slug = market_slug
@@ -797,6 +841,7 @@ class BTC1sMarketMonitor:
 			self._encode_levels(up_asks_5),
 			self._encode_levels(down_bids_5),
 			self._encode_levels(down_asks_5),
+			None,  # winning_direction: backfilled on window transition
 		)
 
 

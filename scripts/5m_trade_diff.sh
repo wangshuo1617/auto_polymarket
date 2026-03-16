@@ -7,10 +7,10 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$PROJECT_ROOT"
 
-DEFAULT_STRATEGY="m=4,pre=7,diff=45,max=0.95,stake=5,hold=70,tp_cap=0.97,tp_val_cap=0.15,sl_ratio=2.5"
+DEFAULT_STRATEGY="m=4,pre=9,diff=30,max=0.95,stake=5,hold=60,tp_cap=0.97,tp_val_cap=0.15,sl_ratio=0.9"
 NOW_TS="$(date +%s)"
-DEFAULT_SINCE_TS="1773450376"
-DEFAULT_UNTIL_TS=""
+DEFAULT_SINCE_TS="1773654509"
+DEFAULT_UNTIL_TS="1773666098"
 
 FAST_MODE="false"
 if [[ "${1:-}" == "--fast-live-latest" ]]; then
