@@ -122,6 +122,27 @@ def open_position(trader: Any, market_slug: str, direction: str) -> None:
         token_id,
     )
 
+    # Polymarket 报价新鲜度检查（对齐回测 max_quote_age_ms / stale_entry_ask）
+    ws_snapshot = self._ws_book_cache.get(token_id)
+    if ws_snapshot is not None:
+        now_ms = int(time.time() * 1000)
+        snapshot_received_ms = int(ws_snapshot.get("received_ms") or 0)
+        quote_age_ms = now_ms - snapshot_received_ms
+        if quote_age_ms > self.WS_BOOK_MAX_AGE_MS:
+            logger.warning(
+                "放弃开仓：Polymarket报价过期 (age=%dms > %dms) token=%s",
+                quote_age_ms,
+                self.WS_BOOK_MAX_AGE_MS,
+                token_id,
+            )
+            return
+    else:
+        logger.warning(
+            "放弃开仓：无Polymarket WS报价数据 token=%s",
+            token_id,
+        )
+        return
+
     entry_levels_payload = self._fetch_orderbook_levels(token_id=token_id, side="buy")
     entry_levels = entry_levels_payload.get("levels") or []
     if not entry_levels:

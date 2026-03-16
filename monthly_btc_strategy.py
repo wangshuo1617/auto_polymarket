@@ -27,6 +27,8 @@ def _derive_summary(
     rsi_text = sentiment.get("rsi_interpretation", "N/A")
     fng = sentiment.get("fear_greed", {})
     fng_text = f"{fng.get('value', 'N/A')} ({fng.get('status', 'N/A')})"
+    etf_flow_2w = liquidity.get("etf_net_inflow_2w", [])
+    etf_flow_2w_text = json.dumps(etf_flow_2w, ensure_ascii=False) if etf_flow_2w else "N/A"
 
     # 简单的4h趋势判断：比较最后两根K线收盘价
     trend = "震荡"
@@ -69,7 +71,7 @@ def _derive_summary(
         "rsi_summary": rsi_text,
         "funding_rate": liquidity.get("funding_rate_pct", "N/A"),
         "open_interest": liquidity.get("open_interest", "N/A"),
-        "etf_net_inflow": liquidity.get("etf_net_inflow", "N/A"),
+        "etf_net_inflow": etf_flow_2w_text,
         "stablecoin_liquidity": liquidity.get("stablecoin_macro_liquidity", "N/A"),
         "fear_greed": fng_text,
         "long_short_ratio": sentiment.get("ls_interpretation", "N/A"),

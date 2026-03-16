@@ -1,0 +1,9 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/root/auto_polymarket/.venv/bin/python": true,
+        "/^bash -n scripts/optuna_search_5m_trade\\.sh$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
