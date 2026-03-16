@@ -1,9 +1,10 @@
 import logging
 import os
+import json
 import sqlite3
 import threading
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from .models import OpenPosition, TradeRecord
 
@@ -71,6 +72,40 @@ class TradeSQLiteStore:
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_trade_events_side ON trade_events(side);"
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trade_startups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    start_ts_sec INTEGER NOT NULL,
+                    strategy_signature TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    dry_run INTEGER NOT NULL,
+                    entry_minute INTEGER,
+                    entry_preclose_sec INTEGER,
+                    min_direction_diff REAL,
+                    max_entry_price REAL,
+                    stake_usd REAL,
+                    report_interval_sec INTEGER,
+                    min_hold_before_close_sec INTEGER,
+                    tp_price_cap REAL,
+                    tp_value_cap REAL,
+                    sl_to_tp_ratio REAL,
+                    toxic_utc_hours TEXT,
+                    trade_db_path TEXT,
+                    pid INTEGER,
+                    hostname TEXT,
+                    et_time_str TEXT,
+                    params_json TEXT
+                );
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_startups_start_ts_sec ON trade_startups(start_ts_sec);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_startups_signature ON trade_startups(strategy_signature);"
             )
             self._conn.commit()
 
@@ -196,6 +231,69 @@ class TradeSQLiteStore:
                     btc_price_at_trade,
                     order_id,
                     "dry-run" if dry_run else "live",
+                ),
+            )
+            self._conn.commit()
+
+    def write_startup_event(
+        self,
+        start_ts_sec: int,
+        strategy_signature: str,
+        dry_run: bool,
+        startup_params: Dict[str, Any],
+        pid: Optional[int] = None,
+        hostname: Optional[str] = None,
+        et_time_str: Optional[str] = None,
+    ) -> None:
+        payload = json.dumps(startup_params, ensure_ascii=False, sort_keys=True)
+        mode = "dry-run" if dry_run else "live"
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO trade_startups (
+                    start_ts_sec,
+                    strategy_signature,
+                    mode,
+                    dry_run,
+                    entry_minute,
+                    entry_preclose_sec,
+                    min_direction_diff,
+                    max_entry_price,
+                    stake_usd,
+                    report_interval_sec,
+                    min_hold_before_close_sec,
+                    tp_price_cap,
+                    tp_value_cap,
+                    sl_to_tp_ratio,
+                    toxic_utc_hours,
+                    trade_db_path,
+                    pid,
+                    hostname,
+                    et_time_str,
+                    params_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(start_ts_sec),
+                    str(strategy_signature),
+                    mode,
+                    self._bool_to_int(dry_run),
+                    startup_params.get("entry_minute"),
+                    startup_params.get("entry_preclose_sec"),
+                    startup_params.get("min_direction_diff"),
+                    startup_params.get("max_entry_price"),
+                    startup_params.get("stake_usd"),
+                    startup_params.get("report_interval_sec"),
+                    startup_params.get("min_hold_before_close_sec"),
+                    startup_params.get("tp_price_cap"),
+                    startup_params.get("tp_value_cap"),
+                    startup_params.get("sl_to_tp_ratio"),
+                    startup_params.get("toxic_utc_hours"),
+                    startup_params.get("trade_db_path"),
+                    pid,
+                    hostname,
+                    et_time_str,
+                    payload,
                 ),
             )
             self._conn.commit()

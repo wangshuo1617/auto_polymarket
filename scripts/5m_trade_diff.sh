@@ -12,17 +12,36 @@ NOW_TS="$(date +%s)"
 DEFAULT_SINCE_TS="1773450376"
 DEFAULT_UNTIL_TS=""
 
-STRATEGY="${1:-$DEFAULT_STRATEGY}"
-SINCE_TS="${2:-$DEFAULT_SINCE_TS}"
-UNTIL_TS="${3:-$DEFAULT_UNTIL_TS}"
-DB_PATH="${4:-logs/trade.sqlite3}"
-REPORT_JSON="${5:-output/5m_backtest_live_diff_report.json}"
-BACKTEST_SUMMARY_CSV="${6:-output/5m_backtest_diff_summary.csv}"
-BACKTEST_EVENTS_CSV="${7:-output/5m_backtest_diff_trade_events.csv}"
-PRINT_TOP_N="${8:-10}"
-EXISTING_BACKTEST_EVENTS_CSV="${9:-}"
-TS_MODE="${10:---disable-output-timestamp}"
-TRADE_COMPARE_CSV="${11:-output/5m_backtest_live_trade_compare.csv}"
+FAST_MODE="false"
+if [[ "${1:-}" == "--fast-live-latest" ]]; then
+  FAST_MODE="true"
+fi
+
+if [[ "$FAST_MODE" == "true" ]]; then
+  STRATEGY=""
+  SINCE_TS=""
+  DB_PATH="${2:-logs/trade.sqlite3}"
+  UNTIL_TS="${3:-$DEFAULT_UNTIL_TS}"
+  REPORT_JSON="${4:-output/5m_backtest_live_diff_report.json}"
+  BACKTEST_SUMMARY_CSV="${5:-output/5m_backtest_diff_summary.csv}"
+  BACKTEST_EVENTS_CSV="${6:-output/5m_backtest_diff_trade_events.csv}"
+  PRINT_TOP_N="${7:-10}"
+  EXISTING_BACKTEST_EVENTS_CSV="${8:-}"
+  TS_MODE="${9:---disable-output-timestamp}"
+  TRADE_COMPARE_CSV="${10:-output/5m_backtest_live_trade_compare.csv}"
+else
+  STRATEGY="${1:-$DEFAULT_STRATEGY}"
+  SINCE_TS="${2:-$DEFAULT_SINCE_TS}"
+  UNTIL_TS="${3:-$DEFAULT_UNTIL_TS}"
+  DB_PATH="${4:-logs/trade.sqlite3}"
+  REPORT_JSON="${5:-output/5m_backtest_live_diff_report.json}"
+  BACKTEST_SUMMARY_CSV="${6:-output/5m_backtest_diff_summary.csv}"
+  BACKTEST_EVENTS_CSV="${7:-output/5m_backtest_diff_trade_events.csv}"
+  PRINT_TOP_N="${8:-10}"
+  EXISTING_BACKTEST_EVENTS_CSV="${9:-}"
+  TS_MODE="${10:---disable-output-timestamp}"
+  TRADE_COMPARE_CSV="${11:-output/5m_backtest_live_trade_compare.csv}"
+fi
 
 USAGE="./scripts/5m_trade_diff.sh [strategy] [since_ts] [until_ts] [db_path] [report_json] [backtest_summary_csv] [backtest_events_csv] [print_top_n] [existing_backtest_events_csv] [--disable-output-timestamp|--with-timestamp] [trade_compare_csv]"
 
@@ -41,6 +60,12 @@ print_usage() {
 
 示例4（自定义逐笔逐市场对比CSV输出）:
   ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476 logs/trade.sqlite3 output/report.json output/summary.csv output/events.csv 10 "" --disable-output-timestamp output/my_trade_compare.csv
+
+示例5（快速模式：自动读取最近一次 live 启动策略和启动时间）:
+  ./scripts/5m_trade_diff.sh --fast-live-latest
+
+示例6（快速模式 + 自定义数据库和截止时间）:
+  ./scripts/5m_trade_diff.sh --fast-live-latest logs/trade.sqlite3 1773629750
 EOF
 }
 
@@ -49,6 +74,36 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   echo
   /root/auto_polymarket/.venv/bin/python -m services.five_minute_trade.trade_diff_service --help
   exit 0
+fi
+
+if [[ "$FAST_MODE" == "true" ]]; then
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "❌ 快速模式依赖 sqlite3 命令，但当前环境未安装"
+    exit 1
+  fi
+
+  set +e
+  LATEST_LIVE_ROW="$(sqlite3 -noheader -separator $'\t' "$DB_PATH" "SELECT strategy_signature, start_ts_sec FROM trade_startups WHERE mode='live' ORDER BY start_ts_sec DESC, id DESC LIMIT 1;")"
+  SQLITE_EXIT=$?
+  set -e
+
+  if (( SQLITE_EXIT != 0 )); then
+    echo "❌ 快速模式读取数据库失败: $DB_PATH"
+    echo "请确认 trade_startups 表存在且数据库可读"
+    exit 1
+  fi
+
+  if [[ -z "$LATEST_LIVE_ROW" ]]; then
+    echo "❌ 快速模式未找到 live 启动记录（trade_startups.mode='live'）"
+    exit 1
+  fi
+
+  IFS=$'\t' read -r STRATEGY SINCE_TS <<< "$LATEST_LIVE_ROW"
+
+  if [[ -z "$STRATEGY" || -z "$SINCE_TS" ]]; then
+    echo "❌ 快速模式解析最新 live 启动记录失败"
+    exit 1
+  fi
 fi
 
 if ! [[ "$SINCE_TS" =~ ^[0-9]+$ ]]; then
@@ -90,6 +145,9 @@ echo "=========================================="
 echo "运行 5m_trade_diff"
 echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "工作目录: $PROJECT_ROOT"
+if [[ "$FAST_MODE" == "true" ]]; then
+  echo "模式: 快速模式（最近一次 live 启动）"
+fi
 echo "策略签名: $STRATEGY"
 echo "比较区间: $SINCE_TS -> $UNTIL_TS"
 echo "数据库: $DB_PATH"

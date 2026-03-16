@@ -19,6 +19,8 @@ BTC 5m up/down 策略交易服务
 """
 
 import logging
+import os
+import socket
 import threading
 import time
 from datetime import datetime, timezone
@@ -989,13 +991,47 @@ class FiveMinuteUpDownTrader:
 def main() -> None:
     args = build_trade_arg_parser().parse_args()
     configure_trade_logging()
+    startup_ts_sec = int(time.time())
     strategy_signature = _build_startup_strategy_signature(args)
     logger.info(
         "新5m_trade服务启动 | ET时间=%s | 秒级时间戳=%s | 本次启动策略=%s",
         _current_et_time_str(),
-        int(time.time()),
+        startup_ts_sec,
         strategy_signature,
     )
+
+    startup_store: Optional[TradeSQLiteStore] = None
+    try:
+        startup_store = TradeSQLiteStore(db_path=str(args.trade_db_path))
+        startup_store.write_startup_event(
+            start_ts_sec=startup_ts_sec,
+            strategy_signature=strategy_signature,
+            dry_run=bool(args.dry_run),
+            startup_params={
+                "entry_minute": args.entry_minute,
+                "entry_preclose_sec": args.entry_preclose_sec,
+                "min_direction_diff": args.min_direction_diff,
+                "max_entry_price": args.max_entry_price,
+                "stake_usd": args.stake_usd,
+                "report_interval_sec": args.report_interval_sec,
+                "min_hold_before_close_sec": args.min_hold_before_close_sec,
+                "tp_price_cap": args.tp_price_cap,
+                "tp_value_cap": args.tp_value_cap,
+                "sl_to_tp_ratio": args.sl_to_tp_ratio,
+                "toxic_utc_hours": args.toxic_utc_hours,
+                "trade_db_path": args.trade_db_path,
+            },
+            pid=os.getpid(),
+            hostname=socket.gethostname(),
+            et_time_str=_current_et_time_str(),
+        )
+        logger.info("已记录启动信息到SQLite: strategy=%s", strategy_signature)
+    except Exception as e:
+        logger.error("写入启动信息到SQLite失败: %s", e)
+    finally:
+        if startup_store is not None:
+            startup_store.close()
+
     trader = create_trader_from_args(args=args, trader_cls=FiveMinuteUpDownTrader)
     try:
         trader.start()
