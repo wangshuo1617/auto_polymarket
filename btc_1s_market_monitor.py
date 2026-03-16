@@ -274,7 +274,6 @@ class SQLiteBatchWriter:
 
 class BTC1sMarketMonitor:
 	WINDOW_MS = 5 * 60 * 1000
-	BOOK_LEVELS_TO_STORE = 5
 	HTTP_BOOK_MAX_AGE_MS = 2000
 
 	def __init__(
@@ -757,10 +756,10 @@ class BTC1sMarketMonitor:
 		if down_best_bid_low is None and down_state is not None:
 			down_best_bid_low = down_state.best_bid
 
-		up_bids_5 = self._top_bids(up_state.bids if up_state else None, self.BOOK_LEVELS_TO_STORE)
-		up_asks_5 = self._top_asks(up_state.asks if up_state else None, self.BOOK_LEVELS_TO_STORE)
-		down_bids_5 = self._top_bids(down_state.bids if down_state else None, self.BOOK_LEVELS_TO_STORE)
-		down_asks_5 = self._top_asks(down_state.asks if down_state else None, self.BOOK_LEVELS_TO_STORE)
+		up_bids_5 = [dict(item) for item in (up_state.bids or []) if isinstance(item, dict)] if up_state else []
+		up_asks_5 = [dict(item) for item in (up_state.asks or []) if isinstance(item, dict)] if up_state else []
+		down_bids_5 = [dict(item) for item in (down_state.bids or []) if isinstance(item, dict)] if down_state else []
+		down_asks_5 = [dict(item) for item in (down_state.asks or []) if isinstance(item, dict)] if down_state else []
 
 		def _age_ms(event_ms: Optional[int]) -> Optional[int]:
 			if event_ms is None:
