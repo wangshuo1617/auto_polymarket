@@ -9,7 +9,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -202,6 +202,21 @@ def run_backtest_for_signature(
         str(strategy.tp_value_cap),
         "--sl-to-tp-ratio-grid",
         str(strategy.sl_to_tp_ratio),
+        # 对齐实盘行为：实盘不检查 BTC/报价新鲜度，禁用回测的新鲜度过滤
+        "--max-btc-age-ms",
+        "0",
+        "--max-quote-age-ms",
+        "0",
+        # 对齐实盘行为：实盘不对 orderbook 做队列填充折扣
+        "--entry-queue-fill-ratio",
+        "1.0",
+        "--exit-queue-fill-ratio",
+        "1.0",
+        # 模拟实盘真实下单延迟（market lookup + orderbook fetch + plan + submit）
+        "--entry-submit-latency-ms",
+        "2000",
+        "--exit-submit-latency-ms",
+        "1000",
         "--workers",
         "1",
         "--min-trades",
@@ -486,123 +501,310 @@ def _write_trade_compare_csv(path: str, rows: Sequence[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _event_notional(event: NormalizedTradeEvent) -> float:
+    notional = float(event.notional_usdc)
+    if notional > 0:
+        return notional
+    if event.price > 0 and event.size > 0:
+        return float(event.price * event.size)
+    return 0.0
+
+
+def _total_profit(events: Sequence[NormalizedTradeEvent]) -> float:
+    # Cashflow convention: BUY is expense, SELL/REDEEM are income.
+    profit = 0.0
+    for event in events:
+        notional = _event_notional(event)
+        if notional <= 0:
+            continue
+        if event.side == "buy":
+            profit -= notional
+        elif event.side == "sell" or event.event_type == "REDEEM" or event.side == "redeem":
+            profit += notional
+    return profit
+
+
+def _event_cashflow_totals(events: Sequence[NormalizedTradeEvent]) -> Tuple[float, float]:
+    win_total = 0.0
+    loss_total = 0.0
+    for event in events:
+        notional = _event_notional(event)
+        if notional <= 0:
+            continue
+        if event.side == "buy":
+            loss_total -= notional
+        elif event.side == "sell" or event.event_type == "REDEEM" or event.side == "redeem":
+            win_total += notional
+    return float(win_total), float(loss_total)
+
+
+def _compute_window_cashflow_stats(
+    events: Sequence[NormalizedTradeEvent],
+    total_windows: int,
+    total_pnl: float,
+) -> Dict[str, float]:
+    window_pnl: Dict[str, float] = {}
+    window_last_ts: Dict[str, int] = {}
+
+    for event in events:
+        cf = 0.0
+        notional = _event_notional(event)
+        if notional > 0:
+            if event.side == "buy":
+                cf = -notional
+            elif event.side == "sell" or event.event_type == "REDEEM" or event.side == "redeem":
+                cf = notional
+        if _is_close(cf, 0.0):
+            continue
+
+        slug = str(event.market_slug or "")
+        if not slug:
+            continue
+        window_pnl[slug] = float(window_pnl.get(slug, 0.0) + cf)
+        last_ts = int(window_last_ts.get(slug, 0))
+        if event.timestamp > last_ts:
+            window_last_ts[slug] = int(event.timestamp)
+
+    trades = len(window_pnl)
+    wins = sum(1 for pnl in window_pnl.values() if pnl > 0)
+    losses = sum(1 for pnl in window_pnl.values() if pnl < 0)
+
+    win_total_pnl = float(sum(pnl for pnl in window_pnl.values() if pnl > 0))
+    loss_total_pnl = float(sum(pnl for pnl in window_pnl.values() if pnl < 0))
+    win_rate = (float(wins) / float(trades)) if trades > 0 else 0.0
+    trade_rate = (float(trades) / float(total_windows)) if total_windows > 0 else 0.0
+    avg_pnl = (float(total_pnl) / float(trades)) if trades > 0 else 0.0
+    avg_win_pnl = (win_total_pnl / float(wins)) if wins > 0 else 0.0
+    avg_loss_pnl = (loss_total_pnl / float(losses)) if losses > 0 else 0.0
+
+    loss_abs = abs(loss_total_pnl)
+    profit_factor = (win_total_pnl / loss_abs) if loss_abs > 0 else 0.0
+
+    equity = 0.0
+    equity_peak = 0.0
+    max_drawdown = 0.0
+    ordered_windows = sorted(window_pnl.keys(), key=lambda slug: window_last_ts.get(slug, 0))
+    for slug in ordered_windows:
+        equity += float(window_pnl[slug])
+        if equity > equity_peak:
+            equity_peak = equity
+        drawdown = equity_peak - equity
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+
+    return {
+        "trades": int(trades),
+        "trade_rate": _round6(trade_rate),
+        "wins": int(wins),
+        "losses": int(losses),
+        "win_rate": _round6(win_rate),
+        "avg_pnl": _round6(avg_pnl),
+        "win_total_pnl": _round6(win_total_pnl),
+        "loss_total_pnl": _round6(loss_total_pnl),
+        "profit_factor": _round6(profit_factor),
+        "max_drawdown": _round6(max_drawdown),
+        "avg_win_pnl": _round6(avg_win_pnl),
+        "avg_loss_pnl": _round6(avg_loss_pnl),
+    }
+
+
+def _avg(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def _compute_dataset_stats(
+    events: Sequence[NormalizedTradeEvent],
+    total_windows: int,
+) -> Dict[str, float]:
+    market_pairs = _build_market_trade_pairs(events)
+    windows = max(0, int(total_windows))
+
+    trade_pnls: List[Tuple[int, float]] = []
+    for pairs in market_pairs.values():
+        for entry_event, exit_event in pairs:
+            if entry_event is None or exit_event is None:
+                continue
+            if entry_event.side != "buy":
+                continue
+
+            entry_notional = float(entry_event.notional_usdc)
+            if entry_notional <= 0 and entry_event.price > 0 and entry_event.size > 0:
+                entry_notional = float(entry_event.price * entry_event.size)
+
+            exit_notional = float(exit_event.notional_usdc)
+            if exit_notional <= 0 and exit_event.price > 0 and exit_event.size > 0:
+                exit_notional = float(exit_event.price * exit_event.size)
+
+            if entry_notional <= 0 or exit_notional <= 0:
+                continue
+
+            trade_pnls.append((int(exit_event.timestamp), float(exit_notional - entry_notional)))
+
+    trades = len(trade_pnls)
+    wins = sum(1 for _, pnl in trade_pnls if pnl > 0)
+    losses = sum(1 for _, pnl in trade_pnls if pnl < 0)
+
+    total_pnl = float(sum(pnl for _, pnl in trade_pnls))
+    avg_pnl = (total_pnl / trades) if trades > 0 else 0.0
+    trade_rate = (float(trades) / float(windows)) if windows > 0 else 0.0
+    win_rate = (float(wins) / float(trades)) if trades > 0 else 0.0
+
+    win_pnls = [pnl for _, pnl in trade_pnls if pnl > 0]
+    loss_pnls = [pnl for _, pnl in trade_pnls if pnl < 0]
+    gross_profit = float(sum(win_pnls))
+    gross_loss = float(sum(loss_pnls))
+    gross_loss_abs = abs(gross_loss)
+    profit_factor = (gross_profit / gross_loss_abs) if gross_loss_abs > 0 else 0.0
+    avg_win_pnl = (gross_profit / len(win_pnls)) if win_pnls else 0.0
+    avg_loss_pnl = (gross_loss / len(loss_pnls)) if loss_pnls else 0.0
+
+    equity = 0.0
+    equity_peak = 0.0
+    max_drawdown = 0.0
+    for _, pnl in sorted(trade_pnls, key=lambda item: item[0]):
+        equity += pnl
+        if equity > equity_peak:
+            equity_peak = equity
+        drawdown = equity_peak - equity
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+
+    return {
+        "windows": int(windows),
+        "trades": int(trades),
+        "trade_rate": _round6(trade_rate),
+        "wins": int(wins),
+        "losses": int(losses),
+        "win_rate": _round6(win_rate),
+        "total_pnl": _round6(total_pnl),
+        "avg_pnl": _round6(avg_pnl),
+        "win_total_pnl": _round6(gross_profit),
+        "loss_total_pnl": _round6(gross_loss),
+        "profit_factor": _round6(profit_factor),
+        "max_drawdown": _round6(max_drawdown),
+        "avg_win_pnl": _round6(avg_win_pnl),
+        "avg_loss_pnl": _round6(avg_loss_pnl),
+    }
+
+
 def compare_events(
     backtest_events: Sequence[NormalizedTradeEvent],
     live_events: Sequence[NormalizedTradeEvent],
+    total_windows: int,
 ) -> Dict[str, Any]:
     backtest_grouped = _group_by_key(backtest_events)
     live_grouped = _group_by_key(live_events)
 
     keys = sorted(set(backtest_grouped.keys()) | set(live_grouped.keys()))
-    matched: List[Dict[str, Any]] = []
+    matched_count = 0
+    only_backtest_count = 0
+    only_live_count = 0
     matched_backtest_events: List[NormalizedTradeEvent] = []
     matched_live_events: List[NormalizedTradeEvent] = []
-    only_backtest: List[Dict[str, Any]] = []
     only_backtest_events: List[NormalizedTradeEvent] = []
-    only_live: List[Dict[str, Any]] = []
     only_live_events: List[NormalizedTradeEvent] = []
-    pair_stats: List[Dict[str, Any]] = []
+    price_abs: List[float] = []
+    size_abs: List[float] = []
+    notional_abs: List[float] = []
+    ts_abs: List[float] = []
 
     for key in keys:
         bt_list = list(backtest_grouped.get(key, []))
         lv_list = list(live_grouped.get(key, []))
 
         match_count = min(len(bt_list), len(lv_list))
-        market_slug, side = key
-
-        pair_stats.append(
-            {
-                "market_slug": market_slug,
-                "side": side,
-                "backtest_count": len(bt_list),
-                "live_count": len(lv_list),
-                "count_gap": len(lv_list) - len(bt_list),
-                "matched_count": match_count,
-            }
-        )
+        matched_count += int(match_count)
+        only_backtest_count += int(len(bt_list) - match_count)
+        only_live_count += int(len(lv_list) - match_count)
 
         for idx in range(match_count):
             bt = bt_list[idx]
             lv = lv_list[idx]
             matched_backtest_events.append(bt)
             matched_live_events.append(lv)
-            price_delta = lv.price - bt.price
-            size_delta = lv.size - bt.size
-            notional_delta = lv.notional_usdc - bt.notional_usdc
+            price_abs.append(abs(lv.price - bt.price))
+            size_abs.append(abs(lv.size - bt.size))
+            notional_abs.append(abs(lv.notional_usdc - bt.notional_usdc))
+            ts_abs.append(abs(float(lv.timestamp - bt.timestamp)))
 
-            if _is_close(bt.price, 0.0):
-                price_delta_bps = None
-            else:
-                price_delta_bps = (price_delta / bt.price) * 10000.0
+        only_backtest_events.extend(bt_list[match_count:])
+        only_live_events.extend(lv_list[match_count:])
 
-            matched.append(
-                {
-                    "market_slug": market_slug,
-                    "side": side,
-                    "backtest": asdict(bt),
-                    "live": asdict(lv),
-                    "delta": {
-                        "timestamp_sec": lv.timestamp - bt.timestamp,
-                        "price": _round6(price_delta),
-                        "price_bps": None if price_delta_bps is None else _round6(price_delta_bps),
-                        "size": _round6(size_delta),
-                        "notional_usdc": _round6(notional_delta),
-                    },
-                }
-            )
-
-        for extra in bt_list[match_count:]:
-            only_backtest_events.append(extra)
-            only_backtest.append(asdict(extra))
-        for extra in lv_list[match_count:]:
-            only_live_events.append(extra)
-            only_live.append(asdict(extra))
-
-    def _avg(values: Sequence[float]) -> float:
-        if not values:
-            return 0.0
-        return float(sum(values) / len(values))
-
-    def _event_notional(event: NormalizedTradeEvent) -> float:
-        notional = float(event.notional_usdc)
-        if notional > 0:
-            return notional
-        if event.price > 0 and event.size > 0:
-            return float(event.price * event.size)
-        return 0.0
-
-    def _total_profit(events: Sequence[NormalizedTradeEvent]) -> float:
-        # Cashflow convention: BUY is expense, SELL/REDEEM are income.
-        profit = 0.0
-        for event in events:
-            notional = _event_notional(event)
-            if notional <= 0:
-                continue
-            if event.side == "buy":
-                profit -= notional
-            elif event.side == "sell" or event.event_type == "REDEEM" or event.side == "redeem":
-                profit += notional
-        return profit
-
-    price_abs = [abs(_to_float(item["delta"]["price"])) for item in matched]
-    size_abs = [abs(_to_float(item["delta"]["size"])) for item in matched]
-    notional_abs = [abs(_to_float(item["delta"]["notional_usdc"])) for item in matched]
-    ts_abs = [abs(_to_float(item["delta"]["timestamp_sec"])) for item in matched]
+    backtest_stats = _compute_dataset_stats(backtest_events, total_windows=total_windows)
+    live_stats = _compute_dataset_stats(live_events, total_windows=total_windows)
 
     backtest_total_profit = _total_profit(backtest_events)
+    backtest_win_total_pnl, backtest_loss_total_pnl = _event_cashflow_totals(backtest_events)
     live_total_profit = _total_profit(live_events)
+    live_win_total_pnl, live_loss_total_pnl = _event_cashflow_totals(live_events)
     backtest_matched_profit = _total_profit(matched_backtest_events)
     live_matched_profit = _total_profit(matched_live_events)
     backtest_only_backtest_profit = _total_profit(only_backtest_events)
     live_only_live_profit = _total_profit(only_live_events)
 
+    # Derive window-based metrics from full-event cashflow aggregated by market window.
+    backtest_window_stats = _compute_window_cashflow_stats(
+        events=backtest_events,
+        total_windows=total_windows,
+        total_pnl=backtest_total_profit,
+    )
+    for key in (
+        "trades",
+        "trade_rate",
+        "wins",
+        "losses",
+        "win_rate",
+        "avg_pnl",
+        "win_total_pnl",
+        "loss_total_pnl",
+        "profit_factor",
+        "max_drawdown",
+        "avg_win_pnl",
+        "avg_loss_pnl",
+    ):
+        backtest_stats[key] = backtest_window_stats[key]
+
+    # Keep full-event totals explicit.
+    backtest_stats["total_pnl"] = _round6(backtest_total_profit)
+    backtest_stats["total_income"] = _round6(backtest_win_total_pnl)
+    backtest_stats["total_expense"] = _round6(abs(backtest_loss_total_pnl))
+
+    # Derive window-based metrics from full-event cashflow aggregated by market window.
+    live_window_stats = _compute_window_cashflow_stats(
+        events=live_events,
+        total_windows=total_windows,
+        total_pnl=live_total_profit,
+    )
+    for key in (
+        "trades",
+        "trade_rate",
+        "wins",
+        "losses",
+        "win_rate",
+        "avg_pnl",
+        "win_total_pnl",
+        "loss_total_pnl",
+        "profit_factor",
+        "max_drawdown",
+        "avg_win_pnl",
+        "avg_loss_pnl",
+    ):
+        live_stats[key] = live_window_stats[key]
+
+    # Keep full-event totals explicit.
+    live_stats["total_pnl"] = _round6(live_total_profit)
+    live_stats["total_income"] = _round6(live_win_total_pnl)
+    live_stats["total_expense"] = _round6(abs(live_loss_total_pnl))
+
     return {
         "summary": {
             "backtest_event_count": len(backtest_events),
             "live_event_count": len(live_events),
-            "matched_event_count": len(matched),
-            "only_backtest_count": len(only_backtest),
-            "only_live_count": len(only_live),
+            "matched_event_count": int(matched_count),
+            "only_backtest_count": int(only_backtest_count),
+            "only_live_count": int(only_live_count),
             "backtest_total_profit": _round6(backtest_total_profit),
             "live_total_profit": _round6(live_total_profit),
             "backtest_matched_profit": _round6(backtest_matched_profit),
@@ -615,10 +817,8 @@ def compare_events(
             "avg_abs_notional_delta": _round6(_avg(notional_abs)),
             "avg_abs_timestamp_delta_sec": _round6(_avg(ts_abs)),
         },
-        "pair_stats": pair_stats,
-        "matched": matched,
-        "only_backtest": only_backtest,
-        "only_live": only_live,
+        "backtest": backtest_stats,
+        "live": live_stats,
     }
 
 
@@ -747,7 +947,12 @@ def run_trade_diff_service(args: argparse.Namespace) -> Dict[str, Any]:
         until_ts=until_ts_int,
     )
 
-    comparison = compare_events(backtest_events=backtest_events, live_events=live_events)
+    total_windows = ((until_ts_int - since_ts_int) // 300) + 1
+    comparison = compare_events(
+        backtest_events=backtest_events,
+        live_events=live_events,
+        total_windows=total_windows,
+    )
     trade_compare_rows = _build_trade_compare_rows(backtest_events=backtest_events, live_events=live_events)
 
     since_utc_text = datetime.fromtimestamp(since_ts_int, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -835,16 +1040,51 @@ def _print_console_summary(report: Dict[str, Any], top_n: int) -> None:
     ):
         print(f"  - {key}: {summary.get(key)}")
 
-    pair_stats = list(comp.get("pair_stats", []))
-    pair_stats.sort(key=lambda x: abs(_to_int(x.get("count_gap"))), reverse=True)
+    backtest_stats = comp.get("backtest", {})
+    live_stats = comp.get("live", {})
     print("")
-    print(f"top {max(0, int(top_n))} count gaps (market_slug + side):")
-    for row in pair_stats[: max(0, int(top_n))]:
-        print(
-            "  - "
-            f"{row.get('market_slug')} | {row.get('side')} | "
-            f"bt={row.get('backtest_count')} live={row.get('live_count')} gap={row.get('count_gap')}"
-        )
+    print("backtest_stats:")
+    for key in (
+        "windows",
+        "trades",
+        "trade_rate",
+        "wins",
+        "losses",
+        "win_rate",
+        "total_pnl",
+        "avg_pnl",
+        "win_total_pnl",
+        "loss_total_pnl",
+        "total_income",
+        "total_expense",
+        "profit_factor",
+        "max_drawdown",
+        "avg_win_pnl",
+        "avg_loss_pnl",
+    ):
+        print(f"  - {key}: {backtest_stats.get(key)}")
+
+    print("")
+    print("live_stats:")
+    for key in (
+        "windows",
+        "trades",
+        "trade_rate",
+        "wins",
+        "losses",
+        "win_rate",
+        "total_pnl",
+        "avg_pnl",
+        "win_total_pnl",
+        "loss_total_pnl",
+        "total_income",
+        "total_expense",
+        "profit_factor",
+        "max_drawdown",
+        "avg_win_pnl",
+        "avg_loss_pnl",
+    ):
+        print(f"  - {key}: {live_stats.get(key)}")
 
 
 def main() -> None:
