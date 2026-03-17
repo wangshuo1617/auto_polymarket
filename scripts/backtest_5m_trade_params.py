@@ -1898,7 +1898,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-btc-age-ms",
         type=int,
-        default=2000,
+        default=3000,
         help="Max allowed BTC snapshot age at entry/decision checks (<=0 disables freshness filter)",
     )
     parser.add_argument(
