@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .models import TradeRecord
 
@@ -92,7 +92,9 @@ def build_pnl_report_content_and_subject(
     source_counts_snapshot: Dict[str, int],
     source_counts_index: Dict[str, int],
     format_latency_summary: Callable[[str, List[float]], str],
-) -> Tuple[str, str, float, float]:
+    api_pnl_hourly: Optional[Dict[str, Any]] = None,
+    api_pnl_cumulative: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
     hourly_pnl = sum(t.pnl for t in new_trades)
     hourly_count = len(new_trades)
     cumulative_pnl = sum(t.pnl for t in all_trades)
@@ -294,11 +296,48 @@ def build_pnl_report_content_and_subject(
         )
     if not new_trades:
         lines.append("- 本小时无新平仓交易")
+
+    # --- API 实盘盈亏（基于 Polymarket Activity） ---
+    lines.append("")
+    lines.append("API实盘盈亏（Polymarket Activity）:")
+    if api_pnl_hourly is not None:
+        h_net = api_pnl_hourly.get("net_pnl", 0.0)
+        h_income = api_pnl_hourly.get("total_income", 0.0)
+        h_expense = api_pnl_hourly.get("expense_trade_buy", 0.0)
+        h_count = api_pnl_hourly.get("activity_count", 0)
+        h_sell = api_pnl_hourly.get("count_trade_sell", 0)
+        h_redeem = api_pnl_hourly.get("count_redeem", 0)
+        h_buy = api_pnl_hourly.get("count_trade_buy", 0)
+        lines.append(
+            f"- 本小时: net_pnl={h_net:.2f} USDC (收入={h_income:.2f}, 支出={h_expense:.2f}, "
+            f"activity={h_count}, sell={h_sell}, redeem={h_redeem}, buy={h_buy})"
+        )
+    else:
+        lines.append("- 本小时: 拉取失败")
+    if api_pnl_cumulative is not None:
+        c_net = api_pnl_cumulative.get("net_pnl", 0.0)
+        c_income = api_pnl_cumulative.get("total_income", 0.0)
+        c_expense = api_pnl_cumulative.get("expense_trade_buy", 0.0)
+        c_count = api_pnl_cumulative.get("activity_count", 0)
+        c_sell = api_pnl_cumulative.get("count_trade_sell", 0)
+        c_redeem = api_pnl_cumulative.get("count_redeem", 0)
+        c_buy = api_pnl_cumulative.get("count_trade_buy", 0)
+        c_profit = api_pnl_cumulative.get("slug_profit_count", 0)
+        c_loss = api_pnl_cumulative.get("slug_loss_count", 0)
+        c_flat = api_pnl_cumulative.get("slug_flat_count", 0)
+        lines.append(
+            f"- 累计: net_pnl={c_net:.2f} USDC (收入={c_income:.2f}, 支出={c_expense:.2f}, "
+            f"activity={c_count}, sell={c_sell}, redeem={c_redeem}, buy={c_buy}, "
+            f"slug盈利={c_profit}, slug亏损={c_loss}, slug持平={c_flat})"
+        )
+    else:
+        lines.append("- 累计: 拉取失败")
+
     content = "\n".join(lines)
 
     subject = (
-        f"[Polymarket BTC 5m] 每小时盈亏汇总（本小时 {hourly_pnl:.2f} / 累计 {cumulative_pnl:.2f} USDC） "
+        f"[BTC 5m] 盈亏汇总: 本小时 {h_net:.2f} / 累计 {c_net:.2f} USDC "
         f"({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC)"
     )
 
-    return content, subject, hourly_pnl, cumulative_pnl
+    return content, subject

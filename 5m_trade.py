@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 
 from config import TO_EMAIL
 from data.polymarket import (
+    calculate_activity_pnl_from_trade_events,
     ensure_http_keepalive,
 )
 from notifications.email import EmailSender
@@ -180,6 +181,8 @@ class FiveMinuteUpDownTrader:
         self._running = False
         self._report_thread: Optional[threading.Thread] = None
         self._last_report_index: int = 0
+        self._startup_ts_sec: int = int(time.time())
+        self._last_report_ts_sec: int = self._startup_ts_sec
         # 预热过的市场信息缓存：slug -> {"market_id", "up_token", "down_token", "market_meta"}
         self._market_cache: Dict[str, Dict[str, Any]] = {}
         self._latency_metrics: Dict[str, List[float]] = {}
@@ -1073,6 +1076,7 @@ class FiveMinuteUpDownTrader:
                 logger.error("发送盈亏报告异常: %s", e)
 
     def _send_pnl_report(self, sender: EmailSender) -> None:
+        now_ts = int(time.time())
         with self._lock:
             new_trades = self.trades[self._last_report_index :]
             self._last_report_index = len(self.trades)
@@ -1088,7 +1092,27 @@ class FiveMinuteUpDownTrader:
             source_counts_index = dict(self._book_source_report_index)
             for key, val in self._book_source_counts.items():
                 self._book_source_report_index[key] = val
-        content, subject, hourly_pnl, cumulative_pnl = build_pnl_report_content_and_subject(
+            hourly_since_ts = self._last_report_ts_sec
+            cumulative_since_ts = self._startup_ts_sec
+            self._last_report_ts_sec = now_ts
+
+        # 从 Polymarket API 拉取真实盈亏
+        api_pnl_hourly = None
+        api_pnl_cumulative = None
+        try:
+            api_pnl_hourly = calculate_activity_pnl_from_trade_events(
+                since_ts=hourly_since_ts, until_ts=now_ts,
+            )
+        except Exception as e:
+            logger.warning("拉取本小时API实盘盈亏失败: %s", e)
+        try:
+            api_pnl_cumulative = calculate_activity_pnl_from_trade_events(
+                since_ts=cumulative_since_ts, until_ts=now_ts,
+            )
+        except Exception as e:
+            logger.warning("拉取累计API实盘盈亏失败: %s", e)
+
+        content, subject = build_pnl_report_content_and_subject(
             report_interval_sec=self.report_interval_sec,
             new_trades=new_trades,
             all_trades=all_trades,
@@ -1097,6 +1121,8 @@ class FiveMinuteUpDownTrader:
             source_counts_snapshot=source_counts_snapshot,
             source_counts_index=source_counts_index,
             format_latency_summary=self._format_latency_summary,
+            api_pnl_hourly=api_pnl_hourly,
+            api_pnl_cumulative=api_pnl_cumulative,
         )
 
         if not TO_EMAIL:
