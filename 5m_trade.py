@@ -98,6 +98,10 @@ class FiveMinuteUpDownTrader:
     MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
     MAX_ENTRY_SLIPPAGE_BPS = 120.0
     MAX_EXIT_SLIPPAGE_BPS_WARN = 250.0
+    ENTRY_SWEEP_SLIPPAGE = 0.02
+    EXIT_SWEEP_SLIPPAGE_SL = 0.05
+    EXIT_SWEEP_SLIPPAGE_OTHER = 0.01
+    EXPIRY_BEFORE_CLOSE_SEC = 5
     TOXIC_UTC_HOURS = {16, 19, 20}
     WS_BOOK_MAX_AGE_MS = 1200
     MAX_BTC_AGE_MS = 3000
@@ -701,8 +705,8 @@ class FiveMinuteUpDownTrader:
                 self._minute4_recorded = True
                 self._handle_minute4_direction_change()
 
-            # --- 第 5 分钟到期前 10 秒强制平仓（rel_sec >= 290）---
-            if rel_sec >= 290:
+            # --- 第 5 分钟到期前 N 秒强制平仓 ---
+            if rel_sec >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC):
                 self._handle_minute5_expiry()
 
     def _handle_entry_minute(self, projected_close: float, ms_to_close: int) -> None:
@@ -992,6 +996,16 @@ class FiveMinuteUpDownTrader:
             if not self.position:
                 return
             self.position.last_best_bid = best_bid
+
+            # Once the window enters the expiry last-10-seconds phase,
+            # only run expiry close policy and skip TP/SL checks.
+            if (
+                self.current_window_start_ms is not None
+                and self.position.market_slug.split("-")[-1] == str(self.current_window_start_ms // 1000)
+                and int((time.time() * 1000 - self.current_window_start_ms) // 1000) >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC)
+            ):
+                self._handle_minute5_expiry()
+                return
 
             if best_bid <= self.position.stop_loss_price:
                 if self._should_emit_log(
