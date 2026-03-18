@@ -72,7 +72,7 @@ EOF
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   print_usage
   echo
-  /root/auto_polymarket/.venv/bin/python -m services.five_minute_trade.trade_diff_service --help
+  .venv/bin/python -m services.five_minute_trade.trade_diff_service --help
   exit 0
 fi
 
@@ -141,6 +141,55 @@ if [[ "$TS_MODE" != "--disable-output-timestamp" && "$TS_MODE" != "--with-timest
   exit 1
 fi
 
+check_db_health() {
+  local db_path="$1"
+  if [[ ! -f "$db_path" ]]; then
+    return 1
+  fi
+  set +e
+  .venv/bin/python - "$db_path" <<'PY'
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+try:
+    conn = sqlite3.connect(db_path)
+    cur = conn.execute("PRAGMA integrity_check;")
+    row = cur.fetchone()
+    conn.close()
+    ok = bool(row and str(row[0]).lower() == "ok")
+    sys.exit(0 if ok else 2)
+except Exception:
+    sys.exit(1)
+PY
+  local rc=$?
+  set -e
+  return $rc
+}
+
+if ! check_db_health "$DB_PATH"; then
+  ALT_DB_PATH=""
+  if [[ "$DB_PATH" == logs/* ]]; then
+    ALT_DB_PATH="output/trade.sqlite3"
+  elif [[ "$DB_PATH" == output/* ]]; then
+    ALT_DB_PATH="logs/trade.sqlite3"
+  fi
+
+  if [[ -n "$ALT_DB_PATH" ]] && check_db_health "$ALT_DB_PATH"; then
+    echo "⚠️ 检测到数据库不可用或损坏: $DB_PATH"
+    echo "✅ 自动切换到可用数据库: $ALT_DB_PATH"
+    DB_PATH="$ALT_DB_PATH"
+  else
+    echo "❌ 数据库不可用或损坏: $DB_PATH"
+    if [[ -n "$ALT_DB_PATH" ]]; then
+      echo "❌ 备用数据库也不可用: $ALT_DB_PATH"
+    fi
+    echo "建议手动检查:"
+    echo "  sqlite3 \"$DB_PATH\" \"PRAGMA integrity_check;\""
+    exit 1
+  fi
+fi
+
 echo "=========================================="
 echo "运行 5m_trade_diff"
 echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -165,7 +214,7 @@ echo "时间戳后缀模式: $TS_MODE"
 echo "=========================================="
 
 CMD=(
-  /root/auto_polymarket/.venv/bin/python -m services.five_minute_trade.trade_diff_service
+  .venv/bin/python -m services.five_minute_trade.trade_diff_service
   --strategy "$STRATEGY"
   --since-ts "$SINCE_TS"
   --until-ts "$UNTIL_TS"

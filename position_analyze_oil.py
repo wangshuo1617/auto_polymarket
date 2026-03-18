@@ -23,6 +23,7 @@ from notifications.email import EmailSender
 from notifications.html import generate_html_template
 from services.position import match_orders_with_positions, format_matched_data
 from services.profit_optimizer import build_profit_optimization_context
+from services.model_data import append_model_samples
 from services.volatility import build_daily_volatility_profile
 
 LAST_REPORT_PATH = Path(__file__).resolve().parent / "last_report_oil.json"
@@ -217,11 +218,23 @@ if __name__ == "__main__":
         future_possibility_context=future_possibility_context,
         daily_volatility_profile=daily_volatility_profile,
         usdc_balance=usdc_balance,
+        asset="oil",
     )
     print(
         f"{time_now} 收益优化上下文: edge_count={profit_optimization_context.get('all_edge_count')} "
         f"top_edges={len(profit_optimization_context.get('top_edge_opportunities', []))}"
     )
+    try:
+        sample_count = append_model_samples(
+            future_possibility_context=future_possibility_context,
+            daily_volatility_profile=daily_volatility_profile,
+            profit_optimization_context=profit_optimization_context,
+            event_situation=event_situation,
+            asset="oil",
+        )
+        print(f"{time_now} 原油模型样本采集完成: rows={sample_count}")
+    except Exception as e:
+        print(f"{time_now} 原油模型样本采集失败(已忽略): {e}")
 
     oil_market_context = {
         "wti_price_usd_per_bbl": round(current_oil_price, 2),

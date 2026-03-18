@@ -189,6 +189,197 @@ MONTHLY_STRATEGY_SCHEMA = {
     "required": ["月份趋势判断", "月内BTC变动区间", "策略方案", "风险提示", "参考数据摘要"]
 }
 
+# 新兴市场可进入性分析（基于市场消息，非简单价格之和）
+ENTERABILITY_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "opportunities": {
+            "type": "array",
+            "description": "对每个事件的「可进入性」判定，必须基于近期市场消息/新闻，而非仅看 Yes+No 价格之和",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "event_title": {"type": "string", "description": "事件标题"},
+                    "event_slug": {"type": "string", "description": "事件 slug，用于链接"},
+                    "可进入性": {
+                        "type": "string",
+                        "enum": ["可考虑进入", "观望", "不建议参与"],
+                        "description": "根据市场消息与事件性质判定的可进入性"
+                    },
+                    "理由_基于市场消息": {
+                        "type": "string",
+                        "description": "必须基于近期新闻、事件进展、政策或市场情绪等「市场消息」给出理由，禁止仅写「价格之和」或纯数据结论"
+                    },
+                    "建议方向或观望说明": {
+                        "type": "string",
+                        "description": "若可考虑进入：建议 Yes/No 及大致价位或区间；若观望/不建议：说明原因或观察要点"
+                    },
+                    "风险提示": {"type": "string", "description": "该事件或标的的主要风险"},
+                    "参考消息摘要": {
+                        "type": "string",
+                        "description": "简要列出依据的新闻/消息来源或关键词（可用 Google 检索结果）"
+                    }
+                },
+                "required": ["event_title", "event_slug", "可进入性", "理由_基于市场消息", "建议方向或观望说明", "风险提示", "参考消息摘要"]
+            }
+        }
+    },
+    "required": ["opportunities"]
+}
+
+EVENT_SELECTION_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "selected_events": {
+            "type": "array",
+            "description": "从输入事件中筛选出的“可考虑进入且具有获利潜力”的事件",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "event_title": {"type": "string"},
+                    "event_slug": {"type": "string"},
+                    "selection_reason": {"type": "string"},
+                    "enterability": {
+                        "type": "string",
+                        "enum": ["可考虑进入"],
+                        "description": "仅允许可考虑进入；观望/不建议参与不应出现在 selected_events 中",
+                    },
+                    "profit_potential_score": {
+                        "type": "integer",
+                        "description": "1-100，预期获利潜力评分（越高越有潜力）",
+                    },
+                    "priority_score": {
+                        "type": "integer",
+                        "description": "1-100，分数越高优先级越高",
+                    },
+                },
+                "required": [
+                    "event_title",
+                    "event_slug",
+                    "selection_reason",
+                    "enterability",
+                    "profit_potential_score",
+                    "priority_score",
+                ],
+            },
+        }
+    },
+    "required": ["selected_events"],
+}
+
+EVENT_SELECTION_SYSTEM_INSTRUCTION = """# Role
+你是 Polymarket 事件筛选器（Event Selector），目标是从大量活跃事件中挑出最值得后续深度分析的一小部分。
+
+# Goal
+从输入事件中挑选最合理的候选（例如 20 个），用于后续可进入性深度分析。
+
+# Selection Principles
+- 优先考虑：新兴事件、突发事件、与现实新闻进展相关性高的事件。
+- 同时考虑：事件描述是否清晰、结算标准是否可验证、市场活跃度（volume24hr/liquidity）是否可交易。
+- 尽量覆盖多主题，不要全部集中在同一类题材。
+- 只从输入中选，不要杜撰新事件。
+- 只选择“可考虑进入且有获利潜力”的事件；排除观望和不建议参与的事件。
+- 对获利潜力低、信息噪声大、结算不清晰、流动性差的事件应排除。
+
+# Output Constraints
+- 输出必须符合 JSON Schema。
+- 仅输出你选中的事件列表及简要选择理由与优先级分。
+"""
+
+ENTERABILITY_SYSTEM_INSTRUCTION = """# Role
+你是预测市场（Prediction Market）与 Polymarket 的分析师，擅长根据**市场消息、新闻与事件进展**判断某个市场是否值得参与。
+
+# Goal
+对给定的 Polymarket 事件列表，**基于近期新闻、政策、事件动态等「市场消息」**判定每个事件的「可进入性」，并给出理由与建议。  
+**禁止**仅根据「Yes/No 价格之和」或纯数学套利下结论；必须结合真实世界信息（谁说了什么、发生了什么、时间线、可信度等）判断是否可考虑进入、观望或不建议参与。
+
+# Context
+- 输入中会提供每个事件的标题、描述、结算来源、以及各子市场的 outcome 名称与价格（含 Yes/No 或多种结果）。
+- 输入还会提供事件元数据（如 `new`、`featured`、`volume24hr`、`updatedAt`），用于识别新兴或突发事件优先级。
+- 价格数据仅作参考，用于了解市场当前定价；**判定可进入性的核心依据必须是市场消息**。
+- 请使用 Google 搜索（已启用）检索与事件相关的近期新闻或进展，在「理由_基于市场消息」和「参考消息摘要」中体现。
+- 请优先分析：突发事件、短时新上线事件、近期更新频繁且成交快速放大的事件；并明确指出“市场叙事”与“现实进展”之间是否存在偏差。
+
+# Output
+对每个事件输出：可进入性（可考虑进入/观望/不建议参与）、理由_基于市场消息、建议方向或观望说明、风险提示、参考消息摘要。  
+必须覆盖全部输入事件，不允许漏项。若证据不足，必须输出「观望」并写明缺失的关键信息。
+"""
+
+
+def get_enterability_user_prompt(events_summary: list, current_date: str) -> str:
+    """生成可进入性分析的用户 prompt，events_summary 每项含 title, slug, description, resolutionSource, markets(含 question, outcomes, outcomePrices)。"""
+    parts = [
+        f"当前日期：{current_date}。请根据**市场消息与新闻**（非仅价格数据）对以下 Polymarket 事件判定可进入性，并输出结构化 JSON。",
+        "",
+        "事件列表（含描述与各市场价格，价格仅作参考）：",
+        ""
+    ]
+    total = len(events_summary)
+    for i, ev in enumerate(events_summary, 1):
+        title = ev.get("title") or "—"
+        slug = ev.get("slug") or "—"
+        desc = (ev.get("description") or "")[:800]
+        resolution = ev.get("resolutionSource") or "—"
+        is_new = ev.get("new")
+        featured = ev.get("featured")
+        vol24 = ev.get("volume24hr")
+        vol = ev.get("volume")
+        liq = ev.get("liquidity")
+        created_at = ev.get("createdAt") or "—"
+        updated_at = ev.get("updatedAt") or "—"
+        start_at = ev.get("startDate") or "—"
+        parts.append(f"--- 事件 {i}: {title} (slug: {slug}) ---")
+        if desc:
+            parts.append(f"描述: {desc}")
+        parts.append(f"结算依据: {resolution}")
+        parts.append(
+            f"事件元数据: new={is_new}, featured={featured}, volume24hr={vol24}, volume={vol}, liquidity={liq}, createdAt={created_at}, updatedAt={updated_at}, startDate={start_at}"
+        )
+        for m in ev.get("markets") or []:
+            q = m.get("question") or "—"
+            outcomes = m.get("outcomes") or []
+            prices = m.get("outcomePrices") or []
+            price_str = " / ".join(f"{o}: {p}" for o, p in zip(outcomes, prices)) if outcomes and prices else str(prices)
+            parts.append(f"  - {q} 价格: {price_str}")
+        parts.append("")
+    parts.append("")
+    parts.append("严格输出要求：")
+    parts.append(f"1) 必须覆盖全部输入事件，共 {total} 条；每条事件输出一条机会判断。")
+    parts.append("2) 任何事件证据不足时，不可省略，必须输出“可进入性=观望”，并说明缺失证据。")
+    parts.append("3) 事件标题和 slug 请与输入保持一致，避免改写。")
+    parts.append("4) 优先对新兴/突发事件给出更详细理由，但其余事件也必须给结论。")
+    return "\n".join(parts)
+
+
+def get_event_selection_user_prompt(
+    events_summary: list,
+    current_date: str,
+    target_count: int,
+) -> str:
+    parts = [
+        f"当前日期：{current_date}。请从以下事件中筛选出最多 {target_count} 个“可考虑进入且具备获利潜力”的事件，并输出结构化 JSON。",
+        "",
+        "筛选时优先考虑：新兴/突发、现实世界新闻相关性、结算清晰度、活跃度与可交易性。",
+        "必须排除：观望、不建议参与、获利潜力不足、信息不确定性过高的事件。",
+        "",
+    ]
+    for i, ev in enumerate(events_summary, 1):
+        title = ev.get("title") or "—"
+        slug = ev.get("slug") or "—"
+        desc = (ev.get("description") or "")[:400]
+        resolution = ev.get("resolutionSource") or "—"
+        parts.append(
+            f"[{i}] title={title} | slug={slug} | new={ev.get('new')} | featured={ev.get('featured')} | "
+            f"volume24hr={ev.get('volume24hr')} | volume={ev.get('volume')} | liquidity={ev.get('liquidity')}"
+        )
+        if desc:
+            parts.append(f"    desc={desc}")
+        parts.append(f"    resolution={resolution}")
+    parts.append("")
+    parts.append(f"请输出不超过 {target_count} 个 selected_events，且只能从以上输入中选择。")
+    parts.append("若满足条件的事件不足，允许少于目标数量（宁缺毋滥，禁止凑数）。")
+    return "\n".join(parts)
+
 
 SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 你是一名资深的加密货币衍生品交易员和预测市场（Prediction Market）专家。你精通二元期权（Binary Options）的定价模型、Theta衰减特性、Delta对冲策略，并对Polymarket的流动性陷阱有深刻理解。

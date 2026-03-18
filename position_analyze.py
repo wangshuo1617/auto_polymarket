@@ -24,6 +24,7 @@ from notifications.html import generate_html_template
 from services.position import match_orders_with_positions, format_matched_data
 from services.market_sentiment import get_market_sentiment_and_funding
 from services.profit_optimizer import build_profit_optimization_context
+from services.model_data import append_model_samples
 from services.volatility import build_daily_volatility_profile
 
 LAST_REPORT_PATH = Path(__file__).resolve().parent / "last_report.json"
@@ -197,11 +198,37 @@ if __name__ == "__main__":
         future_possibility_context=future_possibility_context,
         daily_volatility_profile=daily_volatility_profile,
         usdc_balance=usdc_balance,
+        asset="btc",
     )
+    risk_budget_cfg = profit_optimization_context.get("risk_budget", {})
+    execution_costs_cfg = profit_optimization_context.get("execution_costs", {})
+    entry_thresholds_cfg = profit_optimization_context.get("entry_thresholds", {})
     print(
         f"{time_now} 收益优化上下文完成: edge_count={profit_optimization_context.get('all_edge_count')} "
         f"top_edges={len(profit_optimization_context.get('top_edge_opportunities', []))}"
     )
+    print(
+        f"{time_now} 当前参数摘要: "
+        f"risk_budget_ratio={risk_budget_cfg.get('risk_budget_ratio')} "
+        f"single_market_cap_ratio={risk_budget_cfg.get('single_market_cap_ratio')} "
+        f"kelly_fraction={risk_budget_cfg.get('kelly_fraction')} "
+        f"fee_bps={execution_costs_cfg.get('fee_bps')} "
+        f"slippage_bps={execution_costs_cfg.get('slippage_bps')} "
+        f"impact_bps={execution_costs_cfg.get('impact_bps')} "
+        f"edge_entry_threshold={entry_thresholds_cfg.get('edge_entry_threshold')}"
+    )
+    try:
+        sample_count = append_model_samples(
+            future_possibility_context=future_possibility_context,
+            daily_volatility_profile=daily_volatility_profile,
+            profit_optimization_context=profit_optimization_context,
+            event_situation=event_situation,
+            asset="btc",
+        )
+        print(f"{time_now} 模型样本采集完成: rows={sample_count}")
+    except Exception as e:
+        print(f"{time_now} 模型样本采集失败(已忽略): {e}")
+
     previous_report = _load_previous_report()
     if previous_report:
         print(f"{time_now} 已加载上一时间段报告作为参考")

@@ -1900,6 +1900,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stake-usd-grid", type=str, default="10")
     parser.add_argument("--min-hold-before-close-sec-grid", type=str, default="20,40,60")
     parser.add_argument(
+        "--tp-sl-mode-grid",
+        type=str,
+        default="dynamic",
+        help="TP/SL mode grid: dynamic, spread, or CSV combination (e.g. dynamic,spread).",
+    )
+    parser.add_argument(
         "--tp-price-cap-grid",
         type=str,
         default="0.9,0.95,0.99",
@@ -1916,6 +1922,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="1,1.33333,1.5",
         help="Dynamic SL/TP ratio grid (default follows live strategy)",
+    )
+    parser.add_argument(
+        "--take-profit-spread-grid",
+        type=str,
+        default="0.02,0.03,0.04",
+        help="Spread-mode TP spread grid (used when tp_sl_mode=spread).",
+    )
+    parser.add_argument(
+        "--stop-loss-spread-grid",
+        type=str,
+        default="-0.02,-0.03,-0.04",
+        help="Spread-mode SL spread grid (negative values, used when tp_sl_mode=spread).",
     )
     parser.add_argument(
         "--size-tick",

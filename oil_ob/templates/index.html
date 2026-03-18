@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Oil OB - CME Crude Oil Tracker</title>
+  <style>
+    :root {
+      --bg: #0f1116;
+      --panel: #161a22;
+      --text: #e8ecf3;
+      --muted: #9ba7ba;
+      --green: #2ecc71;
+      --red: #ff5c5c;
+      --line: #3e8eff;
+      --border: #2a3242;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, Segoe UI, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 20px;
+    }
+    .container { max-width: 1100px; margin: 0 auto; }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    h1 { margin: 0; font-size: 24px; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .value { font-size: 28px; font-weight: 700; line-height: 1.2; }
+    .delta { margin-top: 4px; font-size: 14px; font-weight: 600; }
+    .up { color: var(--green); }
+    .down { color: var(--red); }
+    .chart-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .alert-panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+      margin-bottom: 16px;
+    }
+    .alert-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      align-items: end;
+    }
+    .input-group label {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+    .input-group input {
+      width: 100%;
+      background: #0e1219;
+      border: 1px solid #293243;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 14px;
+      outline: none;
+    }
+    .input-group input:focus {
+      border-color: var(--line);
+    }
+    .alert-controls {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .btn {
+      background: #212838;
+      color: var(--text);
+      border: 1px solid #2d3a51;
+      border-radius: 8px;
+      padding: 7px 10px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .btn:hover { background: #26314a; }
+    .alert-log {
+      margin-top: 10px;
+      max-height: 120px;
+      overflow: auto;
+      border-top: 1px dashed #2a3242;
+      padding-top: 8px;
+      font-size: 12px;
+      color: #d7deea;
+    }
+    .alert-log-item {
+      margin: 3px 0;
+    }
+    canvas {
+      width: 100%;
+      height: 340px;
+      background: #0e1219;
+      border-radius: 8px;
+      border: 1px solid #1f2736;
+    }
+    .err {
+      margin-top: 10px;
+      color: var(--red);
+      font-size: 13px;
+      min-height: 18px;
+    }
+    .footer {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Oil OB - CME Crude Oil</h1>
+      <div class="muted">
+        Auto refresh: 1s | Source: Yahoo Finance (CME futures feed)
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">WTI (CL=F) Last</div>
+        <div class="value" id="wti-price">--</div>
+        <div class="delta" id="wti-delta">--</div>
+      </div>
+      <div class="card">
+        <div class="label">Brent (BZ=F) Last</div>
+        <div class="value" id="brent-price">--</div>
+        <div class="delta" id="brent-delta">--</div>
+      </div>
+      <div class="card">
+        <div class="label">WTI-Brent Spread</div>
+        <div class="value" id="spread">--</div>
+        <div class="muted" id="server-time">--</div>
+      </div>
+    </div>
+
+    <div class="alert-panel">
+      <div class="label">Auto Alert Thresholds</div>
+      <div class="alert-grid">
+        <div class="input-group">
+          <label>WTI >=</label>
+          <input id="th-wti-high" type="number" step="0.01" placeholder="e.g. 80.00" />
+        </div>
+        <div class="input-group">
+          <label>WTI <=</label>
+          <input id="th-wti-low" type="number" step="0.01" placeholder="e.g. 75.00" />
+        </div>
+        <div class="input-group">
+          <label>Spread >=</label>
+          <input id="th-spread-high" type="number" step="0.01" placeholder="e.g. 2.00" />
+        </div>
+        <div class="input-group">
+          <label>Spread <=</label>
+          <input id="th-spread-low" type="number" step="0.01" placeholder="e.g. -2.00" />
+        </div>
+      </div>
+      <div class="alert-controls">
+        <button class="btn" id="btn-save-th">Save Thresholds</button>
+        <button class="btn" id="btn-clear-th">Clear Thresholds</button>
+        <button class="btn" id="btn-test-alert">Test Alert Sound</button>
+      </div>
+      <div class="alert-log" id="alert-log"></div>
+    </div>
+
+    <div class="chart-card">
+      <div class="label">WTI Intraday (1m)</div>
+      <canvas id="wti-chart" width="1000" height="340"></canvas>
+      <div class="err" id="error-msg"></div>
+      <div class="footer">Market timestamp: <span id="market-time">--</span></div>
+    </div>
+  </div>
+
+  <script>
+    const wtiPriceEl = document.getElementById("wti-price");
+    const wtiDeltaEl = document.getElementById("wti-delta");
+    const brentPriceEl = document.getElementById("brent-price");
+    const brentDeltaEl = document.getElementById("brent-delta");
+    const spreadEl = document.getElementById("spread");
+    const serverTimeEl = document.getElementById("server-time");
+    const marketTimeEl = document.getElementById("market-time");
+    const errorEl = document.getElementById("error-msg");
+    const thWtiHighEl = document.getElementById("th-wti-high");
+    const thWtiLowEl = document.getElementById("th-wti-low");
+    const thSpreadHighEl = document.getElementById("th-spread-high");
+    const thSpreadLowEl = document.getElementById("th-spread-low");
+    const btnSaveThEl = document.getElementById("btn-save-th");
+    const btnClearThEl = document.getElementById("btn-clear-th");
+    const btnTestAlertEl = document.getElementById("btn-test-alert");
+    const alertLogEl = document.getElementById("alert-log");
+    const canvas = document.getElementById("wti-chart");
+    const ctx = canvas.getContext("2d");
+    const TH_KEY = "oil_ob_thresholds_v1";
+    const triggerState = {};
+
+    function toMaybeNumber(v) {
+      if (v === "" || v === null || v === undefined) return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function parseInputValue(el) {
+      return toMaybeNumber(el.value);
+    }
+
+    function loadThresholds() {
+      try {
+        const raw = localStorage.getItem(TH_KEY);
+        if (!raw) return;
+        const t = JSON.parse(raw);
+        thWtiHighEl.value = t.wtiHigh ?? "";
+        thWtiLowEl.value = t.wtiLow ?? "";
+        thSpreadHighEl.value = t.spreadHigh ?? "";
+        thSpreadLowEl.value = t.spreadLow ?? "";
+      } catch (_) {
+        // ignore malformed local data
+      }
+    }
+
+    function getThresholds() {
+      return {
+        wtiHigh: parseInputValue(thWtiHighEl),
+        wtiLow: parseInputValue(thWtiLowEl),
+        spreadHigh: parseInputValue(thSpreadHighEl),
+        spreadLow: parseInputValue(thSpreadLowEl),
+      };
+    }
+
+    function saveThresholds() {
+      const t = getThresholds();
+      localStorage.setItem(TH_KEY, JSON.stringify(t));
+      appendAlertLog(`Saved thresholds at ${new Date().toLocaleTimeString()}`);
+    }
+
+    function clearThresholds() {
+      thWtiHighEl.value = "";
+      thWtiLowEl.value = "";
+      thSpreadHighEl.value = "";
+      thSpreadLowEl.value = "";
+      localStorage.removeItem(TH_KEY);
+      Object.keys(triggerState).forEach((k) => delete triggerState[k]);
+      appendAlertLog(`Cleared thresholds at ${new Date().toLocaleTimeString()}`);
+    }
+
+    function appendAlertLog(msg) {
+      const item = document.createElement("div");
+      item.className = "alert-log-item";
+      item.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      alertLogEl.prepend(item);
+      while (alertLogEl.childNodes.length > 20) {
+        alertLogEl.removeChild(alertLogEl.lastChild);
+      }
+    }
+
+    function playAlertSound() {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const audioCtx = new AudioCtx();
+      const now = audioCtx.currentTime;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(880, now);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.12, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.35);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(now);
+      osc.stop(now + 0.35);
+      osc.onended = () => audioCtx.close();
+    }
+
+    function raiseAlert(key, message) {
+      appendAlertLog(message);
+      playAlertSound();
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification("Oil OB Alert", { body: message });
+      }
+      triggerState[key] = true;
+    }
+
+    function maybeTrigger(key, condition, message) {
+      if (condition && !triggerState[key]) {
+        raiseAlert(key, message);
+      }
+      if (!condition) {
+        triggerState[key] = false;
+      }
+    }
+
+    function evaluateThresholds(wtiPrice, spread) {
+      const t = getThresholds();
+      if (typeof wtiPrice === "number") {
+        maybeTrigger("wtiHigh", t.wtiHigh !== null && wtiPrice >= t.wtiHigh, `WTI hit upper threshold: ${wtiPrice.toFixed(2)} >= ${t.wtiHigh}`);
+        maybeTrigger("wtiLow", t.wtiLow !== null && wtiPrice <= t.wtiLow, `WTI hit lower threshold: ${wtiPrice.toFixed(2)} <= ${t.wtiLow}`);
+      } else {
+        triggerState.wtiHigh = false;
+        triggerState.wtiLow = false;
+      }
+      if (typeof spread === "number") {
+        maybeTrigger("spreadHigh", t.spreadHigh !== null && spread >= t.spreadHigh, `Spread hit upper threshold: ${spread.toFixed(2)} >= ${t.spreadHigh}`);
+        maybeTrigger("spreadLow", t.spreadLow !== null && spread <= t.spreadLow, `Spread hit lower threshold: ${spread.toFixed(2)} <= ${t.spreadLow}`);
+      } else {
+        triggerState.spreadHigh = false;
+        triggerState.spreadLow = false;
+      }
+    }
+
+    function formatNumber(v, digits = 2) {
+      return (typeof v === "number" && Number.isFinite(v)) ? v.toFixed(digits) : "--";
+    }
+
+    function setDelta(el, change, pct) {
+      if (typeof change !== "number" || typeof pct !== "number") {
+        el.textContent = "--";
+        el.className = "delta";
+        return;
+      }
+      const sign = change >= 0 ? "+" : "";
+      el.textContent = `${sign}${change.toFixed(2)} (${sign}${pct.toFixed(2)}%)`;
+      el.className = `delta ${change >= 0 ? "up" : "down"}`;
+    }
+
+    function drawChart(points) {
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      if (!points || points.length < 2) {
+        ctx.fillStyle = "#9ba7ba";
+        ctx.font = "14px Arial";
+        ctx.fillText("No intraday data", 12, 24);
+        return;
+      }
+
+      const values = points.map((p) => p.close);
+      const minV = Math.min(...values);
+      const maxV = Math.max(...values);
+      const pad = 30;
+      const range = Math.max(maxV - minV, 0.01);
+
+      ctx.strokeStyle = "#2a3242";
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i++) {
+        const y = pad + ((h - pad * 2) * i) / 4;
+        ctx.beginPath();
+        ctx.moveTo(pad, y);
+        ctx.lineTo(w - pad, y);
+        ctx.stroke();
+      }
+
+      ctx.strokeStyle = "#3e8eff";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      points.forEach((p, idx) => {
+        const x = pad + ((w - pad * 2) * idx) / (points.length - 1);
+        const y = h - pad - ((p.close - minV) / range) * (h - pad * 2);
+        if (idx === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+
+      ctx.fillStyle = "#9ba7ba";
+      ctx.font = "12px Arial";
+      ctx.fillText(maxV.toFixed(2), 6, pad + 4);
+      ctx.fillText(minV.toFixed(2), 6, h - pad + 4);
+      ctx.fillText(points[0].time, pad, h - 8);
+      ctx.fillText(points[points.length - 1].time, w - pad - 38, h - 8);
+    }
+
+    function render(data) {
+      const wti = data.wti || {};
+      const brent = data.brent || {};
+      wtiPriceEl.textContent = formatNumber(wti.price);
+      brentPriceEl.textContent = formatNumber(brent.price);
+      setDelta(wtiDeltaEl, wti.change, wti.change_pct);
+      setDelta(brentDeltaEl, brent.change, brent.change_pct);
+
+      let spread = null;
+      if (typeof wti.price === "number" && typeof brent.price === "number") {
+        spread = wti.price - brent.price;
+        spreadEl.textContent = spread.toFixed(2);
+      } else {
+        spreadEl.textContent = "--";
+      }
+
+      serverTimeEl.textContent = `Server: ${data.server_time || "--"}`;
+      marketTimeEl.textContent = wti.market_time || "--";
+      drawChart(wti.history || []);
+      evaluateThresholds(wti.price, spread);
+
+      if (typeof wti.price === "number") {
+        const deltaSign = typeof wti.change === "number" && wti.change > 0 ? "+" : "";
+        const deltaText = typeof wti.change === "number" ? `${deltaSign}${wti.change.toFixed(2)}` : "--";
+        document.title = `${wti.price.toFixed(2)} (${deltaText}) | Oil OB`;
+      } else {
+        document.title = "Oil OB - CME Crude Oil Tracker";
+      }
+    }
+
+    async function pull() {
+      try {
+        const res = await fetch("/api/market", { cache: "no-store" });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+        errorEl.textContent = "";
+        render(data);
+      } catch (err) {
+        errorEl.textContent = `Fetch failed: ${err.message}`;
+      }
+    }
+
+    btnSaveThEl.addEventListener("click", saveThresholds);
+    btnClearThEl.addEventListener("click", clearThresholds);
+    btnTestAlertEl.addEventListener("click", () => {
+      playAlertSound();
+      appendAlertLog("Manual alert test");
+    });
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+    loadThresholds();
+    pull();
+    setInterval(pull, 1000);
+  </script>
+</body>
+</html>
