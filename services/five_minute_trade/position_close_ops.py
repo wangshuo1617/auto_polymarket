@@ -352,7 +352,7 @@ def schedule_post_close_balance_check(
                         btc_price_at_trade=btc_price_at_trade,
                         order_id=order_id,
                     )
-                logger.info("慢通道确认: 残余份额不足 0.05 (实余 %.6f)，视为粉尘忽略，平仓彻底完成。", remaining_size)
+                logger.info("慢通道确认: 残余份额不足 0.02 (实余 %.6f)，视为粉尘忽略，平仓彻底完成。", remaining_size)
                 return
 
             if realized_size > 0:
@@ -573,10 +573,10 @@ def force_close_position(trader: Any, reason: str) -> None:
                 pos.last_best_bid if pos.last_best_bid else exit_price,
                 exit_price,
             )
-            sweep_price = max(0.01, float(current_bid) - 0.05)
+            sweep_price = max(0.01, float(current_bid) - self.EXIT_SWEEP_SLIPPAGE_SL)
         else:
             current_bid = exit_price
-            sweep_price = max(0.01, float(current_bid) - 0.01)
+            sweep_price = max(0.01, float(current_bid) - self.EXIT_SWEEP_SLIPPAGE_OTHER)
 
         logger.info("应用强平滑点: 预估价=%.4f 实际强平挂单价(sweep)=%.4f", exit_price, sweep_price)
 

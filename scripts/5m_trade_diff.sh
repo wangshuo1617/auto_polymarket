@@ -7,9 +7,9 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$PROJECT_ROOT"
 
-DEFAULT_STRATEGY="m=4,pre=7,diff=45,max=0.95,stake=5,hold=70,tp_cap=0.97,tp_val_cap=0.15,sl_ratio=2.5"
+DEFAULT_STRATEGY="m=4,pre=9,diff=30,max=0.95,stake=5,hold=60,tp_cap=0.97,tp_val_cap=0.15,sl_ratio=0.9"
 NOW_TS="$(date +%s)"
-DEFAULT_SINCE_TS="1773450376"
+DEFAULT_SINCE_TS="1773654509"
 DEFAULT_UNTIL_TS=""
 
 FAST_MODE="false"
@@ -43,7 +43,7 @@ else
   TRADE_COMPARE_CSV="${11:-output/5m_backtest_live_trade_compare.csv}"
 fi
 
-USAGE="./scripts/5m_trade_diff.sh [strategy] [since_ts] [until_ts] [db_path] [report_json] [backtest_summary_csv] [backtest_events_csv] [print_top_n] [existing_backtest_events_csv] [--disable-output-timestamp|--with-timestamp] [trade_compare_csv]"
+USAGE="./scripts/5m_trade_diff.sh [strategy] [since_ts] [until_ts] [db_path] [report_json] [backtest_summary_csv] [backtest_events_csv] [print_top_n] [existing_backtest_events_csv] [--disable-output-timestamp|--with-timestamp] [trade_compare_csv][--fast-live-latest]"
 
 print_usage() {
   cat <<EOF

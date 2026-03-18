@@ -202,10 +202,6 @@ def run_backtest_for_signature(
         str(strategy.tp_value_cap),
         "--sl-to-tp-ratio-grid",
         str(strategy.sl_to_tp_ratio),
-        "--workers",
-        "1",
-        "--min-trades",
-        "0",
         "--disable-output-timestamp",
         "--output-csv",
         summary_csv_path,
@@ -509,6 +505,25 @@ def _total_profit(events: Sequence[NormalizedTradeEvent]) -> float:
     return profit
 
 
+def _window_pnl_map(events: Sequence[NormalizedTradeEvent]) -> Dict[str, float]:
+    """Aggregate cashflow per market_slug window, returning {slug: pnl}."""
+    pnl: Dict[str, float] = {}
+    for event in events:
+        cf = 0.0
+        notional = _event_notional(event)
+        if notional > 0:
+            if event.side == "buy":
+                cf = -notional
+            elif event.side == "sell" or event.event_type == "REDEEM" or event.side == "redeem":
+                cf = notional
+        if _is_close(cf, 0.0):
+            continue
+        slug = str(event.market_slug or "")
+        if slug:
+            pnl[slug] = float(pnl.get(slug, 0.0) + cf)
+    return pnl
+
+
 def _event_cashflow_totals(events: Sequence[NormalizedTradeEvent]) -> Tuple[float, float]:
     win_total = 0.0
     loss_total = 0.0
@@ -674,10 +689,34 @@ def _compute_dataset_stats(
     }
 
 
+def _split_live_events_by_entry(
+    events: Sequence[NormalizedTradeEvent],
+) -> Tuple[List[NormalizedTradeEvent], List[NormalizedTradeEvent]]:
+    """Split live events into (active, orphan).
+
+    *active*: events belonging to windows that have at least one BUY within
+    the event set.  *orphan*: SELL/REDEEM events whose window has no BUY.
+    """
+    slugs_with_buy: set = set()
+    for event in events:
+        if event.side == "buy":
+            slugs_with_buy.add(event.market_slug)
+
+    active: List[NormalizedTradeEvent] = []
+    orphan: List[NormalizedTradeEvent] = []
+    for event in events:
+        if event.market_slug in slugs_with_buy:
+            active.append(event)
+        else:
+            orphan.append(event)
+    return active, orphan
+
+
 def compare_events(
     backtest_events: Sequence[NormalizedTradeEvent],
     live_events: Sequence[NormalizedTradeEvent],
     total_windows: int,
+    orphan_live_events: Optional[Sequence[NormalizedTradeEvent]] = None,
 ) -> Dict[str, Any]:
     backtest_grouped = _group_by_key(backtest_events)
     live_grouped = _group_by_key(live_events)
@@ -724,10 +763,33 @@ def compare_events(
     backtest_win_total_pnl, backtest_loss_total_pnl = _event_cashflow_totals(backtest_events)
     live_total_profit = _total_profit(live_events)
     live_win_total_pnl, live_loss_total_pnl = _event_cashflow_totals(live_events)
-    backtest_matched_profit = _total_profit(matched_backtest_events)
-    live_matched_profit = _total_profit(matched_live_events)
-    backtest_only_backtest_profit = _total_profit(only_backtest_events)
-    live_only_live_profit = _total_profit(only_live_events)
+
+    # --- Window-level PnL classification ---
+    bt_window_pnl = _window_pnl_map(backtest_events)
+    lv_window_pnl = _window_pnl_map(live_events)
+    all_slugs = set(bt_window_pnl.keys()) | set(lv_window_pnl.keys())
+
+    matched_window_count = 0
+    only_backtest_window_count = 0
+    only_live_window_count = 0
+    matched_bt_window_pnl = 0.0
+    matched_lv_window_pnl = 0.0
+    only_bt_window_pnl = 0.0
+    only_lv_window_pnl = 0.0
+
+    for slug in all_slugs:
+        in_bt = slug in bt_window_pnl
+        in_lv = slug in lv_window_pnl
+        if in_bt and in_lv:
+            matched_window_count += 1
+            matched_bt_window_pnl += bt_window_pnl[slug]
+            matched_lv_window_pnl += lv_window_pnl[slug]
+        elif in_bt:
+            only_backtest_window_count += 1
+            only_bt_window_pnl += bt_window_pnl[slug]
+        else:
+            only_live_window_count += 1
+            only_lv_window_pnl += lv_window_pnl[slug]
 
     # Derive window-based metrics from full-event cashflow aggregated by market window.
     backtest_window_stats = _compute_window_cashflow_stats(
@@ -783,20 +845,28 @@ def compare_events(
     live_stats["total_income"] = _round6(live_win_total_pnl)
     live_stats["total_expense"] = _round6(abs(live_loss_total_pnl))
 
-    return {
+    # Pre-compute orphan stats so we can include count in summary.
+    _orphan = list(orphan_live_events or [])
+    _orphan_slugs = sorted(set(e.market_slug for e in _orphan)) if _orphan else []
+
+    result: Dict[str, Any] = {
         "summary": {
-            "backtest_event_count": len(backtest_events),
-            "live_event_count": len(live_events),
             "matched_event_count": int(matched_count),
-            "only_backtest_count": int(only_backtest_count),
-            "only_live_count": int(only_live_count),
-            "backtest_total_profit": _round6(backtest_total_profit),
-            "live_total_profit": _round6(live_total_profit),
-            "backtest_matched_profit": _round6(backtest_matched_profit),
-            "live_matched_profit": _round6(live_matched_profit),
-            "backtest_only_backtest_profit": _round6(backtest_only_backtest_profit),
-            "live_only_live_profit": _round6(live_only_live_profit),
-            "total_profit_gap_live_minus_backtest": _round6(live_total_profit - backtest_total_profit),
+            "only_backtest_event_count": int(only_backtest_count),
+            "only_live_event_count": int(only_live_count),
+            "matched_window_count": int(matched_window_count),
+            "only_backtest_window_count": int(only_backtest_window_count),
+            "only_live_window_count": int(only_live_window_count),
+            "orphan_live_window_count": len(_orphan_slugs),
+            "backtest_total_pnl": _round6(sum(bt_window_pnl.values())),
+            "live_total_pnl": _round6(sum(lv_window_pnl.values())),
+            "backtest_matched_pnl": _round6(matched_bt_window_pnl),
+            "live_matched_pnl": _round6(matched_lv_window_pnl),
+            "backtest_only_pnl": _round6(only_bt_window_pnl),
+            "live_only_pnl": _round6(only_lv_window_pnl),
+            "total_pnl_gap_live_minus_backtest": _round6(
+                sum(lv_window_pnl.values()) - sum(bt_window_pnl.values())
+            ),
             "avg_abs_price_delta": _round6(_avg(price_abs)),
             "avg_abs_size_delta": _round6(_avg(size_abs)),
             "avg_abs_notional_delta": _round6(_avg(notional_abs)),
@@ -805,6 +875,24 @@ def compare_events(
         "backtest": backtest_stats,
         "live": live_stats,
     }
+
+    # --- Orphan live events (SELL/REDEEM without a BUY in range) ---
+    if _orphan:
+        result["orphan_live"] = {
+            "window_count": len(_orphan_slugs),
+            "event_count": len(_orphan),
+            "total_pnl": _round6(_total_profit(_orphan)),
+            "windows": _orphan_slugs,
+        }
+    else:
+        result["orphan_live"] = {
+            "window_count": 0,
+            "event_count": 0,
+            "total_pnl": 0.0,
+            "windows": [],
+        }
+
+    return result
 
 
 def _parse_args() -> argparse.Namespace:
@@ -927,16 +1015,18 @@ def run_trade_diff_service(args: argparse.Namespace) -> Dict[str, Any]:
         since_ts=since_ts_int,
         until_ts=until_ts_int,
     )
-    live_events = load_live_activity_events(
+    all_live_events = load_live_activity_events(
         since_ts=since_ts_int,
         until_ts=until_ts_int,
     )
+    live_events, orphan_live_events = _split_live_events_by_entry(all_live_events)
 
     total_windows = ((until_ts_int - since_ts_int) // 300) + 1
     comparison = compare_events(
         backtest_events=backtest_events,
         live_events=live_events,
         total_windows=total_windows,
+        orphan_live_events=orphan_live_events,
     )
     trade_compare_rows = _build_trade_compare_rows(backtest_events=backtest_events, live_events=live_events)
 
@@ -1006,18 +1096,20 @@ def _print_console_summary(report: Dict[str, Any], top_n: int) -> None:
     print("")
     print("summary:")
     for key in (
-        "backtest_event_count",
-        "live_event_count",
         "matched_event_count",
-        "only_backtest_count",
-        "only_live_count",
-        "backtest_total_profit",
-        "live_total_profit",
-        "backtest_matched_profit",
-        "live_matched_profit",
-        "backtest_only_backtest_profit",
-        "live_only_live_profit",
-        "total_profit_gap_live_minus_backtest",
+        "only_backtest_event_count",
+        "only_live_event_count",
+        "matched_window_count",
+        "only_backtest_window_count",
+        "only_live_window_count",
+        "orphan_live_window_count",
+        "backtest_total_pnl",
+        "live_total_pnl",
+        "backtest_matched_pnl",
+        "live_matched_pnl",
+        "backtest_only_pnl",
+        "live_only_pnl",
+        "total_pnl_gap_live_minus_backtest",
         "avg_abs_price_delta",
         "avg_abs_size_delta",
         "avg_abs_notional_delta",
@@ -1070,6 +1162,16 @@ def _print_console_summary(report: Dict[str, Any], top_n: int) -> None:
         "avg_loss_pnl",
     ):
         print(f"  - {key}: {live_stats.get(key)}")
+
+    orphan = comp.get("orphan_live", {})
+    if orphan.get("window_count", 0) > 0:
+        print("")
+        print("orphan_live (SELL/REDEEM without BUY in range):")
+        print(f"  - window_count: {orphan.get('window_count')}")
+        print(f"  - event_count: {orphan.get('event_count')}")
+        print(f"  - total_pnl: {orphan.get('total_pnl')}")
+        for slug in orphan.get("windows", []):
+            print(f"    * {slug}")
 
 
 def main() -> None:

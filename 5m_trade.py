@@ -22,6 +22,7 @@ BTC 5m up/down 策略交易服务
 import logging
 import os
 import socket
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ from typing import Any, Dict, List, Optional
 
 from config import TO_EMAIL
 from data.polymarket import (
+    calculate_activity_pnl_from_trade_events,
     ensure_http_keepalive,
 )
 from notifications.email import EmailSender
@@ -50,6 +52,7 @@ from services.five_minute_trade.position_close_ops import (
     schedule_position_balance_confirmation,
     schedule_post_close_balance_check,
 )
+from services.five_minute_trade.auto_redeem import run_auto_redeem
 from services.five_minute_trade.reporting import build_pnl_report_content_and_subject
 from services.five_minute_trade.trade_db import TradeSQLiteStore
 from services.five_minute_trade.watchers import (
@@ -98,9 +101,13 @@ class FiveMinuteUpDownTrader:
     MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
     MAX_ENTRY_SLIPPAGE_BPS = 120.0
     MAX_EXIT_SLIPPAGE_BPS_WARN = 250.0
+    ENTRY_SWEEP_SLIPPAGE = 0.02
+    EXIT_SWEEP_SLIPPAGE_SL = 0.05
+    EXIT_SWEEP_SLIPPAGE_OTHER = 0.01
+    EXPIRY_BEFORE_CLOSE_SEC = 5
     TOXIC_UTC_HOURS = {16, 19, 20}
     WS_BOOK_MAX_AGE_MS = 1200
-    MAX_BTC_AGE_MS = 2000
+    MAX_BTC_AGE_MS = 3000
     MIN_HOLD_BEFORE_CLOSE_SEC = 5
     EXPIRY_FORCE_CLOSE_HIGH_PRICE = 2.00
     EXPIRY_WAIT_SETTLE_MIN_PRICE = 0.60
@@ -178,6 +185,8 @@ class FiveMinuteUpDownTrader:
         self._running = False
         self._report_thread: Optional[threading.Thread] = None
         self._last_report_index: int = 0
+        self._startup_ts_sec: int = int(time.time())
+        self._last_report_ts_sec: int = self._startup_ts_sec
         # 预热过的市场信息缓存：slug -> {"market_id", "up_token", "down_token", "market_meta"}
         self._market_cache: Dict[str, Dict[str, Any]] = {}
         self._latency_metrics: Dict[str, List[float]] = {}
@@ -205,6 +214,22 @@ class FiveMinuteUpDownTrader:
                 logger.error("交易记录SQLite初始化失败，将仅保留内存/日志记录: %s", e)
         else:
             logger.warning("未配置 --trade-db-path，交易记录仅保留内存/日志")
+
+        # 与回测对齐的 DB tick 交叉验证读连接
+        self._tick_reader_conn: Optional[sqlite3.Connection] = None
+        if trade_db_path:
+            try:
+                self._tick_reader_conn = sqlite3.connect(
+                    trade_db_path,
+                    timeout=2.0,
+                    check_same_thread=False,
+                    isolation_level=None,
+                )
+                self._tick_reader_conn.execute("PRAGMA journal_mode=WAL;")
+                self._tick_reader_conn.execute("PRAGMA query_only=ON;")
+                logger.info("tick交叉验证读连接已初始化: %s", trade_db_path)
+            except Exception as e:
+                logger.warning("tick交叉验证读连接初始化失败，将跳过入场交叉验证: %s", e)
 
     def _should_emit_log(self, key: str, interval_sec: Optional[float] = None) -> bool:
         interval = (
@@ -520,6 +545,12 @@ class FiveMinuteUpDownTrader:
         if self._poly_watcher:
             self._poly_watcher.stop()
             self._poly_watcher = None
+        if self._tick_reader_conn is not None:
+            try:
+                self._tick_reader_conn.close()
+            except Exception:
+                pass
+            self._tick_reader_conn = None
         if self._trade_db is not None:
             self._trade_db.close()
 
@@ -681,8 +712,8 @@ class FiveMinuteUpDownTrader:
                 self._minute4_recorded = True
                 self._handle_minute4_direction_change()
 
-            # --- 第 5 分钟到期前 10 秒强制平仓（rel_sec >= 290）---
-            if rel_sec >= 290:
+            # --- 第 5 分钟到期前 N 秒强制平仓 ---
+            if rel_sec >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC):
                 self._handle_minute5_expiry()
 
     def _handle_entry_minute(self, projected_close: float, ms_to_close: int) -> None:
@@ -732,6 +763,11 @@ class FiveMinuteUpDownTrader:
             self.window_traded = True
             return
 
+        # DB tick 交叉验证：确保回测使用同一 DB 数据也会入场，避免误入
+        if not self._validate_entry_with_db_ticks(direction):
+            self.window_traded = True
+            return
+
         # 优先使用窗口开始时预热好的 market_slug
         if self.current_market_slug:
             market_slug = self.current_market_slug
@@ -752,6 +788,80 @@ class FiveMinuteUpDownTrader:
         except Exception as e:
             logger.error("开仓失败: %s", e)
             self.window_traded = True
+
+    def _validate_entry_with_db_ticks(self, direction: str) -> bool:
+        """与回测对齐：读取 btc_poly_1s_ticks 中同窗口的快照，验证 BTC 价差和方向也满足入场条件。
+
+        返回 True 表示 DB 数据也支持入场；False 表示回测不会入场，应跳过。
+        DB 不可用或缺少数据时回退为 True（不拦截）。
+        """
+        conn = self._tick_reader_conn
+        if conn is None or self.current_window_start_ms is None:
+            return True
+
+        window_start_sec = self.current_window_start_ms // 1000
+        market_slug = f"btc-updown-5m-{window_start_sec}"
+        trigger_sec = self.entry_decision_minute * 60 - self.entry_preclose_seconds
+        deadline_sec = self.entry_decision_minute * 60
+
+        try:
+            # open_price：窗口首条含 btc_price 的行（对齐回测 open_row）
+            row = conn.execute(
+                "SELECT btc_price FROM btc_poly_1s_ticks "
+                "WHERE market_slug = ? AND btc_price IS NOT NULL AND btc_price > 0 "
+                "ORDER BY ts_sec ASC LIMIT 1",
+                (market_slug,),
+            ).fetchone()
+            if row is None:
+                return True
+            db_open_price = float(row[0])
+
+            # decision_price：决策区间 [trigger, deadline) 的首条行（对齐回测 entry_signal_row_source=first）
+            trigger_ts = window_start_sec + trigger_sec
+            deadline_ts = window_start_sec + deadline_sec
+            row = conn.execute(
+                "SELECT btc_price FROM btc_poly_1s_ticks "
+                "WHERE market_slug = ? AND ts_sec >= ? AND ts_sec < ? "
+                "AND btc_price IS NOT NULL AND btc_price > 0 "
+                "ORDER BY ts_sec ASC LIMIT 1",
+                (market_slug, trigger_ts, deadline_ts),
+            ).fetchone()
+            if row is None:
+                # DB 可能还未写入决策秒的 tick，向前扩展 2 秒回退
+                row = conn.execute(
+                    "SELECT btc_price FROM btc_poly_1s_ticks "
+                    "WHERE market_slug = ? AND ts_sec >= ? AND ts_sec < ? "
+                    "AND btc_price IS NOT NULL AND btc_price > 0 "
+                    "ORDER BY ts_sec DESC LIMIT 1",
+                    (market_slug, trigger_ts - 2, trigger_ts),
+                ).fetchone()
+            if row is None:
+                logger.info("DB交叉验证: 决策区间无tick数据，跳过验证 slug=%s", market_slug)
+                return True
+            db_decision_price = float(row[0])
+
+            db_diff = db_decision_price - db_open_price
+            db_abs_diff = abs(db_diff)
+            db_direction = "up" if db_diff > 0 else "down"
+
+            if db_abs_diff <= self.min_direction_diff:
+                logger.info(
+                    "DB交叉验证拦截: DB价差不足 |%.2f - %.2f| = %.2f <= 阈值%.2f，回测不会入场",
+                    db_decision_price, db_open_price, db_abs_diff, self.min_direction_diff,
+                )
+                return False
+
+            if db_direction != direction:
+                logger.info(
+                    "DB交叉验证拦截: 方向不一致 live=%s db=%s (db_open=%.2f db_decision=%.2f)",
+                    direction, db_direction, db_open_price, db_decision_price,
+                )
+                return False
+
+            return True
+        except Exception as e:
+            logger.warning("DB交叉验证异常，跳过验证: %s", e)
+            return True
 
     def _handle_minute4_direction_change(self) -> None:
         if (
@@ -894,6 +1004,16 @@ class FiveMinuteUpDownTrader:
                 return
             self.position.last_best_bid = best_bid
 
+            # Once the window enters the expiry last-10-seconds phase,
+            # only run expiry close policy and skip TP/SL checks.
+            if (
+                self.current_window_start_ms is not None
+                and self.position.market_slug.split("-")[-1] == str(self.current_window_start_ms // 1000)
+                and int((time.time() * 1000 - self.current_window_start_ms) // 1000) >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC)
+            ):
+                self._handle_minute5_expiry()
+                return
+
             if best_bid <= self.position.stop_loss_price:
                 if self._should_emit_log(
                     key=f"sl_trigger:{self.position.market_slug}:{self.position.token_id}",
@@ -953,13 +1073,32 @@ class FiveMinuteUpDownTrader:
     def _report_loop(self) -> None:
         sender = EmailSender()
         while self._running:
-            time.sleep(self.report_interval_sec)
+            self._sleep_until_next_hour()
+            if not self._running:
+                break
+            try:
+                run_auto_redeem()
+            except Exception as e:
+                logger.error("自动赎回异常: %s", e)
+            time.sleep(60)  # 赎回后稍作停顿，避免与盈亏报告争抢API资源
             try:
                 self._send_pnl_report(sender)
             except Exception as e:
                 logger.error("发送盈亏报告异常: %s", e)
 
+    def _sleep_until_next_hour(self) -> None:
+        """睡眠到下一个整点后 1~2 分钟（随机偏移避免尖峰），期间每秒检查 _running。"""
+        import random
+        now = time.time()
+        current_hour_start = (int(now) // 3600) * 3600
+        next_hour_start = current_hour_start + 3600
+        offset = 30 + random.random() * 60  # 整点后 1~2 分钟
+        target = next_hour_start + offset
+        while self._running and time.time() < target:
+            time.sleep(1)
+
     def _send_pnl_report(self, sender: EmailSender) -> None:
+        now_ts = int(time.time())
         with self._lock:
             new_trades = self.trades[self._last_report_index :]
             self._last_report_index = len(self.trades)
@@ -975,7 +1114,27 @@ class FiveMinuteUpDownTrader:
             source_counts_index = dict(self._book_source_report_index)
             for key, val in self._book_source_counts.items():
                 self._book_source_report_index[key] = val
-        content, subject, hourly_pnl, cumulative_pnl = build_pnl_report_content_and_subject(
+            hourly_since_ts = self._last_report_ts_sec
+            cumulative_since_ts = self._startup_ts_sec
+            self._last_report_ts_sec = now_ts
+
+        # 从 Polymarket API 拉取真实盈亏
+        api_pnl_hourly = None
+        api_pnl_cumulative = None
+        try:
+            api_pnl_hourly = calculate_activity_pnl_from_trade_events(
+                since_ts=hourly_since_ts, until_ts=now_ts,
+            )
+        except Exception as e:
+            logger.warning("拉取本小时API实盘盈亏失败: %s", e)
+        try:
+            api_pnl_cumulative = calculate_activity_pnl_from_trade_events(
+                since_ts=cumulative_since_ts, until_ts=now_ts,
+            )
+        except Exception as e:
+            logger.warning("拉取累计API实盘盈亏失败: %s", e)
+
+        content, subject = build_pnl_report_content_and_subject(
             report_interval_sec=self.report_interval_sec,
             new_trades=new_trades,
             all_trades=all_trades,
@@ -984,6 +1143,8 @@ class FiveMinuteUpDownTrader:
             source_counts_snapshot=source_counts_snapshot,
             source_counts_index=source_counts_index,
             format_latency_summary=self._format_latency_summary,
+            api_pnl_hourly=api_pnl_hourly,
+            api_pnl_cumulative=api_pnl_cumulative,
         )
 
         if not TO_EMAIL:

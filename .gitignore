@@ -17,3 +17,4 @@ last_report.json
 price_warn_config.py
 logs/
 *.json
+*.sql
