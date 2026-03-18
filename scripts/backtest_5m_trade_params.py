@@ -56,17 +56,17 @@ LAST_NO_FILL_SETTLEMENT_SEC = WINDOW_SECONDS - 10
 EXPIRY_TRIGGER_SEC = WINDOW_SECONDS - 10
 MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
 MAX_ENTRY_SLIPPAGE_BPS = 120.0
-FALLBACK_LEVEL_SIZE = 1_000_000.0
+FALLBACK_LEVEL_SIZE = 22_000.0
 DEFAULT_SIZE_TICK = "0.01"
 MIN_DUST_SIZE = 0.02
 CLOSE_RETRY_DELAY_SEC = 5
 MAX_CLOSE_RETRIES = 3
-WS_BOOK_MAX_AGE_MS = 2000
+WS_BOOK_MAX_AGE_MS = 3000
 HTTP_QUOTE_MAX_AGE_MS = 1200
 DEFAULT_ENTRY_QUEUE_FILL_RATIO = 1
 DEFAULT_EXIT_QUEUE_FILL_RATIO = 1
 DEFAULT_UNFILLED_PENALTY_BPS = 800.0
-DEFAULT_ENTRY_SUBMIT_LATENCY_MS = 2000
+DEFAULT_ENTRY_SUBMIT_LATENCY_MS = 1000
 DEFAULT_EXIT_SUBMIT_LATENCY_MS = 1000
 DEFAULT_MIN_WINDOW_QUALITY = 0.0
 WINDOW_SECONDS_EXPECTED = WINDOW_SECONDS
@@ -131,6 +131,7 @@ class WindowRow:
     minimum_tick_size: Optional[str] = None
     up_fee_rate_bps: Optional[float] = None
     down_fee_rate_bps: Optional[float] = None
+    winning_direction: Optional[str] = None
 
 
 @dataclass
@@ -589,7 +590,7 @@ def _get_market_context(
     size_tick = str(row.minimum_tick_size or default_size_tick)
     up_fee_bps = float(_to_float(row.up_fee_rate_bps) or default_fee_bps)
     down_fee_bps = float(_to_float(row.down_fee_rate_bps) or default_fee_bps)
-    winning_direction: Optional[str] = None
+    winning_direction: Optional[str] = row.winning_direction
 
     def _extract_winning_direction(market_payload: Dict[str, Any]) -> Optional[str]:
         token_ids = market_payload.get("token_id") or []
@@ -927,6 +928,7 @@ def _find_row_after_latency(
     base_row: WindowRow,
     latency_ms: int,
     require_btc: bool = False,
+    skip_ask_anomaly: bool = False,
 ) -> Optional[WindowRow]:
     latency_sec = int(math.ceil(max(0, int(latency_ms)) / 1000.0))
     target_rel = base_row.rel_sec + latency_sec
@@ -935,6 +937,11 @@ def _find_row_after_latency(
             continue
         if require_btc and r.btc_price is None:
             continue
+        if skip_ask_anomaly:
+            up_a = r.up_ask if r.up_ask is not None else 0.0
+            dn_a = r.down_ask if r.down_ask is not None else 0.0
+            if up_a + dn_a > 1.5:
+                continue
         return r
     return None
 
@@ -1185,6 +1192,7 @@ def _simulate_window(
         base_row=entry_row,
         latency_ms=entry_submit_latency_ms,
         require_btc=True,
+        skip_ask_anomaly=True,
     )
     if entry_exec_row is None:
         return None, "missing_entry_exec_row", None
@@ -1217,6 +1225,22 @@ def _simulate_window(
         default_fee_bps=default_fee_bps,
         resolve_metadata=resolve_market_metadata,
     )
+    # Fallback: derive winning_direction from window open/close BTC prices
+    if market_ctx.winning_direction not in ("up", "down") and open_row and open_row.btc_price is not None:
+        last_btc_rows = [r for r in rows if r.btc_price is not None]
+        if last_btc_rows:
+            close_price = last_btc_rows[-1].btc_price
+            if close_price is not None and close_price != open_row.btc_price:
+                derived = "up" if close_price > open_row.btc_price else "down"
+                market_ctx = WindowMarketContext(
+                    market_slug=market_ctx.market_slug,
+                    up_token=market_ctx.up_token,
+                    down_token=market_ctx.down_token,
+                    size_tick=market_ctx.size_tick,
+                    up_fee_bps=market_ctx.up_fee_bps,
+                    down_fee_bps=market_ctx.down_fee_bps,
+                    winning_direction=derived,
+                )
     fee_bps = market_ctx.up_fee_bps if direction == "up" else market_ctx.down_fee_bps
     exec_ask = entry_exec_row.up_ask if direction == "up" else entry_exec_row.down_ask
     exec_ask_event_ms = entry_exec_row.up_event_ms if direction == "up" else entry_exec_row.down_event_ms
@@ -1526,7 +1550,8 @@ def _iter_window_rows(
             down_best_ask,
             down_event_ms,
             {_col_or_null('down_bids_5')},
-            {_col_or_null('down_asks_5')}
+            {_col_or_null('down_asks_5')},
+            {_col_or_null('winning_direction')}
         FROM btc_poly_1s_ticks
         WHERE {' AND '.join(where_clauses)}
         ORDER BY window_start_ms ASC, ts_sec ASC
@@ -1576,6 +1601,7 @@ def _iter_window_rows(
                 down_event_ms=(int(row[22]) if row[22] is not None else None),
                 down_bids_5=_parse_levels_json(row[23]),
                 down_asks_5=_parse_levels_json(row[24]),
+                winning_direction=(str(row[25]) if row[25] is not None else None),
             )
         )
 
@@ -1932,7 +1958,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-btc-age-ms",
         type=int,
-        default=2000,
+        default=3000,
         help="Max allowed BTC snapshot age at entry/decision checks (<=0 disables freshness filter)",
     )
     parser.add_argument(

@@ -246,11 +246,14 @@ def open_position(trader: Any, market_slug: str, direction: str) -> None:
         logger.info("dry-run 模式：不实际下单，仅模拟持仓与盈亏")
         order_id = None
     else:
+        # 应用建仓滑点：在 worst_price 基础上加价，确保尽快抢到仓位
+        sweep_entry_price = min(0.99, entry_price + self.ENTRY_SWEEP_SLIPPAGE)
+        logger.info("应用建仓滑点: 预估价=%.4f 实际建仓挂单价(sweep)=%.4f", entry_price, sweep_entry_price)
         submit_t0 = time.perf_counter()
         order_id = buy_order(
             market_id,
             token_id,
-            entry_price,
+            sweep_entry_price,
             size,
             market_meta=market_meta,
         )
