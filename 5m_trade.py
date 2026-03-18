@@ -51,6 +51,7 @@ from services.five_minute_trade.position_close_ops import (
     schedule_position_balance_confirmation,
     schedule_post_close_balance_check,
 )
+from services.five_minute_trade.auto_redeem import run_auto_redeem
 from services.five_minute_trade.reporting import build_pnl_report_content_and_subject
 from services.five_minute_trade.trade_db import TradeSQLiteStore
 from services.five_minute_trade.watchers import (
@@ -1069,11 +1070,29 @@ class FiveMinuteUpDownTrader:
     def _report_loop(self) -> None:
         sender = EmailSender()
         while self._running:
-            time.sleep(self.report_interval_sec)
+            self._sleep_until_next_hour()
+            if not self._running:
+                break
+            try:
+                run_auto_redeem()
+            except Exception as e:
+                logger.error("自动赎回异常: %s", e)
+            time.sleep(60)  # 赎回后稍作停顿，避免与盈亏报告争抢API资源
             try:
                 self._send_pnl_report(sender)
             except Exception as e:
                 logger.error("发送盈亏报告异常: %s", e)
+
+    def _sleep_until_next_hour(self) -> None:
+        """睡眠到下一个整点后 1~2 分钟（随机偏移避免尖峰），期间每秒检查 _running。"""
+        import random
+        now = time.time()
+        current_hour_start = (int(now) // 3600) * 3600
+        next_hour_start = current_hour_start + 3600
+        offset = 30 + random.random() * 60  # 整点后 1~2 分钟
+        target = next_hour_start + offset
+        while self._running and time.time() < target:
+            time.sleep(1)
 
     def _send_pnl_report(self, sender: EmailSender) -> None:
         now_ts = int(time.time())
