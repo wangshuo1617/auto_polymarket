@@ -7,9 +7,9 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$PROJECT_ROOT"
 
-DEFAULT_STRATEGY="m=4,pre=9,diff=30,max=0.95,stake=5,hold=60,tp_cap=0.97,tp_val_cap=0.15,sl_ratio=0.9"
+DEFAULT_STRATEGY="m=4,pre=9,diff=1,max=0.99,stake=5,hold=120,tp_cap=0.99,tp_val_cap=0.5,sl_ratio=2,cross=3,ud_diff=0.05"
 NOW_TS="$(date +%s)"
-DEFAULT_SINCE_TS="1773654509"
+DEFAULT_SINCE_TS="1773825462"
 DEFAULT_UNTIL_TS=""
 
 FAST_MODE="false"

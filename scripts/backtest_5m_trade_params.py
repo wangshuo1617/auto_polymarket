@@ -86,6 +86,8 @@ class ParamSet:
     tp_price_cap: float
     tp_value_cap: float
     sl_to_tp_ratio: float
+    max_btc_cross_count: int = DEFAULT_MAX_BTC_CROSS_COUNT
+    min_entry_updown_diff: float = DEFAULT_MIN_ENTRY_UPDOWN_DIFF
 
     def key(self) -> str:
         return (
@@ -93,7 +95,8 @@ class ParamSet:
             f"diff={self.min_direction_diff:g},max={self.max_entry_price:g},"
             f"stake={self.stake_usd:g},hold={self.min_hold_before_close_sec},"
             f"tp_cap={self.tp_price_cap:g},tp_val_cap={self.tp_value_cap:g},"
-            f"sl_ratio={self.sl_to_tp_ratio:g}"
+            f"sl_ratio={self.sl_to_tp_ratio:g},"
+            f"cross={self.max_btc_cross_count},ud_diff={self.min_entry_updown_diff:g}"
         )
 
 
@@ -208,8 +211,7 @@ class SimulationConfig:
     entry_price_gate_source: str
     entry_signal_row_source: str
     expiry_win_haircut: float
-    max_btc_cross_count: int
-    min_entry_updown_diff: float
+
 
 
 _WORKER_WINDOWS_DATA: Optional[Sequence[WindowPrepared]] = None
@@ -1146,8 +1148,6 @@ def _simulate_window(
     min_window_quality: float,
     entry_price_gate_source: str,
     expiry_win_haircut: float = 0.0,
-    max_btc_cross_count: int = DEFAULT_MAX_BTC_CROSS_COUNT,
-    min_entry_updown_diff: float = DEFAULT_MIN_ENTRY_UPDOWN_DIFF,
 ) -> Tuple[Optional[WindowTrade], Optional[str], Optional[TradeEventPair]]:
     rows = prepared.rows
     if not rows:
@@ -1186,6 +1186,8 @@ def _simulate_window(
         return None, "stale_entry_btc", None
 
     # BTC 越过开盘价次数检查
+    max_btc_cross_count = params.max_btc_cross_count
+    min_entry_updown_diff = params.min_entry_updown_diff
     if max_btc_cross_count > 0:
         _cross_count = 0
         _last_side: Optional[str] = None
@@ -1658,9 +1660,11 @@ def _build_param_grid(args: argparse.Namespace) -> List[ParamSet]:
     tp_price_cap_grid = _parse_float_grid(args.tp_price_cap_grid)
     tp_value_cap_grid = _parse_float_grid(args.tp_value_cap_grid)
     sl_to_tp_ratio_grid = _parse_float_grid(args.sl_to_tp_ratio_grid)
+    max_btc_cross_count_grid = _parse_int_grid(args.max_btc_cross_count_grid)
+    min_entry_updown_diff_grid = _parse_float_grid(args.min_entry_updown_diff_grid)
 
     params: List[ParamSet] = []
-    for m, pre, diff, max_entry, stake, hold, tp_cap, tp_value_cap, sl_ratio in itertools.product(
+    for m, pre, diff, max_entry, stake, hold, tp_cap, tp_value_cap, sl_ratio, cross_count, updown_diff in itertools.product(
         entry_minute_grid,
         preclose_grid,
         diff_grid,
@@ -1670,6 +1674,8 @@ def _build_param_grid(args: argparse.Namespace) -> List[ParamSet]:
         tp_price_cap_grid,
         tp_value_cap_grid,
         sl_to_tp_ratio_grid,
+        max_btc_cross_count_grid,
+        min_entry_updown_diff_grid,
     ):
         if m < 1 or m > 4:
             continue
@@ -1700,6 +1706,8 @@ def _build_param_grid(args: argparse.Namespace) -> List[ParamSet]:
                 tp_price_cap=tp_cap,
                 tp_value_cap=tp_value_cap,
                 sl_to_tp_ratio=sl_ratio,
+                max_btc_cross_count=cross_count,
+                min_entry_updown_diff=updown_diff,
             )
         )
 
@@ -1848,8 +1856,6 @@ def _evaluate_one_param(
             min_window_quality=sim_config.min_window_quality,
             entry_price_gate_source=sim_config.entry_price_gate_source,
             expiry_win_haircut=sim_config.expiry_win_haircut,
-            max_btc_cross_count=sim_config.max_btc_cross_count,
-            min_entry_updown_diff=sim_config.min_entry_updown_diff,
         )
         if trade is None:
             st.add_skip(skip_reason or "unknown")
@@ -2036,16 +2042,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Haircut applied to expiry winning side (1.0 -> 1.0 - haircut) for conservative backtest.",
     )
     parser.add_argument(
-        "--max-btc-cross-count",
-        type=int,
-        default=DEFAULT_MAX_BTC_CROSS_COUNT,
-        help="Max BTC open-price crossover count before skipping entry (default 5, 0 disables).",
+        "--max-btc-cross-count-grid",
+        type=str,
+        default=str(DEFAULT_MAX_BTC_CROSS_COUNT),
+        help="Grid of max BTC open-price crossover counts (default '5', 0 disables).",
     )
     parser.add_argument(
-        "--min-entry-updown-diff",
-        type=float,
-        default=DEFAULT_MIN_ENTRY_UPDOWN_DIFF,
-        help="Min |up_ask - down_ask| spread at entry; skip if narrower (default 0.30, 0 disables).",
+        "--min-entry-updown-diff-grid",
+        type=str,
+        default=str(DEFAULT_MIN_ENTRY_UPDOWN_DIFF),
+        help="Grid of min |up_ask - down_ask| spread at entry (default '0.3', 0 disables).",
     )
     parser.add_argument(
         "--sort-by",
@@ -2188,8 +2194,6 @@ def main() -> None:
         entry_price_gate_source=str(args.entry_price_gate_source),
         entry_signal_row_source=str(args.entry_signal_row_source),
         expiry_win_haircut=float(args.expiry_win_haircut),
-        max_btc_cross_count=int(args.max_btc_cross_count),
-        min_entry_updown_diff=float(args.min_entry_updown_diff),
     )
 
     started_at = time.time()
