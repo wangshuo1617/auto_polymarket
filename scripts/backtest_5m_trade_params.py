@@ -58,6 +58,7 @@ MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
 MAX_ENTRY_SLIPPAGE_BPS = 120.0
 FALLBACK_LEVEL_SIZE = 22_000.0
 DEFAULT_SIZE_TICK = "0.01"
+DEFAULT_EXPIRY_WIN_HAIRCUT = 0.02
 MIN_DUST_SIZE = 0.02
 CLOSE_RETRY_DELAY_SEC = 5
 MAX_CLOSE_RETRIES = 3
@@ -69,6 +70,8 @@ DEFAULT_UNFILLED_PENALTY_BPS = 800.0
 DEFAULT_ENTRY_SUBMIT_LATENCY_MS = 1000
 DEFAULT_EXIT_SUBMIT_LATENCY_MS = 1000
 DEFAULT_MIN_WINDOW_QUALITY = 0.0
+DEFAULT_MAX_BTC_CROSS_COUNT = 5
+DEFAULT_MIN_ENTRY_UPDOWN_DIFF = 0.30
 WINDOW_SECONDS_EXPECTED = WINDOW_SECONDS
 
 
@@ -204,6 +207,9 @@ class SimulationConfig:
     min_window_quality: float
     entry_price_gate_source: str
     entry_signal_row_source: str
+    expiry_win_haircut: float
+    max_btc_cross_count: int
+    min_entry_updown_diff: float
 
 
 _WORKER_WINDOWS_DATA: Optional[Sequence[WindowPrepared]] = None
@@ -694,10 +700,16 @@ def _get_market_context(
     return ctx
 
 
-def _resolution_price_from_winner(position_direction: str, winning_direction: Optional[str]) -> Optional[float]:
+def _resolution_price_from_winner(
+    position_direction: str,
+    winning_direction: Optional[str],
+    win_haircut: float = 0.0,
+) -> Optional[float]:
     if winning_direction not in {"up", "down"}:
         return None
-    return 1.0 if position_direction == winning_direction else 0.0
+    if position_direction == winning_direction:
+        return 1.0 - win_haircut
+    return 0.0
 
 
 def _row_levels_for_side(
@@ -1133,6 +1145,9 @@ def _simulate_window(
     window_quality: WindowQuality,
     min_window_quality: float,
     entry_price_gate_source: str,
+    expiry_win_haircut: float = 0.0,
+    max_btc_cross_count: int = DEFAULT_MAX_BTC_CROSS_COUNT,
+    min_entry_updown_diff: float = DEFAULT_MIN_ENTRY_UPDOWN_DIFF,
 ) -> Tuple[Optional[WindowTrade], Optional[str], Optional[TradeEventPair]]:
     rows = prepared.rows
     if not rows:
@@ -1169,6 +1184,35 @@ def _simulate_window(
     entry_btc_age = _age_ms_at_row(entry_row.ts_sec, entry_row.btc_event_ms)
     if not _is_fresh(entry_btc_age, max_btc_age_ms):
         return None, "stale_entry_btc", None
+
+    # BTC 越过开盘价次数检查
+    if max_btc_cross_count > 0:
+        _cross_count = 0
+        _last_side: Optional[str] = None
+        for _r in rows:
+            if _r.ts_sec > entry_row.ts_sec:
+                break
+            if _r.btc_price is None:
+                continue
+            if _r.btc_price > open_row.btc_price:
+                _s = "above"
+            elif _r.btc_price < open_row.btc_price:
+                _s = "below"
+            else:
+                continue
+            if _last_side is not None and _s != _last_side:
+                _cross_count += 1
+            _last_side = _s
+        if _cross_count > max_btc_cross_count:
+            return None, "btc_cross_count_exceeded", None
+
+    # UP/DOWN token 价差检查
+    if min_entry_updown_diff > 0:
+        _e_up_ask = _to_positive_float(entry_row.up_ask)
+        _e_dn_ask = _to_positive_float(entry_row.down_ask)
+        if _e_up_ask is not None and _e_dn_ask is not None:
+            if abs(_e_up_ask - _e_dn_ask) < min_entry_updown_diff:
+                return None, "updown_spread_too_narrow", None
 
     diff = entry_row.btc_price - open_row.btc_price
     abs_diff = abs(diff)
@@ -1275,6 +1319,7 @@ def _simulate_window(
             resolution_price = _resolution_price_from_winner(
                 position_direction=direction,
                 winning_direction=market_ctx.winning_direction,
+                win_haircut=expiry_win_haircut,
             )
             if resolution_price is None:
                 return None, "missing_expiry_resolution", None
@@ -1321,6 +1366,7 @@ def _simulate_window(
             resolution_price = _resolution_price_from_winner(
                 position_direction=direction,
                 winning_direction=market_ctx.winning_direction,
+                win_haircut=expiry_win_haircut,
             )
             if resolution_price is None:
                 return None, "missing_expiry_resolution", None
@@ -1801,6 +1847,9 @@ def _evaluate_one_param(
             window_quality=window_quality,
             min_window_quality=sim_config.min_window_quality,
             entry_price_gate_source=sim_config.entry_price_gate_source,
+            expiry_win_haircut=sim_config.expiry_win_haircut,
+            max_btc_cross_count=sim_config.max_btc_cross_count,
+            min_entry_updown_diff=sim_config.min_entry_updown_diff,
         )
         if trade is None:
             st.add_skip(skip_reason or "unknown")
@@ -1981,6 +2030,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Skip windows with quality score below threshold (0-1).",
     )
     parser.add_argument(
+        "--expiry-win-haircut",
+        type=float,
+        default=DEFAULT_EXPIRY_WIN_HAIRCUT,
+        help="Haircut applied to expiry winning side (1.0 -> 1.0 - haircut) for conservative backtest.",
+    )
+    parser.add_argument(
+        "--max-btc-cross-count",
+        type=int,
+        default=DEFAULT_MAX_BTC_CROSS_COUNT,
+        help="Max BTC open-price crossover count before skipping entry (default 5, 0 disables).",
+    )
+    parser.add_argument(
+        "--min-entry-updown-diff",
+        type=float,
+        default=DEFAULT_MIN_ENTRY_UPDOWN_DIFF,
+        help="Min |up_ask - down_ask| spread at entry; skip if narrower (default 0.30, 0 disables).",
+    )
+    parser.add_argument(
         "--sort-by",
         choices=["total_pnl", "win_rate", "profit_factor", "max_drawdown", "trades"],
         default="total_pnl",
@@ -2120,6 +2187,9 @@ def main() -> None:
         min_window_quality=float(args.min_window_quality),
         entry_price_gate_source=str(args.entry_price_gate_source),
         entry_signal_row_source=str(args.entry_signal_row_source),
+        expiry_win_haircut=float(args.expiry_win_haircut),
+        max_btc_cross_count=int(args.max_btc_cross_count),
+        min_entry_updown_diff=float(args.min_entry_updown_diff),
     )
 
     started_at = time.time()

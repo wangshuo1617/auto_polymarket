@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from config import SQLITE_DB_PATH
 
 from data.polymarket import (
+	client,
 	get_event_token_id,
 	get_market_metadata,
 	get_order_book,
@@ -561,8 +562,18 @@ class BTC1sMarketMonitor:
 			if row is not None:
 				self._writer.put(row)
 
+	# -- winning_direction resolution -------------------------------------------
+
+	RESOLUTION_VERIFY_DELAYS = (300, 900)  # seconds after window end to verify
+
 	def _resolve_previous_window(self, prev_window_start_ms: int) -> None:
-		"""Compute winning_direction for the previous window and UPDATE its rows."""
+		"""Compute winning_direction for the previous window and UPDATE its rows.
+
+		1. Immediate pass: derive from BTC open/close prices (fast, available now).
+		2. Delayed pass: schedule API verification to get Polymarket's actual
+		   resolution (Chainlink oracle) and overwrite if it differs.
+	"""
+		# --- immediate BTC-price-based resolution ---
 		try:
 			conn = sqlite3.connect(self.db_path)
 			cur = conn.execute(
@@ -596,6 +607,104 @@ class BTC1sMarketMonitor:
 			conn.close()
 		except Exception:
 			logger.exception("回填 winning_direction 失败 window_start_ms=%d", prev_window_start_ms)
+
+		# --- schedule delayed API verification ---
+		slug = f"btc-updown-5m-{prev_window_start_ms // 1000}"
+		cached = self._market_cache.get(slug)
+		condition_id = cached.get("market_id") if cached else None
+		self._schedule_resolution_verify(prev_window_start_ms, condition_id, attempt=0)
+
+	def _schedule_resolution_verify(
+		self, window_start_ms: int, condition_id: Optional[str], attempt: int,
+	) -> None:
+		"""Schedule a delayed API call to verify / correct winning_direction."""
+		if attempt >= len(self.RESOLUTION_VERIFY_DELAYS):
+			return
+		delay = self.RESOLUTION_VERIFY_DELAYS[attempt]
+		t = threading.Timer(
+			delay,
+			self._verify_resolution_from_api,
+			args=(window_start_ms, condition_id, attempt),
+		)
+		t.daemon = True
+		t.start()
+
+	def _verify_resolution_from_api(
+		self, window_start_ms: int, condition_id: Optional[str], attempt: int,
+	) -> None:
+		"""Query Polymarket CLOB API for actual market resolution and update DB."""
+		try:
+			# Resolve condition_id if not cached
+			if not condition_id:
+				slug = f"btc-updown-5m-{window_start_ms // 1000}"
+				info = get_event_token_id(slug)
+				markets = (info or {}).get("markets") or []
+				if markets:
+					condition_id = str(markets[0].get("market_id", ""))
+				if not condition_id:
+					logger.warning(
+						"无法获取 condition_id，跳过 API 验证 window_start_ms=%d",
+						window_start_ms,
+					)
+					return
+
+			market = client.get_market(condition_id)
+			tokens = market.get("tokens", []) if isinstance(market, dict) else []
+
+			api_winner: Optional[str] = None
+			for tok in tokens:
+				if not isinstance(tok, dict):
+					continue
+				if tok.get("winner") is True:
+					outcome = str(tok.get("outcome", "")).lower()
+					if outcome in ("up", "down"):
+						api_winner = outcome
+						break
+
+			if api_winner is None:
+				# Market not yet resolved — retry if attempts remain
+				logger.info(
+					"API 尚未返回结算结果 window_start_ms=%d attempt=%d，稍后重试",
+					window_start_ms, attempt,
+				)
+				self._schedule_resolution_verify(window_start_ms, condition_id, attempt + 1)
+				return
+
+			# Update DB — overwrite all rows for this window
+			conn = sqlite3.connect(self.db_path)
+			cur = conn.execute(
+				"SELECT winning_direction FROM btc_poly_1s_ticks "
+				"WHERE window_start_ms = ? LIMIT 1",
+				(window_start_ms,),
+			)
+			row = cur.fetchone()
+			old_winner = row[0] if row else None
+
+			if old_winner != api_winner:
+				conn.execute(
+					"UPDATE btc_poly_1s_ticks SET winning_direction = ? "
+					"WHERE window_start_ms = ?",
+					(api_winner, window_start_ms),
+				)
+				conn.commit()
+				logger.warning(
+					"API 验证修正 winning_direction: %s -> %s window_start_ms=%d",
+					old_winner, api_winner, window_start_ms,
+				)
+			else:
+				logger.info(
+					"API 验证 winning_direction=%s 一致 window_start_ms=%d",
+					api_winner, window_start_ms,
+				)
+			conn.close()
+
+		except Exception:
+			logger.exception(
+				"API 验证 winning_direction 失败 window_start_ms=%d attempt=%d",
+				window_start_ms, attempt,
+			)
+			# Still retry on failure
+			self._schedule_resolution_verify(window_start_ms, condition_id, attempt + 1)
 
 	def _ensure_window_and_market(self, now_ms: int) -> None:
 		window_start_ms = (now_ms // self.WINDOW_MS) * self.WINDOW_MS

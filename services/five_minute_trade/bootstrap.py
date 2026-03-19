@@ -133,6 +133,18 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         help="最短持仓保护时间（秒，默认 5；0 表示关闭保护）",
     )
     parser.add_argument(
+        "--max-btc-cross-count",
+        type=int,
+        default=5,
+        help="窗口内 BTC 价格越过开盘价的最大次数；超过则跳过入场（默认 5，0 表示关闭）",
+    )
+    parser.add_argument(
+        "--min-entry-updown-diff",
+        type=float,
+        default=0.30,
+        help="入场时 UP/DOWN token 的最小 ask 价差；低于则跳过入场（默认 0.30，0 表示关闭）",
+    )
+    parser.add_argument(
         "--toxic-utc-hours",
         type=str,
         default="16,19,20",
@@ -161,6 +173,8 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         tp_value_cap=args.tp_value_cap,
         sl_to_tp_ratio=args.sl_to_tp_ratio,
         min_hold_before_close_sec=args.min_hold_before_close_sec,
+        max_btc_cross_count=args.max_btc_cross_count,
+        min_entry_updown_diff=args.min_entry_updown_diff,
         toxic_utc_hours=args.toxic_utc_hours,
         trade_db_path=args.trade_db_path,
         dry_run=args.dry_run,

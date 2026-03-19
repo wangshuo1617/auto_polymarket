@@ -22,9 +22,11 @@ TAKE_PROFIT_SPREAD="${8:-0.15}"
 STOP_LOSS_SPREAD="${9:--0.20}"
 TRADE_DB_PATH="${11:-}"
 TOXIC_UTC_HOURS="${15-""}"
+MAX_BTC_CROSS_COUNT="${16:-5}"
+MIN_ENTRY_UPDOWN_DIFF="${17:-0.30}"
 LOG_FILE="logs/5m_trade.stdout.log"
 PID_FILE="logs/5m_trade.pid"
-USAGE="./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio] [toxic_utc_hours_csv]"
+USAGE="./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio] [toxic_utc_hours_csv] [max_btc_cross_count] [min_entry_updown_diff]"
 
 print_usage() {
   echo "用法: $USAGE"
@@ -110,6 +112,18 @@ if ! [[ "$SL_TO_TP_RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($SL_
   exit 1
 fi
 
+if ! [[ "$MAX_BTC_CROSS_COUNT" =~ ^[0-9]+$ ]]; then
+  echo "❌ max_btc_cross_count 必须是大于等于 0 的整数"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$MIN_ENTRY_UPDOWN_DIFF" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ min_entry_updown_diff 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+
 if [ -n "$TOXIC_UTC_HOURS" ]; then
   IFS=',' read -r -a TOXIC_HOUR_PARTS <<< "$TOXIC_UTC_HOURS"
   for hour_part in "${TOXIC_HOUR_PARTS[@]}"; do
@@ -162,6 +176,8 @@ else
 fi
 echo "兼容参数(当前策略未使用): take_profit_spread=$TAKE_PROFIT_SPREAD stop_loss_spread=$STOP_LOSS_SPREAD"
 echo "最短持仓保护秒数: $MIN_HOLD_BEFORE_CLOSE_SEC"
+echo "BTC越过开盘价最大次数: $MAX_BTC_CROSS_COUNT"
+echo "UP/DOWN最小价差: $MIN_ENTRY_UPDOWN_DIFF"
 if [ -n "$TRADE_DB_PATH" ]; then
   echo "交易数据库路径: $TRADE_DB_PATH"
 else
@@ -196,6 +212,8 @@ CMD=(
   --sl-to-tp-ratio "$SL_TO_TP_RATIO"
   --toxic-utc-hours "$TOXIC_UTC_HOURS"
   --min-hold-before-close-sec "$MIN_HOLD_BEFORE_CLOSE_SEC"
+  --max-btc-cross-count "$MAX_BTC_CROSS_COUNT"
+  --min-entry-updown-diff "$MIN_ENTRY_UPDOWN_DIFF"
 )
 
 if [ -n "$TRADE_DB_PATH" ]; then

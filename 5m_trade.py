@@ -76,7 +76,9 @@ def _build_startup_strategy_signature(args: Any) -> str:
         f"hold={args.min_hold_before_close_sec},"
         f"tp_cap={_fmt_num(args.tp_price_cap)},"
         f"tp_val_cap={_fmt_num(args.tp_value_cap)},"
-        f"sl_ratio={_fmt_num(args.sl_to_tp_ratio)}"
+        f"sl_ratio={_fmt_num(args.sl_to_tp_ratio)},"
+        f"cross={args.max_btc_cross_count},"
+        f"ud_diff={_fmt_num(args.min_entry_updown_diff)}"
     )
 
 
@@ -107,6 +109,9 @@ class FiveMinuteUpDownTrader:
     TOXIC_UTC_HOURS = {16, 19, 20}
     WS_BOOK_MAX_AGE_MS = 1200
     MAX_BTC_AGE_MS = 3000
+    MAX_ENTRY_RETRIES = 2
+    MAX_BTC_CROSS_COUNT = 5
+    MIN_ENTRY_UPDOWN_DIFF = 0.30
     MIN_HOLD_BEFORE_CLOSE_SEC = 5
     EXPIRY_FORCE_CLOSE_HIGH_PRICE = 2.00
     EXPIRY_WAIT_SETTLE_MIN_PRICE = 0.60
@@ -126,6 +131,8 @@ class FiveMinuteUpDownTrader:
         tp_value_cap: float = TP_VALUE_CAP,
         sl_to_tp_ratio: float = SL_TO_TP_RATIO,
         min_hold_before_close_sec: int = MIN_HOLD_BEFORE_CLOSE_SEC,
+        max_btc_cross_count: int = MAX_BTC_CROSS_COUNT,
+        min_entry_updown_diff: float = MIN_ENTRY_UPDOWN_DIFF,
         toxic_utc_hours: Optional[str] = None,
         trade_db_path: Optional[str] = None,
         dry_run: bool = False,
@@ -157,6 +164,8 @@ class FiveMinuteUpDownTrader:
         self.entry_preclose_seconds = entry_preclose_seconds
         self.min_direction_diff = min_direction_diff
         self.min_hold_before_close_sec = int(min_hold_before_close_sec)
+        self.max_btc_cross_count = int(max_btc_cross_count)
+        self.min_entry_updown_diff = float(min_entry_updown_diff)
         self.toxic_utc_hours = self._parse_toxic_utc_hours(toxic_utc_hours)
 
         self._lock = threading.RLock()
@@ -170,6 +179,9 @@ class FiveMinuteUpDownTrader:
         self.window_open_price: Optional[float] = None
         self.window_traded: bool = False
         self.preclose_entry_triggered: bool = False
+        self._entry_attempt_count: int = 0
+        self._btc_cross_count: int = 0
+        self._last_btc_side: Optional[str] = None
         self.minute_closes: Dict[int, float] = {}
         self.latest_btc_price: Optional[float] = None
         self.latest_btc_price_event_ms: Optional[int] = None
@@ -620,13 +632,13 @@ class FiveMinuteUpDownTrader:
             self.latest_btc_price_event_ms = event_ms
 
     def _clock_loop(self) -> None:
-        """时间驱动主循环，每 500ms 检查一次系统时钟，对齐回测的逐秒快照逻辑。"""
+        """时间驱动主循环，每 1s 检查一次系统时钟，对齐回测的逐秒快照逻辑。"""
         while self._running:
             try:
                 self._clock_tick()
             except Exception as e:
                 logger.error("clock_tick 异常: %s", e)
-            time.sleep(0.5)
+            time.sleep(1.0)
 
     def _clock_tick(self) -> None:
         """基于系统绝对时间驱动所有窗口管理和开仓判定，取代原有的事件驱动 _on_kline。"""
@@ -650,6 +662,9 @@ class FiveMinuteUpDownTrader:
                 self.window_open_price = btc_price
                 self.window_traded = False
                 self.preclose_entry_triggered = False
+                self._entry_attempt_count = 0
+                self._btc_cross_count = 0
+                self._last_btc_side = None
                 self.minute_closes = {}
                 self._minute3_recorded = False
                 self._minute4_recorded = False
@@ -673,6 +688,19 @@ class FiveMinuteUpDownTrader:
                         e,
                     )
 
+            # --- BTC 越过开盘价计数（用于入场过滤）---
+            if self.window_open_price is not None:
+                if btc_price > self.window_open_price:
+                    _side = "above"
+                elif btc_price < self.window_open_price:
+                    _side = "below"
+                else:
+                    _side = None
+                if _side is not None and self._last_btc_side is not None and _side != self._last_btc_side:
+                    self._btc_cross_count += 1
+                if _side is not None:
+                    self._last_btc_side = _side
+
             # --- 时钟驱动入场判定（对齐回测 decision_row 时间窗口）---
             entry_trigger_sec = self.entry_decision_minute * 60 - self.entry_preclose_seconds
             entry_deadline_sec = self.entry_decision_minute * 60
@@ -682,21 +710,24 @@ class FiveMinuteUpDownTrader:
                 and entry_trigger_sec <= rel_sec < entry_deadline_sec
             ):
                 # BTC 价格新鲜度检查（对齐回测 max_btc_age_ms）
-                btc_age_ms = now_ms - (self.latest_btc_price_event_ms or 0)
+                # 回测用 ts_sec*1000（整秒对齐）计算 age，实盘也对齐到整秒，
+                # 避免 500ms 轮询偏移导致 age 虚高而误判 stale。
+                aligned_ms = (now_ms // 1000) * 1000
+                btc_age_ms = aligned_ms - (self.latest_btc_price_event_ms or 0)
                 if btc_age_ms > self.MAX_BTC_AGE_MS:
                     logger.warning(
-                        "Skip entry: BTC price stale (age=%dms > %dms)",
+                        "Skip entry: BTC price stale (age=%dms > %dms), will retry next tick",
                         btc_age_ms,
                         self.MAX_BTC_AGE_MS,
                     )
-                    self.preclose_entry_triggered = True
-                    return
+                    return  # 不设置 preclose_entry_triggered，下个 500ms tick 自动重试
                 ms_to_close = int((entry_deadline_sec - rel_sec) * 1000)
                 self._handle_entry_minute(
                     projected_close=btc_price,
                     ms_to_close=ms_to_close,
                 )
-                self.preclose_entry_triggered = True
+                if self.window_traded:
+                    self.preclose_entry_triggered = True
 
             # --- 第 3 分钟收盘价记录（对齐回测 close3_row at rel_sec >= 180）---
             if rel_sec >= 180 and not self._minute3_recorded:
@@ -729,6 +760,36 @@ class FiveMinuteUpDownTrader:
             )
             self.window_traded = True
             return
+
+        # BTC 越过开盘价次数检查：过多交叉说明方向不稳定
+        if self.max_btc_cross_count > 0 and self._btc_cross_count > self.max_btc_cross_count:
+            logger.info(
+                "Skip entry: BTC crossed open price %d times (> %d), 方向不稳定",
+                self._btc_cross_count,
+                self.max_btc_cross_count,
+            )
+            self.window_traded = True
+            return
+
+        # UP/DOWN token 价差检查：差值太小说明市场方向不明确
+        if self.min_entry_updown_diff > 0 and self.current_market_slug:
+            _mi = self._market_cache.get(self.current_market_slug)
+            if _mi:
+                _up_book = self._ws_book_cache.get(str(_mi.get("up_token") or ""))
+                _dn_book = self._ws_book_cache.get(str(_mi.get("down_token") or ""))
+                if _up_book and _dn_book:
+                    _up_ask = self._to_positive_float(_up_book.get("best_ask"))
+                    _dn_ask = self._to_positive_float(_dn_book.get("best_ask"))
+                    if _up_ask is not None and _dn_ask is not None:
+                        _ud_diff = abs(_up_ask - _dn_ask)
+                        if _ud_diff < self.min_entry_updown_diff:
+                            logger.info(
+                                "Skip entry: UP/DOWN spread too narrow (%.4f < %.4f)",
+                                _ud_diff,
+                                self.min_entry_updown_diff,
+                            )
+                            self.window_traded = True
+                            return
 
         open_price = self.window_open_price
         diff = projected_close - open_price
@@ -783,8 +844,12 @@ class FiveMinuteUpDownTrader:
             self._open_position(market_slug, direction)
             self.window_traded = True
         except Exception as e:
-            logger.error("开仓失败: %s", e)
-            self.window_traded = True
+            self._entry_attempt_count += 1
+            if self._entry_attempt_count >= self.MAX_ENTRY_RETRIES:
+                logger.error("开仓失败（已达重试上限 %d）: %s", self.MAX_ENTRY_RETRIES, e)
+                self.window_traded = True
+            else:
+                logger.warning("开仓失败（第 %d 次，将在下一 tick 重试）: %s", self._entry_attempt_count, e)
 
     def _validate_entry_with_db_ticks(self, direction: str) -> bool:
         """与回测对齐：读取 btc_poly_1s_ticks 中同窗口的快照，验证 BTC 价差和方向也满足入场条件。
