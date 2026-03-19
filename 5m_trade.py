@@ -1041,6 +1041,7 @@ class FiveMinuteUpDownTrader:
         order_id: Optional[str] = None,
         match_check_delay_sec: int = 3,
         balance_check_delay_sec: int = 5,
+        close_retry_count: int = 0,
     ) -> None:
         schedule_post_close_balance_check(
             trader=self,
@@ -1055,6 +1056,7 @@ class FiveMinuteUpDownTrader:
             order_id=order_id,
             match_check_delay_sec=match_check_delay_sec,
             balance_check_delay_sec=balance_check_delay_sec,
+            close_retry_count=close_retry_count,
         )
 
     def _on_polymarket_price(
@@ -1129,8 +1131,8 @@ class FiveMinuteUpDownTrader:
 
             self._ws_book_cache[asset_id] = snapshot
 
-    def _force_close_position(self, reason: str) -> None:
-        force_close_position(trader=self, reason=reason)
+    def _force_close_position(self, reason: str, close_retry_count: int = 0) -> None:
+        force_close_position(trader=self, reason=reason, close_retry_count=close_retry_count)
 
     def _report_loop(self) -> None:
         sender = EmailSender()
