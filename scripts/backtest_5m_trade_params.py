@@ -40,6 +40,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from services.five_minute_trade.execution_plans import build_execution_plan as live_build_execution_plan
+from services.five_minute_trade.risk_sizing import assess_risk as _assess_risk
 from data.polymarket import (
     get_event_token_id,
     get_market_metadata,
@@ -88,8 +89,18 @@ class ParamSet:
     sl_to_tp_ratio: float
     max_btc_cross_count: int = DEFAULT_MAX_BTC_CROSS_COUNT
     min_entry_updown_diff: float = DEFAULT_MIN_ENTRY_UPDOWN_DIFF
+    enable_risk_sizing: bool = False
+    risk_min_stake_ratio: float = 0.15
+    risk_max_stake_ratio: float = 1.0
+    confidence_boost_enabled: bool = True
 
     def key(self) -> str:
+        risk_suffix = ""
+        if self.enable_risk_sizing:
+            risk_suffix = (
+                f",risk=1,rmin={self.risk_min_stake_ratio:g}"
+                f",rmax={self.risk_max_stake_ratio:g}"
+            )
         return (
             f"m={self.entry_minute},pre={self.entry_preclose_sec},"
             f"diff={self.min_direction_diff:g},max={self.max_entry_price:g},"
@@ -97,6 +108,7 @@ class ParamSet:
             f"tp_cap={self.tp_price_cap:g},tp_val_cap={self.tp_value_cap:g},"
             f"sl_ratio={self.sl_to_tp_ratio:g},"
             f"cross={self.max_btc_cross_count},ud_diff={self.min_entry_updown_diff:g}"
+            f"{risk_suffix}"
         )
 
 
@@ -434,6 +446,7 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
     minimum_tick_size: Optional[str] = None
     up_fee_rate_bps: Optional[float] = None
     down_fee_rate_bps: Optional[float] = None
+    winning_direction: Optional[str] = None
 
     for r in rows:
         if r.btc_price is not None:
@@ -473,6 +486,8 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
             up_fee_rate_bps = float(r.up_fee_rate_bps)
         if r.down_fee_rate_bps is not None:
             down_fee_rate_bps = float(r.down_fee_rate_bps)
+        if r.winning_direction:
+            winning_direction = str(r.winning_direction)
         out.append(
             WindowRow(
                 ts_sec=r.ts_sec,
@@ -500,6 +515,7 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
                 minimum_tick_size=minimum_tick_size,
                 up_fee_rate_bps=up_fee_rate_bps,
                 down_fee_rate_bps=down_fee_rate_bps,
+                winning_direction=winning_direction,
             )
         )
     return out
@@ -1188,8 +1204,8 @@ def _simulate_window(
     # BTC 越过开盘价次数检查
     max_btc_cross_count = params.max_btc_cross_count
     min_entry_updown_diff = params.min_entry_updown_diff
+    _cross_count = 0
     if max_btc_cross_count > 0:
-        _cross_count = 0
         _last_side: Optional[str] = None
         for _r in rows:
             if _r.ts_sec > entry_row.ts_sec:
@@ -1267,7 +1283,26 @@ def _simulate_window(
         return None, "stale_entry_ask", None
 
     rough_entry_price = float(exec_ask)
-    raw_target_size = params.stake_usd / rough_entry_price
+
+    # Risk-based position sizing
+    effective_stake = params.stake_usd
+    risk_score = 0.0
+    if params.enable_risk_sizing:
+        _ra = _assess_risk(
+            entry_price=rough_entry_price,
+            abs_btc_diff=abs_diff,
+            min_direction_diff=params.min_direction_diff,
+            btc_cross_count=_cross_count,
+            max_btc_cross_count=max_btc_cross_count,
+            base_stake=params.stake_usd,
+            min_stake_ratio=params.risk_min_stake_ratio,
+            max_stake_ratio=params.risk_max_stake_ratio,
+            confidence_boost_enabled=getattr(params, "confidence_boost_enabled", True),
+        )
+        effective_stake = _ra.adjusted_stake
+        risk_score = _ra.risk_score
+
+    raw_target_size = effective_stake / rough_entry_price
     if raw_target_size <= 0:
         return None, "invalid_entry_size", None
     target_size = _normalize_order_size(raw_target_size, tick_size=market_ctx.size_tick)
@@ -1377,18 +1412,22 @@ def _simulate_window(
             exit_row = r
             break
 
+    if not exit_reason.startswith("expiry_resolution"):
+        if exit_price is None or exit_price <= 0:
+            # Final fallback: use latest available bid in this window; if still missing, no trade.
+            for r in reversed(rows):
+                bid = r.up_bid if direction == "up" else r.down_bid
+                bid_event_ms = r.up_event_ms if direction == "up" else r.down_event_ms
+                bid_age = _age_ms_at_row(r.ts_sec, bid_event_ms)
+                if bid is not None and bid > 0 and _is_fresh(bid_age, max_quote_age_ms):
+                    exit_price = float(bid)
+                    exit_row = r
+                    break
     if exit_price is None or exit_price <= 0:
-        # Final fallback: use latest available bid in this window; if still missing, no trade.
-        for r in reversed(rows):
-            bid = r.up_bid if direction == "up" else r.down_bid
-            bid_event_ms = r.up_event_ms if direction == "up" else r.down_event_ms
-            bid_age = _age_ms_at_row(r.ts_sec, bid_event_ms)
-            if bid is not None and bid > 0 and _is_fresh(bid_age, max_quote_age_ms):
-                exit_price = float(bid)
-                exit_row = r
-                break
-    if exit_price is None or exit_price <= 0:
-        return None, "missing_exit_bid", None
+        if exit_reason.startswith("expiry_resolution"):
+            exit_price = 0.0
+        else:
+            return None, "missing_exit_bid", None
 
     if exit_reason.startswith("expiry_resolution"):
         close_submit_row = exit_row or rows[-1]
@@ -1708,6 +1747,10 @@ def _build_param_grid(args: argparse.Namespace) -> List[ParamSet]:
                 sl_to_tp_ratio=sl_ratio,
                 max_btc_cross_count=cross_count,
                 min_entry_updown_diff=updown_diff,
+                enable_risk_sizing=bool(getattr(args, "enable_risk_sizing", False)),
+                risk_min_stake_ratio=float(getattr(args, "risk_min_stake_ratio", 0.20)),
+                risk_max_stake_ratio=float(getattr(args, "risk_max_stake_ratio", 1.50)),
+                confidence_boost_enabled=not getattr(args, "disable_confidence_boost", False),
             )
         )
 
@@ -2052,6 +2095,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=str(DEFAULT_MIN_ENTRY_UPDOWN_DIFF),
         help="Grid of min |up_ask - down_ask| spread at entry (default '0.3', 0 disables).",
+    )
+    parser.add_argument(
+        "--enable-risk-sizing",
+        action="store_true",
+        help="Enable risk-adaptive position sizing (scale stake by entry risk).",
+    )
+    parser.add_argument(
+        "--risk-min-stake-ratio",
+        type=float,
+        default=0.15,
+        help="Min stake ratio when risk is highest (default 0.15).",
+    )
+    parser.add_argument(
+        "--risk-max-stake-ratio",
+        type=float,
+        default=1.0,
+        help="Max stake ratio when risk is lowest (default 1.0).",
+    )
+    parser.add_argument(
+        "--disable-confidence-boost",
+        action="store_true",
+        default=False,
+        help="Disable confidence boost (1.5x) for entry price >= 0.95.",
     )
     parser.add_argument(
         "--sort-by",

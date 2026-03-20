@@ -156,6 +156,29 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         default=SQLITE_DB_PATH,
         help="交易事件SQLite文件路径（默认读取 config.SQLITE_DB_PATH）",
     )
+    parser.add_argument(
+        "--enable-risk-sizing",
+        action="store_true",
+        help="启用风险自适应仓位管理（根据入场风险动态调整 stake）",
+    )
+    parser.add_argument(
+        "--risk-min-stake-ratio",
+        type=float,
+        default=0.20,
+        help="风险仓位下限（base_stake 的比例，默认 0.15 即 15%%）",
+    )
+    parser.add_argument(
+        "--risk-max-stake-ratio",
+        type=float,
+        default=1.0,
+        help="风险仓位上限（base_stake 的比例，默认 1.0 即不超过基础额度）",
+    )
+    parser.add_argument(
+        "--disable-confidence-boost",
+        action="store_true",
+        default=False,
+        help="禁用 >=0.95 入场价的信心加仓（默认启用，1.5x）",
+    )
     return parser
 
 
@@ -178,4 +201,8 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         toxic_utc_hours=args.toxic_utc_hours,
         trade_db_path=args.trade_db_path,
         dry_run=args.dry_run,
+        enable_risk_sizing=args.enable_risk_sizing,
+        risk_min_stake_ratio=args.risk_min_stake_ratio,
+        risk_max_stake_ratio=args.risk_max_stake_ratio,
+        confidence_boost_enabled=not getattr(args, "disable_confidence_boost", False),
     )

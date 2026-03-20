@@ -78,7 +78,10 @@ def _build_startup_strategy_signature(args: Any) -> str:
         f"tp_val_cap={_fmt_num(args.tp_value_cap)},"
         f"sl_ratio={_fmt_num(args.sl_to_tp_ratio)},"
         f"cross={args.max_btc_cross_count},"
-        f"ud_diff={_fmt_num(args.min_entry_updown_diff)}"
+        f"ud_diff={_fmt_num(args.min_entry_updown_diff)},"
+        f"risk={int(args.enable_risk_sizing)},"
+        f"rmin={_fmt_num(args.risk_min_stake_ratio)},"
+        f"rmax={_fmt_num(args.risk_max_stake_ratio)}"
     )
 
 
@@ -136,6 +139,10 @@ class FiveMinuteUpDownTrader:
         toxic_utc_hours: Optional[str] = None,
         trade_db_path: Optional[str] = None,
         dry_run: bool = False,
+        enable_risk_sizing: bool = False,
+        risk_min_stake_ratio: float = 0.15,
+        risk_max_stake_ratio: float = 1.0,
+        confidence_boost_enabled: bool = True,
     ) -> None:
         self.stake_usd = stake_usd
         self.report_interval_sec = report_interval_sec
@@ -167,6 +174,10 @@ class FiveMinuteUpDownTrader:
         self.max_btc_cross_count = int(max_btc_cross_count)
         self.min_entry_updown_diff = float(min_entry_updown_diff)
         self.toxic_utc_hours = self._parse_toxic_utc_hours(toxic_utc_hours)
+        self.enable_risk_sizing = bool(enable_risk_sizing)
+        self.risk_min_stake_ratio = float(risk_min_stake_ratio)
+        self.risk_max_stake_ratio = float(risk_max_stake_ratio)
+        self.confidence_boost_enabled = bool(confidence_boost_enabled)
 
         self._lock = threading.RLock()
         self._price_watcher = ChainlinkBTCPriceWatcher(callback=self._on_price_update)
@@ -841,7 +852,7 @@ class FiveMinuteUpDownTrader:
         )
 
         try:
-            self._open_position(market_slug, direction)
+            self._open_position(market_slug, direction, abs_btc_diff=abs_diff)
             self.window_traded = True
         except Exception as e:
             self._entry_attempt_count += 1
@@ -1006,8 +1017,14 @@ class FiveMinuteUpDownTrader:
     ) -> Dict[str, Any]:
         return select_market_and_tokens(trader=self, market_slug=market_slug)
 
-    def _open_position(self, market_slug: str, direction: str) -> None:
-        open_position(trader=self, market_slug=market_slug, direction=direction)
+    def _open_position(self, market_slug: str, direction: str, abs_btc_diff: float = 0.0) -> None:
+        open_position(
+            trader=self,
+            market_slug=market_slug,
+            direction=direction,
+            abs_btc_diff=abs_btc_diff,
+            btc_cross_count=self._btc_cross_count,
+        )
 
     def _schedule_position_balance_confirmation(
         self,
@@ -1259,6 +1276,9 @@ def main() -> None:
                 "sl_to_tp_ratio": args.sl_to_tp_ratio,
                 "toxic_utc_hours": args.toxic_utc_hours,
                 "trade_db_path": args.trade_db_path,
+                "enable_risk_sizing": args.enable_risk_sizing,
+                "risk_min_stake_ratio": args.risk_min_stake_ratio,
+                "risk_max_stake_ratio": args.risk_max_stake_ratio,
             },
             pid=os.getpid(),
             hostname=socket.gethostname(),
