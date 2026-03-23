@@ -2,6 +2,9 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
+os.makedirs("logs", exist_ok=True)
+os.makedirs("output", exist_ok=True)
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 POLYMARKET_KEY = os.getenv("POLYMARKET_KEY")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
