@@ -151,17 +151,10 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         help="窗口内每秒 BTC 价格变化绝对值均值上限；超过则跳过入场（默认 3.0，0 表示关闭）",
     )
     parser.add_argument(
-        "--enable-minute-consistency",
-        action="store_true",
-        dest="minute_consistency",
-        default=True,
-        help="启用入场前分钟收盘价一致性检查（默认已启用）",
-    )
-    parser.add_argument(
-        "--disable-minute-consistency",
-        action="store_false",
-        dest="minute_consistency",
-        help="禁用入场前分钟收盘价一致性检查",
+        "--minute-consistency",
+        type=str,
+        default="1,2,3",
+        help="入场前检查哪些分钟的收盘价方向一致性，逗号分隔（如 '1,2,3'）。空字符串表示禁用",
     )
     parser.add_argument(
         "--exit-mode",

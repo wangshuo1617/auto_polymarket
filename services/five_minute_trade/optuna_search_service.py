@@ -197,6 +197,8 @@ def _study_best_param(study: optuna.Study, args: argparse.Namespace) -> ParamSet
         sl_to_tp_ratio=float(best_params_raw["sl_ratio"]),
         max_btc_cross_count=int(best_params_raw.get("cross", args.max_btc_cross_count)),
         min_entry_updown_diff=float(best_params_raw.get("ud_diff", args.min_entry_updown_diff)),
+        max_avg_btc_delta=float(getattr(args, "max_avg_btc_delta", 3.0)),
+        minute_consistency=getattr(args, "minute_consistency", "1,2,3"),
     )
 
 
@@ -213,6 +215,8 @@ def _param_from_trial_params(params: Dict[str, Any], args: argparse.Namespace) -
         sl_to_tp_ratio=float(params["sl_ratio"]),
         max_btc_cross_count=int(params.get("cross", args.max_btc_cross_count)),
         min_entry_updown_diff=float(params.get("ud_diff", args.min_entry_updown_diff)),
+        max_avg_btc_delta=float(getattr(args, "max_avg_btc_delta", 3.0)),
+        minute_consistency=bool(getattr(args, "minute_consistency", True)),
     )
 
 
@@ -263,6 +267,8 @@ def _build_plateau_neighbors(param: ParamSet, args: argparse.Namespace) -> List[
                 sl_to_tp_ratio=param.sl_to_tp_ratio,
                 max_btc_cross_count=param.max_btc_cross_count,
                 min_entry_updown_diff=param.min_entry_updown_diff,
+                max_avg_btc_delta=param.max_avg_btc_delta,
+                minute_consistency=param.minute_consistency,
             )
         )
 
@@ -283,6 +289,8 @@ def _build_plateau_neighbors(param: ParamSet, args: argparse.Namespace) -> List[
                 sl_to_tp_ratio=param.sl_to_tp_ratio,
                 max_btc_cross_count=param.max_btc_cross_count,
                 min_entry_updown_diff=param.min_entry_updown_diff,
+                max_avg_btc_delta=param.max_avg_btc_delta,
+                minute_consistency=param.minute_consistency,
             )
         )
         
@@ -304,6 +312,8 @@ def _build_plateau_neighbors(param: ParamSet, args: argparse.Namespace) -> List[
                 sl_to_tp_ratio=new_sl,
                 max_btc_cross_count=param.max_btc_cross_count,
                 min_entry_updown_diff=param.min_entry_updown_diff,
+                max_avg_btc_delta=param.max_avg_btc_delta,
+                minute_consistency=param.minute_consistency,
             )
         )
 
@@ -563,6 +573,8 @@ def _load_windows(
                         end_sec_exclusive=5 * 60,
                         require_btc=True,
                     ),
+                    close1_row=_first_row_at_or_after(filled_rows, sec=1 * 60, require_btc=True),
+                    close2_row=_first_row_at_or_after(filled_rows, sec=2 * 60, require_btc=True),
                     close3_row=_first_row_at_or_after(filled_rows, sec=3 * 60, require_btc=True),
                     close4_row=_first_row_at_or_after(filled_rows, sec=4 * 60, require_btc=True),
                     decision_row_map=decision_row_map,
@@ -595,6 +607,8 @@ def _build_param(trial: optuna.trial.Trial, args: argparse.Namespace) -> ParamSe
         sl_to_tp_ratio=trial.suggest_float("sl_ratio", args.sl_ratio_min, args.sl_ratio_max, step=args.sl_ratio_step),
         max_btc_cross_count=int(args.max_btc_cross_count),
         min_entry_updown_diff=float(args.min_entry_updown_diff),
+        max_avg_btc_delta=float(args.max_avg_btc_delta),
+        minute_consistency=args.minute_consistency,
     )
 
 
@@ -680,6 +694,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Max BTC open-price crossover count (0 disables).")
     parser.add_argument("--min-entry-updown-diff", type=float, default=DEFAULT_MIN_ENTRY_UPDOWN_DIFF,
                         help="Min |up_ask - down_ask| spread at entry (0 disables).")
+    parser.add_argument("--max-avg-btc-delta", type=float, default=3.0,
+                        help="Max avg |Δbtc|/s threshold; windows with higher per-second volatility are skipped (0 disables).")
+    parser.add_argument("--minute-consistency", type=str, default="1,2,3",
+                        help="Comma-separated list of minutes to check direction consistency (e.g. '1,2,3'). Empty string disables.")
 
     parser.add_argument("--output-json", type=str, default="output/5m_optuna_best.json")
     parser.add_argument("--trials-csv", type=str, default="output/5m_optuna_trials.csv")

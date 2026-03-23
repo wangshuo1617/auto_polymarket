@@ -89,6 +89,8 @@ class ParamSet:
     sl_to_tp_ratio: float
     max_btc_cross_count: int = DEFAULT_MAX_BTC_CROSS_COUNT
     min_entry_updown_diff: float = DEFAULT_MIN_ENTRY_UPDOWN_DIFF
+    max_avg_btc_delta: float = 3.0
+    minute_consistency: str = "1,2,3"
     enable_risk_sizing: bool = True
     risk_min_stake_ratio: float = 0.15
     risk_max_stake_ratio: float = 1.0
@@ -107,7 +109,8 @@ class ParamSet:
             f"stake={self.stake_usd:g},hold={self.min_hold_before_close_sec},"
             f"tp_cap={self.tp_price_cap:g},tp_val_cap={self.tp_value_cap:g},"
             f"sl_ratio={self.sl_to_tp_ratio:g},"
-            f"cross={self.max_btc_cross_count},ud_diff={self.min_entry_updown_diff:g}"
+            f"cross={self.max_btc_cross_count},ud_diff={self.min_entry_updown_diff:g},"
+            f"atr={self.max_avg_btc_delta:g},mc={self.minute_consistency}"
             f"{risk_suffix}"
         )
 
@@ -199,6 +202,8 @@ class WindowMarketContext:
 class WindowPrepared:
     rows: Sequence[WindowRow]
     open_row: Optional[WindowRow]
+    close1_row: Optional[WindowRow]
+    close2_row: Optional[WindowRow]
     close3_row: Optional[WindowRow]
     close4_row: Optional[WindowRow]
     decision_row_map: Dict[Tuple[int, int], Optional[WindowRow]]
@@ -1224,7 +1229,23 @@ def _simulate_window(
         if _cross_count > max_btc_cross_count:
             return None, "btc_cross_count_exceeded", None
 
+    # ATR filter: average BTC per-second absolute delta (aligned with live max_avg_btc_delta)
+    if params.max_avg_btc_delta > 0:
+        _btc_ticks: List[float] = []
+        for _r in rows:
+            if _r.ts_sec > entry_row.ts_sec:
+                break
+            if _r.btc_price is not None:
+                _btc_ticks.append(_r.btc_price)
+        if len(_btc_ticks) >= 2:
+            _total_abs_delta = sum(abs(_btc_ticks[i] - _btc_ticks[i - 1]) for i in range(1, len(_btc_ticks)))
+            _avg_delta = _total_abs_delta / (len(_btc_ticks) - 1)
+            if _avg_delta > params.max_avg_btc_delta:
+                return None, "avg_btc_delta_exceeded", None
+
     # UP/DOWN token 价差检查
+    _e_up_ask: Optional[float] = None
+    _e_dn_ask: Optional[float] = None
     if min_entry_updown_diff > 0:
         _e_up_ask = _to_positive_float(entry_row.up_ask)
         _e_dn_ask = _to_positive_float(entry_row.down_ask)
@@ -1238,6 +1259,31 @@ def _simulate_window(
         return None, "diff_below_threshold", None
 
     direction = "up" if diff > 0 else "down"
+
+    # Minute consistency check: only check minutes specified in minute_consistency list
+    _mc_minutes = [int(x) for x in params.minute_consistency.split(",") if x.strip()] if params.minute_consistency.strip() else []
+    if _mc_minutes:
+        _minute_close_rows = {
+            1: prepared.close1_row,
+            2: prepared.close2_row,
+            3: prepared.close3_row,
+        }
+        for _m in _mc_minutes:
+            if _m >= params.entry_minute:
+                continue
+            _mc_row = _minute_close_rows.get(_m)
+            if _mc_row is None or _mc_row.btc_price is None:
+                continue
+            _m_side = "up" if _mc_row.btc_price > open_row.btc_price else "down" if _mc_row.btc_price < open_row.btc_price else None
+            if _m_side is not None and _m_side != direction:
+                return None, "minute_consistency_mismatch", None
+
+    # Entry direction must be market-favored side (aligned with live entry_ask > other_ask check)
+    if min_entry_updown_diff > 0 and _e_up_ask is not None and _e_dn_ask is not None:
+        _entry_ask = _e_up_ask if direction == "up" else _e_dn_ask
+        _other_ask = _e_dn_ask if direction == "up" else _e_up_ask
+        if _entry_ask <= _other_ask:
+            return None, "entry_not_market_favored", None
 
     gate_row = entry_row if entry_price_gate_source == "decision" else entry_exec_row
     gate_ask = gate_row.up_ask if direction == "up" else gate_row.down_ask
@@ -1701,9 +1747,10 @@ def _build_param_grid(args: argparse.Namespace) -> List[ParamSet]:
     sl_to_tp_ratio_grid = _parse_float_grid(args.sl_to_tp_ratio_grid)
     max_btc_cross_count_grid = _parse_int_grid(args.max_btc_cross_count_grid)
     min_entry_updown_diff_grid = _parse_float_grid(args.min_entry_updown_diff_grid)
+    max_avg_btc_delta_grid = _parse_float_grid(args.max_avg_btc_delta_grid)
 
     params: List[ParamSet] = []
-    for m, pre, diff, max_entry, stake, hold, tp_cap, tp_value_cap, sl_ratio, cross_count, updown_diff in itertools.product(
+    for m, pre, diff, max_entry, stake, hold, tp_cap, tp_value_cap, sl_ratio, cross_count, updown_diff, avg_btc_delta in itertools.product(
         entry_minute_grid,
         preclose_grid,
         diff_grid,
@@ -1715,6 +1762,7 @@ def _build_param_grid(args: argparse.Namespace) -> List[ParamSet]:
         sl_to_tp_ratio_grid,
         max_btc_cross_count_grid,
         min_entry_updown_diff_grid,
+        max_avg_btc_delta_grid,
     ):
         if m < 1 or m > 4:
             continue
@@ -1747,6 +1795,8 @@ def _build_param_grid(args: argparse.Namespace) -> List[ParamSet]:
                 sl_to_tp_ratio=sl_ratio,
                 max_btc_cross_count=cross_count,
                 min_entry_updown_diff=updown_diff,
+                max_avg_btc_delta=avg_btc_delta,
+                minute_consistency=getattr(args, "minute_consistency", "1,2,3"),
                 enable_risk_sizing=bool(getattr(args, "enable_risk_sizing", True)),
                 risk_min_stake_ratio=float(getattr(args, "risk_min_stake_ratio", 0.20)),
                 risk_max_stake_ratio=float(getattr(args, "risk_max_stake_ratio", 1.50)),
@@ -2128,6 +2178,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable confidence boost (1.5x) for entry price >= 0.95.",
     )
     parser.add_argument(
+        "--max-avg-btc-delta-grid",
+        type=str,
+        default="3.0",
+        help="Grid of max avg |Δbtc|/s thresholds; windows with higher per-second volatility are skipped (default '3.0', 0 disables).",
+    )
+    parser.add_argument(
+        "--minute-consistency",
+        type=str,
+        default="1,2,3",
+        help="Comma-separated list of minutes to check direction consistency before entry (e.g. '1,2,3'). Empty string disables.",
+    )
+    parser.add_argument(
         "--sort-by",
         choices=["total_pnl", "win_rate", "profit_factor", "max_drawdown", "trades"],
         default="total_pnl",
@@ -2230,6 +2292,8 @@ def main() -> None:
                         end_sec_exclusive=WINDOW_SECONDS,
                         require_btc=True,
                     ),
+                    close1_row=_first_row_at_or_after(filled_rows, sec=1 * 60, require_btc=True),
+                    close2_row=_first_row_at_or_after(filled_rows, sec=2 * 60, require_btc=True),
                     close3_row=_first_row_at_or_after(filled_rows, sec=3 * 60, require_btc=True),
                     close4_row=_first_row_at_or_after(filled_rows, sec=4 * 60, require_btc=True),
                     decision_row_map=decision_row_map,

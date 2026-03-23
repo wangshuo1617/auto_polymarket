@@ -80,7 +80,7 @@ def _build_startup_strategy_signature(args: Any) -> str:
         f"cross={args.max_btc_cross_count},"
         f"ud_diff={_fmt_num(args.min_entry_updown_diff)},"
         f"atr={_fmt_num(args.max_avg_btc_delta)},"
-        f"mc={int(args.minute_consistency)},"
+        f"mc={args.minute_consistency},"
         f"exit={args.exit_mode},"
         f"risk={int(args.enable_risk_sizing)},"
         f"rmin={_fmt_num(args.risk_min_stake_ratio)},"
@@ -141,7 +141,7 @@ class FiveMinuteUpDownTrader:
         max_btc_cross_count: int = MAX_BTC_CROSS_COUNT,
         min_entry_updown_diff: float = MIN_ENTRY_UPDOWN_DIFF,
         max_avg_btc_delta: float = MAX_AVG_BTC_DELTA,
-        minute_consistency: bool = True,
+        minute_consistency: str = "1,2,3",
         exit_mode: str = "tpsl",
         toxic_utc_hours: Optional[str] = None,
         trade_db_path: Optional[str] = None,
@@ -181,7 +181,7 @@ class FiveMinuteUpDownTrader:
         self.max_btc_cross_count = int(max_btc_cross_count)
         self.min_entry_updown_diff = float(min_entry_updown_diff)
         self.max_avg_btc_delta = float(max_avg_btc_delta)
-        self.minute_consistency = bool(minute_consistency)
+        self.minute_consistency = self._parse_minute_consistency(minute_consistency)
         if exit_mode not in ("tpsl", "hold"):
             raise ValueError("exit_mode 必须是 'tpsl' 或 'hold'")
         self.exit_mode = exit_mode
@@ -520,6 +520,18 @@ class FiveMinuteUpDownTrader:
                 raise ValueError(f"toxic_utc_hours 小时必须在 0-23: {hour}")
             parsed.add(hour)
         return parsed
+
+    @staticmethod
+    def _parse_minute_consistency(raw_value) -> list[int]:
+        """Parse minute_consistency: str '1,2,3' -> [1,2,3], bool True -> [1,2,3], '' or False -> []."""
+        if isinstance(raw_value, bool):
+            return [1, 2, 3] if raw_value else []
+        if isinstance(raw_value, (list, tuple)):
+            return sorted(int(x) for x in raw_value)
+        val = str(raw_value).strip()
+        if not val:
+            return []
+        return sorted(int(x.strip()) for x in val.split(",") if x.strip())
 
     def _is_toxic_time_regime(self) -> bool:
         if not self.toxic_utc_hours:
@@ -895,9 +907,11 @@ class FiveMinuteUpDownTrader:
             self.window_traded = True
             return
 
-        # 入场前每分钟收盘价一致性检查：1~3 分钟收盘都必须与预判方向同侧
+        # 入场前每分钟收盘价一致性检查：只检查 minute_consistency 列表指定的分钟
         if self.minute_consistency:
-            for m in range(1, self.entry_decision_minute):
+            for m in self.minute_consistency:
+                if m >= self.entry_decision_minute:
+                    continue
                 mc = self.minute_closes.get(m)
                 if mc is None:
                     continue

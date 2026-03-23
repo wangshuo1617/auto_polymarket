@@ -20,7 +20,7 @@ MAX_BTC_CROSS_COUNT="${16:-5}"
 MIN_ENTRY_UPDOWN_DIFF="${17:-0.02}"
 EXIT_MODE="${18:-hold}"
 MAX_AVG_BTC_DELTA="${19:-3.0}"
-MINUTE_CONSISTENCY="${20:-true}"
+MINUTE_CONSISTENCY="${20:-3}"
 ENABLE_RISK_SIZING="${21:-true}"
 RISK_MIN_STAKE_RATIO="${22:-0.20}"
 RISK_MAX_STAKE_RATIO="${23:-1.2}"
@@ -143,10 +143,18 @@ if ! [[ "$MAX_AVG_BTC_DELTA" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 1
 fi
 
-if [ "$MINUTE_CONSISTENCY" != "true" ] && [ "$MINUTE_CONSISTENCY" != "false" ]; then
-  echo "❌ minute_consistency 必须是 true 或 false"
-  print_usage
-  exit 1
+# minute_consistency: 逗号分隔的分钟列表 (如 "1,2,3") 或空字符串
+if [ -n "$MINUTE_CONSISTENCY" ]; then
+  IFS=',' read -r -a MC_PARTS <<< "$MINUTE_CONSISTENCY"
+  for mc_part in "${MC_PARTS[@]}"; do
+    mc_trimmed="$(echo "$mc_part" | tr -d '[:space:]')"
+    if [ -z "$mc_trimmed" ]; then continue; fi
+    if ! [[ "$mc_trimmed" =~ ^[1-4]$ ]]; then
+      echo "❌ minute_consistency 每项必须是 1-4 的整数，当前值: $mc_trimmed"
+      print_usage
+      exit 1
+    fi
+  done
 fi
 
 if [ "$ENABLE_RISK_SIZING" != "true" ] && [ "$ENABLE_RISK_SIZING" != "false" ]; then
@@ -228,7 +236,11 @@ echo "最短持仓保护秒数: $MIN_HOLD_BEFORE_CLOSE_SEC"
 echo "BTC越过开盘价最大次数: $MAX_BTC_CROSS_COUNT"
 echo "UP/DOWN最小价差: $MIN_ENTRY_UPDOWN_DIFF"
 echo "ATR波动率上限: $MAX_AVG_BTC_DELTA"
-echo "分钟一致性检查: $MINUTE_CONSISTENCY"
+if [ -n "$MINUTE_CONSISTENCY" ]; then
+  echo "分钟一致性检查: 第 $MINUTE_CONSISTENCY 分钟"
+else
+  echo "分钟一致性检查: 已禁用"
+fi
 echo "平仓模式: $EXIT_MODE"
 echo "风险仓位管理: $ENABLE_RISK_SIZING (min=$RISK_MIN_STAKE_RATIO max=$RISK_MAX_STAKE_RATIO)"
 echo "信心加仓: $CONFIDENCE_BOOST"
@@ -278,9 +290,7 @@ if [ -n "$TRADE_DB_PATH" ]; then
   CMD+=(--trade-db-path "$TRADE_DB_PATH")
 fi
 
-if [ "$MINUTE_CONSISTENCY" = "false" ]; then
-  CMD+=(--disable-minute-consistency)
-fi
+CMD+=(--minute-consistency "$MINUTE_CONSISTENCY")
 
 if [ "$ENABLE_RISK_SIZING" = "false" ]; then
   CMD+=(--disable-risk-sizing)
