@@ -239,6 +239,7 @@ class FiveMinuteUpDownTrader:
             "sell_ws": 0,
             "sell_http": 0,
         }
+        self._prev_hour_pending_slugs: List[Dict[str, Any]] = []
         self._log_throttle_last_ts: Dict[str, float] = {}
         self._trade_db: Optional[TradeSQLiteStore] = None
         if trade_db_path:
@@ -1327,7 +1328,7 @@ class FiveMinuteUpDownTrader:
         except Exception as e:
             logger.warning("拉取累计API实盘盈亏失败: %s", e)
 
-        content, subject = build_pnl_report_content_and_subject(
+        content, subject, new_pending_slugs = build_pnl_report_content_and_subject(
             report_interval_sec=self.report_interval_sec,
             new_trades=new_trades,
             all_trades=all_trades,
@@ -1338,7 +1339,9 @@ class FiveMinuteUpDownTrader:
             format_latency_summary=self._format_latency_summary,
             api_pnl_hourly=api_pnl_hourly,
             api_pnl_cumulative=api_pnl_cumulative,
+            prev_hour_pending_slugs=self._prev_hour_pending_slugs,
         )
+        self._prev_hour_pending_slugs = new_pending_slugs
 
         if not TO_EMAIL:
             logger.warning("未配置 TO_EMAIL，盈亏报告仅写入日志:\n%s", content)
