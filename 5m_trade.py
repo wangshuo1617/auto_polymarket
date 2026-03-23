@@ -79,6 +79,9 @@ def _build_startup_strategy_signature(args: Any) -> str:
         f"sl_ratio={_fmt_num(args.sl_to_tp_ratio)},"
         f"cross={args.max_btc_cross_count},"
         f"ud_diff={_fmt_num(args.min_entry_updown_diff)},"
+        f"atr={_fmt_num(args.max_avg_btc_delta)},"
+        f"mc={int(args.minute_consistency)},"
+        f"exit={args.exit_mode},"
         f"risk={int(args.enable_risk_sizing)},"
         f"rmin={_fmt_num(args.risk_min_stake_ratio)},"
         f"rmax={_fmt_num(args.risk_max_stake_ratio)}"
@@ -115,6 +118,7 @@ class FiveMinuteUpDownTrader:
     MAX_ENTRY_RETRIES = 2
     MAX_BTC_CROSS_COUNT = 5
     MIN_ENTRY_UPDOWN_DIFF = 0.30
+    MAX_AVG_BTC_DELTA = 3.0
     MIN_HOLD_BEFORE_CLOSE_SEC = 5
     EXPIRY_FORCE_CLOSE_HIGH_PRICE = 2.00
     EXPIRY_WAIT_SETTLE_MIN_PRICE = 0.60
@@ -136,10 +140,13 @@ class FiveMinuteUpDownTrader:
         min_hold_before_close_sec: int = MIN_HOLD_BEFORE_CLOSE_SEC,
         max_btc_cross_count: int = MAX_BTC_CROSS_COUNT,
         min_entry_updown_diff: float = MIN_ENTRY_UPDOWN_DIFF,
+        max_avg_btc_delta: float = MAX_AVG_BTC_DELTA,
+        minute_consistency: bool = True,
+        exit_mode: str = "tpsl",
         toxic_utc_hours: Optional[str] = None,
         trade_db_path: Optional[str] = None,
         dry_run: bool = False,
-        enable_risk_sizing: bool = False,
+        enable_risk_sizing: bool = True,
         risk_min_stake_ratio: float = 0.15,
         risk_max_stake_ratio: float = 1.0,
         confidence_boost_enabled: bool = True,
@@ -173,6 +180,11 @@ class FiveMinuteUpDownTrader:
         self.min_hold_before_close_sec = int(min_hold_before_close_sec)
         self.max_btc_cross_count = int(max_btc_cross_count)
         self.min_entry_updown_diff = float(min_entry_updown_diff)
+        self.max_avg_btc_delta = float(max_avg_btc_delta)
+        self.minute_consistency = bool(minute_consistency)
+        if exit_mode not in ("tpsl", "hold"):
+            raise ValueError("exit_mode 必须是 'tpsl' 或 'hold'")
+        self.exit_mode = exit_mode
         self.toxic_utc_hours = self._parse_toxic_utc_hours(toxic_utc_hours)
         self.enable_risk_sizing = bool(enable_risk_sizing)
         self.risk_min_stake_ratio = float(risk_min_stake_ratio)
@@ -193,9 +205,12 @@ class FiveMinuteUpDownTrader:
         self._entry_attempt_count: int = 0
         self._btc_cross_count: int = 0
         self._last_btc_side: Optional[str] = None
+        self._window_btc_ticks: List[float] = []
         self.minute_closes: Dict[int, float] = {}
         self.latest_btc_price: Optional[float] = None
         self.latest_btc_price_event_ms: Optional[int] = None
+        self._minute1_recorded: bool = False
+        self._minute2_recorded: bool = False
         self._minute3_recorded: bool = False
         self._minute4_recorded: bool = False
 
@@ -676,7 +691,10 @@ class FiveMinuteUpDownTrader:
                 self._entry_attempt_count = 0
                 self._btc_cross_count = 0
                 self._last_btc_side = None
+                self._window_btc_ticks = []
                 self.minute_closes = {}
+                self._minute1_recorded = False
+                self._minute2_recorded = False
                 self._minute3_recorded = False
                 self._minute4_recorded = False
                 slug_ts = window_start_ms // 1000
@@ -698,6 +716,9 @@ class FiveMinuteUpDownTrader:
                         self.current_market_slug,
                         e,
                     )
+
+            # --- 记录窗口内每秒 BTC 价格（用于 ATR 过滤）---
+            self._window_btc_ticks.append(btc_price)
 
             # --- BTC 越过开盘价计数（用于入场过滤）---
             if self.window_open_price is not None:
@@ -740,6 +761,16 @@ class FiveMinuteUpDownTrader:
                 if self.window_traded:
                     self.preclose_entry_triggered = True
 
+            # --- 第 1 分钟收盘价记录 ---
+            if rel_sec >= 60 and not self._minute1_recorded:
+                self.minute_closes[1] = btc_price
+                self._minute1_recorded = True
+
+            # --- 第 2 分钟收盘价记录 ---
+            if rel_sec >= 120 and not self._minute2_recorded:
+                self.minute_closes[2] = btc_price
+                self._minute2_recorded = True
+
             # --- 第 3 分钟收盘价记录（对齐回测 close3_row at rel_sec >= 180）---
             if rel_sec >= 180 and not self._minute3_recorded:
                 self.minute_closes[3] = btc_price
@@ -772,6 +803,20 @@ class FiveMinuteUpDownTrader:
             self.window_traded = True
             return
 
+        # 窗口内 BTC 每秒变化绝对值均值（ATR）检查：波动过大说明行情剧烈，方向不可靠
+        if self.max_avg_btc_delta > 0 and len(self._window_btc_ticks) >= 2:
+            ticks = self._window_btc_ticks
+            total_abs_delta = sum(abs(ticks[i] - ticks[i - 1]) for i in range(1, len(ticks)))
+            avg_delta = total_abs_delta / (len(ticks) - 1)
+            if avg_delta > self.max_avg_btc_delta:
+                logger.info(
+                    "Skip entry: avg |Δbtc|/s = %.2f (> %.2f), 窗口波动过大",
+                    avg_delta,
+                    self.max_avg_btc_delta,
+                )
+                self.window_traded = True
+                return
+
         # BTC 越过开盘价次数检查：过多交叉说明方向不稳定
         if self.max_btc_cross_count > 0 and self._btc_cross_count > self.max_btc_cross_count:
             logger.info(
@@ -783,24 +828,42 @@ class FiveMinuteUpDownTrader:
             return
 
         # UP/DOWN token 价差检查：差值太小说明市场方向不明确
+        _up_ask: Optional[float] = None
+        _dn_ask: Optional[float] = None
         if self.min_entry_updown_diff > 0 and self.current_market_slug:
             _mi = self._market_cache.get(self.current_market_slug)
-            if _mi:
-                _up_book = self._ws_book_cache.get(str(_mi.get("up_token") or ""))
-                _dn_book = self._ws_book_cache.get(str(_mi.get("down_token") or ""))
-                if _up_book and _dn_book:
-                    _up_ask = self._to_positive_float(_up_book.get("best_ask"))
-                    _dn_ask = self._to_positive_float(_dn_book.get("best_ask"))
-                    if _up_ask is not None and _dn_ask is not None:
-                        _ud_diff = abs(_up_ask - _dn_ask)
-                        if _ud_diff < self.min_entry_updown_diff:
-                            logger.info(
-                                "Skip entry: UP/DOWN spread too narrow (%.4f < %.4f)",
-                                _ud_diff,
-                                self.min_entry_updown_diff,
-                            )
-                            self.window_traded = True
-                            return
+            if not _mi:
+                logger.info("Skip entry: market cache 缺失 slug=%s，无法做 UP/DOWN spread 检查", self.current_market_slug)
+                self.window_traded = True
+                return
+            _up_book = self._ws_book_cache.get(str(_mi.get("up_token") or ""))
+            _dn_book = self._ws_book_cache.get(str(_mi.get("down_token") or ""))
+            if not _up_book or not _dn_book:
+                logger.info(
+                    "Skip entry: 订单簿缓存不完整 (up_book=%s, dn_book=%s)，无法做 UP/DOWN spread 检查",
+                    "有" if _up_book else "无",
+                    "有" if _dn_book else "无",
+                )
+                self.window_traded = True
+                return
+            _up_ask = self._to_positive_float(_up_book.get("best_ask"))
+            _dn_ask = self._to_positive_float(_dn_book.get("best_ask"))
+            if _up_ask is None or _dn_ask is None:
+                logger.info(
+                    "Skip entry: best_ask 缺失 (up_ask=%s, dn_ask=%s)，无法做 UP/DOWN spread 检查",
+                    _up_ask, _dn_ask,
+                )
+                self.window_traded = True
+                return
+            _ud_diff = abs(_up_ask - _dn_ask)
+            if _ud_diff < self.min_entry_updown_diff:
+                logger.info(
+                    "Skip entry: UP/DOWN spread too narrow (%.4f < %.4f)",
+                    _ud_diff,
+                    self.min_entry_updown_diff,
+                )
+                self.window_traded = True
+                return
 
         open_price = self.window_open_price
         diff = projected_close - open_price
@@ -831,6 +894,33 @@ class FiveMinuteUpDownTrader:
             )
             self.window_traded = True
             return
+
+        # 入场前每分钟收盘价一致性检查：1~3 分钟收盘都必须与预判方向同侧
+        if self.minute_consistency:
+            for m in range(1, self.entry_decision_minute):
+                mc = self.minute_closes.get(m)
+                if mc is None:
+                    continue
+                m_side = "up" if mc > open_price else "down" if mc < open_price else None
+                if m_side is not None and m_side != direction:
+                    logger.info(
+                        "Skip entry: 第%d分钟收盘价=%.2f 在open=%.2f的%s侧，与预判方向%s不一致",
+                        m, mc, open_price, m_side, direction,
+                    )
+                    self.window_traded = True
+                    return
+
+        # 入场方向必须是市场看好的一方（ask 更高 = 概率更高），且优势 >= min_entry_updown_diff
+        if self.min_entry_updown_diff > 0 and _up_ask is not None and _dn_ask is not None:
+            entry_ask = _up_ask if direction == "up" else _dn_ask
+            other_ask = _dn_ask if direction == "up" else _up_ask
+            if entry_ask <= other_ask:
+                logger.info(
+                    "Skip entry: 入场方向=%s 不是市场优势方 (entry_ask=%.4f <= other_ask=%.4f)",
+                    direction, entry_ask, other_ask,
+                )
+                self.window_traded = True
+                return
 
         # DB tick 交叉验证：确保回测使用同一 DB 数据也会入场，避免误入
         if not self._validate_entry_with_db_ticks(direction):
@@ -937,6 +1027,8 @@ class FiveMinuteUpDownTrader:
             return True
 
     def _handle_minute4_direction_change(self) -> None:
+        if self.exit_mode == "hold":
+            return
         if (
             not self.position
             or self.current_window_start_ms is None
@@ -969,6 +1061,8 @@ class FiveMinuteUpDownTrader:
             self._force_close_position(reason="sl_direction_change")
 
     def _handle_minute5_expiry(self) -> None:
+        if self.exit_mode == "hold":
+            return
         if not self.position:
             return
         if (
@@ -1031,8 +1125,8 @@ class FiveMinuteUpDownTrader:
         market_slug: str,
         token_id: str,
         order_id: Optional[str] = None,
-        match_check_delay_sec: int = 7,
-        first_balance_delay_sec: int = 10,
+        match_check_delay_sec: int = 3,
+        first_balance_delay_sec: int = 5,
         retry_balance_delay_sec: int = 12,
     ) -> None:
         schedule_position_balance_confirmation(
@@ -1096,6 +1190,8 @@ class FiveMinuteUpDownTrader:
                 return
 
             if best_bid <= self.position.stop_loss_price:
+                if self.exit_mode == "hold":
+                    return
                 if self._should_emit_log(
                     key=f"sl_trigger:{self.position.market_slug}:{self.position.token_id}",
                     interval_sec=2.0,
@@ -1109,6 +1205,8 @@ class FiveMinuteUpDownTrader:
                 return
 
             if best_bid > self.position.take_profit_price:
+                if self.exit_mode == "hold":
+                    return
                 logger.info(
                     "触发价格止盈: best_bid=%.4f TP=%.4f",
                     best_bid,

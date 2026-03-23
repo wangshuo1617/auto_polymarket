@@ -89,7 +89,7 @@ class ParamSet:
     sl_to_tp_ratio: float
     max_btc_cross_count: int = DEFAULT_MAX_BTC_CROSS_COUNT
     min_entry_updown_diff: float = DEFAULT_MIN_ENTRY_UPDOWN_DIFF
-    enable_risk_sizing: bool = False
+    enable_risk_sizing: bool = True
     risk_min_stake_ratio: float = 0.15
     risk_max_stake_ratio: float = 1.0
     confidence_boost_enabled: bool = True
@@ -1747,7 +1747,7 @@ def _build_param_grid(args: argparse.Namespace) -> List[ParamSet]:
                 sl_to_tp_ratio=sl_ratio,
                 max_btc_cross_count=cross_count,
                 min_entry_updown_diff=updown_diff,
-                enable_risk_sizing=bool(getattr(args, "enable_risk_sizing", False)),
+                enable_risk_sizing=bool(getattr(args, "enable_risk_sizing", True)),
                 risk_min_stake_ratio=float(getattr(args, "risk_min_stake_ratio", 0.20)),
                 risk_max_stake_ratio=float(getattr(args, "risk_max_stake_ratio", 1.50)),
                 confidence_boost_enabled=not getattr(args, "disable_confidence_boost", False),
@@ -2099,7 +2099,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable-risk-sizing",
         action="store_true",
-        help="Enable risk-adaptive position sizing (scale stake by entry risk).",
+        dest="enable_risk_sizing",
+        default=True,
+        help="Enable risk-adaptive position sizing (default: enabled).",
+    )
+    parser.add_argument(
+        "--disable-risk-sizing",
+        action="store_false",
+        dest="enable_risk_sizing",
+        help="Disable risk-adaptive position sizing.",
     )
     parser.add_argument(
         "--risk-min-stake-ratio",

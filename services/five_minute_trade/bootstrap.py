@@ -145,6 +145,32 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         help="入场时 UP/DOWN token 的最小 ask 价差；低于则跳过入场（默认 0.30，0 表示关闭）",
     )
     parser.add_argument(
+        "--max-avg-btc-delta",
+        type=float,
+        default=3.0,
+        help="窗口内每秒 BTC 价格变化绝对值均值上限；超过则跳过入场（默认 3.0，0 表示关闭）",
+    )
+    parser.add_argument(
+        "--enable-minute-consistency",
+        action="store_true",
+        dest="minute_consistency",
+        default=True,
+        help="启用入场前分钟收盘价一致性检查（默认已启用）",
+    )
+    parser.add_argument(
+        "--disable-minute-consistency",
+        action="store_false",
+        dest="minute_consistency",
+        help="禁用入场前分钟收盘价一致性检查",
+    )
+    parser.add_argument(
+        "--exit-mode",
+        type=str,
+        default="tpsl",
+        choices=["tpsl", "hold"],
+        help="平仓模式: tpsl=止盈止损（默认）, hold=持有到结算",
+    )
+    parser.add_argument(
         "--toxic-utc-hours",
         type=str,
         default="16,19,20",
@@ -159,19 +185,27 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable-risk-sizing",
         action="store_true",
-        help="启用风险自适应仓位管理（根据入场风险动态调整 stake）",
+        dest="enable_risk_sizing",
+        default=True,
+        help="启用风险自适应仓位管理（默认已启用）",
+    )
+    parser.add_argument(
+        "--disable-risk-sizing",
+        action="store_false",
+        dest="enable_risk_sizing",
+        help="禁用风险自适应仓位管理",
     )
     parser.add_argument(
         "--risk-min-stake-ratio",
         type=float,
         default=0.20,
-        help="风险仓位下限（base_stake 的比例，默认 0.15 即 15%%）",
+        help="风险仓位下限（base_stake 的比例，默认 0.20 即 20%）",
     )
     parser.add_argument(
         "--risk-max-stake-ratio",
         type=float,
-        default=1.0,
-        help="风险仓位上限（base_stake 的比例，默认 1.0 即不超过基础额度）",
+        default=1.2,
+        help="风险仓位上限（base_stake 的比例，默认 1.2 即不超过基础额度的 120%）",
     )
     parser.add_argument(
         "--disable-confidence-boost",
@@ -198,6 +232,9 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         min_hold_before_close_sec=args.min_hold_before_close_sec,
         max_btc_cross_count=args.max_btc_cross_count,
         min_entry_updown_diff=args.min_entry_updown_diff,
+        max_avg_btc_delta=args.max_avg_btc_delta,
+        minute_consistency=args.minute_consistency,
+        exit_mode=args.exit_mode,
         toxic_utc_hours=args.toxic_utc_hours,
         trade_db_path=args.trade_db_path,
         dry_run=args.dry_run,
