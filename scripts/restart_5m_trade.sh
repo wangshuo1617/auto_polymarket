@@ -16,15 +16,24 @@ MIN_HOLD_BEFORE_CLOSE_SEC="${10:-70}"
 TP_PRICE_CAP="${12:-0.99}"
 TP_VALUE_CAP="${13:-0.15}"
 SL_TO_TP_RATIO="${14:-0.9}"
+MAX_BTC_CROSS_COUNT="${16:-4}"
+MIN_ENTRY_UPDOWN_DIFF="${17:-0.38}"
+EXIT_MODE="${18:-hold}"
+MAX_AVG_BTC_DELTA="${19:-3.0}"
+MINUTE_CONSISTENCY="${20:-3}"
+ENABLE_RISK_SIZING="${21:-true}"
+RISK_MIN_STAKE_RATIO="${22:-0.20}"
+RISK_MAX_STAKE_RATIO="${23:-1.2}"
+CONFIDENCE_BOOST="${24:-true}"
 
 REPORT_INTERVAL_SEC="${6:-3600}"
 TAKE_PROFIT_SPREAD="${8:-0.15}"
 STOP_LOSS_SPREAD="${9:--0.20}"
 TRADE_DB_PATH="${11:-}"
-TOXIC_UTC_HOURS="${15-""}"
+TOXIC_UTC_HOURS="${15-"0,5,7,16,19"}"
 LOG_FILE="logs/5m_trade.stdout.log"
 PID_FILE="logs/5m_trade.pid"
-USAGE="./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio] [toxic_utc_hours_csv]"
+USAGE="./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio] [toxic_utc_hours_csv] [max_btc_cross_count] [min_entry_updown_diff]"
 
 print_usage() {
   echo "用法: $USAGE"
@@ -110,6 +119,68 @@ if ! [[ "$SL_TO_TP_RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($SL_
   exit 1
 fi
 
+if ! [[ "$MAX_BTC_CROSS_COUNT" =~ ^[0-9]+$ ]]; then
+  echo "❌ max_btc_cross_count 必须是大于等于 0 的整数"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$MIN_ENTRY_UPDOWN_DIFF" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ min_entry_updown_diff 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+
+if [ "$EXIT_MODE" != "tpsl" ] && [ "$EXIT_MODE" != "hold" ]; then
+  echo "❌ exit_mode 必须是 tpsl 或 hold"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$MAX_AVG_BTC_DELTA" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ max_avg_btc_delta 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+
+# minute_consistency: 逗号分隔的分钟列表 (如 "1,2,3") 或空字符串
+if [ -n "$MINUTE_CONSISTENCY" ]; then
+  IFS=',' read -r -a MC_PARTS <<< "$MINUTE_CONSISTENCY"
+  for mc_part in "${MC_PARTS[@]}"; do
+    mc_trimmed="$(echo "$mc_part" | tr -d '[:space:]')"
+    if [ -z "$mc_trimmed" ]; then continue; fi
+    if ! [[ "$mc_trimmed" =~ ^[1-4]$ ]]; then
+      echo "❌ minute_consistency 每项必须是 1-4 的整数，当前值: $mc_trimmed"
+      print_usage
+      exit 1
+    fi
+  done
+fi
+
+if [ "$ENABLE_RISK_SIZING" != "true" ] && [ "$ENABLE_RISK_SIZING" != "false" ]; then
+  echo "❌ enable_risk_sizing 必须是 true 或 false"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$RISK_MIN_STAKE_RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ risk_min_stake_ratio 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$RISK_MAX_STAKE_RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ risk_max_stake_ratio 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+
+if [ "$CONFIDENCE_BOOST" != "true" ] && [ "$CONFIDENCE_BOOST" != "false" ]; then
+  echo "❌ confidence_boost 必须是 true 或 false"
+  print_usage
+  exit 1
+fi
+
 if [ -n "$TOXIC_UTC_HOURS" ]; then
   IFS=',' read -r -a TOXIC_HOUR_PARTS <<< "$TOXIC_UTC_HOURS"
   for hour_part in "${TOXIC_HOUR_PARTS[@]}"; do
@@ -162,6 +233,17 @@ else
 fi
 echo "兼容参数(当前策略未使用): take_profit_spread=$TAKE_PROFIT_SPREAD stop_loss_spread=$STOP_LOSS_SPREAD"
 echo "最短持仓保护秒数: $MIN_HOLD_BEFORE_CLOSE_SEC"
+echo "BTC越过开盘价最大次数: $MAX_BTC_CROSS_COUNT"
+echo "UP/DOWN最小价差: $MIN_ENTRY_UPDOWN_DIFF"
+echo "ATR波动率上限: $MAX_AVG_BTC_DELTA"
+if [ -n "$MINUTE_CONSISTENCY" ]; then
+  echo "分钟一致性检查: 第 $MINUTE_CONSISTENCY 分钟"
+else
+  echo "分钟一致性检查: 已禁用"
+fi
+echo "平仓模式: $EXIT_MODE"
+echo "风险仓位管理: $ENABLE_RISK_SIZING (min=$RISK_MIN_STAKE_RATIO max=$RISK_MAX_STAKE_RATIO)"
+echo "信心加仓: $CONFIDENCE_BOOST"
 if [ -n "$TRADE_DB_PATH" ]; then
   echo "交易数据库路径: $TRADE_DB_PATH"
 else
@@ -196,10 +278,26 @@ CMD=(
   --sl-to-tp-ratio "$SL_TO_TP_RATIO"
   --toxic-utc-hours "$TOXIC_UTC_HOURS"
   --min-hold-before-close-sec "$MIN_HOLD_BEFORE_CLOSE_SEC"
+  --max-btc-cross-count "$MAX_BTC_CROSS_COUNT"
+  --min-entry-updown-diff "$MIN_ENTRY_UPDOWN_DIFF"
+  --max-avg-btc-delta "$MAX_AVG_BTC_DELTA"
+  --exit-mode "$EXIT_MODE"
+  --risk-min-stake-ratio "$RISK_MIN_STAKE_RATIO"
+  --risk-max-stake-ratio "$RISK_MAX_STAKE_RATIO"
 )
 
 if [ -n "$TRADE_DB_PATH" ]; then
   CMD+=(--trade-db-path "$TRADE_DB_PATH")
+fi
+
+CMD+=(--minute-consistency "$MINUTE_CONSISTENCY")
+
+if [ "$ENABLE_RISK_SIZING" = "false" ]; then
+  CMD+=(--disable-risk-sizing)
+fi
+
+if [ "$CONFIDENCE_BOOST" = "false" ]; then
+  CMD+=(--disable-confidence-boost)
 fi
 
 if [ "$MODE" = "--live" ]; then

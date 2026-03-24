@@ -1,76 +1,76 @@
 """
 自动赎回（Redeem）5m-updown 市场中只有 BUY 没有 SELL/REDEEM 的仓位。
 
-通过 ProxyWalletFactory.proxy() 调用 CTF.redeemPositions 完成链上赎回。
+通过 Polymarket Gasless Relayer（py-builder-relayer-client）完成链上赎回，
+无需持有 POL 支付 gas。
 """
 import logging
-import time
+import time, sys
 from typing import Optional
+from pathlib import Path
 
+# 添加项目根目录到 sys.path，以便可以导入 config
+_project_root = Path(__file__).resolve().parent.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+    
 from eth_abi.abi import encode
-from eth_account import Account
-from web3 import Web3
-from web3.types import TxParams, Wei
+from py_builder_relayer_client.client import RelayClient
+from py_builder_relayer_client.models import RelayerTxType, Transaction
+from py_builder_signing_sdk.config import BuilderConfig
+from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 
-from config import POLYMARKET_KEY, WALLET_ADDRESS
+from config import (
+    BUILDER_API_KEY,
+    BUILDER_PASSPHRASE,
+    BUILDER_SECRET,
+    POLYMARKET_KEY,
+    WALLET_ADDRESS,
+)
 from data.polymarket import client as clob_client, get_5m_updown_activity_history
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 链上常量
+# 合约常量
 # ---------------------------------------------------------------------------
-RPC_URLS = [
-    "https://polygon-bor-rpc.publicnode.com",
-    "https://polygon.meowrpc.com",
-]
+CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
-CTF_ADDRESS = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
-USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-PROXY_WALLET_FACTORY = Web3.to_checksum_address("0xaB45c5A4B0c941a2F231C04C3f49182e1A254052")
+RELAYER_URL = "https://relayer-v2.polymarket.com/"
+CHAIN_ID = 137
+LOOKBACK_SECONDS = 7200  # 查找过去 2 小时内的活动，避免遗漏未赎回市场
 
-CTF_REDEEM_SELECTOR = Web3.keccak(text="redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
-
-PROXY_FACTORY_ABI = [
-    {
-        "inputs": [
-            {
-                "components": [
-                    {"name": "typeCode", "type": "uint8"},
-                    {"name": "to", "type": "address"},
-                    {"name": "value", "type": "uint256"},
-                    {"name": "data", "type": "bytes"},
-                ],
-                "name": "_calls",
-                "type": "tuple[]",
-            }
-        ],
-        "name": "proxy",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    }
-]
-
-LOOKBACK_SECONDS = 3600
+# redeemPositions(address,bytes32,bytes32,uint256[]) 的 4-byte selector
+_REDEEM_SELECTOR = bytes.fromhex("01b7037c")
 
 
-def _get_web3() -> Web3:
-    for url in RPC_URLS:
-        w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 15}))
-        if w3.is_connected():
-            return w3
-    raise RuntimeError(f"无法连接到任何 RPC: {RPC_URLS}")
+def _build_relay_client() -> RelayClient:
+    """构建并返回 gasless Relayer 客户端（Safe Wallet 模式）。"""
+    creds = BuilderApiKeyCreds(
+        key=BUILDER_API_KEY,
+        secret=BUILDER_SECRET,
+        passphrase=BUILDER_PASSPHRASE,
+    )
+    builder_config = BuilderConfig(local_builder_creds=creds)
+    return RelayClient(
+        relayer_url=RELAYER_URL,
+        chain_id=CHAIN_ID,
+        private_key=POLYMARKET_KEY,
+        builder_config=builder_config,
+        relay_tx_type=RelayerTxType.SAFE,
+    )
 
 
-def _encode_redeem_positions(condition_id_hex: str) -> bytes:
+def _encode_redeem_calldata(condition_id_hex: str) -> str:
+    """编码 CTF.redeemPositions 的 calldata，返回 0x 前缀的 hex 字符串。"""
     parent_collection_id = b"\x00" * 32
     condition_id_bytes = bytes.fromhex(condition_id_hex.replace("0x", ""))
     params = encode(
         ["address", "bytes32", "bytes32", "uint256[]"],
         [USDC_ADDRESS, parent_collection_id, condition_id_bytes, [1, 2]],
     )
-    return CTF_REDEEM_SELECTOR + params
+    return "0x" + (_REDEEM_SELECTOR + params).hex()
 
 
 def find_unredeemed_markets(lookback_sec: int = LOOKBACK_SECONDS) -> list[dict]:
@@ -109,35 +109,24 @@ def find_unredeemed_markets(lookback_sec: int = LOOKBACK_SECONDS) -> list[dict]:
     return unredeemed
 
 
-def redeem_market(w3: Web3, account: object, condition_id: str, slug: str) -> Optional[str]:
-    """发送赎回交易，返回 tx hash 或 None。"""
+def redeem_market(relay_client: RelayClient, condition_id: str, slug: str) -> Optional[str]:
+    """通过 gasless relayer 发送赎回交易，返回 transaction ID 或 None。"""
     logger.info("auto_redeem: 正在赎回 conditionId=%s slug=%s", condition_id, slug)
 
-    redeem_calldata = _encode_redeem_positions(condition_id)
-    factory = w3.eth.contract(address=PROXY_WALLET_FACTORY, abi=PROXY_FACTORY_ABI)
-    calls = [(1, CTF_ADDRESS, 0, redeem_calldata)]
+    calldata = _encode_redeem_calldata(condition_id)
+    tx = Transaction(to=CTF_ADDRESS, data=calldata, value="0")
 
-    tx_params: TxParams = {
-        "from": account.address,  # type: ignore[union-attr]
-        "nonce": w3.eth.get_transaction_count(account.address),  # type: ignore[union-attr]
-        "gas": Wei(300_000),
-        "maxFeePerGas": Wei(w3.eth.gas_price * 2),
-        "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
-        "chainId": 137,
-    }
-    tx = factory.functions.proxy(calls).build_transaction(tx_params)
+    response = relay_client.execute([tx], f"Redeem {slug}")
+    result = response.wait()
 
-    signed = account.sign_transaction(tx)  # type: ignore[union-attr]
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    tx_hash_hex = tx_hash.hex()
-    logger.info("auto_redeem: 交易已发送 tx=%s", tx_hash_hex)
-
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-    if receipt["status"] == 1:
-        logger.info("auto_redeem: 赎回成功 tx=%s gas_used=%d", tx_hash_hex, receipt["gasUsed"])
+    if result is not None:
+        tx_hash = result.get("transactionHash", "")
+        state = result.get("state", "")
+        logger.info("auto_redeem: 赎回完成 conditionId=%s state=%s tx=%s", condition_id, state, tx_hash)
+        return response.transaction_id
     else:
-        logger.error("auto_redeem: 赎回失败(reverted) tx=%s", tx_hash_hex)
-    return tx_hash_hex
+        logger.error("auto_redeem: 赎回失败或超时 conditionId=%s slug=%s", condition_id, slug)
+        return None
 
 
 def run_auto_redeem(lookback_sec: int = LOOKBACK_SECONDS) -> int:
@@ -151,9 +140,9 @@ def run_auto_redeem(lookback_sec: int = LOOKBACK_SECONDS) -> int:
         logger.info("auto_redeem: 没有需要赎回的市场")
         return 0
 
-    w3 = _get_web3()
-    account = Account.from_key(POLYMARKET_KEY)
-    logger.info("auto_redeem: EOA=%s ProxyWallet=%s", account.address, WALLET_ADDRESS)
+    relay_client = _build_relay_client()
+    safe_addr = relay_client.get_expected_safe()
+    logger.info("auto_redeem: 使用 gasless relayer, Safe=%s WALLET_ADDRESS=%s", safe_addr, WALLET_ADDRESS)
 
     success_count = 0
     for market in unredeemed:
@@ -163,8 +152,9 @@ def run_auto_redeem(lookback_sec: int = LOOKBACK_SECONDS) -> int:
             if not _is_market_resolved(cid):
                 logger.info("auto_redeem: 市场尚未resolved，跳过 conditionId=%s slug=%s", cid, slug)
                 continue
-            redeem_market(w3, account, cid, slug)
-            success_count += 1
+            result = redeem_market(relay_client, cid, slug)
+            if result is not None:
+                success_count += 1
         except Exception:
             logger.exception("auto_redeem: 赎回失败 conditionId=%s slug=%s", cid, slug)
     return success_count
@@ -179,3 +169,18 @@ def _is_market_resolved(condition_id: str) -> bool:
     except Exception as e:
         logger.warning("auto_redeem: 查询市场状态失败 conditionId=%s error=%s", condition_id, e)
         return False
+
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    client = _build_relay_client()
+    safe_addr = client.get_expected_safe()
+    print(f"Safe wallet: {safe_addr}")
+    print(f"WALLET_ADDRESS: {WALLET_ADDRESS}")
+    if safe_addr.lower() != (WALLET_ADDRESS or "").lower():
+        print(f"WARNING: Safe地址与WALLET_ADDRESS不匹配!")
+    conditionId = "0x0548c3ba5886378f222257a73cdb0d86c1bad160eea31840c5d9b0caee24c2b5"
+    market_slug = "btc-updown-5m-1774222500"
+    result = redeem_market(client, conditionId, market_slug)
+    print(f"Result: {result}")

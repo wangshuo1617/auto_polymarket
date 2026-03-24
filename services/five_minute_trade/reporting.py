@@ -94,7 +94,8 @@ def build_pnl_report_content_and_subject(
     format_latency_summary: Callable[[str, List[float]], str],
     api_pnl_hourly: Optional[Dict[str, Any]] = None,
     api_pnl_cumulative: Optional[Dict[str, Any]] = None,
-) -> Tuple[str, str]:
+    prev_hour_pending_slugs: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, str, List[Dict[str, Any]]]:
     hourly_pnl = sum(t.pnl for t in new_trades)
     hourly_count = len(new_trades)
     cumulative_pnl = sum(t.pnl for t in all_trades)
@@ -297,9 +298,110 @@ def build_pnl_report_content_and_subject(
     if not new_trades:
         lines.append("- 本小时无新平仓交易")
 
-    # --- API 实盘盈亏（基于 Polymarket Activity） ---
+    # --- API 实盘盈亏（基于 Polymarket Activity）--- 三部分结构 ---
     lines.append("")
+    lines.append("=" * 50)
     lines.append("API实盘盈亏（Polymarket Activity）:")
+
+    # 构建累计 slug 索引，用于查询上小时待结算单的最新状态
+    cumulative_slug_map: Dict[str, Dict[str, Any]] = {}
+    if api_pnl_cumulative is not None:
+        for s in api_pnl_cumulative.get("slug_summary", []):
+            cumulative_slug_map[s["slug"]] = s
+
+    # --- Part 1: 上小时待结算单的情况 ---
+    lines.append("")
+    lines.append("【Part 1】上小时未结算单（仅有 BUY，等待 REDEEM）:")
+    prev_pending = prev_hour_pending_slugs or []
+    if prev_pending:
+        prev_settled_count = 0
+        prev_still_pending_count = 0
+        prev_settled_pnl = 0.0
+        for ps in prev_pending:
+            slug_name = ps["slug"]
+            buy_cost = ps["expense_trade_buy"]
+            cum = cumulative_slug_map.get(slug_name)
+            if cum and (cum.get("count_redeem", 0) > 0 or cum.get("count_trade_sell", 0) > 0):
+                # 已结算
+                slug_income = cum.get("total_income", 0.0)
+                slug_expense = cum.get("expense_trade_buy", 0.0)
+                slug_pnl = slug_income - slug_expense
+                prev_settled_pnl += slug_pnl
+                prev_settled_count += 1
+                lines.append(
+                    f"  ✅ {slug_name}: 已结算, buy={slug_expense:.2f}, "
+                    f"income={slug_income:.2f}, pnl={slug_pnl:+.2f} USDC"
+                )
+            else:
+                # 仍未结算
+                prev_still_pending_count += 1
+                lines.append(
+                    f"  ⏳ {slug_name}: 仍未结算, buy={buy_cost:.2f} USDC"
+                )
+        lines.append(
+            f"  小结: 已结算 {prev_settled_count} 单 (pnl={prev_settled_pnl:+.2f}), "
+            f"仍未结算 {prev_still_pending_count} 单"
+        )
+    else:
+        lines.append("  无上小时待结算单")
+
+    # --- Part 2 & 3: 本小时分类 ---
+    current_completed_slugs: List[Dict[str, Any]] = []
+    current_buy_only_slugs: List[Dict[str, Any]] = []
+
+    if api_pnl_hourly is not None:
+        for s in api_pnl_hourly.get("slug_summary", []):
+            has_buy = s.get("count_trade_buy", 0) > 0
+            has_income = (s.get("count_redeem", 0) > 0 or s.get("count_trade_sell", 0) > 0)
+            if has_buy and has_income:
+                current_completed_slugs.append(s)
+            elif has_buy and not has_income:
+                current_buy_only_slugs.append(s)
+            # 只有 sell/redeem 没有 buy 的属于之前的单被结算，不在这里展示
+
+    # --- Part 2: 本小时已完成（BUY + REDEEM/SELL） ---
+    lines.append("")
+    lines.append("【Part 2】本小时已完成交易（BUY + REDEEM/SELL）:")
+    if current_completed_slugs:
+        completed_total_pnl = 0.0
+        for s in current_completed_slugs:
+            slug_income = s.get("total_income", 0.0)
+            slug_expense = s.get("expense_trade_buy", 0.0)
+            slug_pnl = slug_income - slug_expense
+            completed_total_pnl += slug_pnl
+            lines.append(
+                f"  {s['slug']}: buy={slug_expense:.2f}, "
+                f"income={slug_income:.2f}, pnl={slug_pnl:+.2f} USDC "
+                f"(redeem={s.get('count_redeem', 0)}, sell={s.get('count_trade_sell', 0)})"
+            )
+        lines.append(
+            f"  小结: {len(current_completed_slugs)} 单, "
+            f"合计 pnl={completed_total_pnl:+.2f} USDC"
+        )
+    else:
+        lines.append("  无")
+
+    # --- Part 3: 本小时仅买入（等待下小时结算） ---
+    lines.append("")
+    lines.append("【Part 3】本小时仅买入（待结算）:")
+    if current_buy_only_slugs:
+        buy_only_total = 0.0
+        for s in current_buy_only_slugs:
+            buy_cost = s.get("expense_trade_buy", 0.0)
+            buy_only_total += buy_cost
+            lines.append(
+                f"  ⏳ {s['slug']}: buy={buy_cost:.2f} USDC "
+                f"(buy_count={s.get('count_trade_buy', 0)})"
+            )
+        lines.append(
+            f"  小结: {len(current_buy_only_slugs)} 单待结算, "
+            f"合计买入 {buy_only_total:.2f} USDC"
+        )
+    else:
+        lines.append("  无")
+
+    # --- 汇总行 ---
+    lines.append("")
     if api_pnl_hourly is not None:
         h_net = api_pnl_hourly.get("net_pnl", 0.0)
         h_income = api_pnl_hourly.get("total_income", 0.0)
@@ -309,11 +411,11 @@ def build_pnl_report_content_and_subject(
         h_redeem = api_pnl_hourly.get("count_redeem", 0)
         h_buy = api_pnl_hourly.get("count_trade_buy", 0)
         lines.append(
-            f"- 本小时: net_pnl={h_net:.2f} USDC (收入={h_income:.2f}, 支出={h_expense:.2f}, "
+            f"本小时汇总: net_pnl={h_net:.2f} USDC (收入={h_income:.2f}, 支出={h_expense:.2f}, "
             f"activity={h_count}, sell={h_sell}, redeem={h_redeem}, buy={h_buy})"
         )
     else:
-        lines.append("- 本小时: 拉取失败")
+        lines.append("本小时汇总: 拉取失败")
     if api_pnl_cumulative is not None:
         c_net = api_pnl_cumulative.get("net_pnl", 0.0)
         c_income = api_pnl_cumulative.get("total_income", 0.0)
@@ -326,18 +428,20 @@ def build_pnl_report_content_and_subject(
         c_loss = api_pnl_cumulative.get("slug_loss_count", 0)
         c_flat = api_pnl_cumulative.get("slug_flat_count", 0)
         lines.append(
-            f"- 累计: net_pnl={c_net:.2f} USDC (收入={c_income:.2f}, 支出={c_expense:.2f}, "
+            f"累计汇总: net_pnl={c_net:.2f} USDC (收入={c_income:.2f}, 支出={c_expense:.2f}, "
             f"activity={c_count}, sell={c_sell}, redeem={c_redeem}, buy={c_buy}, "
             f"slug盈利={c_profit}, slug亏损={c_loss}, slug持平={c_flat})"
         )
     else:
-        lines.append("- 累计: 拉取失败")
+        lines.append("累计汇总: 拉取失败")
 
     content = "\n".join(lines)
 
+    h_net = api_pnl_hourly.get("net_pnl", 0.0) if api_pnl_hourly else 0.0
+    c_net = api_pnl_cumulative.get("net_pnl", 0.0) if api_pnl_cumulative else 0.0
     subject = (
         f"[BTC 5m] 盈亏汇总: 本小时 {h_net:.2f} / 累计 {c_net:.2f} USDC "
         f"({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC)"
     )
 
-    return content, subject
+    return content, subject, current_buy_only_slugs

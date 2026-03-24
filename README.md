@@ -284,6 +284,35 @@ chmod +x scripts/restart_5m_trade.sh
 ./scripts/restart_5m_trade.sh --dry-run 3 5 10 5.0 3600 0.80 0.15 -0.20 60 logs/5m_trade.sqlite3 0.95 0.15 1.333333
 ```
 
+#### 生成 5m 窗口分析报表
+
+可以把最近一段时间的 5m 窗口逐个汇总成 CSV，包含：
+- 是否入场 / 跳过原因
+- 预测方向与风控信息
+- 决策时点 BTC 波动、穿越次数、UP/DOWN ask
+- 窗口最终实际方向（`actual_final_direction`）
+- 基于 `data/polymarket.py` activity 接口统计的实盘盈亏
+
+最近 9 小时：
+
+```bash
+uv run scripts/generate_5m_window_report.py --last-hours 9
+```
+
+指定 UTC 时间范围：
+
+```bash
+uv run scripts/generate_5m_window_report.py \
+  --start-utc 2026-03-23T16:30:00+00:00 \
+  --end-utc 2026-03-24T01:30:00+00:00 \
+  --output-prefix my_9h_report
+```
+
+默认会在 `output/` 下生成 3 个文件：
+- `*_summary.json`
+- `*.csv`（完整窗口总表）
+- `*_entries.csv`（仅入场窗口）
+
 参数说明：
 - `--dry-run`：仅模拟交易，不实际下单（脚本模式参数使用 `--dry-run|--live`）
 - `--entry-minute`：在第几分钟做方向预判（1-4，默认 `3`）

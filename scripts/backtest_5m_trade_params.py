@@ -40,6 +40,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from services.five_minute_trade.execution_plans import build_execution_plan as live_build_execution_plan
+from services.five_minute_trade.risk_sizing import assess_risk as _assess_risk
 from data.polymarket import (
     get_event_token_id,
     get_market_metadata,
@@ -58,6 +59,7 @@ MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
 MAX_ENTRY_SLIPPAGE_BPS = 120.0
 FALLBACK_LEVEL_SIZE = 22_000.0
 DEFAULT_SIZE_TICK = "0.01"
+DEFAULT_EXPIRY_WIN_HAIRCUT = 0.02
 MIN_DUST_SIZE = 0.02
 CLOSE_RETRY_DELAY_SEC = 5
 MAX_CLOSE_RETRIES = 3
@@ -69,6 +71,8 @@ DEFAULT_UNFILLED_PENALTY_BPS = 800.0
 DEFAULT_ENTRY_SUBMIT_LATENCY_MS = 1000
 DEFAULT_EXIT_SUBMIT_LATENCY_MS = 1000
 DEFAULT_MIN_WINDOW_QUALITY = 0.0
+DEFAULT_MAX_BTC_CROSS_COUNT = 5
+DEFAULT_MIN_ENTRY_UPDOWN_DIFF = 0.30
 WINDOW_SECONDS_EXPECTED = WINDOW_SECONDS
 
 
@@ -191,6 +195,8 @@ class WindowMarketContext:
 class WindowPrepared:
     rows: Sequence[WindowRow]
     open_row: Optional[WindowRow]
+    close1_row: Optional[WindowRow]
+    close2_row: Optional[WindowRow]
     close3_row: Optional[WindowRow]
     close4_row: Optional[WindowRow]
     decision_row_map: Dict[Tuple[int, int], Optional[WindowRow]]
@@ -214,6 +220,8 @@ class SimulationConfig:
     min_window_quality: float
     entry_price_gate_source: str
     entry_signal_row_source: str
+    expiry_win_haircut: float
+
 
 
 _WORKER_WINDOWS_DATA: Optional[Sequence[WindowPrepared]] = None
@@ -450,6 +458,7 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
     minimum_tick_size: Optional[str] = None
     up_fee_rate_bps: Optional[float] = None
     down_fee_rate_bps: Optional[float] = None
+    winning_direction: Optional[str] = None
 
     for r in rows:
         if r.btc_price is not None:
@@ -489,6 +498,8 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
             up_fee_rate_bps = float(r.up_fee_rate_bps)
         if r.down_fee_rate_bps is not None:
             down_fee_rate_bps = float(r.down_fee_rate_bps)
+        if r.winning_direction:
+            winning_direction = str(r.winning_direction)
         out.append(
             WindowRow(
                 ts_sec=r.ts_sec,
@@ -516,6 +527,7 @@ def _forward_fill_rows(rows: Sequence[WindowRow]) -> List[WindowRow]:
                 minimum_tick_size=minimum_tick_size,
                 up_fee_rate_bps=up_fee_rate_bps,
                 down_fee_rate_bps=down_fee_rate_bps,
+                winning_direction=winning_direction,
             )
         )
     return out
@@ -718,10 +730,16 @@ def _get_market_context(
     return ctx
 
 
-def _resolution_price_from_winner(position_direction: str, winning_direction: Optional[str]) -> Optional[float]:
+def _resolution_price_from_winner(
+    position_direction: str,
+    winning_direction: Optional[str],
+    win_haircut: float = 0.0,
+) -> Optional[float]:
     if winning_direction not in {"up", "down"}:
         return None
-    return 1.0 if position_direction == winning_direction else 0.0
+    if position_direction == winning_direction:
+        return 1.0 - win_haircut
+    return 0.0
 
 
 def _row_levels_for_side(
@@ -1163,6 +1181,7 @@ def _simulate_window(
     window_quality: WindowQuality,
     min_window_quality: float,
     entry_price_gate_source: str,
+    expiry_win_haircut: float = 0.0,
 ) -> Tuple[Optional[WindowTrade], Optional[str], Optional[TradeEventPair]]:
     rows = prepared.rows
     if not rows:
@@ -1200,12 +1219,84 @@ def _simulate_window(
     if not _is_fresh(entry_btc_age, max_btc_age_ms):
         return None, "stale_entry_btc", None
 
+    # BTC 越过开盘价次数检查
+    max_btc_cross_count = params.max_btc_cross_count
+    min_entry_updown_diff = params.min_entry_updown_diff
+    _cross_count = 0
+    if max_btc_cross_count > 0:
+        _last_side: Optional[str] = None
+        for _r in rows:
+            if _r.ts_sec > entry_row.ts_sec:
+                break
+            if _r.btc_price is None:
+                continue
+            if _r.btc_price > open_row.btc_price:
+                _s = "above"
+            elif _r.btc_price < open_row.btc_price:
+                _s = "below"
+            else:
+                continue
+            if _last_side is not None and _s != _last_side:
+                _cross_count += 1
+            _last_side = _s
+        if _cross_count > max_btc_cross_count:
+            return None, "btc_cross_count_exceeded", None
+
+    # ATR filter: average BTC per-second absolute delta (aligned with live max_avg_btc_delta)
+    if params.max_avg_btc_delta > 0:
+        _btc_ticks: List[float] = []
+        for _r in rows:
+            if _r.ts_sec > entry_row.ts_sec:
+                break
+            if _r.btc_price is not None:
+                _btc_ticks.append(_r.btc_price)
+        if len(_btc_ticks) >= 2:
+            _total_abs_delta = sum(abs(_btc_ticks[i] - _btc_ticks[i - 1]) for i in range(1, len(_btc_ticks)))
+            _avg_delta = _total_abs_delta / (len(_btc_ticks) - 1)
+            if _avg_delta > params.max_avg_btc_delta:
+                return None, "avg_btc_delta_exceeded", None
+
+    # UP/DOWN token 价差检查
+    _e_up_ask: Optional[float] = None
+    _e_dn_ask: Optional[float] = None
+    if min_entry_updown_diff > 0:
+        _e_up_ask = _to_positive_float(entry_row.up_ask)
+        _e_dn_ask = _to_positive_float(entry_row.down_ask)
+        if _e_up_ask is not None and _e_dn_ask is not None:
+            if abs(_e_up_ask - _e_dn_ask) < min_entry_updown_diff:
+                return None, "updown_spread_too_narrow", None
+
     diff = entry_row.btc_price - open_row.btc_price
     abs_diff = abs(diff)
     if abs_diff <= params.min_direction_diff:
         return None, "diff_below_threshold", None
 
     direction = "up" if diff > 0 else "down"
+
+    # Minute consistency check: only check minutes specified in minute_consistency list
+    _mc_minutes = [int(x) for x in params.minute_consistency.split(",") if x.strip()] if params.minute_consistency.strip() else []
+    if _mc_minutes:
+        _minute_close_rows = {
+            1: prepared.close1_row,
+            2: prepared.close2_row,
+            3: prepared.close3_row,
+        }
+        for _m in _mc_minutes:
+            if _m >= params.entry_minute:
+                continue
+            _mc_row = _minute_close_rows.get(_m)
+            if _mc_row is None or _mc_row.btc_price is None:
+                continue
+            _m_side = "up" if _mc_row.btc_price > open_row.btc_price else "down" if _mc_row.btc_price < open_row.btc_price else None
+            if _m_side is not None and _m_side != direction:
+                return None, "minute_consistency_mismatch", None
+
+    # Entry direction must be market-favored side (aligned with live entry_ask > other_ask check)
+    if min_entry_updown_diff > 0 and _e_up_ask is not None and _e_dn_ask is not None:
+        _entry_ask = _e_up_ask if direction == "up" else _e_dn_ask
+        _other_ask = _e_dn_ask if direction == "up" else _e_up_ask
+        if _entry_ask <= _other_ask:
+            return None, "entry_not_market_favored", None
 
     gate_row = entry_row if entry_price_gate_source == "decision" else entry_exec_row
     gate_ask = gate_row.up_ask if direction == "up" else gate_row.down_ask
@@ -1251,7 +1342,26 @@ def _simulate_window(
         return None, "stale_entry_ask", None
 
     rough_entry_price = float(exec_ask)
-    raw_target_size = params.stake_usd / rough_entry_price
+
+    # Risk-based position sizing
+    effective_stake = params.stake_usd
+    risk_score = 0.0
+    if params.enable_risk_sizing:
+        _ra = _assess_risk(
+            entry_price=rough_entry_price,
+            abs_btc_diff=abs_diff,
+            min_direction_diff=params.min_direction_diff,
+            btc_cross_count=_cross_count,
+            max_btc_cross_count=max_btc_cross_count,
+            base_stake=params.stake_usd,
+            min_stake_ratio=params.risk_min_stake_ratio,
+            max_stake_ratio=params.risk_max_stake_ratio,
+            confidence_boost_enabled=getattr(params, "confidence_boost_enabled", True),
+        )
+        effective_stake = _ra.adjusted_stake
+        risk_score = _ra.risk_score
+
+    raw_target_size = effective_stake / rough_entry_price
     if raw_target_size <= 0:
         return None, "invalid_entry_size", None
     target_size = _normalize_order_size(raw_target_size, tick_size=market_ctx.size_tick)
@@ -1305,6 +1415,7 @@ def _simulate_window(
             resolution_price = _resolution_price_from_winner(
                 position_direction=direction,
                 winning_direction=market_ctx.winning_direction,
+                win_haircut=expiry_win_haircut,
             )
             if resolution_price is None:
                 return None, "missing_expiry_resolution", None
@@ -1351,6 +1462,7 @@ def _simulate_window(
             resolution_price = _resolution_price_from_winner(
                 position_direction=direction,
                 winning_direction=market_ctx.winning_direction,
+                win_haircut=expiry_win_haircut,
             )
             if resolution_price is None:
                 return None, "missing_expiry_resolution", None
@@ -1359,18 +1471,22 @@ def _simulate_window(
             exit_row = r
             break
 
+    if not exit_reason.startswith("expiry_resolution"):
+        if exit_price is None or exit_price <= 0:
+            # Final fallback: use latest available bid in this window; if still missing, no trade.
+            for r in reversed(rows):
+                bid = r.up_bid if direction == "up" else r.down_bid
+                bid_event_ms = r.up_event_ms if direction == "up" else r.down_event_ms
+                bid_age = _age_ms_at_row(r.ts_sec, bid_event_ms)
+                if bid is not None and bid > 0 and _is_fresh(bid_age, max_quote_age_ms):
+                    exit_price = float(bid)
+                    exit_row = r
+                    break
     if exit_price is None or exit_price <= 0:
-        # Final fallback: use latest available bid in this window; if still missing, no trade.
-        for r in reversed(rows):
-            bid = r.up_bid if direction == "up" else r.down_bid
-            bid_event_ms = r.up_event_ms if direction == "up" else r.down_event_ms
-            bid_age = _age_ms_at_row(r.ts_sec, bid_event_ms)
-            if bid is not None and bid > 0 and _is_fresh(bid_age, max_quote_age_ms):
-                exit_price = float(bid)
-                exit_row = r
-                break
-    if exit_price is None or exit_price <= 0:
-        return None, "missing_exit_bid", None
+        if exit_reason.startswith("expiry_resolution"):
+            exit_price = 0.0
+        else:
+            return None, "missing_exit_bid", None
 
     if exit_reason.startswith("expiry_resolution"):
         close_submit_row = exit_row or rows[-1]
@@ -1847,6 +1963,7 @@ def _evaluate_one_param(
             window_quality=window_quality,
             min_window_quality=sim_config.min_window_quality,
             entry_price_gate_source=sim_config.entry_price_gate_source,
+            expiry_win_haircut=sim_config.expiry_win_haircut,
         )
         if trade is None:
             st.add_skip(skip_reason or "unknown")
@@ -2059,6 +2176,67 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Skip windows with quality score below threshold (0-1).",
     )
     parser.add_argument(
+        "--expiry-win-haircut",
+        type=float,
+        default=DEFAULT_EXPIRY_WIN_HAIRCUT,
+        help="Haircut applied to expiry winning side (1.0 -> 1.0 - haircut) for conservative backtest.",
+    )
+    parser.add_argument(
+        "--max-btc-cross-count-grid",
+        type=str,
+        default=str(DEFAULT_MAX_BTC_CROSS_COUNT),
+        help="Grid of max BTC open-price crossover counts (default '5', 0 disables).",
+    )
+    parser.add_argument(
+        "--min-entry-updown-diff-grid",
+        type=str,
+        default=str(DEFAULT_MIN_ENTRY_UPDOWN_DIFF),
+        help="Grid of min |up_ask - down_ask| spread at entry (default '0.3', 0 disables).",
+    )
+    parser.add_argument(
+        "--enable-risk-sizing",
+        action="store_true",
+        dest="enable_risk_sizing",
+        default=True,
+        help="Enable risk-adaptive position sizing (default: enabled).",
+    )
+    parser.add_argument(
+        "--disable-risk-sizing",
+        action="store_false",
+        dest="enable_risk_sizing",
+        help="Disable risk-adaptive position sizing.",
+    )
+    parser.add_argument(
+        "--risk-min-stake-ratio",
+        type=float,
+        default=0.15,
+        help="Min stake ratio when risk is highest (default 0.15).",
+    )
+    parser.add_argument(
+        "--risk-max-stake-ratio",
+        type=float,
+        default=1.0,
+        help="Max stake ratio when risk is lowest (default 1.0).",
+    )
+    parser.add_argument(
+        "--disable-confidence-boost",
+        action="store_true",
+        default=False,
+        help="Disable confidence boost (1.5x) for entry price >= 0.95.",
+    )
+    parser.add_argument(
+        "--max-avg-btc-delta-grid",
+        type=str,
+        default="3.0",
+        help="Grid of max avg |Δbtc|/s thresholds; windows with higher per-second volatility are skipped (default '3.0', 0 disables).",
+    )
+    parser.add_argument(
+        "--minute-consistency",
+        type=str,
+        default="1,2,3",
+        help="Comma-separated list of minutes to check direction consistency before entry (e.g. '1,2,3'). Empty string disables.",
+    )
+    parser.add_argument(
         "--sort-by",
         choices=["total_pnl", "win_rate", "profit_factor", "max_drawdown", "trades"],
         default="total_pnl",
@@ -2166,6 +2344,8 @@ def main() -> None:
                         end_sec_exclusive=WINDOW_SECONDS,
                         require_btc=True,
                     ),
+                    close1_row=_first_row_at_or_after(filled_rows, sec=1 * 60, require_btc=True),
+                    close2_row=_first_row_at_or_after(filled_rows, sec=2 * 60, require_btc=True),
                     close3_row=_first_row_at_or_after(filled_rows, sec=3 * 60, require_btc=True),
                     close4_row=_first_row_at_or_after(filled_rows, sec=4 * 60, require_btc=True),
                     decision_row_map=decision_row_map,
@@ -2203,6 +2383,7 @@ def main() -> None:
         min_window_quality=float(args.min_window_quality),
         entry_price_gate_source=str(args.entry_price_gate_source),
         entry_signal_row_source=str(args.entry_signal_row_source),
+        expiry_win_haircut=float(args.expiry_win_haircut),
     )
 
     started_at = time.time()

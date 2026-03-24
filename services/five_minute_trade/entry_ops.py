@@ -12,6 +12,7 @@ from data.polymarket import (
 )
 
 from .models import OpenPosition
+from .risk_sizing import RiskAssessment, assess_risk
 from .watchers import PolymarketAssetPriceWatcher
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,13 @@ def select_market_and_tokens(trader: Any, market_slug: str) -> Dict[str, Any]:
     return result
 
 
-def open_position(trader: Any, market_slug: str, direction: str) -> None:
+def open_position(
+    trader: Any,
+    market_slug: str,
+    direction: str,
+    abs_btc_diff: float = 0.0,
+    btc_cross_count: int = 0,
+) -> None:
     self = trader
 
     if self.position is not None:
@@ -151,7 +158,44 @@ def open_position(trader: Any, market_slug: str, direction: str) -> None:
     if best_ask_price is None:
         best_ask_price = float(entry_levels[0]["price"])
     rough_entry_price = best_ask_price
-    size = round(self.stake_usd / rough_entry_price, 6)
+
+    # --- Risk-based position sizing ---
+    risk_assessment = None
+    effective_stake = self.stake_usd
+    if getattr(self, "enable_risk_sizing", False):
+        risk_assessment = assess_risk(
+            entry_price=rough_entry_price,
+            abs_btc_diff=abs_btc_diff,
+            min_direction_diff=self.min_direction_diff,
+            btc_cross_count=btc_cross_count,
+            max_btc_cross_count=self.max_btc_cross_count,
+            base_stake=self.stake_usd,
+            min_stake_ratio=getattr(self, "risk_min_stake_ratio", 0.20),
+            max_stake_ratio=getattr(self, "risk_max_stake_ratio", 1.50),
+            confidence_boost_enabled=getattr(self, "confidence_boost_enabled", True),
+        )
+        effective_stake = risk_assessment.adjusted_stake
+        logger.info(
+            "风险评估: entry_price=%.4f risk_score=%.3f risk_level=%s "
+            "base_stake=%.2f adjusted_stake=%.2f "
+            "(price_risk=%.2f dir_risk=%.2f stab_risk=%.2f)",
+            rough_entry_price,
+            risk_assessment.risk_score,
+            risk_assessment.risk_level,
+            self.stake_usd,
+            effective_stake,
+            risk_assessment.entry_price_risk,
+            risk_assessment.direction_risk,
+            risk_assessment.stability_risk,
+        )
+        if effective_stake <= 0:
+            logger.info(
+                "放弃开仓：风险等级=%s，仓位削减为0",
+                risk_assessment.risk_level,
+            )
+            return
+
+    size = round(effective_stake / rough_entry_price, 6)
     normalized_size = normalize_order_size(
         size=size,
         tick_size=(market_meta or {}).get("minimum_tick_size", "0.01"),
@@ -278,6 +322,9 @@ def open_position(trader: Any, market_slug: str, direction: str) -> None:
         actual_entry_price=float(plan["vwap_price"]),
         actual_entry_size=size,
         total_invested_usdc=float(plan["vwap_price"]) * size,
+        risk_score=risk_assessment.risk_score if risk_assessment else None,
+        risk_level=risk_assessment.risk_level if risk_assessment else None,
+        risk_adjusted_stake=risk_assessment.adjusted_stake if risk_assessment else None,
     )
     self._persist_entry_event(position=self.position, order_id=order_id)
 
