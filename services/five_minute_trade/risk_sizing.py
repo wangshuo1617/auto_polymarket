@@ -107,8 +107,8 @@ def assess_risk(
     max_stake_ratio: float = 1.0,
     confidence_boost_enabled: bool = True,
     w_price: float = 0.50,
-    w_direction: float = 0.25,
-    w_stability: float = 0.25,
+    w_direction: float = 0.15,
+    w_stability: float = 0.35,
 ) -> RiskAssessment:
     """Compute risk score and adjusted stake.
 
@@ -164,6 +164,12 @@ def assess_risk(
         level = "high"
     else:
         level = "very_high"
+
+    # Risk-level-based stake overrides
+    if level == "very_high":
+        adjusted_stake = 0.0
+    elif level == "high":
+        adjusted_stake = min(adjusted_stake, base_stake * 0.50)
 
     return RiskAssessment(
         risk_score=risk_score,

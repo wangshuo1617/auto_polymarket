@@ -188,6 +188,12 @@ def open_position(
             risk_assessment.direction_risk,
             risk_assessment.stability_risk,
         )
+        if effective_stake <= 0:
+            logger.info(
+                "放弃开仓：风险等级=%s，仓位削减为0",
+                risk_assessment.risk_level,
+            )
+            return
 
     size = round(effective_stake / rough_entry_price, 6)
     normalized_size = normalize_order_size(
