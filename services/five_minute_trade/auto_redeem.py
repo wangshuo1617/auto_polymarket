@@ -39,7 +39,7 @@ USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
 RELAYER_URL = "https://relayer-v2.polymarket.com/"
 CHAIN_ID = 137
-LOOKBACK_SECONDS = 3600
+LOOKBACK_SECONDS = 7200  # 查找过去 2 小时内的活动，避免遗漏未赎回市场
 
 # redeemPositions(address,bytes32,bytes32,uint256[]) 的 4-byte selector
 _REDEEM_SELECTOR = bytes.fromhex("01b7037c")
