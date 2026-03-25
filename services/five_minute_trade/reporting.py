@@ -338,7 +338,8 @@ def build_pnl_report_content_and_subject(
     db_realized_cumulative: Optional[Dict[str, Any]] = None,
     db_entry_hourly: Optional[Dict[str, Any]] = None,
     db_entry_cumulative: Optional[Dict[str, Any]] = None,
-) -> Tuple[str, str]:
+    prev_hour_pending_slugs: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, str, List[Dict[str, Any]]]:
     hourly_pnl = sum(t.pnl for t in new_trades)
     hourly_count = len(new_trades)
     cumulative_pnl = sum(t.pnl for t in all_trades)
@@ -707,6 +708,17 @@ def build_pnl_report_content_and_subject(
 
     lines.extend(_slug_pnl_and_mtm_lines(api_pnl_cumulative))
 
+    current_buy_only_slugs: List[Dict[str, Any]] = []
+    if api_pnl_hourly is not None:
+        for slug_item in api_pnl_hourly.get("slug_summary", []):
+            has_buy = int(slug_item.get("count_trade_buy", 0) or 0) > 0
+            has_income = (
+                int(slug_item.get("count_redeem", 0) or 0) > 0
+                or int(slug_item.get("count_trade_sell", 0) or 0) > 0
+            )
+            if has_buy and not has_income:
+                current_buy_only_slugs.append(slug_item)
+
     content = "\n".join(lines)
 
     ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -764,4 +776,4 @@ def build_pnl_report_content_and_subject(
             subject += f" | 盘收益∑{float(blend):.2f}"
     subject += f" ({ts_str} UTC)"
 
-    return content, subject
+    return content, subject, current_buy_only_slugs

@@ -14,6 +14,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from config import SQLITE_DB_PATH
 
 
+DEFAULT_MAX_BTC_CROSS_COUNT = 5
+DEFAULT_MIN_ENTRY_UPDOWN_DIFF = 0.30
+
+
 @dataclass(frozen=True)
 class StrategySignature:
     entry_minute: int
@@ -25,6 +29,8 @@ class StrategySignature:
     tp_price_cap: float
     tp_value_cap: float
     sl_to_tp_ratio: float
+    max_btc_cross_count: int = DEFAULT_MAX_BTC_CROSS_COUNT
+    min_entry_updown_diff: float = DEFAULT_MIN_ENTRY_UPDOWN_DIFF
 
 
 @dataclass
@@ -108,6 +114,9 @@ def parse_strategy_signature(signature: str) -> StrategySignature:
     if missing:
         raise ValueError(f"missing strategy keys: {','.join(missing)}")
 
+    cross_raw = pairs.get("cross")
+    ud_diff_raw = pairs.get("ud_diff") or pairs.get("udiff")
+
     parsed = StrategySignature(
         entry_minute=_to_int(pairs["m"]),
         entry_preclose_sec=_to_int(pairs["pre"]),
@@ -118,6 +127,8 @@ def parse_strategy_signature(signature: str) -> StrategySignature:
         tp_price_cap=_to_float(pairs["tp_cap"]),
         tp_value_cap=_to_float(pairs["tp_val_cap"]),
         sl_to_tp_ratio=_to_float(pairs["sl_ratio"]),
+        max_btc_cross_count=_to_int(cross_raw, DEFAULT_MAX_BTC_CROSS_COUNT) if cross_raw is not None else DEFAULT_MAX_BTC_CROSS_COUNT,
+        min_entry_updown_diff=_to_float(ud_diff_raw, DEFAULT_MIN_ENTRY_UPDOWN_DIFF) if ud_diff_raw is not None else DEFAULT_MIN_ENTRY_UPDOWN_DIFF,
     )
 
     if parsed.entry_minute < 1 or parsed.entry_minute > 4:
@@ -204,6 +215,10 @@ def run_backtest_for_signature(
         str(strategy.tp_value_cap),
         "--sl-to-tp-ratio-grid",
         str(strategy.sl_to_tp_ratio),
+        "--max-btc-cross-count-grid",
+        str(strategy.max_btc_cross_count),
+        "--min-entry-updown-diff-grid",
+        str(strategy.min_entry_updown_diff),
         "--disable-output-timestamp",
         "--output-csv",
         summary_csv_path,

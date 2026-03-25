@@ -67,3 +67,6 @@ class OpenPosition:
     actual_entry_price: Optional[float] = None
     actual_entry_size: Optional[float] = None
     total_invested_usdc: Optional[float] = None
+    risk_score: Optional[float] = None
+    risk_level: Optional[str] = None
+    risk_adjusted_stake: Optional[float] = None

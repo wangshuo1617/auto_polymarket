@@ -137,9 +137,12 @@ class ChainlinkBTCPriceWatcher:
         if price is None:
             return
 
-        raw_ts = payload.get("timestamp")
+        # 优先使用消息级时间戳（RTDS 投递时间），而非 payload 级（链上预言机更新时间）
+        # payload.timestamp 是 Chainlink 预言机最后一次链上更新时间，可能滞后数分钟
+        # message.timestamp 是 Polymarket RTDS 推送时间，接近实时
+        raw_ts = message.get("timestamp") or payload.get("timestamp")
         try:
-            event_ms = int(raw_ts) if raw_ts is not None else int(message.get("timestamp"))
+            event_ms = int(raw_ts) if raw_ts is not None else int(time.time() * 1000)
         except Exception:
             event_ms = int(time.time() * 1000)
 

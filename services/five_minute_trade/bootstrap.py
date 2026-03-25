@@ -133,6 +133,37 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         help="最短持仓保护时间（秒，默认 5；0 表示关闭保护）",
     )
     parser.add_argument(
+        "--max-btc-cross-count",
+        type=int,
+        default=5,
+        help="窗口内 BTC 价格越过开盘价的最大次数；超过则跳过入场（默认 5，0 表示关闭）",
+    )
+    parser.add_argument(
+        "--min-entry-updown-diff",
+        type=float,
+        default=0.30,
+        help="入场时 UP/DOWN token 的最小 ask 价差；低于则跳过入场（默认 0.30，0 表示关闭）",
+    )
+    parser.add_argument(
+        "--max-avg-btc-delta",
+        type=float,
+        default=3.0,
+        help="窗口内每秒 BTC 价格变化绝对值均值上限；超过则跳过入场（默认 3.0，0 表示关闭）",
+    )
+    parser.add_argument(
+        "--minute-consistency",
+        type=str,
+        default="1,2,3",
+        help="入场前检查哪些分钟的收盘价方向一致性，逗号分隔（如 '1,2,3'）。空字符串表示禁用",
+    )
+    parser.add_argument(
+        "--exit-mode",
+        type=str,
+        default="tpsl",
+        choices=["tpsl", "hold"],
+        help="平仓模式: tpsl=止盈止损（默认）, hold=持有到结算",
+    )
+    parser.add_argument(
         "--toxic-utc-hours",
         type=str,
         default="16,19,20",
@@ -143,6 +174,37 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=SQLITE_DB_PATH,
         help="交易事件SQLite文件路径（默认读取 config.SQLITE_DB_PATH）",
+    )
+    parser.add_argument(
+        "--enable-risk-sizing",
+        action="store_true",
+        dest="enable_risk_sizing",
+        default=True,
+        help="启用风险自适应仓位管理（默认已启用）",
+    )
+    parser.add_argument(
+        "--disable-risk-sizing",
+        action="store_false",
+        dest="enable_risk_sizing",
+        help="禁用风险自适应仓位管理",
+    )
+    parser.add_argument(
+        "--risk-min-stake-ratio",
+        type=float,
+        default=0.20,
+        help="风险仓位下限（base_stake 的比例，默认 0.20 即 20%）",
+    )
+    parser.add_argument(
+        "--risk-max-stake-ratio",
+        type=float,
+        default=1.2,
+        help="风险仓位上限（base_stake 的比例，默认 1.2 即不超过基础额度的 120%）",
+    )
+    parser.add_argument(
+        "--disable-confidence-boost",
+        action="store_true",
+        default=False,
+        help="禁用 >=0.95 入场价的信心加仓（默认启用，1.5x）",
     )
     return parser
 
@@ -161,7 +223,16 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         tp_value_cap=args.tp_value_cap,
         sl_to_tp_ratio=args.sl_to_tp_ratio,
         min_hold_before_close_sec=args.min_hold_before_close_sec,
+        max_btc_cross_count=args.max_btc_cross_count,
+        min_entry_updown_diff=args.min_entry_updown_diff,
+        max_avg_btc_delta=args.max_avg_btc_delta,
+        minute_consistency=args.minute_consistency,
+        exit_mode=args.exit_mode,
         toxic_utc_hours=args.toxic_utc_hours,
         trade_db_path=args.trade_db_path,
         dry_run=args.dry_run,
+        enable_risk_sizing=args.enable_risk_sizing,
+        risk_min_stake_ratio=args.risk_min_stake_ratio,
+        risk_max_stake_ratio=args.risk_max_stake_ratio,
+        confidence_boost_enabled=not getattr(args, "disable_confidence_boost", False),
     )

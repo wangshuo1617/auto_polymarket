@@ -18,4 +18,8 @@ dependencies = [
     "polymarket-apis>=0.4.3",
     "flask>=3.0.0",
     "duckdb>=1.2.2",
+    "py-builder-relayer-client",
 ]
+
+[tool.uv.sources]
+py-builder-relayer-client = { git = "https://github.com/Polymarket/py-builder-relayer-client.git" }

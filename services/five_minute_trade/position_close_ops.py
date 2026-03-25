@@ -213,6 +213,7 @@ def schedule_post_close_balance_check(
     order_id: Optional[str] = None,
     match_check_delay_sec: int = 3,
     balance_check_delay_sec: int = 5,
+    close_retry_count: int = 0,
 ) -> None:
     self = trader
 
@@ -423,8 +424,18 @@ def schedule_post_close_balance_check(
                 )
 
         if should_retry:
+            if close_retry_count >= MAX_CLOSE_RETRIES:
+                logger.error(
+                    "平仓重试已达上限(%d次)，停止重试，请人工介入: market=%s token=%s remaining=%.6f reason=%s",
+                    MAX_CLOSE_RETRIES,
+                    closed_position.market_slug,
+                    closed_position.token_id,
+                    remaining_size,
+                    reason,
+                )
+                return
             residual_reason = f"{reason}_residual" if not reason.endswith("_residual") else reason
-            self._force_close_position(reason=residual_reason)
+            self._force_close_position(reason=residual_reason, close_retry_count=close_retry_count + 1)
 
     threading.Thread(
         target=_run,
@@ -433,7 +444,10 @@ def schedule_post_close_balance_check(
     ).start()
 
 
-def force_close_position(trader: Any, reason: str) -> None:
+MAX_CLOSE_RETRIES = 3
+
+
+def force_close_position(trader: Any, reason: str, close_retry_count: int = 0) -> None:
     self = trader
 
     if not self.position:
@@ -610,6 +624,7 @@ def force_close_position(trader: Any, reason: str) -> None:
                 order_id=None,
                 match_check_delay_sec=3,
                 balance_check_delay_sec=5,
+                close_retry_count=close_retry_count,
             )
             close_ms = (time.perf_counter() - close_t0) * 1000
             self._record_latency("close_total", close_ms)
@@ -637,6 +652,7 @@ def force_close_position(trader: Any, reason: str) -> None:
                 order_id=order_id,
                 match_check_delay_sec=3,
                 balance_check_delay_sec=5,
+                close_retry_count=close_retry_count,
             )
     elif self.dry_run:
         dry_run_exit = exit_price
