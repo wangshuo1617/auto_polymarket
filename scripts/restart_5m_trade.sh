@@ -25,6 +25,17 @@ ENABLE_RISK_SIZING="${21:-true}"
 RISK_MIN_STAKE_RATIO="${22:-0.20}"
 RISK_MAX_STAKE_RATIO="${23:-1.2}"
 CONFIDENCE_BOOST="${24:-true}"
+CONFIDENCE_BOOST_GE_095="${25:-1.5}"
+STAKE_CAP_VERY_HIGH="${26:-0.0}"
+STAKE_CAP_HIGH="${27:-0.50}"
+STAKE_CAP_MEDIUM_HIGH="${28:-0.50}"
+MEDIUM_HIGH_THRESHOLD="${29:-0.40}"
+RISK_W_PRICE="${30:-0.30}"
+RISK_W_DIRECTION="${31:-0.15}"
+RISK_W_STABILITY="${32:-0.55}"
+RISK_DIFF_BOOST_THRESHOLD="${33:-0.44}"
+RISK_DIFF_BOOST_MULTIPLIER="${34:-1.40}"
+CROSS_BORDERLINE_DIFF_MULTIPLIER="${35:-0.0}"
 
 REPORT_INTERVAL_SEC="${6:-3600}"
 TAKE_PROFIT_SPREAD="${8:-0.15}"
@@ -243,7 +254,11 @@ else
 fi
 echo "平仓模式: $EXIT_MODE"
 echo "风险仓位管理: $ENABLE_RISK_SIZING (min=$RISK_MIN_STAKE_RATIO max=$RISK_MAX_STAKE_RATIO)"
-echo "信心加仓: $CONFIDENCE_BOOST"
+echo "信心加仓: $CONFIDENCE_BOOST (>=0.95倍率=$CONFIDENCE_BOOST_GE_095)"
+echo "风险等级stake上限: very_high=$STAKE_CAP_VERY_HIGH high=$STAKE_CAP_HIGH medium_high=$STAKE_CAP_MEDIUM_HIGH (阈值=$MEDIUM_HIGH_THRESHOLD)"
+echo "风险权重: price=$RISK_W_PRICE direction=$RISK_W_DIRECTION stability=$RISK_W_STABILITY"
+echo "risk_diff_boost: threshold=$RISK_DIFF_BOOST_THRESHOLD multiplier=$RISK_DIFF_BOOST_MULTIPLIER"
+echo "cross_borderline: diff_multiplier=$CROSS_BORDERLINE_DIFF_MULTIPLIER"
 if [ -n "$TRADE_DB_PATH" ]; then
   echo "交易数据库路径: $TRADE_DB_PATH"
 else
@@ -284,6 +299,17 @@ CMD=(
   --exit-mode "$EXIT_MODE"
   --risk-min-stake-ratio "$RISK_MIN_STAKE_RATIO"
   --risk-max-stake-ratio "$RISK_MAX_STAKE_RATIO"
+  --confidence-boost-ge-095 "$CONFIDENCE_BOOST_GE_095"
+  --stake-cap-very-high "$STAKE_CAP_VERY_HIGH"
+  --stake-cap-high "$STAKE_CAP_HIGH"
+  --stake-cap-medium-high "$STAKE_CAP_MEDIUM_HIGH"
+  --medium-high-threshold "$MEDIUM_HIGH_THRESHOLD"
+  --risk-w-price "$RISK_W_PRICE"
+  --risk-w-direction "$RISK_W_DIRECTION"
+  --risk-w-stability "$RISK_W_STABILITY"
+  --risk-diff-boost-threshold "$RISK_DIFF_BOOST_THRESHOLD"
+  --risk-diff-boost-multiplier "$RISK_DIFF_BOOST_MULTIPLIER"
+  --cross-borderline-diff-multiplier "$CROSS_BORDERLINE_DIFF_MULTIPLIER"
 )
 
 if [ -n "$TRADE_DB_PATH" ]; then

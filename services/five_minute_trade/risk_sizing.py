@@ -84,7 +84,10 @@ def compute_stability_risk(
     return min(1.0, btc_cross_count / max_btc_cross_count)
 
 
-def compute_confidence_boost(entry_price: float) -> float:
+def compute_confidence_boost(
+    entry_price: float,
+    boost_ge_095: float = 1.5,
+) -> float:
     """Extra multiplier for highest-confidence entry prices.
 
     Applied *after* the normal risk sizing so that only the most
@@ -92,7 +95,7 @@ def compute_confidence_boost(entry_price: float) -> float:
     Zones without 100 % WR in walk-forward data stay at 1.0 (no boost).
     """
     if entry_price >= 0.95:
-        return 1.5   # 100 % WR across all OOS windows, boost 50 %
+        return boost_ge_095
     return 1.0
 
 
@@ -109,6 +112,11 @@ def assess_risk(
     w_price: float = 0.50,
     w_direction: float = 0.15,
     w_stability: float = 0.35,
+    stake_cap_very_high: float = 0.0,
+    stake_cap_high: float = 0.50,
+    stake_cap_medium_high: float = 0.35,
+    medium_high_threshold: float = 0.40,
+    confidence_boost_ge_095: float = 1.5,
 ) -> RiskAssessment:
     """Compute risk score and adjusted stake.
 
@@ -124,6 +132,11 @@ def assess_risk(
     max_stake_ratio : ceiling for adjusted stake (fraction of base)
     confidence_boost_enabled : apply extra multiplier for >=0.95
     w_price / w_direction / w_stability : component weights
+    stake_cap_very_high : stake ratio cap for very_high risk (0 = no trade)
+    stake_cap_high : stake ratio cap for high risk level
+    stake_cap_medium_high : stake ratio cap when medium level + score >= medium_high_threshold
+    medium_high_threshold : risk_score cutoff within medium level for extra clamping
+    confidence_boost_ge_095 : confidence boost multiplier for entry_price >= 0.95
 
     Returns
     -------
@@ -147,11 +160,15 @@ def assess_risk(
 
     # Targeted boost for highest-confidence zones (applied after risk scaling)
     if confidence_boost_enabled:
-        adjusted_stake *= compute_confidence_boost(entry_price)
+        adjusted_stake *= compute_confidence_boost(
+            entry_price, boost_ge_095=confidence_boost_ge_095,
+        )
 
     adjusted_stake = max(
         base_stake * min_stake_ratio,
-        min(base_stake * max_stake_ratio * compute_confidence_boost(entry_price)
+        min(base_stake * max_stake_ratio * compute_confidence_boost(
+                entry_price, boost_ge_095=confidence_boost_ge_095,
+            )
             if confidence_boost_enabled else base_stake * max_stake_ratio,
             adjusted_stake),
     )
@@ -167,9 +184,11 @@ def assess_risk(
 
     # Risk-level-based stake overrides
     if level == "very_high":
-        adjusted_stake = 0.0
+        adjusted_stake = min(adjusted_stake, base_stake * stake_cap_very_high)
     elif level == "high":
-        adjusted_stake = min(adjusted_stake, base_stake * 0.50)
+        adjusted_stake = min(adjusted_stake, base_stake * stake_cap_high)
+    elif level == "medium" and risk_score >= medium_high_threshold:
+        adjusted_stake = min(adjusted_stake, base_stake * stake_cap_medium_high)
 
     return RiskAssessment(
         risk_score=risk_score,
