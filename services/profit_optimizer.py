@@ -67,7 +67,11 @@ def _param_value(
 
 def _normalize_asset(asset: str | None) -> str:
     normalized = str(asset or "btc").strip().lower()
-    return "oil" if normalized == "oil" else "btc"
+    if normalized == "oil":
+        return "oil"
+    if normalized == "gold":
+        return "gold"
+    return "btc"
 
 
 def _calibrate_probability(prob: float, model_payload: dict | None) -> tuple[float, bool]:
@@ -249,7 +253,12 @@ def build_profit_optimization_context(
     """构建“期望收益最大化”所需的结构化先验和边际机会列表。"""
     param_overrides = _load_realtime_effective_params()
     asset_name = _normalize_asset(asset)
-    model_name = "minimal_market_model_oil" if asset_name == "oil" else "minimal_market_model"
+    if asset_name == "oil":
+        model_name = "minimal_market_model_oil"
+    elif asset_name == "gold":
+        model_name = "minimal_market_model_gold"
+    else:
+        model_name = "minimal_market_model"
     minimal_model = _load_minimal_market_model(model_name=model_name)
     current_price = _to_float(future_possibility_context.get("current_btc_price"), 0.0)
     days_left = max(1, int(_to_float(future_possibility_context.get("days_left_in_month"), 1.0)))

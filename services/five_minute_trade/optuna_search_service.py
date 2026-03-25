@@ -9,6 +9,8 @@ import sqlite3
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from config import SQLITE_DB_PATH
+
 try:
     import optuna
 except Exception as exc:  # pragma: no cover - runtime guard
@@ -600,7 +602,11 @@ def _score_from_stats(stats_row: Dict[str, object], args: argparse.Namespace) ->
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Optuna hyperparameter search for 5m backtest strategy")
-    parser.add_argument("--db-path", type=str, default=os.getenv("SQLITE_DB_PATH", "logs/trade.sqlite3"))
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default=os.getenv("SQLITE_DB_PATH", SQLITE_DB_PATH),
+    )
     parser.add_argument("--start-ts-sec", type=int, required=True)
     parser.add_argument("--end-ts-sec", type=int, required=True)
     parser.add_argument("--trials", type=int, default=300)

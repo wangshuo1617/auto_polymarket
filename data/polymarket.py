@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +343,20 @@ def prefetch_order_metadata_for_tokens(
         else:
             fee_rate_bps = _get_cached_fee_rate_bps(token)
 
+        # 缓存未命中时常为 0；CLOB 下单要求与 market 的 taker fee 一致，否则会 400：
+        # invalid fee rate (0), current market's taker fee: 1000
+        if fee_rate_bps == 0:
+            try:
+                fetched = int(client.get_fee_rate_bps(token) or 0)
+                if fetched > 0:
+                    fee_rate_bps = fetched
+            except Exception as e:
+                logger.warning(
+                    "get_fee_rate_bps when cached fee was 0: token_id=%s error=%s",
+                    _token_id_short(token),
+                    e,
+                )
+
         meta = _cache_token_order_metadata(
             token,
             minimum_tick_size=minimum_tick_size,
@@ -416,6 +430,155 @@ def _token_id_short(tid: str) -> str:
     if not tid or len(tid) <= 16:
         return tid or ""
     return f"{tid[:8]}...{tid[-4:]}"
+
+
+def _safe_optional_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _is_timeout_like_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    timeout_signals = (
+        "readtimeout",
+        "read timeout",
+        "the read operation timed out",
+        "request exception",
+        "timed out",
+    )
+    return any(sig in msg for sig in timeout_signals)
+
+
+def _extract_order_id_from_activity_item(item: Dict[str, Any]) -> Optional[str]:
+    for k in ("orderID", "orderId", "order_id", "clobOrderId", "clob_order_id"):
+        v = item.get(k)
+        if v:
+            return str(v)
+    return None
+
+
+def _extract_token_id_from_item(item: Dict[str, Any]) -> Optional[str]:
+    for k in (
+        "token_id",
+        "tokenId",
+        "asset_id",
+        "assetId",
+        "outcomeTokenId",
+        "clobTokenId",
+        "clob_token_id",
+    ):
+        v = item.get(k)
+        if v:
+            return str(v)
+    return None
+
+
+def _recover_timeout_buy_order(
+    market_id: str,
+    token_id: str,
+    submitted_price: float,
+    submitted_size: float,
+    timeout_ts: int,
+) -> Optional[str]:
+    """
+    当下单超时时，尝试回查是否已被服务端接收，避免“假失败后重复下单”。
+    返回真实 order_id；若仅能确认有成交但无 order_id，返回 tx:<hash> 占位。
+    """
+    # 1) 先查 open orders（若订单仍挂着，通常可拿到 order_id）
+    try:
+        open_orders = get_open_orders()
+        if isinstance(open_orders, list):
+            for od in reversed(open_orders):
+                if not isinstance(od, dict):
+                    continue
+                od_token = _extract_token_id_from_item(od)
+                if od_token and od_token != str(token_id):
+                    continue
+                side = str(od.get("side") or "").upper()
+                if side and side != "BUY":
+                    continue
+                p = _safe_optional_float(od.get("price"))
+                s = _safe_optional_float(od.get("size"))
+                if p is None or s is None:
+                    continue
+                price_ok = abs(p - float(submitted_price)) <= 0.03
+                size_ok = abs(s - float(submitted_size)) <= max(0.2, float(submitted_size) * 0.12)
+                if not (price_ok and size_ok):
+                    continue
+                recovered_oid = (
+                    str(od.get("id") or "")
+                    or str(od.get("orderID") or "")
+                    or str(od.get("orderId") or "")
+                    or str(od.get("order_id") or "")
+                )
+                if recovered_oid:
+                    logger.warning(
+                        "buy_order 超时后在 open_orders 找到匹配订单: market_id=%s token_id=%s order_id=%s",
+                        market_id,
+                        _token_id_short(token_id),
+                        recovered_oid,
+                    )
+                    return recovered_oid
+    except Exception as e:
+        logger.warning("buy_order 超时回查 open_orders 失败: %s", e)
+
+    # 2) 再查 activity（可能已快速成交，不在 open_orders）
+    try:
+        activity = get_activity_history(market_id)
+        if isinstance(activity, list):
+            now_ts = int(time.time())
+            for item in sorted(
+                [x for x in activity if isinstance(x, dict)],
+                key=lambda x: int(x.get("timestamp") or 0),
+                reverse=True,
+            ):
+                ts = int(item.get("timestamp") or 0)
+                if ts and ts < timeout_ts - 10:
+                    break
+                if ts and ts > now_ts + 10:
+                    continue
+                event_type = str(item.get("type") or "").upper()
+                side = str(item.get("side") or "").upper()
+                if event_type != "TRADE" or side != "BUY":
+                    continue
+                item_token = _extract_token_id_from_item(item)
+                if item_token and item_token != str(token_id):
+                    continue
+                p = _safe_optional_float(item.get("price"))
+                s = _safe_optional_float(item.get("size"))
+                if p is None or s is None:
+                    continue
+                price_ok = abs(p - float(submitted_price)) <= 0.03
+                size_ok = abs(s - float(submitted_size)) <= max(0.2, float(submitted_size) * 0.2)
+                if not (price_ok and size_ok):
+                    continue
+
+                oid = _extract_order_id_from_activity_item(item)
+                if oid:
+                    logger.warning(
+                        "buy_order 超时后在 activity 找到匹配订单ID: market_id=%s token_id=%s order_id=%s",
+                        market_id,
+                        _token_id_short(token_id),
+                        oid,
+                    )
+                    return oid
+
+                tx_hash = str(item.get("transactionHash") or "").strip()
+                if tx_hash:
+                    pseudo = f"tx:{tx_hash}"
+                    logger.warning(
+                        "buy_order 超时后在 activity 确认成交(无order_id)，返回占位ID: %s",
+                        pseudo,
+                    )
+                    return pseudo
+    except Exception as e:
+        logger.warning("buy_order 超时回查 activity 失败: %s", e)
+
+    return None
 
 
 def get_market_metadata(market_id: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
@@ -503,7 +666,24 @@ def buy_order(
         logger.info("buy_order success: market_id=%s order_id=%s submit_latency=%.2fms", market_id, order_id, submit_ms)
         return order_id
     except Exception as e:
-        logger.exception("buy_order create_and_post_order failed: market_id=%s token_id=%s price=%s size=%s error=%s", market_id, _token_id_short(token_id), price, size, e)
+        logger.exception(
+            "buy_order create_and_post_order failed: market_id=%s token_id=%s price=%s size=%s error=%s",
+            market_id,
+            _token_id_short(token_id),
+            price,
+            size,
+            e,
+        )
+        if _is_timeout_like_error(e):
+            recovered = _recover_timeout_buy_order(
+                market_id=market_id,
+                token_id=token_id,
+                submitted_price=float(price),
+                submitted_size=float(normalized_size),
+                timeout_ts=int(time.time()),
+            )
+            if recovered:
+                return recovered
         return None
 
 
@@ -586,6 +766,13 @@ def cancel_order(order_id: str):
 def get_order_detail(order_id: str) -> Optional[Dict[str, Any]]:
     if not order_id:
         return None
+    if str(order_id).startswith("tx:"):
+        # 占位ID：来自超时后 activity 回查，无法通过 clob get_order 查询。
+        return {
+            "id": order_id,
+            "status": "MATCHED_BY_ACTIVITY",
+            "matched_size": 0,
+        }
     try:
         detail = client.get_order(order_id)
         if isinstance(detail, dict):
@@ -665,20 +852,41 @@ def get_activity_history(market_id: str) -> List[Dict[str, Any]]:
         return []
 
 def get_5m_updown_activity_history(since_ts: Optional[int] = None, until_ts: Optional[int] = None) -> List[Dict[str, Any]]:
+    """拉取用户在时间窗内的 activity，并只保留 BTC 5m up/down 相关 slug。
+
+    Data API 对单页条数有限制；单页拉满时继续用 offset 翻页，避免累计盈亏只统计前 N 条。
+    """
     url = "https://data-api.polymarket.com/activity"
-    params = {"user": WALLET_ADDRESS,"limit": 1000,"start": since_ts, "end": until_ts}
+    page_limit = 500
+    max_pages = 80  # 最多约 4 万条原始 activity，防失控
+    filtered: List[Dict[str, Any]] = []
+    offset = 0
     try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        result = response.json()
-        if isinstance(result, list):
-            filtered = []
+        for _ in range(max_pages):
+            params: Dict[str, Any] = {
+                "user": WALLET_ADDRESS,
+                "limit": page_limit,
+                "offset": offset,
+            }
+            if since_ts is not None:
+                params["start"] = int(since_ts)
+            if until_ts is not None:
+                params["end"] = int(until_ts)
+            response = requests.get(url, params=params, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            if not isinstance(result, list) or not result:
+                break
             for item in result:
+                if not isinstance(item, dict):
+                    continue
                 slug = str(item.get("eventSlug") or "").lower()
                 if "btc-updown-5m" in slug:
                     filtered.append(item)
-            return filtered
-        return []
+            if len(result) < page_limit:
+                break
+            offset += page_limit
+        return filtered
     except Exception as e:
         logger.warning("get_5m_updown_activity_history failed: error=%s", e)
     return []
@@ -707,9 +915,251 @@ def _round2(value: float) -> float:
     return round(float(value), 2)
 
 
+def _activity_trade_size(item: Dict[str, Any]) -> float:
+    """从 activity 条目推断成交份额（shares）。"""
+    s = _safe_float(item.get("size"))
+    if s > 0:
+        return s
+    p = _safe_float(item.get("price"))
+    u = _safe_float(item.get("usdcSize"))
+    if p > 0 and u > 0:
+        return u / p
+    return 0.0
+
+
+def _activity_outcome_up_down(item: Dict[str, Any]) -> Optional[str]:
+    o = str(item.get("outcome") or "").lower()
+    if "up" in o:
+        return "up"
+    if "down" in o:
+        return "down"
+    idx = item.get("outcomeIndex")
+    try:
+        idx_int = int(idx)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        idx_int = None
+    if idx_int == 0:
+        return "up"
+    if idx_int == 1:
+        return "down"
+    return None
+
+
+def _build_slug_net_shares_from_trades(
+    batch: List[Any],
+    since_ts: int,
+    until_ts_int: Optional[int],
+    *,
+    include_redeem: bool = True,
+) -> Dict[str, Dict[str, float]]:
+    """用 TRADE 推导每个 slug 的 Up/Down 净份额（仅本时间窗内流水）。
+
+    include_redeem=False 时忽略 REDEEM，用于「按最终结算价」反推盈亏（不把赎回当作头寸变化）。
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    for item in batch:
+        if not isinstance(item, dict):
+            continue
+        ts = int(item.get("timestamp") or 0)
+        if ts < since_ts:
+            continue
+        if until_ts_int is not None and ts > until_ts_int:
+            continue
+        event_slug = str(item.get("eventSlug") or item.get("slug") or "unknown").strip().lower() or "unknown"
+        if event_slug not in out:
+            out[event_slug] = {"up": 0.0, "down": 0.0}
+        bucket = out[event_slug]
+        event_type = str(item.get("type") or "").upper()
+        if event_type == "TRADE":
+            side = str(item.get("side") or "").upper()
+            if side not in {"BUY", "SELL"}:
+                continue
+            od = _activity_outcome_up_down(item)
+            if od is None:
+                continue
+            sz = _activity_trade_size(item)
+            if sz <= 0:
+                continue
+            sign = 1.0 if side == "BUY" else -1.0
+            bucket[od] += sign * sz
+        elif include_redeem and event_type == "REDEEM":
+            od = _activity_outcome_up_down(item)
+            sz = _activity_trade_size(item)
+            if sz <= 0 or od is None:
+                continue
+            bucket[od] -= sz
+    return out
+
+
+def _infer_up_down_winner_from_market_first(market: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    """根据 Gamma 盘口末价（接近 0/1）推断 Up/Down 谁赢；未分胜负则 unresolved。"""
+    import json
+
+    outcomes = market.get("outcomes") or []
+    if isinstance(outcomes, str):
+        try:
+            outcomes = json.loads(outcomes) if outcomes else []
+        except json.JSONDecodeError:
+            outcomes = []
+    if not isinstance(outcomes, list):
+        outcomes = []
+    prices_raw = market.get("outcomePrices") or []
+    plist: List[float] = []
+    if isinstance(prices_raw, str):
+        try:
+            parsed = json.loads(prices_raw)
+            prices_raw = parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            prices_raw = []
+    if isinstance(prices_raw, list):
+        for p in prices_raw:
+            try:
+                plist.append(float(p))
+            except (TypeError, ValueError):
+                plist.append(0.0)
+    if len(plist) < 2:
+        return None, "bad_prices"
+    n = min(len(outcomes), len(plist))
+    if n < 2:
+        plist = plist[:2]
+        outcomes = outcomes[:2] if len(outcomes) >= 2 else outcomes
+        n = min(len(outcomes), len(plist))
+    if n < 2:
+        return None, "bad_prices"
+    plist = plist[:n]
+    outcomes = outcomes[:n]
+    pmax = max(plist)
+    pmin = min(plist)
+    # 避免盘中价(≈0.5)误判为已结算：要求胜侧足够接近 1 或价差足够大
+    if pmax < 0.80 and (pmax - pmin) < 0.50:
+        return None, "unresolved"
+    win_i = max(range(len(plist)), key=lambda i: plist[i])
+    o = str(outcomes[win_i]).lower()
+    if "up" in o:
+        return "up", "ok"
+    if "down" in o:
+        return "down", "ok"
+    return None, "unknown_outcome"
+
+
+def _payout_usdc_at_settlement(nu: float, nd: float, winner: str) -> float:
+    """二元结算：胜方每股 1 USDC，败方 0。"""
+    if winner == "up":
+        return float(nu)
+    if winner == "down":
+        return float(nd)
+    return 0.0
+
+
+def _apply_slug_settlement_estimates(
+    slug_rows: List[Dict[str, Any]],
+    *,
+    max_slugs: int = 40,
+    sleep_sec: float = 0.06,
+    trade_only_positions: Optional[Dict[str, Dict[str, float]]] = None,
+    prefer_settlement_final: bool = False,
+) -> None:
+    """填充每盘的 settlement 反推与展示用盈亏。
+
+    prefer_settlement_final=False（默认）:
+      已赎回：展示用 Activity net_pnl；未赎回：Gamma 胜负 + 净头寸反推。
+
+    prefer_settlement_final=True:
+      一律用 Gamma 已分胜负时的「卖出收入 + 胜方净份额×1 − 买入成本」，
+      净份额来自 trade_only_positions（仅 TRADE，不含 REDEEM），不依赖赎回流水。
+    """
+    from data.gamma_api import fetch_event_by_slug
+
+    rows = sorted(
+        slug_rows,
+        key=lambda r: (abs(float(r.get("net_pnl", 0) or 0)), int(r.get("activity_count", 0) or 0)),
+        reverse=True,
+    )[: max(0, int(max_slugs))]
+
+    for row in rows:
+        slug = str(row.get("slug") or "").strip()
+        if not slug:
+            continue
+        nu = float(row.get("net_shares_up") or 0.0)
+        nd = float(row.get("net_shares_down") or 0.0)
+        if trade_only_positions is not None:
+            pos_to = trade_only_positions.get(slug) or {"up": 0.0, "down": 0.0}
+            nu = float(pos_to.get("up", 0.0))
+            nd = float(pos_to.get("down", 0.0))
+        buy_cost = float(row.get("expense_trade_buy") or 0.0)
+        sell_inc = float(row.get("income_trade_sell") or 0.0)
+        inc_redeem = float(row.get("income_redeem") or 0.0)
+        cnt_redeem = int(row.get("count_redeem") or 0)
+        net_pnl = float(row.get("net_pnl") or 0.0)
+
+        redeemed = cnt_redeem > 0 or inc_redeem > 1e-6
+        row["redeemed"] = redeemed
+        row["settlement_est_pnl_usdc"] = None
+        row["resolution_winner"] = None
+        row["settlement_note"] = ""
+        row["gamma_settlement_prices"] = None
+
+        if not prefer_settlement_final and redeemed:
+            row["pnl_display_mode"] = "actual_redeem"
+            row["display_round_pnl_usdc"] = _round2(net_pnl)
+            time.sleep(sleep_sec)
+            continue
+
+        ev = fetch_event_by_slug(slug)
+        if ev is None:
+            row["settlement_note"] = "gamma_fetch_fail"
+            if prefer_settlement_final:
+                row["pnl_display_mode"] = "settlement_final_pending"
+                row["display_round_pnl_usdc"] = None
+            time.sleep(sleep_sec)
+            continue
+
+        mkts = list(ev.get("markets") or [])
+        if not mkts:
+            row["settlement_note"] = "no_markets"
+            if prefer_settlement_final:
+                row["pnl_display_mode"] = "settlement_final_pending"
+                row["display_round_pnl_usdc"] = None
+            time.sleep(sleep_sec)
+            continue
+
+        m0 = mkts[0]
+        plist = m0.get("outcomePrices") or []
+        row["gamma_settlement_prices"] = plist if isinstance(plist, list) else str(plist)[:120]
+
+        winner, note = _infer_up_down_winner_from_market_first(m0)
+        row["settlement_note"] = note
+        if winner is None:
+            if prefer_settlement_final:
+                row["pnl_display_mode"] = "settlement_final_pending"
+                row["display_round_pnl_usdc"] = None
+            time.sleep(sleep_sec)
+            continue
+
+        row["resolution_winner"] = winner
+        payout = _payout_usdc_at_settlement(nu, nd, winner)
+        if prefer_settlement_final:
+            est = float(payout) + sell_inc - buy_cost
+            row["settlement_est_pnl_usdc"] = _round2(est)
+            row["pnl_display_mode"] = "settlement_final"
+            row["display_round_pnl_usdc"] = _round2(est)
+        else:
+            est = float(payout) - buy_cost
+            row["settlement_est_pnl_usdc"] = _round2(est)
+            row["pnl_display_mode"] = "settlement_reverse"
+            row["display_round_pnl_usdc"] = _round2(est)
+        time.sleep(sleep_sec)
+
+
 def calculate_activity_pnl_from_trade_events(
     since_ts: int,
-    until_ts: Optional[int] = None
+    until_ts: Optional[int] = None,
+    *,
+    include_settlement_estimate: bool = False,
+    max_settlement_slugs: int = 40,
+    include_gamma_mtm: Optional[bool] = None,
+    max_gamma_mtm_slugs: Optional[int] = None,
+    prefer_settlement_final: bool = False,
 ) -> Dict[str, Any]:
     """统计给定时间区间内 5m up/down activity 的 USDC 收益。
 
@@ -719,10 +1169,19 @@ def calculate_activity_pnl_from_trade_events(
     - 仅统计 usdcSize
 
     说明：
-    - 直接使用 get_5m_updown_activity_history 的返回数据，不再依赖 SQLite 中的 market_id。
-    - db_path/sleep_sec 参数保留用于兼容旧调用。
-    - 新增 slug 维度聚合：返回每个 slug 的净盈亏，以及盈利/亏损/持平次数统计。
+    - slug 维度：每条含 net_shares_up/down（由 TRADE/REDEEM 推导）。
+    - include_settlement_estimate=True（或兼容参数 include_gamma_mtm=True）时：
+      默认：已赎回用 Activity net_pnl；未赎回用 Gamma 反推。
+    - prefer_settlement_final=True（需同时 include_settlement_estimate）时：
+      一律用 Gamma 已分胜负 + 仅 TRADE 净头寸，公式「胜方份额×1 + 卖出收入 − 买入成本」，
+      不把 REDEEM 当作头寸或现金流依据（与链上 Activity 净值对照用）。
     """
+    if include_gamma_mtm is not None:
+        include_settlement_estimate = bool(include_gamma_mtm)
+    if max_gamma_mtm_slugs is not None:
+        max_settlement_slugs = int(max_gamma_mtm_slugs)
+    if prefer_settlement_final:
+        include_settlement_estimate = True
     since_ts = int(since_ts)
     until_ts_int = int(until_ts) if until_ts is not None else None
     batch = get_5m_updown_activity_history(since_ts=since_ts, until_ts=until_ts_int)
@@ -829,6 +1288,72 @@ def calculate_activity_pnl_from_trade_events(
 
     slug_pnl_summary.sort(key=lambda x: (x["net_pnl"], x["slug"]), reverse=True)
 
+    slug_positions = _build_slug_net_shares_from_trades(batch, since_ts, until_ts_int, include_redeem=True)
+    slug_positions_trade_only = _build_slug_net_shares_from_trades(
+        batch, since_ts, until_ts_int, include_redeem=False
+    )
+    for row in slug_pnl_summary:
+        skey = str(row.get("slug") or "").strip()
+        pos = slug_positions.get(skey) or {"up": 0.0, "down": 0.0}
+        row["net_shares_up"] = _round2(float(pos.get("up", 0.0)))
+        row["net_shares_down"] = _round2(float(pos.get("down", 0.0)))
+        pos_to = slug_positions_trade_only.get(skey) or {"up": 0.0, "down": 0.0}
+        row["net_shares_up_trade_only"] = _round2(float(pos_to.get("up", 0.0)))
+        row["net_shares_down_trade_only"] = _round2(float(pos_to.get("down", 0.0)))
+        cnt_redeem = int(row.get("count_redeem") or 0)
+        inc_redeem = float(row.get("income_redeem") or 0.0)
+        redeemed = cnt_redeem > 0 or inc_redeem > 1e-6
+        row["redeemed"] = redeemed
+        row["settlement_est_pnl_usdc"] = None
+        row["resolution_winner"] = None
+        row["settlement_note"] = ""
+        row["pnl_display_mode"] = "actual_redeem" if redeemed else "pending"
+        row["display_round_pnl_usdc"] = _round2(float(row.get("net_pnl") or 0.0)) if redeemed else None
+        row["gamma_settlement_prices"] = None
+
+    slug_blend_pnl_total_usdc: Optional[float] = None
+    if include_settlement_estimate and slug_pnl_summary:
+        _apply_slug_settlement_estimates(
+            slug_pnl_summary,
+            max_slugs=max_settlement_slugs,
+            trade_only_positions=slug_positions_trade_only if prefer_settlement_final else None,
+            prefer_settlement_final=bool(prefer_settlement_final),
+        )
+
+    blend_parts: List[float] = []
+    if prefer_settlement_final:
+        for r in slug_pnl_summary:
+            if r.get("pnl_display_mode") == "settlement_final" and r.get("display_round_pnl_usdc") is not None:
+                blend_parts.append(float(r["display_round_pnl_usdc"]))
+    else:
+        for r in slug_pnl_summary:
+            if r.get("redeemed"):
+                blend_parts.append(float(r.get("net_pnl") or 0.0))
+            elif r.get("settlement_est_pnl_usdc") is not None:
+                blend_parts.append(float(r.get("settlement_est_pnl_usdc") or 0.0))
+    if blend_parts:
+        slug_blend_pnl_total_usdc = _round2(sum(blend_parts))
+    elif prefer_settlement_final:
+        # 本窗口无已结算盘时仍返回 0，避免邮件主题误用 Activity 主数字
+        slug_blend_pnl_total_usdc = 0.0
+
+    if prefer_settlement_final and slug_pnl_summary:
+        pf = lo = z = 0
+        for r in slug_pnl_summary:
+            d = r.get("display_round_pnl_usdc")
+            if d is None or r.get("pnl_display_mode") != "settlement_final":
+                continue
+            v = float(d)
+            if v > 0:
+                pf += 1
+            elif v < 0:
+                lo += 1
+            else:
+                z += 1
+        slug_profit_count = pf
+        slug_loss_count = lo
+        slug_flat_count = z
+
     return {
         "since_ts": since_ts,
         "until_ts": until_ts_int,
@@ -846,8 +1371,13 @@ def calculate_activity_pnl_from_trade_events(
         "slug_loss_count": slug_loss_count,
         "slug_flat_count": slug_flat_count,
         "slug_total_count": len(slug_pnl_summary),
+        "slug_blend_pnl_total_usdc": slug_blend_pnl_total_usdc,
+        "slug_mtm_total_usdc": slug_blend_pnl_total_usdc,
+        "include_settlement_estimate": bool(include_settlement_estimate),
+        "include_gamma_mtm": bool(include_settlement_estimate),
+        "prefer_settlement_final": bool(prefer_settlement_final),
     }
 
 if __name__ == "__main__":
-    result = calculate_activity_pnl_from_trade_events(since_ts=1773390285)
+    result = calculate_activity_pnl_from_trade_events(since_ts=1773801000)
     print(result)

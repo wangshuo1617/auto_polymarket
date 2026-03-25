@@ -1,0 +1,2 @@
+# Bash 脚本在 Windows 上若用 CRLF 会导致 `$'\r': command not found`
+*.sh text eol=lf

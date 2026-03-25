@@ -1118,21 +1118,76 @@ class FiveMinuteUpDownTrader:
             cumulative_since_ts = self._startup_ts_sec
             self._last_report_ts_sec = now_ts
 
-        # 从 Polymarket API 拉取真实盈亏
+        # 盈亏邮件主口径：Gamma outcome 推断 resolution（settlement_final），与 REDEEM 到账时间解耦。
+        # PNL_PREFER_SETTLEMENT_FINAL=0 时改回「已赎回用流水净额 + 未赎回 Gamma 反推」混合口径。
+        _prefer_sf = os.getenv("PNL_PREFER_SETTLEMENT_FINAL", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        # 对每 slug 拉 Gamma 判胜负有次数上限；默认 3000 覆盖多日累计（旧默认 40 会导致长跑进程「结算合计」严重偏小）
+        try:
+            _max_settlement_slugs = int(
+                os.getenv("PNL_MAX_SETTLEMENT_SLUGS", "3000").strip() or "3000"
+            )
+        except ValueError:
+            _max_settlement_slugs = 3000
+        _max_settlement_slugs = max(40, min(_max_settlement_slugs, 50_000))
         api_pnl_hourly = None
         api_pnl_cumulative = None
         try:
             api_pnl_hourly = calculate_activity_pnl_from_trade_events(
-                since_ts=hourly_since_ts, until_ts=now_ts,
+                since_ts=hourly_since_ts,
+                until_ts=now_ts,
+                include_gamma_mtm=True,
+                prefer_settlement_final=_prefer_sf,
+                max_gamma_mtm_slugs=_max_settlement_slugs,
             )
         except Exception as e:
             logger.warning("拉取本小时API实盘盈亏失败: %s", e)
         try:
             api_pnl_cumulative = calculate_activity_pnl_from_trade_events(
-                since_ts=cumulative_since_ts, until_ts=now_ts,
+                since_ts=cumulative_since_ts,
+                until_ts=now_ts,
+                include_gamma_mtm=True,
+                prefer_settlement_final=_prefer_sf,
+                max_gamma_mtm_slugs=_max_settlement_slugs,
             )
         except Exception as e:
             logger.warning("拉取累计API实盘盈亏失败: %s", e)
+
+        db_realized_hourly = None
+        db_realized_cumulative = None
+        db_entry_hourly = None
+        db_entry_cumulative = None
+        if self._trade_db is not None:
+            try:
+                mode = "dry-run" if self.dry_run else "live"
+                hourly_since_dt = datetime.fromtimestamp(hourly_since_ts, tz=timezone.utc)
+                now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+                startup_dt = datetime.fromtimestamp(cumulative_since_ts, tz=timezone.utc)
+                db_realized_hourly = self._trade_db.aggregate_realized_pnl(
+                    exit_after=hourly_since_dt,
+                    exit_before=now_dt,
+                    mode=mode,
+                )
+                db_realized_cumulative = self._trade_db.aggregate_realized_pnl(
+                    exit_after=startup_dt,
+                    exit_before=now_dt,
+                    mode=mode,
+                )
+                db_entry_hourly = self._trade_db.aggregate_entry_buys(
+                    entry_after=hourly_since_dt,
+                    entry_before=now_dt,
+                    mode=mode,
+                )
+                db_entry_cumulative = self._trade_db.aggregate_entry_buys(
+                    entry_after=startup_dt,
+                    entry_before=now_dt,
+                    mode=mode,
+                )
+            except Exception as e:
+                logger.warning("SQLite 汇总实际成交盈亏失败: %s", e)
 
         content, subject = build_pnl_report_content_and_subject(
             report_interval_sec=self.report_interval_sec,
@@ -1145,6 +1200,10 @@ class FiveMinuteUpDownTrader:
             format_latency_summary=self._format_latency_summary,
             api_pnl_hourly=api_pnl_hourly,
             api_pnl_cumulative=api_pnl_cumulative,
+            db_realized_hourly=db_realized_hourly,
+            db_realized_cumulative=db_realized_cumulative,
+            db_entry_hourly=db_entry_hourly,
+            db_entry_cumulative=db_entry_cumulative,
         )
 
         if not TO_EMAIL:

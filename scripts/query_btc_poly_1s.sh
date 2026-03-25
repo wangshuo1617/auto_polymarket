@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-DB_PATH="${1:-logs/trade.sqlite3}"
+DB_PATH="${1:-tmp/trade.sqlite3}"
 CMD="${2:-latest}"
 ARG3="${3:-}"
 
@@ -54,10 +54,10 @@ command:
 
 示例:
   ./scripts/query_btc_poly_1s.sh
-  ./scripts/query_btc_poly_1s.sh logs/trade.sqlite3 latest 50
-  ./scripts/query_btc_poly_1s.sh logs/trade.sqlite3 market btc-updown-5m-1741032000
-  ./scripts/query_btc_poly_1s.sh logs/trade.sqlite3 corr
-  ./scripts/query_btc_poly_1s.sh logs/trade.sqlite3 sql "SELECT count(*) FROM btc_poly_1s_ticks"
+  ./scripts/query_btc_poly_1s.sh tmp/trade.sqlite3 latest 50
+  ./scripts/query_btc_poly_1s.sh tmp/trade.sqlite3 market btc-updown-5m-1741032000
+  ./scripts/query_btc_poly_1s.sh tmp/trade.sqlite3 corr
+  ./scripts/query_btc_poly_1s.sh tmp/trade.sqlite3 sql "SELECT count(*) FROM btc_poly_1s_ticks"
 EOF
 }
 

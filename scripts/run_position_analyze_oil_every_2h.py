@@ -8,7 +8,7 @@ from pathlib import Path
 from datetime import datetime
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-INTERVAL_SEC = 2 * 3600  # 2 小时
+INTERVAL_SEC = 4 * 3600  # 4 小时
 SCRIPT_NAME = "position_analyze_oil.py"
 
 

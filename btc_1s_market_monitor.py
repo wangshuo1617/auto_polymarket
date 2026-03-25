@@ -230,10 +230,13 @@ class SQLiteBatchWriter:
 		if state.best_bid_low is None or best_bid < state.best_bid_low:
 			state.best_bid_low = best_bid
 
+	_FLUSH_MAX_RETRIES = 3
+	_FLUSH_RETRY_DELAY = 1.0
+
 	def _run(self) -> None:
 		conn = sqlite3.connect(
 			self.db_path,
-			timeout=5.0,
+			timeout=10.0,
 			check_same_thread=False,
 			isolation_level=None,
 		)
@@ -261,18 +264,43 @@ class SQLiteBatchWriter:
 					or (buffer and (now - last_flush) >= self.flush_interval_sec)
 				)
 				if should_flush:
-					self._flush_rows(conn, buffer)
+					self._safe_flush(conn, buffer)
 					buffer.clear()
 					last_flush = now
 
 			if buffer:
-				self._flush_rows(conn, buffer)
+				self._safe_flush(conn, buffer)
 				buffer.clear()
 		finally:
 			try:
 				conn.close()
 			except Exception:
 				pass
+
+	def _safe_flush(
+		self,
+		conn: sqlite3.Connection,
+		rows: List[Tuple[Any, ...]],
+	) -> None:
+		for attempt in range(1, self._FLUSH_MAX_RETRIES + 1):
+			try:
+				self._flush_rows(conn, rows)
+				return
+			except sqlite3.OperationalError as e:
+				if attempt < self._FLUSH_MAX_RETRIES:
+					logger.warning(
+						"SQLite flush 失败 (尝试 %d/%d): %s — %.1fs 后重试",
+						attempt, self._FLUSH_MAX_RETRIES, e, self._FLUSH_RETRY_DELAY,
+					)
+					time.sleep(self._FLUSH_RETRY_DELAY)
+				else:
+					logger.error(
+						"SQLite flush 连续失败 %d 次，丢弃 %d 行: %s",
+						self._FLUSH_MAX_RETRIES, len(rows), e,
+					)
+			except Exception as e:
+				logger.error("SQLite flush 未知异常，丢弃 %d 行: %s", len(rows), e)
+				return
 
 
 class BTC1sMarketMonitor:

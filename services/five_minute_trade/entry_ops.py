@@ -214,10 +214,35 @@ def open_position(trader: Any, market_slug: str, direction: str) -> None:
         )
         return
 
+    if entry_price > self.max_entry_price:
+        logger.info(
+            "放弃开仓：worst_fill=%.4f 高于 MAX_ENTRY_PRICE=%.4f (best_ask=%.4f)",
+            entry_price,
+            self.max_entry_price,
+            best_ask_price,
+        )
+        return
+
+    planned_order_price = min(0.99, entry_price + self.ENTRY_SWEEP_SLIPPAGE)
+    if planned_order_price > self.max_entry_price:
+        logger.info(
+            (
+                "放弃开仓：最终挂单价=%.4f 高于 MAX_ENTRY_PRICE=%.4f "
+                "(best_ask=%.4f worst_fill=%.4f sweep=%.4f)"
+            ),
+            planned_order_price,
+            self.max_entry_price,
+            best_ask_price,
+            entry_price,
+            self.ENTRY_SWEEP_SLIPPAGE,
+        )
+        return
+
     logger.info(
-        "建仓价格判定: best_ask=%.4f worst_fill=%.4f max_entry=%.4f",
+        "建仓价格判定: best_ask=%.4f worst_fill=%.4f final_order=%.4f max_entry=%.4f",
         best_ask_price,
         entry_price,
+        planned_order_price,
         self.max_entry_price,
     )
 
@@ -247,7 +272,7 @@ def open_position(trader: Any, market_slug: str, direction: str) -> None:
         order_id = None
     else:
         # 应用建仓滑点：在 worst_price 基础上加价，确保尽快抢到仓位
-        sweep_entry_price = min(0.99, entry_price + self.ENTRY_SWEEP_SLIPPAGE)
+        sweep_entry_price = planned_order_price
         logger.info("应用建仓滑点: 预估价=%.4f 实际建仓挂单价(sweep)=%.4f", entry_price, sweep_entry_price)
         submit_t0 = time.perf_counter()
         order_id = buy_order(

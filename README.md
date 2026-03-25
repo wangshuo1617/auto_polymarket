@@ -300,6 +300,11 @@ chmod +x scripts/restart_5m_trade.sh
 - `--min-hold-before-close-sec`：最短持仓保护时间（秒，默认 `5`，`0` 表示关闭保护）
 - `--trade-db-path`：交易事件 SQLite 文件路径（例如 `logs/5m_trade.sqlite3`）
 
+邮件/API 盈亏主口径（环境变量，可选）：
+
+- `PNL_PREFER_SETTLEMENT_FINAL`：默认 `1`。为 `1` 时邮件标题与「结算盈亏」按 **Gamma 已结算 outcome（resolution）** + 仅 TRADE 净头寸计算，**不以 REDEEM 到账为主判断**；设为 `0` 则回到链上 Activity 混合口径。
+- `PNL_MAX_SETTLEMENT_SLUGS`：默认 `3000`。每封报告最多对多少个 slug 请求 Gamma；进程跑得久、盘数多时勿过小，否则「累计结算合计」会漏算。
+
 重启脚本参数顺序：
 
 ```bash
@@ -313,7 +318,7 @@ chmod +x scripts/restart_5m_trade.sh
 切换实盘：
 
 ```bash
-./scripts/restart_5m_trade.sh --live 3 5 10 5.0 3600 0.80 0.15 -0.20 60 logs/trade.sqlite3 0.95 0.15 1.333333
+./scripts/restart_5m_trade.sh --live 3 5 10 5.0 3600 0.80 0.15 -0.20 60 tmp/trade.sqlite3 0.95 0.15 1.333333
 ```
 
 #### 5m_trade 模块化说明（重构后）
@@ -338,12 +343,21 @@ uv run btc_1s_market_monitor.py --symbol btcusdt
 - Binance 使用 WS 维护 BTC 最新价格；
 - Polymarket 使用 WS 订阅当前 5m 市场 up/down 双边盘口；
 - 服务每秒写入一条对齐快照到 `btc_poly_1s_ticks` 表，便于后续分析；
-- 数据库路径由 `config.SQLITE_DB_PATH`（环境变量 `SQLITE_DB_PATH`）统一控制，默认 `logs/trade.sqlite3`。
+- 数据库路径由 `config.SQLITE_DB_PATH`（环境变量 `SQLITE_DB_PATH`）统一控制，默认 `tmp/trade.sqlite3`（项目根下）。
+
+定时健康检查（`PRAGMA integrity_check`、数据延迟、近 N 分钟行数；失败 exit 1 便于告警）：
+
+```bash
+uv run python scripts/check_tick_db_health.py
+# 或指定库 / 放宽延迟：python scripts/check_tick_db_health.py --db-path tmp/trade.sqlite3 --max-lag-sec 600
+```
+
+`scripts/start_mp_trade.sh` **默认不**在启动交易前跑上述检查（避免损坏库 / 冷启动误拦）。需要预检时：`MP_RUN_TICK_HEALTH=1 bash scripts/start_mp_trade.sh`（失败则**不启动**交易、`exit 1`；见脚本内 `MP_HEALTH_*` 变量）。
 
 快速查询示例：
 
 ```bash
-uv run python -c "import sqlite3; c=sqlite3.connect('logs/trade.sqlite3'); print(c.execute('SELECT * FROM btc_poly_1s_ticks ORDER BY ts_sec DESC LIMIT 5').fetchall())"
+uv run python -c "import sqlite3; c=sqlite3.connect('tmp/trade.sqlite3'); print(c.execute('SELECT * FROM btc_poly_1s_ticks ORDER BY ts_sec DESC LIMIT 5').fetchall())"
 ```
 
 #### 运行 5m_trade 参数回测（网格搜索）
@@ -352,7 +366,7 @@ uv run python -c "import sqlite3; c=sqlite3.connect('logs/trade.sqlite3'); print
 
 ```bash
 uv run scripts/backtest_5m_trade_params.py \
-    --db-path logs/trade.sqlite3 \
+    --db-path tmp/trade.sqlite3 \
     --entry-minute-grid 2,3,4 \
     --entry-preclose-sec-grid 4,5,6 \
     --min-direction-diff-grid 5,10,15,20 \
@@ -371,7 +385,7 @@ uv run scripts/backtest_5m_trade_params.py \
 
 ```bash
 uv run scripts/backtest_5m_trade_params.py \
-    --db-path logs/trade.sqlite3 \
+    --db-path tmp/trade.sqlite3 \
     --start-ts-sec 1772700000 \
     --end-ts-sec 1772775000
 ```

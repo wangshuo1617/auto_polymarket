@@ -14,6 +14,7 @@ class ChainlinkBTCPriceWatcher:
 
     WS_URL = "wss://ws-live-data.polymarket.com"
     TOPIC = "crypto_prices_chainlink"
+    DATA_STALE_TIMEOUT_SEC = 25.0
 
     def __init__(
         self,
@@ -29,6 +30,7 @@ class ChainlinkBTCPriceWatcher:
         self.running = False
         self.last_price: Optional[float] = None
         self.last_update_time: Optional[float] = None
+        self._connected_time: Optional[float] = None
 
     @staticmethod
     def _to_chainlink_symbol(symbol: str) -> str:
@@ -59,9 +61,31 @@ class ChainlinkBTCPriceWatcher:
                     self.ws.send("PING")
             except Exception as e:
                 logger.debug("发送 Chainlink RTDS ping 异常: %s", e)
+
+            self._check_data_freshness()
             time.sleep(5)
 
+    def _check_data_freshness(self) -> None:
+        """检测数据流是否静默中断，若超时则主动断开触发重连。"""
+        if not self.ws or not self.running:
+            return
+        ref_time = self.last_update_time or self._connected_time
+        if ref_time is None:
+            return
+        silence = time.time() - ref_time
+        if silence > self.DATA_STALE_TIMEOUT_SEC:
+            logger.warning(
+                "Chainlink RTDS 数据流静默 %.1fs > %.0fs，主动断开重连",
+                silence,
+                self.DATA_STALE_TIMEOUT_SEC,
+            )
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
     def _on_open(self, ws: WebSocketApp) -> None:
+        self._connected_time = time.time()
         filters = json.dumps({"symbol": self.chainlink_symbol}, separators=(",", ":"))
         subscribe_msg = {
             "action": "subscribe",
@@ -490,6 +514,13 @@ class PolymarketAssetPriceWatcher:
                         continue
                     asks.append({"price": price, "size": size})
 
+                # WS 推送的档位顺序**不保证**已排序；必须先按价格排序再取最优，
+                # 否则 asks[0] 可能是最高卖价（例如误显示 0.99），与 HTTP 快照不一致。
+                if bids:
+                    bids.sort(key=lambda x: float(x["price"]))
+                if asks:
+                    asks.sort(key=lambda x: float(x["price"]))
+
                 ts_ms: Optional[int] = None
                 try:
                     raw_ts = payload.get("timestamp")
@@ -498,7 +529,7 @@ class PolymarketAssetPriceWatcher:
                 except Exception:
                     ts_ms = None
 
-                # 按交易所约定：best_bid 是 bids 最后一个，best_ask 是 asks 第一个
+                # 升序：best_bid = 最高买价 = bids[-1]，best_ask = 最低卖价 = asks[0]
                 if bids:
                     best_bid = bids[-1]["price"]
                 best_ask = asks[0]["price"] if asks else None

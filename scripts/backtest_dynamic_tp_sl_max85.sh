@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-DB_PATH="${1:-logs/trade.sqlite3}"
+DB_PATH="${1:-tmp/trade.sqlite3}"
 
 echo "=========================================="
 echo "Dynamic TP/SL 回测 (max_entry=0.85)"

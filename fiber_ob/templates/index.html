@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>黄金 · 原油 · 比特币 - 实时期货行情</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0d1219;
+      --panel: #141c26;
+      --text: #e6edf5;
+      --muted: #8b9cb8;
+      --green: #22c55e;
+      --red: #ef4444;
+      --accent: #06b6d4;
+      --border: #1e2a3a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 20px;
+      min-height: 100vh;
+    }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    h1 {
+      margin: 0;
+      font-size: 26px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #d4af37 0%, #22c55e 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .muted { color: var(--muted); font-size: 13px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+    }
+    .price-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px;
+    }
+    .price-card.gold { border-color: #3d3a2e; }
+    .price-card.oil { border-color: #2e3d3a; }
+    .price-card.btc { border-color: #f7931a33; }
+    .price-card .value.unit { color: var(--muted); }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .label {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .exchange-tag {
+      font-size: 11px;
+      color: var(--accent);
+      background: rgba(6, 182, 212, 0.15);
+      padding: 2px 8px;
+      border-radius: 6px;
+    }
+    .value {
+      font-size: 32px;
+      font-weight: 700;
+      line-height: 1.2;
+      letter-spacing: -0.5px;
+    }
+    .value.unit { font-size: 14px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+    .delta { margin-top: 8px; font-size: 15px; font-weight: 600; }
+    .up { color: var(--green); }
+    .down { color: var(--red); }
+    .flat { color: var(--muted); }
+    .card-footer {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px dashed var(--border);
+      font-size: 12px;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .err {
+      margin-top: 10px;
+      color: var(--red);
+      font-size: 13px;
+      padding: 10px;
+      background: rgba(239, 68, 68, 0.1);
+      border-radius: 8px;
+    }
+    .footer {
+      margin-top: 20px;
+      color: var(--muted);
+      font-size: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .refresh-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      background: rgba(6, 182, 212, 0.15);
+      border-radius: 8px;
+      font-size: 12px;
+      color: var(--accent);
+    }
+    .refresh-badge::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      background: var(--accent);
+      border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>黄金 · 原油 · 比特币 · 实时期货行情</h1>
+      <div class="muted">
+        GC=F / CL=F（Yahoo）· BTCUSDT（Binance）
+      </div>
+    </div>
+
+    <div class="grid" id="price-grid">
+      <!-- 由 JS 动态填充 -->
+    </div>
+
+    <div class="err" id="error-msg" style="display: none;"></div>
+
+    <div class="footer">
+      <span>数据源：Yahoo Finance（黄金·原油）· Binance（BTC）</span>
+      <span class="refresh-badge">每 2 秒刷新</span>
+      <span id="server-time">--</span>
+    </div>
+  </div>
+
+  <script>
+    const priceGrid = document.getElementById("price-grid");
+    const errorEl = document.getElementById("error-msg");
+    const serverTimeEl = document.getElementById("server-time");
+
+    function formatNumber(v, digits = 0) {
+      if (typeof v !== "number" || !Number.isFinite(v)) return "--";
+      return v.toFixed(digits);
+    }
+
+    function setDeltaClass(change) {
+      if (change === null || change === undefined) return "flat";
+      if (change > 0) return "up";
+      if (change < 0) return "down";
+      return "flat";
+    }
+
+    function renderDelta(change, changePct) {
+      if (typeof change !== "number" || typeof changePct !== "number") {
+        return { html: "--", cls: "flat" };
+      }
+      const sign = change >= 0 ? "+" : "";
+      return {
+        html: `${sign}${formatNumber(change, 2)} (${sign}${formatNumber(changePct, 2)}%)`,
+        cls: setDeltaClass(change)
+      };
+    }
+
+    const FALLBACKS = {
+      gold: { name: "黄金", symbol: "GC=F", unit: "美元/盎司" },
+      oil: { name: "原油", symbol: "CL=F", unit: "美元/桶" },
+      btc: { name: "比特币", symbol: "BTCUSDT", unit: "USDT" }
+    };
+    function renderPriceCard(item, type) {
+      const cardClass = type;
+      const fallback = FALLBACKS[type] || FALLBACKS.gold;
+      const defaultExchange = type === "btc" ? "Binance" : "Yahoo";
+      if (!item || item.price == null) {
+        return `
+          <div class="price-card ${cardClass}">
+            <div class="card-header">
+              <span class="label">${fallback.name} (${fallback.symbol})</span>
+              <span class="exchange-tag">${defaultExchange}</span>
+            </div>
+            <div class="value">-- <span class="value unit">${fallback.unit}</span></div>
+            <div class="delta flat">数据加载中...</div>
+          </div>
+        `;
+      }
+      const delta = renderDelta(item.change, item.change_pct);
+      const priceDigits = type === "btc" ? 0 : 2;
+      const priceStr = formatNumber(item.price, priceDigits);
+      const openStr = item.open != null ? formatNumber(item.open, 2) : "--";
+      const highStr = item.high != null ? formatNumber(item.high, 2) : "--";
+      const lowStr = item.low != null ? formatNumber(item.low, 2) : "--";
+      const volStr = item.volume != null ? (item.volume >= 1000000 ? (item.volume / 1000000).toFixed(1) + "M" : (item.volume >= 1000 ? (item.volume / 1000).toFixed(1) + "K" : item.volume)) : "--";
+      return `
+        <div class="price-card ${cardClass}">
+          <div class="card-header">
+            <span class="label">${item.name || fallback.name} (${item.symbol || fallback.symbol})</span>
+            <span class="exchange-tag">${item.exchange || defaultExchange}</span>
+          </div>
+          <div class="value">
+            ${priceStr}
+            <span class="value unit">${item.unit || fallback.unit}</span>
+          </div>
+          <div class="delta ${delta.cls}">${delta.html}</div>
+          <div class="card-footer">
+            <span>开 ${openStr} · 高 ${highStr} · 低 ${lowStr}</span>
+            <span>成交量 ${volStr}</span>
+          </div>
+        </div>
+      `;
+    }
+
+    function render(data) {
+      data = data || {};
+      priceGrid.innerHTML = renderPriceCard(data.gold, "gold") + renderPriceCard(data.oil, "oil") + renderPriceCard(data.btc, "btc");
+      if (data.error) {
+        errorEl.textContent = `获取数据失败: ${data.error}`;
+        errorEl.style.display = "block";
+      } else if (data.warnings) {
+        errorEl.textContent = `部分数据源不可用: ${data.warnings}`;
+        errorEl.style.display = "block";
+      } else {
+        errorEl.style.display = "none";
+      }
+      serverTimeEl.textContent = `更新时间: ${data.server_time || "--"}`;
+
+      // 选项卡标签展示实时价格与涨跌
+      const parts = [];
+      if (typeof data.gold?.price === "number") {
+        const pct = data.gold.change_pct != null ? ` (${data.gold.change_pct >= 0 ? "+" : ""}${data.gold.change_pct.toFixed(2)}%)` : "";
+        parts.push(`黄金 ${data.gold.price.toFixed(2)}${pct}`);
+      }
+      if (typeof data.oil?.price === "number") {
+        const pct = data.oil.change_pct != null ? ` (${data.oil.change_pct >= 0 ? "+" : ""}${data.oil.change_pct.toFixed(2)}%)` : "";
+        parts.push(`原油 ${data.oil.price.toFixed(2)}${pct}`);
+      }
+      if (typeof data.btc?.price === "number") {
+        const pct = data.btc.change_pct != null ? ` (${data.btc.change_pct >= 0 ? "+" : ""}${data.btc.change_pct.toFixed(2)}%)` : "";
+        parts.push(`BTC ${Math.round(data.btc.price).toLocaleString()}${pct}`);
+      }
+      document.title = parts.length ? parts.join(" · ") + " | 实时期货" : "黄金 · 原油 · 比特币 - 实时期货行情";
+    }
+
+    async function pull() {
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 15000);
+        const res = await fetch("/api/market", { cache: "no-store", signal: ctrl.signal });
+        clearTimeout(t);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        if (data.error) throw new Error(data.error);
+        render(data);
+      } catch (err) {
+        const msg = err.name === "AbortError" ? "请求超时，请检查网络或稍后重试" : err.message;
+        render({ error: msg, server_time: new Date().toLocaleString("zh-CN"), gold: null, oil: null, btc: null });
+      }
+    }
+
+    // 立即显示加载状态，避免空白
+    render({ server_time: "--", gold: null, oil: null, btc: null });
+    pull();
+    setInterval(pull, 2000);
+  </script>
+</body>
+</html>

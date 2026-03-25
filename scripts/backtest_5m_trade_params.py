@@ -39,6 +39,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from config import SQLITE_DB_PATH
+
 from services.five_minute_trade.execution_plans import build_execution_plan as live_build_execution_plan
 from data.polymarket import (
     get_event_token_id,
@@ -1880,11 +1882,12 @@ def _build_timestamped_output_path(path: str) -> str:
 
 def _abort_corrupted_db(db_path: str, err: BaseException) -> None:
     """Print clear message and exit when DB is corrupted (e.g. disk image malformed)."""
-    alt = "output/trade.sqlite3" if "logs" in db_path else "logs/trade.sqlite3"
+    alt_tmp = _PROJECT_ROOT / "tmp" / "trade.sqlite3"
+    alt_out = _PROJECT_ROOT / "output" / "trade.sqlite3"
     print(f"Database error: {err}", file=sys.stderr)
     print(
         f"\nThe database may be corrupted (e.g. 'database disk image is malformed').\n"
-        f"  - Try the other DB: --db-path {alt}\n"
+        f"  - Try another copy: --db-path {alt_tmp} or --db-path {alt_out}\n"
         f"  - Check integrity: sqlite3 \"{db_path}\" \"PRAGMA integrity_check;\"\n"
         f"  - Restore from backup if needed.",
         file=sys.stderr,
@@ -1904,8 +1907,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--db-path",
         type=str,
-        default=os.getenv("SQLITE_DB_PATH", "logs/trade.sqlite3"),
-        help="SQLite path (default: env SQLITE_DB_PATH or logs/trade.sqlite3)",
+        default=os.getenv("SQLITE_DB_PATH", SQLITE_DB_PATH),
+        help="SQLite path (default: env SQLITE_DB_PATH or config.SQLITE_DB_PATH, tmp/trade.sqlite3)",
     )
     parser.add_argument(
         "--start-ts-sec",

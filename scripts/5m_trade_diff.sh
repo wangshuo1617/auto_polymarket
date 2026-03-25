@@ -20,7 +20,7 @@ fi
 if [[ "$FAST_MODE" == "true" ]]; then
   STRATEGY=""
   SINCE_TS=""
-  DB_PATH="${2:-logs/trade.sqlite3}"
+  DB_PATH="${2:-tmp/trade.sqlite3}"
   UNTIL_TS="${3:-$DEFAULT_UNTIL_TS}"
   REPORT_JSON="${4:-output/5m_backtest_live_diff_report.json}"
   BACKTEST_SUMMARY_CSV="${5:-output/5m_backtest_diff_summary.csv}"
@@ -33,7 +33,7 @@ else
   STRATEGY="${1:-$DEFAULT_STRATEGY}"
   SINCE_TS="${2:-$DEFAULT_SINCE_TS}"
   UNTIL_TS="${3:-$DEFAULT_UNTIL_TS}"
-  DB_PATH="${4:-logs/trade.sqlite3}"
+  DB_PATH="${4:-tmp/trade.sqlite3}"
   REPORT_JSON="${5:-output/5m_backtest_live_diff_report.json}"
   BACKTEST_SUMMARY_CSV="${6:-output/5m_backtest_diff_summary.csv}"
   BACKTEST_EVENTS_CSV="${7:-output/5m_backtest_diff_trade_events.csv}"
@@ -56,16 +56,16 @@ print_usage() {
   ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476
 
 示例3（跳过回测，直接对比已有回测逐单CSV）:
-  ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476 logs/trade.sqlite3 output/report.json output/summary.csv output/events.csv 10 output/existing_backtest_events.csv
+  ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476 tmp/trade.sqlite3 output/report.json output/summary.csv output/events.csv 10 output/existing_backtest_events.csv
 
 示例4（自定义逐笔逐市场对比CSV输出）:
-  ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476 logs/trade.sqlite3 output/report.json output/summary.csv output/events.csv 10 "" --disable-output-timestamp output/my_trade_compare.csv
+  ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476 tmp/trade.sqlite3 output/report.json output/summary.csv output/events.csv 10 "" --disable-output-timestamp output/my_trade_compare.csv
 
 示例5（快速模式：自动读取最近一次 live 启动策略和启动时间）:
   ./scripts/5m_trade_diff.sh --fast-live-latest
 
 示例6（快速模式 + 自定义数据库和截止时间）:
-  ./scripts/5m_trade_diff.sh --fast-live-latest logs/trade.sqlite3 1773629750
+  ./scripts/5m_trade_diff.sh --fast-live-latest tmp/trade.sqlite3 1773629750
 EOF
 }
 
@@ -170,9 +170,11 @@ PY
 if ! check_db_health "$DB_PATH"; then
   ALT_DB_PATH=""
   if [[ "$DB_PATH" == logs/* ]]; then
-    ALT_DB_PATH="output/trade.sqlite3"
+    ALT_DB_PATH="tmp/trade.sqlite3"
   elif [[ "$DB_PATH" == output/* ]]; then
-    ALT_DB_PATH="logs/trade.sqlite3"
+    ALT_DB_PATH="tmp/trade.sqlite3"
+  elif [[ "$DB_PATH" == tmp/* ]]; then
+    ALT_DB_PATH="output/trade.sqlite3"
   fi
 
   if [[ -n "$ALT_DB_PATH" ]] && check_db_health "$ALT_DB_PATH"; then

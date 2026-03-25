@@ -59,6 +59,246 @@ def _base_reason(reason: str) -> str:
     return reason
 
 
+def _settlement_first_lines(
+    report_interval_sec: int,
+    api_hourly: Optional[Dict[str, Any]],
+    api_cumulative: Optional[Dict[str, Any]],
+) -> List[str]:
+    """主口径：Gamma resolution（outcome 0/1）倒算经济盈亏；与 REDEEM 到账时间无关。"""
+    out: List[str] = [
+        "【结算盈亏 — Resolution 倒算（主口径）】",
+        "  依据: Polymarket Gamma 市场 outcomePrices 已分胜负（Up/Down）；净头寸仅来自链上 **TRADE**（不含 REDEEM 调仓）。",
+        "  持有至结算（无 CLOB 卖出）时: 单盘盈亏 ≈ 胜方净(TRADE)份额×1 USDC − 该盘买入成本；卖出收入视为 0。",
+        "  若存在卖出，公式仍为: 胜方净份额×1 + 卖出收入 − 买入支出。",
+        "  未分胜负 / Gamma 拉取失败 的盘不计入下方「合计」（与邮件标题主数字一致）。",
+    ]
+    if api_hourly is not None:
+        hb = api_hourly.get("slug_blend_pnl_total_usdc")
+        h_s = f"{float(hb):.2f}" if hb is not None else "N/A"
+        out.append(f"- 本报告期（约 {report_interval_sec // 60} 分钟）已结算盘合计: {h_s} USDC")
+    if api_cumulative is not None:
+        cb = api_cumulative.get("slug_blend_pnl_total_usdc")
+        c_s = f"{float(cb):.2f}" if cb is not None else "N/A"
+        out.append(f"- 本进程时间窗内已结算盘合计: {c_s} USDC")
+    out.append("")
+    return out
+
+
+def _activity_pnl_lines(
+    label_period: str,
+    label_session: str,
+    api_hourly: Optional[Dict[str, Any]],
+    api_cumulative: Optional[Dict[str, Any]],
+    *,
+    prefer_settlement_final: bool = False,
+) -> List[str]:
+    """链上 Activity 流水：净值 = 卖出 + 赎回 − 买入（资金流水对照）。"""
+    title = (
+        "【链上 Activity 流水净值】（含 REDEEM；**资金流水对照**，主结论见上「结算盈亏」）"
+        if prefer_settlement_final
+        else "【链上 Activity 净值】（含 BUY / SELL / REDEEM；与 CLOB 卖出平仓统计不同）"
+    )
+    out: List[str] = [
+        title,
+        "  公式: 流水净额 = 卖出收入 + 赎回收入 − 买入支出",
+    ]
+    if api_hourly is not None:
+        h_net = float(api_hourly.get("net_pnl", 0.0))
+        h_sell_inc = float(api_hourly.get("income_trade_sell", 0.0))
+        h_redeem_inc = float(api_hourly.get("income_redeem", 0.0))
+        h_exp = float(api_hourly.get("expense_trade_buy", 0.0))
+        h_buy = int(api_hourly.get("count_trade_buy", 0) or 0)
+        h_sell = int(api_hourly.get("count_trade_sell", 0) or 0)
+        h_rd = int(api_hourly.get("count_redeem", 0) or 0)
+        out.append(
+            f"- {label_period}: 净 {h_net:.2f} USDC | 买入支出 {h_exp:.2f} | "
+            f"卖出收入 {h_sell_inc:.2f} ({h_sell} 笔) | 赎回收入 {h_redeem_inc:.2f} ({h_rd} 笔) | 买入 {h_buy} 笔"
+        )
+    else:
+        out.append(f"- {label_period}: 拉取失败")
+    if api_cumulative is not None:
+        c_net = float(api_cumulative.get("net_pnl", 0.0))
+        c_sell_inc = float(api_cumulative.get("income_trade_sell", 0.0))
+        c_redeem_inc = float(api_cumulative.get("income_redeem", 0.0))
+        c_exp = float(api_cumulative.get("expense_trade_buy", 0.0))
+        c_buy = int(api_cumulative.get("count_trade_buy", 0) or 0)
+        c_sell = int(api_cumulative.get("count_trade_sell", 0) or 0)
+        c_rd = int(api_cumulative.get("count_redeem", 0) or 0)
+        out.append(
+            f"- {label_session}: 净 {c_net:.2f} USDC | 买入支出 {c_exp:.2f} | "
+            f"卖出收入 {c_sell_inc:.2f} ({c_sell} 笔) | 赎回收入 {c_redeem_inc:.2f} ({c_rd} 笔) | 买入 {c_buy} 笔"
+        )
+    else:
+        out.append(f"- {label_session}: 拉取失败")
+    out.append("")
+    return out
+
+
+def _slug_pnl_and_mtm_lines(api_cumulative: Optional[Dict[str, Any]], max_rows: int = 35) -> List[str]:
+    """各 slug 明细（展示模式依 prefer_settlement_final 而异）。"""
+    if not api_cumulative:
+        return []
+    summ = api_cumulative.get("slug_summary") or []
+    if not summ:
+        return []
+    prefer = bool(api_cumulative.get("prefer_settlement_final"))
+    if prefer:
+        out = [
+            "",
+            "【各盘明细：结算最终结果】",
+            "  已分胜负：settlement_final = 胜方净(TRADE)×1 + 卖出 − 买入（净头寸不含 REDEEM）。",
+            "  未分胜负 / Gamma 失败：本条无结算数字，不计入邮件标题「结算盈亏」合计。",
+            "  净Up/净Down(全量) 含 REDEEM 调整；括号内 trade_only 为仅 TRADE。",
+        ]
+    else:
+        out = [
+            "",
+            "【各盘明细：真实赎回 vs 盘末反推】",
+            "  净份额：本时间窗内链上 TRADE/可解析 REDEEM 推导。",
+            "  已赎回：本条收益以 Activity 为准（net_pnl，含 redeem/sell）。",
+            "  未赎回：拉 Gamma 盘末价；若已分胜负，则 应收≈净胜方份额×1 USDC，反推收益=应收−买入成本（非中间价 MTM）。",
+            "  未分胜负或仅对部分 slug 拉取时，反推可能为空。启动前已有仓位时净份额可能低估。",
+        ]
+    c_profit = api_cumulative.get("slug_profit_count", 0)
+    c_loss = api_cumulative.get("slug_loss_count", 0)
+    c_flat = api_cumulative.get("slug_flat_count", 0)
+    out.append(f"- slug 盈亏家数 盈利/亏损/持平: {c_profit} / {c_loss} / {c_flat}")
+    tot_blend = api_cumulative.get("slug_blend_pnl_total_usdc")
+    if tot_blend is None:
+        tot_blend = api_cumulative.get("slug_mtm_total_usdc")
+    if tot_blend is not None:
+        if prefer:
+            out.append(
+                f"- Resolution 结算合计（settlement_final 求和）: {float(tot_blend):.2f} USDC "
+                f"（未覆盖未分胜负的盘）"
+            )
+        else:
+            out.append(
+                f"- 混合合计（已赎回用真实 + 未赎回且已反推）: {float(tot_blend):.2f} USDC "
+                f"（未覆盖未反推的盘）"
+            )
+
+    cap = max(1, int(max_rows))
+    for row in summ[:cap]:
+        slug = str(row.get("slug") or "")[:80]
+        npnl = float(row.get("net_pnl", 0) or 0)
+        nu = row.get("net_shares_up")
+        nd = row.get("net_shares_down")
+        nut = row.get("net_shares_up_trade_only")
+        ndt = row.get("net_shares_down_trade_only")
+        redeemed = bool(row.get("redeemed"))
+        est = row.get("settlement_est_pnl_usdc")
+        disp = row.get("display_round_pnl_usdc")
+        winner = row.get("resolution_winner")
+        note = str(row.get("settlement_note") or "")
+        mode = str(row.get("pnl_display_mode") or "")
+        est_s = f"{float(est):.2f}" if est is not None else "N/A"
+        disp_s = f"{float(disp):.2f}" if disp is not None else "N/A"
+        if prefer:
+            pos_s = f"净Up {nu} 净Down {nd} (trade {nut}/{ndt})"
+            out.append(
+                f"  · {slug} | 结算 {disp_s} | Activity流水净 {npnl:.2f} | {pos_s} | "
+                f"反推列 {est_s} | 胜方 {winner} | {mode} | {note}"
+            )
+        else:
+            tag = "真实(已赎回)" if redeemed else "反推(未赎回)"
+            out.append(
+                f"  · {slug} | {tag} | Activity净 {npnl:.2f} | 净Up {nu} 净Down {nd} | "
+                f"反推收益 {est_s} | 胜方 {winner} | {mode} | {note}"
+            )
+    if len(summ) > cap:
+        out.append(f"  … 其余 {len(summ) - cap} 个 slug 略")
+    return out
+
+
+def _activity_derived_key_stats(
+    api: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """从 Activity 或（优先）结算口径推导 slug 统计。"""
+    if not api:
+        return None
+    prefer = bool(api.get("prefer_settlement_final"))
+    blend = api.get("slug_blend_pnl_total_usdc")
+    if prefer and blend is not None:
+        net = float(blend)
+    else:
+        net = float(api.get("net_pnl", 0) or 0)
+    cb = int(api.get("count_trade_buy", 0) or 0)
+    ev_per_buy = (net / cb) if cb > 0 else None
+
+    slug_summ = api.get("slug_summary") or []
+    if prefer:
+        settled = [
+            s
+            for s in slug_summ
+            if s.get("pnl_display_mode") == "settlement_final"
+            and s.get("display_round_pnl_usdc") is not None
+        ]
+        n_slugs = len(settled)
+        prof = sum(1 for s in settled if float(s.get("display_round_pnl_usdc") or 0) > 0)
+        win_rate_slugs = (prof / n_slugs * 100.0) if n_slugs > 0 else None
+        gross_profit = sum(
+            float(s.get("display_round_pnl_usdc") or 0)
+            for s in settled
+            if float(s.get("display_round_pnl_usdc") or 0) > 0
+        )
+        gross_loss = abs(
+            sum(
+                float(s.get("display_round_pnl_usdc") or 0)
+                for s in settled
+                if float(s.get("display_round_pnl_usdc") or 0) < 0
+            )
+        )
+    else:
+        n_slugs = len(slug_summ)
+        prof = int(api.get("slug_profit_count", 0) or 0)
+        win_rate_slugs = (prof / n_slugs * 100.0) if n_slugs > 0 else None
+
+        gross_profit = sum(
+            float(s.get("net_pnl") or 0) for s in slug_summ if float(s.get("net_pnl") or 0) > 0
+        )
+        gross_loss = abs(
+            sum(float(s.get("net_pnl") or 0) for s in slug_summ if float(s.get("net_pnl") or 0) < 0)
+        )
+    pf_slugs: Optional[float]
+    if gross_loss > 1e-9:
+        pf_slugs = gross_profit / gross_loss
+    elif gross_profit > 0:
+        pf_slugs = float("inf")
+    else:
+        pf_slugs = None
+
+    loss_ct = (
+        sum(
+            1
+            for s in slug_summ
+            if s.get("pnl_display_mode") == "settlement_final"
+            and s.get("display_round_pnl_usdc") is not None
+            and float(s.get("display_round_pnl_usdc") or 0) < 0
+        )
+        if prefer
+        else int(api.get("slug_loss_count", 0) or 0)
+    )
+    return {
+        "net_pnl": net,
+        "count_trade_buy": cb,
+        "ev_per_buy": ev_per_buy,
+        "n_slugs": n_slugs,
+        "slug_profit_count": prof,
+        "slug_loss_count": loss_ct,
+        "win_rate_slugs": win_rate_slugs,
+        "profit_factor_slugs": pf_slugs,
+    }
+
+
+def _format_pf(val: Optional[float]) -> str:
+    if val is None:
+        return "N/A"
+    if val == float("inf"):
+        return "INF"
+    return f"{val:.4f}"
+
+
 def _reason_breakdown(trades: List[TradeRecord]) -> Dict[str, Dict[str, float]]:
     groups: Dict[str, List[TradeRecord]] = {}
     for t in trades:
@@ -94,17 +334,89 @@ def build_pnl_report_content_and_subject(
     format_latency_summary: Callable[[str, List[float]], str],
     api_pnl_hourly: Optional[Dict[str, Any]] = None,
     api_pnl_cumulative: Optional[Dict[str, Any]] = None,
+    db_realized_hourly: Optional[Dict[str, Any]] = None,
+    db_realized_cumulative: Optional[Dict[str, Any]] = None,
+    db_entry_hourly: Optional[Dict[str, Any]] = None,
+    db_entry_cumulative: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     hourly_pnl = sum(t.pnl for t in new_trades)
     hourly_count = len(new_trades)
     cumulative_pnl = sum(t.pnl for t in all_trades)
     cumulative_count = len(all_trades)
 
-    lines = [
-        f"过去 {report_interval_sec // 60} 分钟新交易共 {hourly_count} 笔，总盈亏：{hourly_pnl:.2f} USDC",
-        f"服务启动以来累计交易 {cumulative_count} 笔，累计盈亏：{cumulative_pnl:.2f} USDC",
-        "",
-    ]
+    lines: List[str] = []
+    prefer_sf = bool(
+        (api_pnl_cumulative or {}).get("prefer_settlement_final")
+        or (api_pnl_hourly or {}).get("prefer_settlement_final")
+    )
+    if api_pnl_hourly is not None or api_pnl_cumulative is not None:
+        if prefer_sf:
+            lines.extend(
+                _settlement_first_lines(
+                    report_interval_sec,
+                    api_pnl_hourly,
+                    api_pnl_cumulative,
+                )
+            )
+        lines.extend(
+            _activity_pnl_lines(
+                label_period=f"本报告期（约 {report_interval_sec // 60} 分钟窗口）",
+                label_session="本进程启动至今",
+                api_hourly=api_pnl_hourly,
+                api_cumulative=api_pnl_cumulative,
+                prefer_settlement_final=prefer_sf,
+            )
+        )
+    if db_realized_hourly is not None and db_realized_cumulative is not None:
+        lines.extend(
+            [
+                "【SQLite：仅 CLOB 卖出平仓】（每笔 = 卖出收回 − 开仓成本；若策略只靠 redeem 结算、不在订单簿卖出，此处通常接近 0）",
+                (
+                    f"- 本报告期（按平仓时间）: {db_realized_hourly['sell_count']} 笔平仓，"
+                    f"已实现 {db_realized_hourly['total_pnl']:.2f} USDC "
+                    f"(卖出收回 {db_realized_hourly['total_recovered_usdc']:.2f}，"
+                    f"对应成本约 {db_realized_hourly['total_entry_cost_estimate']:.2f})"
+                ),
+                (
+                    f"- 本进程启动至今（按平仓时间）: {db_realized_cumulative['sell_count']} 笔平仓，"
+                    f"已实现 {db_realized_cumulative['total_pnl']:.2f} USDC "
+                    f"(卖出收回 {db_realized_cumulative['total_recovered_usdc']:.2f}，"
+                    f"对应成本约 {db_realized_cumulative['total_entry_cost_estimate']:.2f})"
+                ),
+            ]
+        )
+        if db_entry_hourly is not None:
+            lines.append(
+                f"- 同期开仓（按开仓时间，可与平仓不同窗）: {db_entry_hourly['buy_count']} 笔，"
+                f"买入支出约 {db_entry_hourly['total_spent_usdc']:.2f} USDC"
+            )
+        if db_entry_cumulative is not None:
+            lines.append(
+                f"- 启动至今开仓（按开仓时间）: {db_entry_cumulative['buy_count']} 笔，"
+                f"买入支出约 {db_entry_cumulative['total_spent_usdc']:.2f} USDC"
+            )
+        lines.append("")
+    elif api_pnl_hourly is None and api_pnl_cumulative is None:
+        lines.extend(
+            [
+                f"过去 {report_interval_sec // 60} 分钟新交易共 {hourly_count} 笔，总盈亏：{hourly_pnl:.2f} USDC",
+                f"服务启动以来累计交易 {cumulative_count} 笔，累计盈亏：{cumulative_pnl:.2f} USDC",
+                "（链上 Activity 拉取失败且未配置 SQLite 时仅显示内存口径）",
+                "",
+            ]
+        )
+
+    mem_hdr = "【本进程内存平仓】（重启后清零；与链上 redeem 结算无直接对应）"
+    if prefer_sf:
+        mem_hdr += " — **持有至结算策略请以「结算盈亏」为准，本节常为 0 属正常**"
+    lines.extend(
+        [
+            mem_hdr,
+            f"- 过去 {report_interval_sec // 60} 分钟新平仓 {hourly_count} 笔，总盈亏：{hourly_pnl:.2f} USDC",
+            f"- 自启动以来平仓 {cumulative_count} 笔，累计盈亏：{cumulative_pnl:.2f} USDC",
+            "",
+        ]
+    )
 
     recent_100 = all_trades[-100:]
     rolling_base = len(recent_100)
@@ -124,7 +436,102 @@ def build_pnl_report_content_and_subject(
     hourly_reason_stats = _reason_breakdown(new_trades)
     cumulative_reason_stats = _reason_breakdown(all_trades)
 
-    lines.append("关键策略统计:")
+    act_stats_h = _activity_derived_key_stats(api_pnl_hourly) if api_pnl_hourly else None
+    act_stats_c = _activity_derived_key_stats(api_pnl_cumulative) if api_pnl_cumulative else None
+    if act_stats_h is not None or act_stats_c is not None:
+        if prefer_sf:
+            lines.append("【关键策略统计 — Resolution 结算口径】（与上方「结算盈亏」合计一致）")
+            lines.append(
+                "- 口径: 仅统计 Gamma 已给出 settlement_final 的 slug；"
+                "EV/已结算盘 = 结算合计 ÷ 已结算 slug 数（**非**链上 BUY 笔数，避免与持有至结算策略错位）；"
+                "盘胜率 / PF 同基于 settlement_final。"
+            )
+        else:
+            lines.append("【关键策略统计 — 链上 Activity】（结算型策略可对照本节）")
+            lines.append(
+                "- 口径: 与上方「链上 Activity 净值」同源；"
+                "EV/买入笔 = 窗口流水净额 ÷ 链上 BUY 笔数；"
+                "盘胜率 = 净额>0 的 slug 数 ÷ 有活动的 slug 总数；"
+                "Profit Factor(slug) = 各 slug 净盈利之和 ÷ |各 slug 净亏损之和|。"
+            )
+        if prefer_sf:
+            if act_stats_h is None:
+                lines.append("- EV/已结算盘(本报告期): N/A")
+            elif act_stats_h.get("ev_per_settled_slug") is None:
+                lines.append(
+                    f"- EV/已结算盘(本报告期): N/A（本窗口无已结算 slug，结算合计 {act_stats_h['net_pnl']:.2f} USDC）"
+                )
+            else:
+                lines.append(
+                    f"- EV/已结算盘(本报告期): {act_stats_h['ev_per_settled_slug']:.4f} USDC "
+                    f"（结算合计 {act_stats_h['net_pnl']:.2f} / 已结算 {act_stats_h['n_slugs']} 盘）"
+                )
+            if act_stats_c is None:
+                lines.append("- EV/已结算盘(启动至今): N/A")
+            elif act_stats_c.get("ev_per_settled_slug") is None:
+                lines.append(
+                    f"- EV/已结算盘(启动至今): N/A（无已结算 slug，合计 {act_stats_c['net_pnl']:.2f} USDC）"
+                )
+            else:
+                lines.append(
+                    f"- EV/已结算盘(启动至今): {act_stats_c['ev_per_settled_slug']:.4f} USDC "
+                    f"（结算合计 {act_stats_c['net_pnl']:.2f} / 已结算 {act_stats_c['n_slugs']} 盘）"
+                )
+        else:
+            if act_stats_h is None:
+                lines.append("- EV/买入笔(本报告期): N/A（本窗口未拉取 Activity 或数据为空）")
+            elif act_stats_h["ev_per_buy"] is None:
+                lines.append(
+                    f"- EV/买入笔(本报告期): N/A（本窗口无链上 BUY，净盈亏 {act_stats_h['net_pnl']:.2f} USDC 可能主要来自 redeem/SELL）"
+                )
+            else:
+                lines.append(
+                    f"- EV/买入笔(本报告期): {act_stats_h['ev_per_buy']:.4f} USDC "
+                    f"（净 {act_stats_h['net_pnl']:.2f} / 买 {act_stats_h['count_trade_buy']} 笔）"
+                )
+            if act_stats_c is None:
+                lines.append("- EV/买入笔(启动至今): N/A")
+            elif act_stats_c["ev_per_buy"] is None:
+                lines.append(
+                    f"- EV/买入笔(启动至今): N/A（无链上 BUY 记录，净 {act_stats_c['net_pnl']:.2f} USDC）"
+                )
+            else:
+                lines.append(
+                    f"- EV/买入笔(启动至今): {act_stats_c['ev_per_buy']:.4f} USDC "
+                    f"（净 {act_stats_c['net_pnl']:.2f} / 买 {act_stats_c['count_trade_buy']} 笔）"
+                )
+
+        if act_stats_h is None or act_stats_h["win_rate_slugs"] is None:
+            lines.append("- 盘胜率 slug 维度(本报告期): N/A")
+        else:
+            ah = act_stats_h
+            lines.append(
+                f"- 盘胜率 slug 维度(本报告期): {ah['win_rate_slugs']:.2f}% "
+                f"（盈 {ah['slug_profit_count']}/总 {ah['n_slugs']}）"
+            )
+        if act_stats_c is None or act_stats_c["win_rate_slugs"] is None:
+            lines.append("- 盘胜率 slug 维度(启动至今): N/A")
+        else:
+            ac = act_stats_c
+            lines.append(
+                f"- 盘胜率 slug 维度(启动至今): {ac['win_rate_slugs']:.2f}% "
+                f"（盈 {ac['slug_profit_count']}/总 {ac['n_slugs']}）"
+            )
+
+        pf_h = act_stats_h["profit_factor_slugs"] if act_stats_h else None
+        pf_c = act_stats_c["profit_factor_slugs"] if act_stats_c else None
+        lines.append(f"- Profit Factor slug 净额(本报告期): {_format_pf(pf_h)}")
+        lines.append(f"- Profit Factor slug 净额(启动至今): {_format_pf(pf_c)}")
+        lines.append(
+            "- 真实滑点率 / 订单全成率: 链上 Activity 无此字段；"
+            "见下方「进程内 CLOB 平仓记录」或成交日志。"
+        )
+        lines.append("")
+
+    lines.append(
+        "【关键策略统计 — 进程内 CLOB 平仓记录】"
+        "（仅写入内存 TradeRecord 的平仓；纯 redeem 结算、未走订单簿平仓时多为 N/A 属预期）"
+    )
     if hourly_slippage_bps is None:
         lines.append("- 真实滑点率(本小时): N/A")
     else:
@@ -136,6 +543,7 @@ def build_pnl_report_content_and_subject(
 
     lines.append(
         f"- 滚动100单胜率(tp占比): {rolling_win_rate:.2f}% ({rolling_tp_count}/{rolling_base})"
+        "（仅内存平仓且 reason=tp；redeem 结算策略常为 0/0）"
     )
 
     if hourly_full_fill_rate is None:
@@ -297,47 +705,63 @@ def build_pnl_report_content_and_subject(
     if not new_trades:
         lines.append("- 本小时无新平仓交易")
 
-    # --- API 实盘盈亏（基于 Polymarket Activity） ---
-    lines.append("")
-    lines.append("API实盘盈亏（Polymarket Activity）:")
-    if api_pnl_hourly is not None:
-        h_net = api_pnl_hourly.get("net_pnl", 0.0)
-        h_income = api_pnl_hourly.get("total_income", 0.0)
-        h_expense = api_pnl_hourly.get("expense_trade_buy", 0.0)
-        h_count = api_pnl_hourly.get("activity_count", 0)
-        h_sell = api_pnl_hourly.get("count_trade_sell", 0)
-        h_redeem = api_pnl_hourly.get("count_redeem", 0)
-        h_buy = api_pnl_hourly.get("count_trade_buy", 0)
-        lines.append(
-            f"- 本小时: net_pnl={h_net:.2f} USDC (收入={h_income:.2f}, 支出={h_expense:.2f}, "
-            f"activity={h_count}, sell={h_sell}, redeem={h_redeem}, buy={h_buy})"
-        )
-    else:
-        lines.append("- 本小时: 拉取失败")
-    if api_pnl_cumulative is not None:
-        c_net = api_pnl_cumulative.get("net_pnl", 0.0)
-        c_income = api_pnl_cumulative.get("total_income", 0.0)
-        c_expense = api_pnl_cumulative.get("expense_trade_buy", 0.0)
-        c_count = api_pnl_cumulative.get("activity_count", 0)
-        c_sell = api_pnl_cumulative.get("count_trade_sell", 0)
-        c_redeem = api_pnl_cumulative.get("count_redeem", 0)
-        c_buy = api_pnl_cumulative.get("count_trade_buy", 0)
-        c_profit = api_pnl_cumulative.get("slug_profit_count", 0)
-        c_loss = api_pnl_cumulative.get("slug_loss_count", 0)
-        c_flat = api_pnl_cumulative.get("slug_flat_count", 0)
-        lines.append(
-            f"- 累计: net_pnl={c_net:.2f} USDC (收入={c_income:.2f}, 支出={c_expense:.2f}, "
-            f"activity={c_count}, sell={c_sell}, redeem={c_redeem}, buy={c_buy}, "
-            f"slug盈利={c_profit}, slug亏损={c_loss}, slug持平={c_flat})"
-        )
-    else:
-        lines.append("- 累计: 拉取失败")
+    lines.extend(_slug_pnl_and_mtm_lines(api_pnl_cumulative))
 
     content = "\n".join(lines)
 
-    subject = (
-        f"[BTC 5m] 盈亏汇总: 本小时 {h_net:.2f} / 累计 {c_net:.2f} USDC "
-        f"({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC)"
+    ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    prefer_subj = bool(
+        (api_pnl_cumulative or {}).get("prefer_settlement_final")
+        or (api_pnl_hourly or {}).get("prefer_settlement_final")
     )
+    api_h_net = float(api_pnl_hourly["net_pnl"]) if api_pnl_hourly is not None else None
+    api_c_net = float(api_pnl_cumulative["net_pnl"]) if api_pnl_cumulative is not None else None
+    h_blend = (
+        api_pnl_hourly.get("slug_blend_pnl_total_usdc") if api_pnl_hourly is not None else None
+    )
+    c_blend = (
+        api_pnl_cumulative.get("slug_blend_pnl_total_usdc") if api_pnl_cumulative is not None else None
+    )
+    if prefer_subj:
+        # 主标题始终用 resolution 结算合计；无已结算盘时为 0.00，避免误显示「链上净值」作主结论
+        hs = f"{float(h_blend if h_blend is not None else 0.0):.2f}"
+        cs = f"{float(c_blend if c_blend is not None else 0.0):.2f}"
+        subject = f"[BTC 5m] 结算盈亏(resolution): 本段 {hs} / 累计 {cs} USDC"
+        if api_h_net is not None and api_c_net is not None:
+            subject += f" | Activity流水 {api_h_net:.2f}/{api_c_net:.2f}"
+    elif api_h_net is not None and api_c_net is not None:
+        subject = (
+            f"[BTC 5m] 链上净值(含redeem): 本段 {api_h_net:.2f} / 累计 {api_c_net:.2f} USDC"
+        )
+    elif api_h_net is not None:
+        subject = f"[BTC 5m] 链上净值(含redeem): 本段 {api_h_net:.2f} USDC"
+    elif api_c_net is not None:
+        subject = f"[BTC 5m] 链上净值(含redeem): 累计 {api_c_net:.2f} USDC"
+    elif db_realized_hourly is not None and db_realized_cumulative is not None:
+        subject = (
+            f"[BTC 5m] SQLite卖出: 本段 {db_realized_hourly['total_pnl']:.2f} / "
+            f"累计 {db_realized_cumulative['total_pnl']:.2f} USDC"
+        )
+    else:
+        subject = (
+            f"[BTC 5m] 内存平仓: 本段 {hourly_pnl:.2f} / 累计 {cumulative_pnl:.2f} USDC"
+        )
+    # 补充：SQLite 卖出（与 redeem 主口径并存时便于对照）
+    if (api_pnl_hourly is not None or api_pnl_cumulative is not None) and (
+        db_realized_hourly is not None and db_realized_cumulative is not None
+    ):
+        subject += (
+            f" | CLOB卖 {db_realized_hourly['total_pnl']:.2f}/{db_realized_cumulative['total_pnl']:.2f}"
+        )
+    # 非 settlement 主口径时，附录累计 settlement 合计便于对照
+    if not prefer_subj:
+        blend = None
+        if api_pnl_cumulative is not None:
+            blend = api_pnl_cumulative.get("slug_blend_pnl_total_usdc")
+            if blend is None:
+                blend = api_pnl_cumulative.get("slug_mtm_total_usdc")
+        if blend is not None:
+            subject += f" | 盘收益∑{float(blend):.2f}"
+    subject += f" ({ts_str} UTC)"
 
     return content, subject

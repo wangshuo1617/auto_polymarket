@@ -4,7 +4,7 @@ import json
 import sqlite3
 import threading
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .models import OpenPosition, TradeRecord
 
@@ -297,6 +297,89 @@ class TradeSQLiteStore:
                 ),
             )
             self._conn.commit()
+
+    def aggregate_realized_pnl(
+        self,
+        *,
+        exit_after: Optional[datetime] = None,
+        exit_before: Optional[datetime] = None,
+        mode: str = "live",
+    ) -> Dict[str, Any]:
+        """按平仓时间汇总已实现盈亏（sell 行，与运行时 _append_realized_trade 写入的 pnl 一致）。
+
+        每笔 pnl = 卖出实际收回 USDC（notional_usdc）− 对应开仓分摊成本。
+        """
+        conditions: List[str] = ["side = 'sell'", "pnl IS NOT NULL", "mode = ?"]
+        params: List[Any] = [mode]
+        if exit_after is not None:
+            conditions.append("event_time >= ?")
+            params.append(self._to_utc_iso(exit_after))
+        if exit_before is not None:
+            conditions.append("event_time <= ?")
+            params.append(self._to_utc_iso(exit_before))
+        where_sql = " AND ".join(conditions)
+        sql = f"""
+            SELECT
+                COUNT(*) AS sell_count,
+                COALESCE(SUM(pnl), 0) AS total_pnl,
+                COALESCE(SUM(notional_usdc), 0) AS total_recovered_usdc
+            FROM trade_events
+            WHERE {where_sql}
+        """
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            row = cur.fetchone()
+        if row is None:
+            return {
+                "sell_count": 0,
+                "total_pnl": 0.0,
+                "total_recovered_usdc": 0.0,
+                "total_entry_cost_estimate": 0.0,
+            }
+        sell_count = int(row["sell_count"] or 0)
+        total_pnl = float(row["total_pnl"] or 0.0)
+        total_recovered = float(row["total_recovered_usdc"] or 0.0)
+        total_entry = total_recovered - total_pnl
+        return {
+            "sell_count": sell_count,
+            "total_pnl": total_pnl,
+            "total_recovered_usdc": total_recovered,
+            "total_entry_cost_estimate": total_entry,
+        }
+
+    def aggregate_entry_buys(
+        self,
+        *,
+        entry_after: Optional[datetime] = None,
+        entry_before: Optional[datetime] = None,
+        mode: str = "live",
+    ) -> Dict[str, Any]:
+        """按开仓时间汇总买入支出（reason=entry）。"""
+        conditions: List[str] = ["side = 'buy'", "reason = 'entry'", "mode = ?"]
+        params: List[Any] = [mode]
+        if entry_after is not None:
+            conditions.append("event_time >= ?")
+            params.append(self._to_utc_iso(entry_after))
+        if entry_before is not None:
+            conditions.append("event_time <= ?")
+            params.append(self._to_utc_iso(entry_before))
+        where_sql = " AND ".join(conditions)
+        sql = f"""
+            SELECT
+                COUNT(*) AS buy_count,
+                COALESCE(SUM(notional_usdc), 0) AS total_spent_usdc
+            FROM trade_events
+            WHERE {where_sql}
+        """
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            row = cur.fetchone()
+        if row is None:
+            return {"buy_count": 0, "total_spent_usdc": 0.0}
+        return {
+            "buy_count": int(row["buy_count"] or 0),
+            "total_spent_usdc": float(row["total_spent_usdc"] or 0.0),
+        }
 
     def delete_entry_event(
         self,

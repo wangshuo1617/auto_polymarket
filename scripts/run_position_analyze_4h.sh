@@ -14,8 +14,11 @@ mkdir -p logs
 if [ -f "$PID_FILE" ]; then
   OLD_PID=$(cat "$PID_FILE")
   if kill -0 "$OLD_PID" 2>/dev/null; then
-    echo "调度器已在运行 (PID: $OLD_PID)，如需重启请先执行: kill $OLD_PID"
-    exit 0
+    echo "正在停止原有持仓分析调度器 (PID: $OLD_PID)..."
+    kill "$OLD_PID" 2>/dev/null || true
+    sleep 2
+    kill -9 "$OLD_PID" 2>/dev/null || true
+    sleep 1
   fi
   rm -f "$PID_FILE"
 fi

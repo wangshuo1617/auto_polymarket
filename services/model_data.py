@@ -75,7 +75,12 @@ def append_model_samples(
     """
     asset_name = str(asset or "btc").strip().lower()
     if out_path is None:
-        out_path = "logs/model_samples_oil.jsonl" if asset_name == "oil" else "logs/model_samples.jsonl"
+        if asset_name == "oil":
+            out_path = "logs/model_samples_oil.jsonl"
+        elif asset_name == "gold":
+            out_path = "logs/model_samples_gold.jsonl"
+        else:
+            out_path = "logs/model_samples.jsonl"
 
     out_file = Path(out_path).resolve()
     out_file.parent.mkdir(parents=True, exist_ok=True)

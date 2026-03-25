@@ -20,6 +20,9 @@ from ai.prompts import (
     OIL_RESPONSE_SCHEMA,
     get_oil_system_instruction,
     get_oil_user_prompt,
+    GOLD_RESPONSE_SCHEMA,
+    get_gold_system_instruction,
+    get_gold_user_prompt,
     ENTERABILITY_RESPONSE_SCHEMA,
     ENTERABILITY_SYSTEM_INSTRUCTION,
     get_enterability_user_prompt,
@@ -44,6 +47,39 @@ def _parse_json_response_text(response_text: str) -> Dict[str, Any]:
             json_end = response_text.find("```", json_start)
             response_text = response_text[json_start:json_end].strip()
         return json.loads(response_text)
+
+
+def _extract_grounding_sources(response, query_tag: str) -> list[dict]:
+    """Extract and deduplicate grounding web sources from Gemini response."""
+    sources: list[dict] = []
+    seen_urls: set[str] = set()
+    fetched_at = datetime.now(ET_TIMEZONE).isoformat(timespec="seconds")
+    try:
+        if hasattr(response, "candidates") and response.candidates:
+            candidate = response.candidates[0]
+            if hasattr(candidate, "grounding_metadata"):
+                grounding_metadata = candidate.grounding_metadata
+                if hasattr(grounding_metadata, "grounding_chunks"):
+                    for chunk in grounding_metadata.grounding_chunks:
+                        if not hasattr(chunk, "web"):
+                            continue
+                        web = chunk.web
+                        uri = str(getattr(web, "uri", "") or "").strip()
+                        if not uri or uri in seen_urls:
+                            continue
+                        seen_urls.add(uri)
+                        sources.append(
+                            {
+                                "url": uri,
+                                "title": str(getattr(web, "title", "") or ""),
+                                "fetched_at": fetched_at,
+                                "query_tag": query_tag,
+                            }
+                        )
+    except Exception:
+        # Source extraction should not block the main result.
+        return []
+    return sources
 
 
 # Initialize the Gemini client
@@ -118,24 +154,7 @@ def analyze_market_with_grounding(
         response_text = response.text
         
         # Extract grounding sources if available
-        sources = []
-        try:
-            if hasattr(response, 'candidates') and response.candidates:
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'grounding_metadata'):
-                    grounding_metadata = candidate.grounding_metadata
-                    if hasattr(grounding_metadata, 'grounding_chunks'):
-                        for chunk in grounding_metadata.grounding_chunks:
-                            if hasattr(chunk, 'web'):
-                                web = chunk.web
-                                if hasattr(web, 'uri'):
-                                    sources.append({
-                                        "url": web.uri,
-                                        "title": getattr(web, 'title', ''),
-                                    })
-        except Exception as e:
-            # If source extraction fails, continue without sources
-            pass
+        sources = _extract_grounding_sources(response, query_tag="btc_market_analysis")
         
         # Parse JSON response
         try:
@@ -153,6 +172,9 @@ def analyze_market_with_grounding(
             
             result = json.loads(response_text)
         
+        if isinstance(result, dict):
+            result["news_sources"] = sources
+            result["source_count"] = len(sources)
         return result
         
     except Exception as e:
@@ -202,6 +224,7 @@ def analyze_oil_market_with_grounding(
             contents=user_prompt,
             config=config,
         )
+        sources = _extract_grounding_sources(response, query_tag="oil_market_analysis")
         response_text = response.text
         try:
             result = json.loads(response_text)
@@ -215,9 +238,78 @@ def analyze_oil_market_with_grounding(
                 json_end = response_text.find("```", json_start)
                 response_text = response_text[json_start:json_end].strip()
             result = json.loads(response_text)
+        if isinstance(result, dict):
+            result["news_sources"] = sources
+            result["source_count"] = len(sources)
         return result
     except Exception as e:
         raise Exception(f"Error calling Gemini API (oil): {str(e)}") from e
+
+
+def analyze_gold_market_with_grounding(
+    polymarket_status: list,
+    gold_4h_k_data: list,
+    gold_1d_k_data: list,
+    daily_volatility_profile: dict,
+    future_possibility_context: dict,
+    profit_optimization_context: dict,
+    gold_market_context: dict,
+    polymarket_event_situation: dict,
+    usdc_balance: str,
+    previous_report: dict | None = None,
+) -> Dict[str, Any]:
+    """
+    针对 Polymarket 黄金类 event 的持仓与市场分析（GC K 线、波动率、收益优化等）。
+    事件 slug 示例：will-gold-gc-hit-by-end-of-march
+    """
+    current_date = datetime.now(ET_TIMEZONE).strftime("%Y-%m-%d")
+    client = _get_client()
+    model = GEMINI_MODEL_ID
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+    config = types.GenerateContentConfig(
+        system_instruction=get_gold_system_instruction(current_date),
+        tools=[grounding_tool],
+        response_schema=GOLD_RESPONSE_SCHEMA,
+        temperature=0.7,
+    )
+    user_prompt = get_gold_user_prompt(
+        polymarket_status,
+        gold_4h_k_data,
+        gold_1d_k_data,
+        daily_volatility_profile,
+        future_possibility_context,
+        profit_optimization_context,
+        gold_market_context,
+        polymarket_event_situation,
+        usdc_balance,
+        previous_report=previous_report,
+    )
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config=config,
+        )
+        sources = _extract_grounding_sources(response, query_tag="gold_market_analysis")
+        response_text = response.text
+        try:
+            result = json.loads(response_text)
+        except json.JSONDecodeError:
+            if "```json" in response_text:
+                json_start = response_text.find("```json") + 7
+                json_end = response_text.find("```", json_start)
+                response_text = response_text[json_start:json_end].strip()
+            elif "```" in response_text:
+                json_start = response_text.find("```") + 3
+                json_end = response_text.find("```", json_start)
+                response_text = response_text[json_start:json_end].strip()
+            result = json.loads(response_text)
+        if isinstance(result, dict):
+            result["news_sources"] = sources
+            result["source_count"] = len(sources)
+        return result
+    except Exception as e:
+        raise Exception(f"Error calling Gemini API (gold): {str(e)}") from e
 
 
 def analyze_monthly_strategy_with_grounding(

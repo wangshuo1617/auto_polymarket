@@ -4,7 +4,7 @@ Polymarket Gamma API 只读接口（仅 requests，无 CLOB 依赖）
 """
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -165,3 +165,21 @@ def fetch_active_events_paginated(
             break
 
     return out
+
+
+def fetch_event_by_slug(slug: str) -> Optional[Dict[str, Any]]:
+    """GET /events/slug/{slug}，返回与 _normalize_event 一致的结构（含 markets outcomePrices）。"""
+    raw_slug = str(slug or "").strip()
+    if not raw_slug:
+        return None
+    url = f"{GAMMA_BASE}/events/slug/{raw_slug}"
+    try:
+        response = requests.get(url, timeout=25)
+        response.raise_for_status()
+        raw = response.json()
+        if not isinstance(raw, dict):
+            return None
+        return _normalize_event(raw)
+    except Exception as e:
+        logger.warning("fetch_event_by_slug failed: slug=%s error=%s", raw_slug, e)
+        return None

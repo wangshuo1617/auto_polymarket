@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from config import SQLITE_DB_PATH
+
 
 @dataclass(frozen=True)
 class StrategySignature:
@@ -915,8 +917,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--db-path",
         type=str,
-        default="logs/trade.sqlite3",
-        help="SQLite path used by backtest (default logs/trade.sqlite3)",
+        default=SQLITE_DB_PATH,
+        help="SQLite path used by backtest (default config.SQLITE_DB_PATH, tmp/trade.sqlite3)",
     )
     parser.add_argument(
         "--backtest-script",
