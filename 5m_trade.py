@@ -20,7 +20,9 @@ BTC 5m up/down 策略交易服务
 """
 
 import logging
+import json
 import os
+from pathlib import Path
 import socket
 import sqlite3
 import threading
@@ -91,6 +93,35 @@ def _build_startup_strategy_signature(args: Any) -> str:
 
 def _current_et_time_str() -> str:
     return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+# region agent log
+def _debug_emit(hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    try:
+        payload = {
+            "sessionId": "56f656",
+            "runId": "iter-2",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        log_candidates = [
+            Path("debug-56f656.log"),
+            Path(__file__).resolve().parent / "debug-56f656.log",
+        ]
+        for p in log_candidates:
+            try:
+                with open(p, "a", encoding="utf-8") as fp:
+                    fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+# endregion
 
 
 class FiveMinuteUpDownTrader:
@@ -846,6 +877,8 @@ class FiveMinuteUpDownTrader:
         # UP/DOWN token 价差检查：差值太小说明市场方向不明确
         _up_ask: Optional[float] = None
         _dn_ask: Optional[float] = None
+        _up_book: Optional[Dict[str, Any]] = None
+        _dn_book: Optional[Dict[str, Any]] = None
         if self.min_entry_updown_diff > 0 and self.current_market_slug:
             _mi = self._market_cache.get(self.current_market_slug)
             if not _mi:
@@ -939,6 +972,26 @@ class FiveMinuteUpDownTrader:
                 )
                 self.window_traded = True
                 return
+
+        # region agent log
+        _debug_emit(
+            hypothesis_id="H6_H7_H8",
+            location="5m_trade.py:_handle_entry_minute:pre_open_position",
+            message="Entry decision snapshot before open_position",
+            data={
+                "market_slug": self.current_market_slug,
+                "direction": direction,
+                "up_best_ask": _up_ask,
+                "down_best_ask": _dn_ask,
+                "up_asks_count": len(list((_up_book or {}).get("asks") or [])),
+                "down_asks_count": len(list((_dn_book or {}).get("asks") or [])),
+                "up_received_ms": (_up_book or {}).get("received_ms"),
+                "down_received_ms": (_dn_book or {}).get("received_ms"),
+                "window_traded": self.window_traded,
+                "entry_attempt_count": self._entry_attempt_count,
+            },
+        )
+        # endregion
 
         # DB tick 交叉验证：确保回测使用同一 DB 数据也会入场，避免误入
         if not self._validate_entry_with_db_ticks(direction):

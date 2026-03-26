@@ -1,4 +1,6 @@
 import logging
+import json
+from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional
 
@@ -7,16 +9,74 @@ from data.polymarket import get_order_book
 logger = logging.getLogger(__name__)
 
 
+# region agent log
+def _debug_emit(hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    try:
+        payload = {
+            "sessionId": "56f656",
+            "runId": "iter-2",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        log_candidates = [
+            Path("debug-56f656.log"),
+            Path(__file__).resolve().parents[2] / "debug-56f656.log",
+        ]
+        for p in log_candidates:
+            try:
+                with open(p, "a", encoding="utf-8") as fp:
+                    fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+# endregion
+
+
 def fetch_orderbook_levels(trader: Any, token_id: str, side: str) -> Dict[str, Any]:
     self = trader
     ws_snapshot = self._ws_book_cache.get(token_id)
     levels: List[Dict[str, float]] = []
     source = "http"
+    ws_age_ms: Optional[int] = None
+    ws_asks_count = 0
+    ws_bids_count = 0
+    ws_best_ask = None
+    ws_best_bid = None
 
     if ws_snapshot is not None:
         now_ms = int(time.time() * 1000)
         snapshot_ts = int(ws_snapshot.get("received_ms") or now_ms)
         age_ms = now_ms - snapshot_ts
+        ws_age_ms = age_ms
+        ws_asks_count = len(list(ws_snapshot.get("asks") or []))
+        ws_bids_count = len(list(ws_snapshot.get("bids") or []))
+        ws_best_ask = ws_snapshot.get("best_ask")
+        ws_best_bid = ws_snapshot.get("best_bid")
+        # region agent log
+        _debug_emit(
+            hypothesis_id="H1_H2_H5",
+            location="services/five_minute_trade/execution_plans.py:fetch_orderbook_levels:ws_snapshot_observed",
+            message="Observed ws snapshot before source selection",
+            data={
+                "token_id": token_id,
+                "side": side,
+                "snapshot_age_ms": age_ms,
+                "ws_book_max_age_ms": int(self.WS_BOOK_MAX_AGE_MS),
+                "ws_asks_count": ws_asks_count,
+                "ws_bids_count": ws_bids_count,
+                "ws_best_ask": ws_best_ask,
+                "ws_best_bid": ws_best_bid,
+                "price_change_only": bool(ws_snapshot.get("price_change_only")),
+            },
+        )
+        # endregion
         if age_ms <= self.WS_BOOK_MAX_AGE_MS:
             if side == "buy":
                 levels = list(ws_snapshot.get("asks") or [])
@@ -87,6 +147,23 @@ def fetch_orderbook_levels(trader: Any, token_id: str, side: str) -> Dict[str, A
         else:
             raise RuntimeError(f"未知 side: {side}")
 
+        # region agent log
+        _debug_emit(
+            hypothesis_id="H2_H4",
+            location="services/five_minute_trade/execution_plans.py:fetch_orderbook_levels:http_book_observed",
+            message="Observed http orderbook before normalization",
+            data={
+                "token_id": token_id,
+                "side": side,
+                "http_latency_ms": round(book_ms, 3),
+                "http_asks_count": len(getattr(book, "asks", None) or []),
+                "http_bids_count": len(getattr(book, "bids", None) or []),
+                "http_best_ask_raw": (getattr((getattr(book, "asks", None) or [None])[0], "price", None) if (getattr(book, "asks", None) or []) else None),
+                "http_best_bid_raw": (getattr((getattr(book, "bids", None) or [None])[0], "price", None) if (getattr(book, "bids", None) or []) else None),
+            },
+        )
+        # endregion
+
         levels = []
         for lvl in sorted_levels:
             lvl_price = self._to_positive_float(getattr(lvl, "price", None))
@@ -113,6 +190,23 @@ def fetch_orderbook_levels(trader: Any, token_id: str, side: str) -> Dict[str, A
         raise RuntimeError(f"未知 side: {side}")
 
     if not normalized_levels:
+        # region agent log
+        _debug_emit(
+            hypothesis_id="H1_H2_H4_H5",
+            location="services/five_minute_trade/execution_plans.py:fetch_orderbook_levels:empty_normalized_levels",
+            message="No usable levels after source+normalize",
+            data={
+                "token_id": token_id,
+                "side": side,
+                "source": source,
+                "ws_age_ms": ws_age_ms,
+                "ws_asks_count": ws_asks_count,
+                "ws_bids_count": ws_bids_count,
+                "ws_best_ask": ws_best_ask,
+                "ws_best_bid": ws_best_bid,
+            },
+        )
+        # endregion
         raise RuntimeError(f"订单簿无可用{'卖' if side == 'buy' else '买'}单")
 
     best_price_from_levels = self._to_positive_float(normalized_levels[0].get("price"))

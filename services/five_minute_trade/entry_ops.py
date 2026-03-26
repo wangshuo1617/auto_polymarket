@@ -1,4 +1,6 @@
 import logging
+import json
+from pathlib import Path
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -16,6 +18,36 @@ from .risk_sizing import RiskAssessment, assess_risk
 from .watchers import PolymarketAssetPriceWatcher
 
 logger = logging.getLogger(__name__)
+
+
+# region agent log
+def _debug_emit(hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    try:
+        payload = {
+            "sessionId": "56f656",
+            "runId": "iter-2",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        log_candidates = [
+            Path("debug-56f656.log"),
+            Path(__file__).resolve().parents[2] / "debug-56f656.log",
+        ]
+        for p in log_candidates:
+            try:
+                with open(p, "a", encoding="utf-8") as fp:
+                    fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+# endregion
 
 
 def select_market_and_tokens(trader: Any, market_slug: str) -> Dict[str, Any]:
@@ -131,6 +163,23 @@ def open_position(
 
     # Polymarket 报价新鲜度检查（对齐回测 max_quote_age_ms / stale_entry_ask）
     ws_snapshot = self._ws_book_cache.get(token_id)
+    # region agent log
+    _debug_emit(
+        hypothesis_id="H6_H7",
+        location="services/five_minute_trade/entry_ops.py:open_position:ws_snapshot_before_guard",
+        message="Open position selected token ws snapshot",
+        data={
+            "market_slug": market_slug,
+            "direction": direction,
+            "token_id": token_id,
+            "ws_present": bool(ws_snapshot is not None),
+            "ws_received_ms": (ws_snapshot or {}).get("received_ms") if ws_snapshot is not None else None,
+            "ws_asks_count": len(list((ws_snapshot or {}).get("asks") or [])) if ws_snapshot is not None else 0,
+            "ws_best_ask": (ws_snapshot or {}).get("best_ask") if ws_snapshot is not None else None,
+            "ws_price_change_only": bool((ws_snapshot or {}).get("price_change_only")) if ws_snapshot is not None else None,
+        },
+    )
+    # endregion
     if ws_snapshot is not None:
         now_ms = int(time.time() * 1000)
         snapshot_received_ms = int(ws_snapshot.get("received_ms") or 0)
@@ -141,6 +190,16 @@ def open_position(
                 quote_age_ms,
                 self.WS_BOOK_MAX_AGE_MS,
                 token_id,
+            )
+            return
+        ws_asks = list(ws_snapshot.get("asks") or [])
+        ws_best_ask = self._to_positive_float(ws_snapshot.get("best_ask"))
+        # 避免进入必然失败路径：目标token已无卖单（常见于单边封盘）
+        if not ws_asks:
+            logger.info(
+                "放弃开仓：目标方向无可用卖单 token=%s ws_best_ask=%s",
+                token_id,
+                f"{ws_best_ask:.4f}" if ws_best_ask is not None else "None",
             )
             return
     else:
