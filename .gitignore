@@ -12,9 +12,8 @@ wheels/
 .env
 *.ipynb
 output/
-last_market_sentiment_and_funding.json
-last_report.json
-price_warn_config.py
+*.json
+price_warn_*.py
 logs/
 *.sql
 .vscode/

@@ -1,6 +1,6 @@
 """
-面向 Polymarket 月度 BTC 事件的收益优化上下文构建。
-仅提供分析输入，不直接下单。
+面向 Polymarket 月度价格预测事件的收益优化上下文构建。
+支持 BTC / 原油 (oil) / 黄金 (gold) 等资产。仅提供分析输入，不直接下单。
 """
 from __future__ import annotations
 
@@ -72,10 +72,11 @@ def _parse_market_prices(market: dict) -> tuple[float | None, float | None]:
 
 def _extract_strike_and_direction(question: str) -> tuple[float | None, str]:
     q = str(question or "")
-    numbers = re.findall(r"\$?\s*(\d{2,3}(?:,\d{3})+|\d{4,6})", q)
+    # Match dollar amounts: $80,000  $3,200  $75  $3200.50
+    dollar_amounts = re.findall(r"\$\s*([\d,]+(?:\.\d+)?)", q)
     strike = None
-    if numbers:
-        strike_text = numbers[0].replace(",", "")
+    if dollar_amounts:
+        strike_text = dollar_amounts[0].replace(",", "")
         strike = _to_float(strike_text, default=0.0)
         if strike <= 0:
             strike = None
@@ -213,9 +214,10 @@ def _build_position_safety_assessment(
     positions: list,
     future_possibility_context: dict,
     daily_volatility_profile: dict,
+    asset: str = "btc",
 ) -> list:
     """对每个持仓评估安全度: safe_to_hold / monitor / at_risk。"""
-    current_price = _to_float(future_possibility_context.get("current_btc_price"), 0.0)
+    current_price = _get_current_price(future_possibility_context, asset)
     days_left = max(0, int(_to_float(future_possibility_context.get("days_left_in_month"), 0)))
     atr_pct = _to_float(daily_volatility_profile.get("atr_pct"), 2.0)
 
@@ -398,12 +400,13 @@ def _build_rotation_opportunities(
 
 def _build_portfolio_analysis(
     position_assessments: list,
-    current_btc_price: float,
+    current_asset_price: float,
     usdc_balance: float,
+    asset: str = "btc",
 ) -> dict:
     """组合级关联风险分析：情景矩阵、对冲结构识别。"""
-    if current_btc_price <= 0:
-        return {"note": "BTC价格无效，无法计算组合分析"}
+    if current_asset_price <= 0:
+        return {"note": f"{asset}价格无效，无法计算组合分析"}
 
     total_position_value = sum(
         _to_float(pa.get("size"), 0) * _to_float(pa.get("cur_price"), 0)
@@ -413,7 +416,7 @@ def _build_portfolio_analysis(
 
     scenarios = {}
     for move_pct in [-10, -5, -3, 3, 5, 10]:
-        scenario_btc = current_btc_price * (1.0 + move_pct / 100.0)
+        scenario_asset = current_asset_price * (1.0 + move_pct / 100.0)
         scenario_pnl = 0.0
 
         for pa in position_assessments:
@@ -429,22 +432,22 @@ def _build_portfolio_analysis(
             is_no = outcome == "no"
 
             if direction == "above":
-                if scenario_btc >= strike:
+                if scenario_asset >= strike:
                     new_price = 0.01 if is_no else 0.99
                 else:
-                    dist_now = max(strike - current_btc_price, 1.0)
-                    dist_new = max(strike - scenario_btc, 0.0)
+                    dist_now = max(strike - current_asset_price, 1.0)
+                    dist_new = max(strike - scenario_asset, 0.0)
                     ratio = min(dist_new / dist_now, 2.0)
                     if is_no:
                         new_price = min(0.99, cur_price + (1.0 - cur_price) * max(0, 1.0 - 1.0 / max(ratio, 0.01)) * 0.4)
                     else:
                         new_price = max(0.01, cur_price * ratio)
             elif direction == "below":
-                if scenario_btc <= strike:
+                if scenario_asset <= strike:
                     new_price = 0.01 if is_no else 0.99
                 else:
-                    dist_now = max(current_btc_price - strike, 1.0)
-                    dist_new = max(scenario_btc - strike, 0.0)
+                    dist_now = max(current_asset_price - strike, 1.0)
+                    dist_new = max(scenario_asset - strike, 0.0)
                     ratio = min(dist_new / dist_now, 2.0)
                     if is_no:
                         new_price = min(0.99, cur_price + (1.0 - cur_price) * max(0, 1.0 - 1.0 / max(ratio, 0.01)) * 0.4)
@@ -455,8 +458,8 @@ def _build_portfolio_analysis(
 
             scenario_pnl += size * (new_price - cur_price)
 
-        scenarios[f"btc_{move_pct:+d}pct"] = {
-            "btc_price": round(scenario_btc, 2),
+        scenarios[f"{asset}_{move_pct:+d}pct"] = {
+            f"{asset}_price": round(scenario_asset, 2),
             "portfolio_pnl_usdc": round(scenario_pnl, 2),
             "portfolio_pnl_pct": round(scenario_pnl / total_net_value * 100.0, 2) if total_net_value > 0 else 0.0,
         }
@@ -472,7 +475,7 @@ def _build_portfolio_analysis(
 
     if has_upside_no and has_downside_no:
         structure = "short_strangle"
-        structure_note = "持有上下两方向 No 仓位（类 Short Strangle），BTC 区间震荡时两端均盈利，具有天然对冲效果"
+        structure_note = f"持有上下两方向 No 仓位（类 Short Strangle），{asset.upper()} 区间震荡时两端均盈利，具有天然对冲效果"
     elif has_upside_no:
         structure = "bearish_range"
         structure_note = "仅持有上方 No 仓位，看空或看区间震荡"
@@ -493,12 +496,14 @@ def _build_portfolio_analysis(
 
 def _build_prediction_review(
     previous_report: dict | None,
-    current_btc_price: float,
+    current_asset_price: float,
+    asset: str = "btc",
 ) -> dict | None:
     """对比上期报告预测 vs 实际走势，生成回顾。"""
     if not previous_report or not isinstance(previous_report, dict):
         return None
 
+    asset_label = asset.upper()
     review: dict = {"has_previous": True, "findings": []}
 
     overall = previous_report.get("整体分析", "")
@@ -506,24 +511,24 @@ def _build_prediction_review(
         review["previous_overall_summary"] = overall[:300] + "..." if len(overall) > 300 else overall
 
     warnings = previous_report.get("预警信号", [])
-    if warnings and current_btc_price > 0:
+    if warnings and current_asset_price > 0:
         for w in warnings:
             direction = w.get("预警方向", "")
             price = _to_float(w.get("价格"), 0.0)
             if price <= 0:
                 continue
             if direction == "up_to":
-                triggered = current_btc_price >= price
+                triggered = current_asset_price >= price
             elif direction == "down_to":
-                triggered = current_btc_price <= price
+                triggered = current_asset_price <= price
             else:
                 continue
             review["findings"].append({
                 "type": "warning_check",
                 "warning": f"{'上行' if direction == 'up_to' else '下行'}预警 ${price:,.0f}",
                 "triggered": triggered,
-                "actual_btc": round(current_btc_price, 2),
-                "note": f"BTC {'已触及' if triggered else '未触及'}该预警位（当前${current_btc_price:,.0f}）",
+                f"actual_{asset}": round(current_asset_price, 2),
+                "note": f"{asset_label} {'已触及' if triggered else '未触及'}该预警位（当前${current_asset_price:,.0f}）",
             })
 
     appendix = previous_report.get("报告解读附录", [])
@@ -551,6 +556,20 @@ def _build_prediction_review(
     return review
 
 
+def _get_current_price(future_possibility_context: dict, asset: str = "btc") -> float:
+    """从 future_possibility_context 中提取当前资产价格。"""
+    key_map = {
+        "btc": "current_btc_price",
+        "oil": "current_oil_price",
+        "gold": "current_gold_price",
+    }
+    key = key_map.get(asset, f"current_{asset}_price")
+    price = _to_float(future_possibility_context.get(key), 0.0)
+    if price <= 0:
+        price = _to_float(future_possibility_context.get("current_price"), 0.0)
+    return price
+
+
 def build_profit_optimization_context(
     polymarket_event_situation: dict,
     future_possibility_context: dict,
@@ -558,8 +577,10 @@ def build_profit_optimization_context(
     usdc_balance: str | float | int,
     positions: list | None = None,
     previous_report: dict | None = None,
+    asset: str = "btc",
 ) -> dict:
     """构建"期望收益最大化"所需的结构化先验、安全度评估、轮动机会和组合分析。"""
+    asset = asset.strip().lower()
 
     scenario_probs = _build_scenario_probs(future_possibility_context, daily_volatility_profile)
 
@@ -571,7 +592,7 @@ def build_profit_optimization_context(
         sigma_daily = max(0.008, _to_float(daily_volatility_profile.get("atr_pct"), 1.8) / 100.0 * 0.6)
 
     days_left = max(0, int(_to_float(future_possibility_context.get("days_left_in_month"), 0)))
-    current_price = _to_float(future_possibility_context.get("current_btc_price"), 0.0)
+    current_price = _get_current_price(future_possibility_context, asset)
 
     mu_ret = drift_daily * days_left
     sigma_ret = max(0.01, sigma_daily * sqrt(days_left))
@@ -587,7 +608,7 @@ def build_profit_optimization_context(
 
     # --- Position safety assessment ---
     position_assessments = _build_position_safety_assessment(
-        positions, future_possibility_context, daily_volatility_profile,
+        positions, future_possibility_context, daily_volatility_profile, asset=asset,
     )
 
     # --- Theta daily income ---
@@ -662,11 +683,11 @@ def build_profit_optimization_context(
 
     # --- Portfolio-level analysis ---
     portfolio_analysis = _build_portfolio_analysis(
-        position_assessments, current_price, balance,
+        position_assessments, current_price, balance, asset=asset,
     )
 
     # --- Prediction review ---
-    prediction_review = _build_prediction_review(previous_report, current_price)
+    prediction_review = _build_prediction_review(previous_report, current_price, asset=asset)
 
     return {
         "objective": "maximize_expected_profit_under_risk_budget",
@@ -682,10 +703,11 @@ def build_profit_optimization_context(
         },
         "scenario_probabilities": scenario_probs,
         "distribution_assumption": {
+            "asset": asset,
             "days_left": days_left,
             "mu_return": round(mu_ret, 4),
             "sigma_return": round(sigma_ret, 4),
-            "current_btc_price": round(current_price, 2),
+            "current_price": round(current_price, 2),
         },
         "position_safety_assessment": position_assessments,
         "theta_income": theta_income,
