@@ -570,6 +570,9 @@ def build_profit_optimization_context(
     if sigma_daily <= 0:
         sigma_daily = max(0.008, _to_float(daily_volatility_profile.get("atr_pct"), 1.8) / 100.0 * 0.6)
 
+    days_left = max(0, int(_to_float(future_possibility_context.get("days_left_in_month"), 0)))
+    current_price = _to_float(future_possibility_context.get("current_btc_price"), 0.0)
+
     mu_ret = drift_daily * days_left
     sigma_ret = max(0.01, sigma_daily * sqrt(days_left))
 
