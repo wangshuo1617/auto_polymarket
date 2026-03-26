@@ -232,6 +232,14 @@ def open_position(
             min_stake_ratio=getattr(self, "risk_min_stake_ratio", 0.20),
             max_stake_ratio=getattr(self, "risk_max_stake_ratio", 1.50),
             confidence_boost_enabled=getattr(self, "confidence_boost_enabled", True),
+            w_price=getattr(self, "risk_w_price", 0.50),
+            w_direction=getattr(self, "risk_w_direction", 0.15),
+            w_stability=getattr(self, "risk_w_stability", 0.35),
+            stake_cap_very_high=getattr(self, "stake_cap_very_high", 0.0),
+            stake_cap_high=getattr(self, "stake_cap_high", 0.50),
+            stake_cap_medium_high=getattr(self, "stake_cap_medium_high", 0.35),
+            medium_high_threshold=getattr(self, "medium_high_threshold", 0.40),
+            confidence_boost_ge_095=getattr(self, "confidence_boost_ge_095", 1.5),
         )
         effective_stake = risk_assessment.adjusted_stake
         logger.info(
