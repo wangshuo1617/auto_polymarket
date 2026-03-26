@@ -17,6 +17,12 @@ echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "工作目录: $PROJECT_ROOT"
 echo "=========================================="
 
+# --foreground 模式：前台运行，供 systemd 调用（通过环境变量 FOREGROUND=1 激活）
+if [ "${FOREGROUND:-}" = "1" ]; then
+  echo "[foreground] 前台启动 app.py ..."
+  exec uv run app.py
+fi
+
 echo "[1/3] 停止已有 app.py 进程..."
 pkill -f "app.py" || true
 sleep 1

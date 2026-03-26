@@ -1,0 +1,20 @@
+[Unit]
+Description=Auto Polymarket - Web App
+After=network-online.target
+Wants=network-online.target
+
+StartLimitIntervalSec=300
+StartLimitBurst=5
+[Service]
+Type=exec
+WorkingDirectory=/root/auto_polymarket
+Environment=FOREGROUND=1
+ExecStart=/bin/bash scripts/restart_app.sh
+Restart=on-failure
+RestartSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

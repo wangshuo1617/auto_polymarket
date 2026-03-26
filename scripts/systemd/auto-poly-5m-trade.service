@@ -1,0 +1,20 @@
+[Unit]
+Description=Auto Polymarket - 5m BTC Trade
+After=network-online.target
+Wants=network-online.target
+
+StartLimitIntervalSec=300
+StartLimitBurst=5
+[Service]
+Type=exec
+WorkingDirectory=/root/auto_polymarket
+Environment=FOREGROUND=1
+ExecStart=/bin/bash scripts/restart_5m_trade.sh
+Restart=on-failure
+RestartSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

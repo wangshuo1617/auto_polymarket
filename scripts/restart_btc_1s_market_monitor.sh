@@ -20,6 +20,12 @@ echo "数据库文件: 使用 config.SQLITE_DB_PATH"
 echo "交易对: $SYMBOL"
 echo "=========================================="
 
+# --foreground 模式：前台运行，供 systemd 调用（通过环境变量 FOREGROUND=1 激活）
+if [ "${FOREGROUND:-}" = "1" ]; then
+  echo "[foreground] 前台启动 btc_1s_market_monitor ..."
+  exec uv run btc_1s_market_monitor.py --symbol "$SYMBOL"
+fi
+
 echo "[1/3] 停止已有 btc_1s_market_monitor 进程..."
 pkill -f "btc_1s_market_monitor.py" || true
 sleep 1

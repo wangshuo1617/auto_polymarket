@@ -266,6 +266,67 @@ else
 fi
 echo "=========================================="
 
+_build_cmd() {
+  CMD=(
+    uv run 5m_trade.py
+    --entry-minute "$ENTRY_MINUTE"
+    --entry-preclose-sec "$ENTRY_PRECLOSE_SEC"
+    --min-direction-diff "$MIN_DIRECTION_DIFF"
+    --stake-usd "$STAKE_USD"
+    --report-interval-sec "$REPORT_INTERVAL_SEC"
+    --max-entry-price "$MAX_ENTRY_PRICE"
+    --take-profit-spread "$TAKE_PROFIT_SPREAD"
+    --stop-loss-spread "$STOP_LOSS_SPREAD"
+    --tp-price-cap "$TP_PRICE_CAP"
+    --tp-value-cap "$TP_VALUE_CAP"
+    --sl-to-tp-ratio "$SL_TO_TP_RATIO"
+    --toxic-utc-hours "$TOXIC_UTC_HOURS"
+    --min-hold-before-close-sec "$MIN_HOLD_BEFORE_CLOSE_SEC"
+    --max-btc-cross-count "$MAX_BTC_CROSS_COUNT"
+    --min-entry-updown-diff "$MIN_ENTRY_UPDOWN_DIFF"
+    --max-avg-btc-delta "$MAX_AVG_BTC_DELTA"
+    --exit-mode "$EXIT_MODE"
+    --risk-min-stake-ratio "$RISK_MIN_STAKE_RATIO"
+    --risk-max-stake-ratio "$RISK_MAX_STAKE_RATIO"
+    --confidence-boost-ge-095 "$CONFIDENCE_BOOST_GE_095"
+    --stake-cap-very-high "$STAKE_CAP_VERY_HIGH"
+    --stake-cap-high "$STAKE_CAP_HIGH"
+    --stake-cap-medium-high "$STAKE_CAP_MEDIUM_HIGH"
+    --medium-high-threshold "$MEDIUM_HIGH_THRESHOLD"
+    --risk-w-price "$RISK_W_PRICE"
+    --risk-w-direction "$RISK_W_DIRECTION"
+    --risk-w-stability "$RISK_W_STABILITY"
+    --risk-diff-boost-threshold "$RISK_DIFF_BOOST_THRESHOLD"
+    --risk-diff-boost-multiplier "$RISK_DIFF_BOOST_MULTIPLIER"
+    --cross-borderline-diff-multiplier "$CROSS_BORDERLINE_DIFF_MULTIPLIER"
+  )
+
+  if [ -n "$TRADE_DB_PATH" ]; then
+    CMD+=(--trade-db-path "$TRADE_DB_PATH")
+  fi
+
+  CMD+=(--minute-consistency "$MINUTE_CONSISTENCY")
+
+  if [ "$ENABLE_RISK_SIZING" = "false" ]; then
+    CMD+=(--disable-risk-sizing)
+  fi
+
+  if [ "$CONFIDENCE_BOOST" = "false" ]; then
+    CMD+=(--disable-confidence-boost)
+  fi
+
+  if [ "$MODE" != "--live" ]; then
+    CMD+=(--dry-run)
+  fi
+}
+
+# --foreground 模式：前台运行，供 systemd 调用（通过环境变量 FOREGROUND=1 激活）
+if [ "${FOREGROUND:-}" = "1" ]; then
+  echo "[foreground] 前台启动 5m_trade ..."
+  _build_cmd
+  exec "${CMD[@]}"
+fi
+
 echo "[1/3] 停止已有 5m_trade 进程..."
 pkill -f "5m_trade.py" || true
 sleep 1
@@ -278,59 +339,8 @@ if [ -n "$REMAINING" ]; then
 fi
 
 echo "[2/3] 启动新进程..."
-CMD=(
-  uv run 5m_trade.py
-  --entry-minute "$ENTRY_MINUTE"
-  --entry-preclose-sec "$ENTRY_PRECLOSE_SEC"
-  --min-direction-diff "$MIN_DIRECTION_DIFF"
-  --stake-usd "$STAKE_USD"
-  --report-interval-sec "$REPORT_INTERVAL_SEC"
-  --max-entry-price "$MAX_ENTRY_PRICE"
-  --take-profit-spread "$TAKE_PROFIT_SPREAD"
-  --stop-loss-spread "$STOP_LOSS_SPREAD"
-  --tp-price-cap "$TP_PRICE_CAP"
-  --tp-value-cap "$TP_VALUE_CAP"
-  --sl-to-tp-ratio "$SL_TO_TP_RATIO"
-  --toxic-utc-hours "$TOXIC_UTC_HOURS"
-  --min-hold-before-close-sec "$MIN_HOLD_BEFORE_CLOSE_SEC"
-  --max-btc-cross-count "$MAX_BTC_CROSS_COUNT"
-  --min-entry-updown-diff "$MIN_ENTRY_UPDOWN_DIFF"
-  --max-avg-btc-delta "$MAX_AVG_BTC_DELTA"
-  --exit-mode "$EXIT_MODE"
-  --risk-min-stake-ratio "$RISK_MIN_STAKE_RATIO"
-  --risk-max-stake-ratio "$RISK_MAX_STAKE_RATIO"
-  --confidence-boost-ge-095 "$CONFIDENCE_BOOST_GE_095"
-  --stake-cap-very-high "$STAKE_CAP_VERY_HIGH"
-  --stake-cap-high "$STAKE_CAP_HIGH"
-  --stake-cap-medium-high "$STAKE_CAP_MEDIUM_HIGH"
-  --medium-high-threshold "$MEDIUM_HIGH_THRESHOLD"
-  --risk-w-price "$RISK_W_PRICE"
-  --risk-w-direction "$RISK_W_DIRECTION"
-  --risk-w-stability "$RISK_W_STABILITY"
-  --risk-diff-boost-threshold "$RISK_DIFF_BOOST_THRESHOLD"
-  --risk-diff-boost-multiplier "$RISK_DIFF_BOOST_MULTIPLIER"
-  --cross-borderline-diff-multiplier "$CROSS_BORDERLINE_DIFF_MULTIPLIER"
-)
-
-if [ -n "$TRADE_DB_PATH" ]; then
-  CMD+=(--trade-db-path "$TRADE_DB_PATH")
-fi
-
-CMD+=(--minute-consistency "$MINUTE_CONSISTENCY")
-
-if [ "$ENABLE_RISK_SIZING" = "false" ]; then
-  CMD+=(--disable-risk-sizing)
-fi
-
-if [ "$CONFIDENCE_BOOST" = "false" ]; then
-  CMD+=(--disable-confidence-boost)
-fi
-
-if [ "$MODE" = "--live" ]; then
-  nohup "${CMD[@]}" >> "$LOG_FILE" 2>&1 &
-else
-  nohup "${CMD[@]}" --dry-run >> "$LOG_FILE" 2>&1 &
-fi
+_build_cmd
+nohup "${CMD[@]}" >> "$LOG_FILE" 2>&1 &
 
 NEW_PID=$!
 echo "$NEW_PID" > "$PID_FILE"
