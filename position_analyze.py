@@ -156,6 +156,10 @@ if __name__ == "__main__":
         f"space_to_reclaim_target={future_possibility_context.get('space_to_reclaim_target_pct')}%"
     )
 
+    previous_report = _load_previous_report()
+    if previous_report:
+        print(f"{time_now} 已加载上一时间段报告作为参考")
+
     event_situation = get_event_situation()
     usdc_balance = get_balance_allowance()
     profit_optimization_context = build_profit_optimization_context(
@@ -163,14 +167,14 @@ if __name__ == "__main__":
         future_possibility_context=future_possibility_context,
         daily_volatility_profile=daily_volatility_profile,
         usdc_balance=usdc_balance,
+        positions=positions,
+        previous_report=previous_report,
     )
     print(
         f"{time_now} 收益优化上下文完成: edge_count={profit_optimization_context.get('all_edge_count')} "
-        f"top_edges={len(profit_optimization_context.get('top_edge_opportunities', []))}"
+        f"top_edges={len(profit_optimization_context.get('top_edge_opportunities', []))} "
+        f"portfolio_net_value={profit_optimization_context.get('portfolio_summary', {}).get('total_net_value')}"
     )
-    previous_report = _load_previous_report()
-    if previous_report:
-        print(f"{time_now} 已加载上一时间段报告作为参考")
     print(f"{time_now} Polymarket 事件/市场现价与 USDC 余额获取完成,开始进行AI分析")
 
     analyze_result = analyze_market_with_grounding(
