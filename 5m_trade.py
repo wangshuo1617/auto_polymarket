@@ -268,6 +268,8 @@ class FiveMinuteUpDownTrader:
         }
         self._prev_hour_pending_slugs: List[Dict[str, Any]] = []
         self._log_throttle_last_ts: Dict[str, float] = {}
+        self._consecutive_stale_windows: int = 0
+        self._stale_alert_sent: bool = False
         self._trade_db: Optional[TradeSQLiteStore] = None
         if trade_db_path:
             try:
@@ -697,6 +699,34 @@ class FiveMinuteUpDownTrader:
             self.latest_btc_price = parsed
             self.latest_btc_price_event_ms = event_ms
 
+    def _send_stale_alert(self, btc_age_ms: int) -> None:
+        """连续多个窗口 BTC 价格 stale 时发送告警邮件。"""
+        reconnect_count = getattr(self._price_watcher, "_watchdog_reconnect_count", 0)
+        subject = "[BTC 5m] ⚠️ 价格源异常: 连续 %d 个窗口 BTC 价格过时" % self._consecutive_stale_windows
+        content = (
+            "BTC 价格源持续异常，已连续 %d 个 5 分钟窗口因价格过时无法入场交易。\n\n"
+            "当前价格延迟: %d ms\n"
+            "看门狗累计重连: %d 次\n"
+            "最新缓存价格: %s\n\n"
+            "建议检查 Chainlink RTDS WebSocket 连接状态，必要时手动重启服务。"
+            % (
+                self._consecutive_stale_windows,
+                btc_age_ms,
+                reconnect_count,
+                self.latest_btc_price,
+            )
+        )
+        logger.error(subject)
+        if not TO_EMAIL:
+            return
+        try:
+            sender = EmailSender()
+            sender.send_email(
+                to_email=TO_EMAIL, subject=subject, content=content, content_type="plain"
+            )
+        except Exception as e:
+            logger.error("stale 告警邮件发送失败: %s", e)
+
     def _clock_loop(self) -> None:
         """时间驱动主循环，每 1s 检查一次系统时钟，对齐回测的逐秒快照逻辑。"""
         while self._running:
@@ -792,7 +822,16 @@ class FiveMinuteUpDownTrader:
                         btc_age_ms,
                         self.MAX_BTC_AGE_MS,
                     )
+                    # 在入场窗口结束时（最后一秒）判定本窗口因 stale 未交易
+                    if rel_sec >= entry_deadline_sec - 1.5:
+                        self._consecutive_stale_windows += 1
+                        if self._consecutive_stale_windows >= 3 and not self._stale_alert_sent:
+                            self._send_stale_alert(btc_age_ms)
+                            self._stale_alert_sent = True
                     return  # 不设置 preclose_entry_triggered，下个 500ms tick 自动重试
+                # 价格恢复正常，重置连续 stale 计数
+                self._consecutive_stale_windows = 0
+                self._stale_alert_sent = False
                 ms_to_close = int((entry_deadline_sec - rel_sec) * 1000)
                 self._handle_entry_minute(
                     projected_close=btc_price,

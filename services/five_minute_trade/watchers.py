@@ -14,6 +14,7 @@ class ChainlinkBTCPriceWatcher:
 
     WS_URL = "wss://ws-live-data.polymarket.com"
     TOPIC = "crypto_prices_chainlink"
+    WATCHDOG_STALE_SEC = 30  # 超过此秒数未收到价格更新则强制重连
 
     def __init__(
         self,
@@ -26,9 +27,11 @@ class ChainlinkBTCPriceWatcher:
         self.ws: Optional[WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
         self._ping_thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
         self.running = False
         self.last_price: Optional[float] = None
         self.last_update_time: Optional[float] = None
+        self._watchdog_reconnect_count: int = 0
 
     @staticmethod
     def _to_chainlink_symbol(symbol: str) -> str:
@@ -60,6 +63,32 @@ class ChainlinkBTCPriceWatcher:
             except Exception as e:
                 logger.debug("发送 Chainlink RTDS ping 异常: %s", e)
             time.sleep(5)
+
+    def _watchdog_loop(self) -> None:
+        """监测价格更新时间，超时未更新则强制断开 WebSocket 触发重连。"""
+        while self.running:
+            time.sleep(10)
+            if not self.running:
+                break
+            last_t = self.last_update_time
+            if last_t is None:
+                continue
+            stale_sec = time.time() - last_t
+            if stale_sec > self.WATCHDOG_STALE_SEC:
+                self._watchdog_reconnect_count += 1
+                logger.warning(
+                    "Chainlink 价格看门狗触发: %.0fs 未更新，强制重连 (累计第 %d 次)",
+                    stale_sec,
+                    self._watchdog_reconnect_count,
+                )
+                ws = self.ws
+                if ws:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                # 重置 last_update_time 避免连续触发
+                self.last_update_time = time.time()
 
     def _on_open(self, ws: WebSocketApp) -> None:
         filters = json.dumps({"symbol": self.chainlink_symbol}, separators=(",", ":"))
@@ -181,6 +210,8 @@ class ChainlinkBTCPriceWatcher:
         self._thread.start()
         self._ping_thread = threading.Thread(target=self._send_ping_loop, daemon=True)
         self._ping_thread.start()
+        self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
+        self._watchdog_thread.start()
 
     def stop(self) -> None:
         self.running = False
