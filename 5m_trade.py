@@ -41,6 +41,7 @@ from services.five_minute_trade.bootstrap import (
     create_trader_from_args,
 )
 from services.five_minute_trade.entry_ops import open_position, select_market_and_tokens
+from services.five_minute_trade.risk_sizing import assess_risk as _assess_risk_fn
 from services.five_minute_trade.execution_plans import (
     build_execution_plan,
     fetch_orderbook_levels,
@@ -85,7 +86,11 @@ def _build_startup_strategy_signature(args: Any) -> str:
         f"exit={args.exit_mode},"
         f"risk={int(args.enable_risk_sizing)},"
         f"rmin={_fmt_num(args.risk_min_stake_ratio)},"
-        f"rmax={_fmt_num(args.risk_max_stake_ratio)}"
+        f"rmax={_fmt_num(args.risk_max_stake_ratio)},"
+        f"rdb={_fmt_num(args.risk_diff_boost_threshold)},"
+        f"rdbm={_fmt_num(args.risk_diff_boost_multiplier)},"
+        f"cbdm={_fmt_num(args.cross_borderline_diff_multiplier)},"
+        f"mht={_fmt_num(args.medium_high_threshold)}"
     )
 
 
@@ -153,6 +158,17 @@ class FiveMinuteUpDownTrader:
         risk_min_stake_ratio: float = 0.15,
         risk_max_stake_ratio: float = 1.0,
         confidence_boost_enabled: bool = True,
+        confidence_boost_ge_095: float = 1.5,
+        stake_cap_very_high: float = 0.0,
+        stake_cap_high: float = 0.50,
+        stake_cap_medium_high: float = 0.35,
+        medium_high_threshold: float = 0.40,
+        risk_w_price: float = 0.50,
+        risk_w_direction: float = 0.15,
+        risk_w_stability: float = 0.35,
+        risk_diff_boost_threshold: float = 0.44,
+        risk_diff_boost_multiplier: float = 1.40,
+        cross_borderline_diff_multiplier: float = 0.0,
     ) -> None:
         self.stake_usd = stake_usd
         self.report_interval_sec = report_interval_sec
@@ -193,6 +209,17 @@ class FiveMinuteUpDownTrader:
         self.risk_min_stake_ratio = float(risk_min_stake_ratio)
         self.risk_max_stake_ratio = float(risk_max_stake_ratio)
         self.confidence_boost_enabled = bool(confidence_boost_enabled)
+        self.confidence_boost_ge_095 = float(confidence_boost_ge_095)
+        self.stake_cap_very_high = float(stake_cap_very_high)
+        self.stake_cap_high = float(stake_cap_high)
+        self.stake_cap_medium_high = float(stake_cap_medium_high)
+        self.medium_high_threshold = float(medium_high_threshold)
+        self.risk_w_price = float(risk_w_price)
+        self.risk_w_direction = float(risk_w_direction)
+        self.risk_w_stability = float(risk_w_stability)
+        self.risk_diff_boost_threshold = float(risk_diff_boost_threshold)
+        self.risk_diff_boost_multiplier = float(risk_diff_boost_multiplier)
+        self.cross_borderline_diff_multiplier = float(cross_borderline_diff_multiplier)
 
         self._lock = threading.RLock()
         self._price_watcher = ChainlinkBTCPriceWatcher(callback=self._on_price_update)
@@ -898,6 +925,62 @@ class FiveMinuteUpDownTrader:
             self.window_traded = True
             return
 
+        # 改动2: cross borderline — 接近 cross 上限时要求更强的 diff 信号
+        if (
+            self.cross_borderline_diff_multiplier > 0
+            and self.max_btc_cross_count > 0
+            and self._btc_cross_count >= self.max_btc_cross_count - 1
+        ):
+            border_threshold = self.min_direction_diff * self.cross_borderline_diff_multiplier
+            if abs_diff <= border_threshold:
+                logger.info(
+                    "Skip entry: cross_borderline — cross_count=%d (>= %d), "
+                    "abs_diff=%.2f <= boosted_threshold=%.2f (base=%.2f × %.2f)",
+                    self._btc_cross_count,
+                    self.max_btc_cross_count - 1,
+                    abs_diff,
+                    border_threshold,
+                    self.min_direction_diff,
+                    self.cross_borderline_diff_multiplier,
+                )
+                self.window_traded = True
+                return
+
+        # 改动1: pre-flight risk check — risk_score 偏高时要求更强的 diff 信号
+        if (
+            self.risk_diff_boost_threshold > 0
+            and self.enable_risk_sizing
+        ):
+            _preflight_risk = _assess_risk_fn(
+                entry_price=0.90,  # 估算值，用于 pre-flight（实际入场价还未知）
+                abs_btc_diff=abs_diff,
+                min_direction_diff=self.min_direction_diff,
+                btc_cross_count=self._btc_cross_count,
+                max_btc_cross_count=self.max_btc_cross_count,
+                base_stake=self.stake_usd,
+                min_stake_ratio=self.risk_min_stake_ratio,
+                max_stake_ratio=self.risk_max_stake_ratio,
+                confidence_boost_enabled=self.confidence_boost_enabled,
+                w_price=self.risk_w_price,
+                w_direction=self.risk_w_direction,
+                w_stability=self.risk_w_stability,
+            )
+            if _preflight_risk.risk_score >= self.risk_diff_boost_threshold:
+                boosted_threshold = self.min_direction_diff * self.risk_diff_boost_multiplier
+                if abs_diff <= boosted_threshold:
+                    logger.info(
+                        "Skip entry: risk_diff_boost — preflight_risk=%.3f (>= %.3f), "
+                        "abs_diff=%.2f <= boosted_threshold=%.2f (base=%.2f × %.2f)",
+                        _preflight_risk.risk_score,
+                        self.risk_diff_boost_threshold,
+                        abs_diff,
+                        boosted_threshold,
+                        self.min_direction_diff,
+                        self.risk_diff_boost_multiplier,
+                    )
+                    self.window_traded = True
+                    return
+
         if diff > 0:
             direction = "up"
         elif diff < 0:
@@ -1397,6 +1480,17 @@ def main() -> None:
                 "enable_risk_sizing": args.enable_risk_sizing,
                 "risk_min_stake_ratio": args.risk_min_stake_ratio,
                 "risk_max_stake_ratio": args.risk_max_stake_ratio,
+                "risk_diff_boost_threshold": args.risk_diff_boost_threshold,
+                "risk_diff_boost_multiplier": args.risk_diff_boost_multiplier,
+                "cross_borderline_diff_multiplier": args.cross_borderline_diff_multiplier,
+                "stake_cap_very_high": args.stake_cap_very_high,
+                "stake_cap_high": args.stake_cap_high,
+                "stake_cap_medium_high": args.stake_cap_medium_high,
+                "medium_high_threshold": args.medium_high_threshold,
+                "confidence_boost_ge_095": args.confidence_boost_ge_095,
+                "risk_w_price": args.risk_w_price,
+                "risk_w_direction": args.risk_w_direction,
+                "risk_w_stability": args.risk_w_stability,
             },
             pid=os.getpid(),
             hostname=socket.gethostname(),

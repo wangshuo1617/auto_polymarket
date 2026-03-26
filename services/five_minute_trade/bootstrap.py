@@ -206,6 +206,76 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="禁用 >=0.95 入场价的信心加仓（默认启用，1.5x）",
     )
+    parser.add_argument(
+        "--confidence-boost-ge-095",
+        type=float,
+        default=1.5,
+        help="entry_price >= 0.95 时的信心加仓倍率（默认 1.5）",
+    )
+    # --- Risk-level stake cap overrides ---
+    parser.add_argument(
+        "--stake-cap-very-high",
+        type=float,
+        default=0.0,
+        help="very_high 风险等级的 stake 上限（base_stake 比例，默认 0.0 即不开仓）",
+    )
+    parser.add_argument(
+        "--stake-cap-high",
+        type=float,
+        default=0.50,
+        help="high 风险等级的 stake 上限（base_stake 比例，默认 0.50）",
+    )
+    parser.add_argument(
+        "--stake-cap-medium-high",
+        type=float,
+        default=0.35,
+        help="medium 风险等级 + risk_score >= medium_high_threshold 时的 stake 上限（base_stake 比例，默认 0.35）",
+    )
+    parser.add_argument(
+        "--medium-high-threshold",
+        type=float,
+        default=0.40,
+        help="medium 等级内进一步收紧仓位的 risk_score 阈值（默认 0.40）",
+    )
+    # --- Risk-score component weights ---
+    parser.add_argument(
+        "--risk-w-price",
+        type=float,
+        default=0.50,
+        help="risk_score 中 entry_price_risk 的权重（默认 0.50）",
+    )
+    parser.add_argument(
+        "--risk-w-direction",
+        type=float,
+        default=0.15,
+        help="risk_score 中 direction_risk 的权重（默认 0.15）",
+    )
+    parser.add_argument(
+        "--risk-w-stability",
+        type=float,
+        default=0.35,
+        help="risk_score 中 stability_risk 的权重（默认 0.35）",
+    )
+    # --- Pre-flight risk-adjusted diff boost (改动1) ---
+    parser.add_argument(
+        "--risk-diff-boost-threshold",
+        type=float,
+        default=0.44,
+        help="pre-flight risk_score 超过此值时对 min_direction_diff 加码（默认 0.44，0 表示关闭）",
+    )
+    parser.add_argument(
+        "--risk-diff-boost-multiplier",
+        type=float,
+        default=1.40,
+        help="加码时 min_direction_diff 的倍率（默认 1.40）",
+    )
+    # --- Cross borderline diff boost (改动2) ---
+    parser.add_argument(
+        "--cross-borderline-diff-multiplier",
+        type=float,
+        default=0.0,
+        help="cross_count 接近上限时对 min_direction_diff 的倍率（默认 0.0 即关闭；建议探索值 2.5）",
+    )
     return parser
 
 
@@ -235,4 +305,15 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         risk_min_stake_ratio=args.risk_min_stake_ratio,
         risk_max_stake_ratio=args.risk_max_stake_ratio,
         confidence_boost_enabled=not getattr(args, "disable_confidence_boost", False),
+        confidence_boost_ge_095=args.confidence_boost_ge_095,
+        stake_cap_very_high=args.stake_cap_very_high,
+        stake_cap_high=args.stake_cap_high,
+        stake_cap_medium_high=args.stake_cap_medium_high,
+        medium_high_threshold=args.medium_high_threshold,
+        risk_w_price=args.risk_w_price,
+        risk_w_direction=args.risk_w_direction,
+        risk_w_stability=args.risk_w_stability,
+        risk_diff_boost_threshold=args.risk_diff_boost_threshold,
+        risk_diff_boost_multiplier=args.risk_diff_boost_multiplier,
+        cross_borderline_diff_multiplier=args.cross_borderline_diff_multiplier,
     )
