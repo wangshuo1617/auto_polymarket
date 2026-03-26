@@ -58,7 +58,7 @@ def _build_relay_client() -> RelayClient:
         chain_id=CHAIN_ID,
         private_key=POLYMARKET_KEY,
         builder_config=builder_config,
-        relay_tx_type=RelayerTxType.SAFE,
+        relay_tx_type=RelayerTxType.PROXY,
     )
 
 
@@ -180,7 +180,7 @@ if __name__ == "__main__":
     print(f"WALLET_ADDRESS: {WALLET_ADDRESS}")
     if safe_addr.lower() != (WALLET_ADDRESS or "").lower():
         print(f"WARNING: Safe地址与WALLET_ADDRESS不匹配!")
-    conditionId = "0x0548c3ba5886378f222257a73cdb0d86c1bad160eea31840c5d9b0caee24c2b5"
-    market_slug = "btc-updown-5m-1774222500"
+    conditionId = "0x17bcbf0869faf80a61c8d40e112f3d0f47147ee36d5af30721f5664418e9a635"
+    market_slug = "btc-updown-5m-1774500600"
     result = redeem_market(client, conditionId, market_slug)
     print(f"Result: {result}")
