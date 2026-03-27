@@ -17,3 +17,4 @@ price_warn_*.py
 logs/
 *.sql
 .vscode/
+.github/

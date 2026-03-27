@@ -272,7 +272,7 @@ def main() -> None:
         """
         SELECT ts_sec, btc_price, window_start_ms, up_best_ask, down_best_ask
         FROM btc_poly_1s_ticks
-        WHERE ts_sec BETWEEN ? AND ?
+        WHERE ts_sec BETWEEN ? AND ? AND btc_price IS NOT NULL
         ORDER BY ts_sec
         """,
         (start_ts, end_ts),
@@ -482,14 +482,64 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(entry_rows)
 
+    # ---- 预测分析 ----
+    predicted_rows = [r for r in full_rows if r["predicted_direction"] in ("up", "down")]
+    pred_correct = [r for r in predicted_rows if r["predicted_direction"] == r["actual_final_direction"]]
+    pred_wrong = [r for r in predicted_rows
+                  if r["actual_final_direction"] in ("up", "down")
+                  and r["predicted_direction"] != r["actual_final_direction"]]
+
+    def _window_detail(r: Dict[str, object]) -> Dict[str, object]:
+        return {
+            "window_start_utc": r["window_start_utc"],
+            "slug": r["slug"],
+            "predicted_direction": r["predicted_direction"],
+            "actual_final_direction": r["actual_final_direction"],
+            "open_price": r["open_price"],
+            "actual_final_close_price": r["actual_final_close_price"],
+            "status": r["status"],
+            "trade_direction": r["trade_direction"],
+            "trade_price": r["trade_price"],
+            "activity_pnl": r["activity_pnl"],
+            "risk_level": r["risk_level"],
+            "reason_detail": r["reason_detail"],
+        }
+
+    prediction_summary = {
+        "predicted_count": len(predicted_rows),
+        "correct_count": len(pred_correct),
+        "wrong_count": len(pred_wrong),
+        "accuracy": round(len(pred_correct) / len(predicted_rows), 4) if predicted_rows else None,
+        "wrong_windows": [_window_detail(r) for r in pred_wrong],
+    }
+
+    # ---- 入场分析 ----
+    entry_win = [r for r in entry_rows if isinstance(r.get("activity_pnl"), (int, float)) and r["activity_pnl"] > 0]
+    entry_loss = [r for r in entry_rows if isinstance(r.get("activity_pnl"), (int, float)) and r["activity_pnl"] < 0]
+    entry_total_pnl = sum(float(r.get("activity_pnl") or 0) for r in entry_rows)
+    entry_total_expense = sum(float(r.get("activity_expense") or 0) for r in entry_rows)
+    entry_total_income = sum(float(r.get("activity_income") or 0) for r in entry_rows)
+
+    entry_summary = {
+        "entry_count": len(entry_rows),
+        "entry_rate": round(len(entry_rows) / len(full_rows), 4) if full_rows else None,
+        "win_count": len(entry_win),
+        "loss_count": len(entry_loss),
+        "win_rate": round(len(entry_win) / len(entry_rows), 4) if entry_rows else None,
+        "total_expense": round(entry_total_expense, 2),
+        "total_income": round(entry_total_income, 2),
+        "net_pnl": round(entry_total_pnl, 2),
+        "loss_windows": [_window_detail(r) for r in entry_loss],
+    }
+
     summary = {
         "start_utc": start_utc.isoformat(),
         "end_utc": end_utc.isoformat(),
         "complete_window_count": len(full_rows),
         "entry_window_count": len(entry_rows),
         "reason_counts": reason_counts,
-        "activity_net_pnl": pnl_summary["net_pnl"],
-        "activity_slug_summary": pnl_summary["slug_summary"],
+        "prediction_summary": prediction_summary,
+        "entry_summary": entry_summary,
         "files": {
             "full_csv": str(full_csv),
             "entry_csv": str(entry_csv),
