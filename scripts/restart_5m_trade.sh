@@ -36,6 +36,13 @@ RISK_W_STABILITY="${32:-0.55}"
 RISK_DIFF_BOOST_THRESHOLD="${33:-0.44}"
 RISK_DIFF_BOOST_MULTIPLIER="${34:-1.40}"
 CROSS_BORDERLINE_DIFF_MULTIPLIER="${35:-0.0}"
+DIRECTION_CONFIRM_PRECLOSE_SEC="${36:-15}"
+ENABLE_DIRECTION_CONFIRM_CLOSE="${37:-true}"
+ENABLE_LAST_SECONDS_REVERSE_GUARD="${38:-true}"
+REVERSE_GUARD_START_SEC="${39:-295}"
+REVERSE_GUARD_LOOKBACK_SEC="${40:-3}"
+REVERSE_GUARD_BTC_MOVE="${41:-15.0}"
+REVERSE_GUARD_REQUIRE_CROSS_OPEN="${42:-true}"
 
 REPORT_INTERVAL_SEC="${6:-3600}"
 TAKE_PROFIT_SPREAD="${8:-0.15}"
@@ -44,7 +51,7 @@ TRADE_DB_PATH="${11:-}"
 TOXIC_UTC_HOURS="${15-"0,5,7,16,19"}"
 LOG_FILE="logs/5m_trade.stdout.log"
 PID_FILE="logs/5m_trade.pid"
-USAGE="./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio] [toxic_utc_hours_csv] [max_btc_cross_count] [min_entry_updown_diff]"
+USAGE="./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio] [toxic_utc_hours_csv] [max_btc_cross_count] [min_entry_updown_diff] ... [direction_confirm_preclose_sec] [enable_direction_confirm_close] [enable_last_seconds_reverse_guard] [reverse_guard_start_sec] [reverse_guard_lookback_sec] [reverse_guard_btc_move] [reverse_guard_require_cross_open]"
 
 print_usage() {
   echo "用法: $USAGE"
@@ -192,6 +199,48 @@ if [ "$CONFIDENCE_BOOST" != "true" ] && [ "$CONFIDENCE_BOOST" != "false" ]; then
   exit 1
 fi
 
+if ! [[ "$DIRECTION_CONFIRM_PRECLOSE_SEC" =~ ^[0-9]+$ ]] || [ "$DIRECTION_CONFIRM_PRECLOSE_SEC" -lt 1 ] || [ "$DIRECTION_CONFIRM_PRECLOSE_SEC" -gt 299 ]; then
+  echo "❌ direction_confirm_preclose_sec 必须是 1-299 的整数"
+  print_usage
+  exit 1
+fi
+
+if [ "$ENABLE_DIRECTION_CONFIRM_CLOSE" != "true" ] && [ "$ENABLE_DIRECTION_CONFIRM_CLOSE" != "false" ]; then
+  echo "❌ enable_direction_confirm_close 必须是 true 或 false"
+  print_usage
+  exit 1
+fi
+
+if [ "$ENABLE_LAST_SECONDS_REVERSE_GUARD" != "true" ] && [ "$ENABLE_LAST_SECONDS_REVERSE_GUARD" != "false" ]; then
+  echo "❌ enable_last_seconds_reverse_guard 必须是 true 或 false"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$REVERSE_GUARD_START_SEC" =~ ^[0-9]+$ ]] || [ "$REVERSE_GUARD_START_SEC" -lt 1 ] || [ "$REVERSE_GUARD_START_SEC" -gt 299 ]; then
+  echo "❌ reverse_guard_start_sec 必须是 1-299 的整数"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$REVERSE_GUARD_LOOKBACK_SEC" =~ ^[0-9]+$ ]] || [ "$REVERSE_GUARD_LOOKBACK_SEC" -lt 1 ] || [ "$REVERSE_GUARD_LOOKBACK_SEC" -gt 30 ]; then
+  echo "❌ reverse_guard_lookback_sec 必须是 1-30 的整数"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$REVERSE_GUARD_BTC_MOVE" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($REVERSE_GUARD_BTC_MOVE > 0)}"; then
+  echo "❌ reverse_guard_btc_move 必须是大于 0 的数字"
+  print_usage
+  exit 1
+fi
+
+if [ "$REVERSE_GUARD_REQUIRE_CROSS_OPEN" != "true" ] && [ "$REVERSE_GUARD_REQUIRE_CROSS_OPEN" != "false" ]; then
+  echo "❌ reverse_guard_require_cross_open 必须是 true 或 false"
+  print_usage
+  exit 1
+fi
+
 if [ -n "$TOXIC_UTC_HOURS" ]; then
   IFS=',' read -r -a TOXIC_HOUR_PARTS <<< "$TOXIC_UTC_HOURS"
   for hour_part in "${TOXIC_HOUR_PARTS[@]}"; do
@@ -259,6 +308,8 @@ echo "风险等级stake上限: very_high=$STAKE_CAP_VERY_HIGH high=$STAKE_CAP_HI
 echo "风险权重: price=$RISK_W_PRICE direction=$RISK_W_DIRECTION stability=$RISK_W_STABILITY"
 echo "risk_diff_boost: threshold=$RISK_DIFF_BOOST_THRESHOLD multiplier=$RISK_DIFF_BOOST_MULTIPLIER"
 echo "cross_borderline: diff_multiplier=$CROSS_BORDERLINE_DIFF_MULTIPLIER"
+echo "方向一致性确认: enable=$ENABLE_DIRECTION_CONFIRM_CLOSE preclose_sec=$DIRECTION_CONFIRM_PRECLOSE_SEC"
+echo "终盘反向风控: enable=$ENABLE_LAST_SECONDS_REVERSE_GUARD start_sec=$REVERSE_GUARD_START_SEC lookback_sec=$REVERSE_GUARD_LOOKBACK_SEC btc_move=$REVERSE_GUARD_BTC_MOVE require_cross_open=$REVERSE_GUARD_REQUIRE_CROSS_OPEN"
 if [ -n "$TRADE_DB_PATH" ]; then
   echo "交易数据库路径: $TRADE_DB_PATH"
 else
@@ -299,6 +350,10 @@ _build_cmd() {
     --risk-diff-boost-threshold "$RISK_DIFF_BOOST_THRESHOLD"
     --risk-diff-boost-multiplier "$RISK_DIFF_BOOST_MULTIPLIER"
     --cross-borderline-diff-multiplier "$CROSS_BORDERLINE_DIFF_MULTIPLIER"
+    --direction-confirm-preclose-sec "$DIRECTION_CONFIRM_PRECLOSE_SEC"
+    --reverse-guard-start-sec "$REVERSE_GUARD_START_SEC"
+    --reverse-guard-lookback-sec "$REVERSE_GUARD_LOOKBACK_SEC"
+    --reverse-guard-btc-move "$REVERSE_GUARD_BTC_MOVE"
   )
 
   if [ -n "$TRADE_DB_PATH" ]; then
@@ -313,6 +368,18 @@ _build_cmd() {
 
   if [ "$CONFIDENCE_BOOST" = "false" ]; then
     CMD+=(--disable-confidence-boost)
+  fi
+
+  if [ "$ENABLE_DIRECTION_CONFIRM_CLOSE" = "false" ]; then
+    CMD+=(--disable-direction-confirm-close)
+  fi
+
+  if [ "$ENABLE_LAST_SECONDS_REVERSE_GUARD" = "false" ]; then
+    CMD+=(--disable-last-seconds-reverse-guard)
+  fi
+
+  if [ "$REVERSE_GUARD_REQUIRE_CROSS_OPEN" = "false" ]; then
+    CMD+=(--disable-reverse-guard-require-cross-open)
   fi
 
   if [ "$MODE" != "--live" ]; then

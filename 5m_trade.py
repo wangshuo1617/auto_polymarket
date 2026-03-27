@@ -89,7 +89,14 @@ def _build_startup_strategy_signature(args: Any) -> str:
         f"rdb={_fmt_num(args.risk_diff_boost_threshold)},"
         f"rdbm={_fmt_num(args.risk_diff_boost_multiplier)},"
         f"cbdm={_fmt_num(args.cross_borderline_diff_multiplier)},"
-        f"mht={_fmt_num(args.medium_high_threshold)}"
+        f"mht={_fmt_num(args.medium_high_threshold)},"
+        f"dc={int(not args.disable_direction_confirm_close)},"
+        f"dcp={args.direction_confirm_preclose_sec},"
+        f"lrg={int(args.enable_last_seconds_reverse_guard)},"
+        f"lrgs={args.reverse_guard_start_sec},"
+        f"lrgl={args.reverse_guard_lookback_sec},"
+        f"lrgm={_fmt_num(args.reverse_guard_btc_move)},"
+        f"lrgx={int(not args.disable_reverse_guard_require_cross_open)}"
     )
 
 
@@ -128,6 +135,10 @@ class FiveMinuteUpDownTrader:
     EXPIRY_FORCE_CLOSE_HIGH_PRICE = 2.00
     EXPIRY_WAIT_SETTLE_MIN_PRICE = 0.60
     REPEATED_LOG_THROTTLE_SEC = 10.0
+    DIRECTION_CONFIRM_PRECLOSE_SEC = 15
+    REVERSE_GUARD_START_SEC = 295
+    REVERSE_GUARD_LOOKBACK_SEC = 3
+    REVERSE_GUARD_BTC_MOVE = 15.0
 
     def __init__(
         self,
@@ -166,6 +177,13 @@ class FiveMinuteUpDownTrader:
         risk_diff_boost_threshold: float = 0.44,
         risk_diff_boost_multiplier: float = 1.40,
         cross_borderline_diff_multiplier: float = 0.0,
+        direction_confirm_preclose_sec: int = DIRECTION_CONFIRM_PRECLOSE_SEC,
+        enable_direction_confirm_close: bool = True,
+        enable_last_seconds_reverse_guard: bool = True,
+        reverse_guard_start_sec: int = REVERSE_GUARD_START_SEC,
+        reverse_guard_lookback_sec: int = REVERSE_GUARD_LOOKBACK_SEC,
+        reverse_guard_btc_move: float = REVERSE_GUARD_BTC_MOVE,
+        reverse_guard_require_cross_open: bool = True,
     ) -> None:
         self.stake_usd = stake_usd
         self.report_interval_sec = report_interval_sec
@@ -190,6 +208,14 @@ class FiveMinuteUpDownTrader:
             raise ValueError("sl_to_tp_ratio 必须大于 0")
         if min_hold_before_close_sec < 0:
             raise ValueError("min_hold_before_close_sec 必须大于等于 0")
+        if direction_confirm_preclose_sec < 1 or direction_confirm_preclose_sec >= 300:
+            raise ValueError("direction_confirm_preclose_sec 必须在 1-299 之间")
+        if reverse_guard_start_sec < 1 or reverse_guard_start_sec >= 300:
+            raise ValueError("reverse_guard_start_sec 必须在 1-299 之间")
+        if reverse_guard_lookback_sec < 1 or reverse_guard_lookback_sec > 30:
+            raise ValueError("reverse_guard_lookback_sec 必须在 1-30 之间")
+        if reverse_guard_btc_move <= 0:
+            raise ValueError("reverse_guard_btc_move 必须大于 0")
         self.entry_decision_minute = entry_decision_minute
         self.entry_preclose_seconds = entry_preclose_seconds
         self.min_direction_diff = min_direction_diff
@@ -217,6 +243,13 @@ class FiveMinuteUpDownTrader:
         self.risk_diff_boost_threshold = float(risk_diff_boost_threshold)
         self.risk_diff_boost_multiplier = float(risk_diff_boost_multiplier)
         self.cross_borderline_diff_multiplier = float(cross_borderline_diff_multiplier)
+        self.direction_confirm_preclose_sec = int(direction_confirm_preclose_sec)
+        self.enable_direction_confirm_close = bool(enable_direction_confirm_close)
+        self.enable_last_seconds_reverse_guard = bool(enable_last_seconds_reverse_guard)
+        self.reverse_guard_start_sec = int(reverse_guard_start_sec)
+        self.reverse_guard_lookback_sec = int(reverse_guard_lookback_sec)
+        self.reverse_guard_btc_move = float(reverse_guard_btc_move)
+        self.reverse_guard_require_cross_open = bool(reverse_guard_require_cross_open)
 
         self._lock = threading.RLock()
         self._price_watcher = ChainlinkBTCPriceWatcher(callback=self._on_price_update)
@@ -233,6 +266,7 @@ class FiveMinuteUpDownTrader:
         self._btc_cross_count: int = 0
         self._last_btc_side: Optional[str] = None
         self._window_btc_ticks: List[float] = []
+        self._window_btc_series: List[tuple[float, float]] = []
         self.minute_closes: Dict[int, float] = {}
         self.latest_btc_price: Optional[float] = None
         self.latest_btc_price_event_ms: Optional[int] = None
@@ -240,6 +274,8 @@ class FiveMinuteUpDownTrader:
         self._minute2_recorded: bool = False
         self._minute3_recorded: bool = False
         self._minute4_recorded: bool = False
+        self._direction_confirm_checked: bool = False
+        self._last_seconds_reverse_guard_triggered: bool = False
 
         self.position: Optional[OpenPosition] = None
         self.trades: List[TradeRecord] = []
@@ -762,11 +798,14 @@ class FiveMinuteUpDownTrader:
                 self._btc_cross_count = 0
                 self._last_btc_side = None
                 self._window_btc_ticks = []
+                self._window_btc_series = []
                 self.minute_closes = {}
                 self._minute1_recorded = False
                 self._minute2_recorded = False
                 self._minute3_recorded = False
                 self._minute4_recorded = False
+                self._direction_confirm_checked = False
+                self._last_seconds_reverse_guard_triggered = False
                 slug_ts = window_start_ms // 1000
                 self.current_market_slug = f"btc-updown-5m-{slug_ts}"
                 try:
@@ -789,6 +828,7 @@ class FiveMinuteUpDownTrader:
 
             # --- 记录窗口内每秒 BTC 价格（用于 ATR 过滤）---
             self._window_btc_ticks.append(btc_price)
+            self._window_btc_series.append((rel_sec, btc_price))
 
             # --- BTC 越过开盘价计数（用于入场过滤）---
             if self.window_open_price is not None:
@@ -860,6 +900,12 @@ class FiveMinuteUpDownTrader:
                 self.minute_closes[4] = btc_price
                 self._minute4_recorded = True
                 self._handle_minute4_direction_change()
+
+            # --- 第4分钟方向一致性确认（不一致则平仓） ---
+            self._handle_direction_confirmation(rel_sec=rel_sec, btc_price=btc_price)
+
+            # --- 最后几秒加速反向风控 ---
+            self._handle_last_seconds_reverse_guard(rel_sec=rel_sec, btc_price=btc_price)
 
             # --- 第 5 分钟到期前 N 秒强制平仓 ---
             if rel_sec >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC):
@@ -1197,6 +1243,104 @@ class FiveMinuteUpDownTrader:
             )
             self._force_close_position(reason="sl_direction_change")
 
+    def _handle_direction_confirmation(self, rel_sec: float, btc_price: float) -> None:
+        if not self.enable_direction_confirm_close:
+            return
+        if self._direction_confirm_checked:
+            return
+        trigger_sec = 300 - self.direction_confirm_preclose_sec
+        if rel_sec < trigger_sec:
+            return
+        self._direction_confirm_checked = True
+        if (
+            not self.position
+            or self.window_open_price is None
+            or self.current_window_start_ms is None
+        ):
+            return
+        if self.position.market_slug.split("-")[-1] != str(self.current_window_start_ms // 1000):
+            return
+
+        open_price = self.window_open_price
+        if btc_price > open_price:
+            confirm_direction = "up"
+        elif btc_price < open_price:
+            confirm_direction = "down"
+        else:
+            logger.info(
+                "方向确认时刻价格与开盘价持平，跳过平仓: rel_sec=%.1f open=%.2f now=%.2f",
+                rel_sec,
+                open_price,
+                btc_price,
+            )
+            return
+
+        if confirm_direction != self.position.direction:
+            logger.info(
+                "第 %d 分钟收盘前 %ds 方向确认不一致，触发平仓: 持仓=%s 确认=%s open=%.2f now=%.2f",
+                5,
+                self.direction_confirm_preclose_sec,
+                self.position.direction,
+                confirm_direction,
+                open_price,
+                btc_price,
+            )
+            self._force_close_position(reason="sl_direction_confirm_mismatch")
+
+    def _handle_last_seconds_reverse_guard(self, rel_sec: float, btc_price: float) -> None:
+        if not self.enable_last_seconds_reverse_guard:
+            return
+        if self._last_seconds_reverse_guard_triggered:
+            return
+        if rel_sec < self.reverse_guard_start_sec:
+            return
+        if (
+            not self.position
+            or self.window_open_price is None
+            or self.current_window_start_ms is None
+        ):
+            return
+        if self.position.market_slug.split("-")[-1] != str(self.current_window_start_ms // 1000):
+            return
+
+        target_rel_sec = rel_sec - self.reverse_guard_lookback_sec
+        lookback_price: Optional[float] = None
+        for point_rel_sec, point_price in reversed(self._window_btc_series):
+            if point_rel_sec <= target_rel_sec:
+                lookback_price = point_price
+                break
+        if lookback_price is None:
+            return
+
+        delta = btc_price - lookback_price
+        open_price = self.window_open_price
+        crossed_open = (
+            (self.position.direction == "up" and btc_price < open_price)
+            or (self.position.direction == "down" and btc_price > open_price)
+        )
+        if self.reverse_guard_require_cross_open and not crossed_open:
+            return
+
+        if self.position.direction == "up":
+            reversed_fast = delta <= -self.reverse_guard_btc_move
+        else:
+            reversed_fast = delta >= self.reverse_guard_btc_move
+        if not reversed_fast:
+            return
+
+        self._last_seconds_reverse_guard_triggered = True
+        logger.info(
+            "最后几秒加速反向风控触发: dir=%s rel_sec=%.1f Δbtc(%ds)=%.2f 阈值=%.2f open=%.2f now=%.2f",
+            self.position.direction,
+            rel_sec,
+            self.reverse_guard_lookback_sec,
+            delta,
+            self.reverse_guard_btc_move,
+            open_price,
+            btc_price,
+        )
+        self._force_close_position(reason="sl_last_seconds_reversal")
+
     def _handle_minute5_expiry(self) -> None:
         if self.exit_mode == "hold":
             return
@@ -1527,6 +1671,13 @@ def main() -> None:
                 "risk_w_price": args.risk_w_price,
                 "risk_w_direction": args.risk_w_direction,
                 "risk_w_stability": args.risk_w_stability,
+                "enable_direction_confirm_close": not args.disable_direction_confirm_close,
+                "direction_confirm_preclose_sec": args.direction_confirm_preclose_sec,
+                "enable_last_seconds_reverse_guard": args.enable_last_seconds_reverse_guard,
+                "reverse_guard_start_sec": args.reverse_guard_start_sec,
+                "reverse_guard_lookback_sec": args.reverse_guard_lookback_sec,
+                "reverse_guard_btc_move": args.reverse_guard_btc_move,
+                "reverse_guard_require_cross_open": not args.disable_reverse_guard_require_cross_open,
             },
             pid=os.getpid(),
             hostname=socket.gethostname(),

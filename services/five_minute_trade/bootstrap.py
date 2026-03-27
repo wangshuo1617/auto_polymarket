@@ -276,6 +276,55 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="cross_count 接近上限时对 min_direction_diff 的倍率（默认 0.0 即关闭；建议探索值 2.5）",
     )
+    parser.add_argument(
+        "--direction-confirm-preclose-sec",
+        type=int,
+        default=15,
+        help="方向一致性确认距离 5 分钟窗口结束前秒数（默认 15，即 4:45）",
+    )
+    parser.add_argument(
+        "--disable-direction-confirm-close",
+        action="store_true",
+        default=False,
+        help="禁用方向一致性确认平仓（默认启用）",
+    )
+    parser.add_argument(
+        "--enable-last-seconds-reverse-guard",
+        action="store_true",
+        dest="enable_last_seconds_reverse_guard",
+        default=True,
+        help="启用最后几秒加速反向风控（默认启用）",
+    )
+    parser.add_argument(
+        "--disable-last-seconds-reverse-guard",
+        action="store_false",
+        dest="enable_last_seconds_reverse_guard",
+        help="禁用最后几秒加速反向风控",
+    )
+    parser.add_argument(
+        "--reverse-guard-start-sec",
+        type=int,
+        default=295,
+        help="终盘反向风控开始秒数（窗口内，从 0 开始，默认 295）",
+    )
+    parser.add_argument(
+        "--reverse-guard-lookback-sec",
+        type=int,
+        default=3,
+        help="终盘反向风控回看秒数（默认 3）",
+    )
+    parser.add_argument(
+        "--reverse-guard-btc-move",
+        type=float,
+        default=15.0,
+        help="终盘反向风控触发阈值：回看窗口内 BTC 反向变动绝对值（默认 15）",
+    )
+    parser.add_argument(
+        "--disable-reverse-guard-require-cross-open",
+        action="store_true",
+        default=False,
+        help="终盘反向风控不再要求价格已穿越开盘价（默认要求）",
+    )
     return parser
 
 
@@ -316,4 +365,11 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         risk_diff_boost_threshold=args.risk_diff_boost_threshold,
         risk_diff_boost_multiplier=args.risk_diff_boost_multiplier,
         cross_borderline_diff_multiplier=args.cross_borderline_diff_multiplier,
+        direction_confirm_preclose_sec=args.direction_confirm_preclose_sec,
+        enable_direction_confirm_close=not getattr(args, "disable_direction_confirm_close", False),
+        enable_last_seconds_reverse_guard=args.enable_last_seconds_reverse_guard,
+        reverse_guard_start_sec=args.reverse_guard_start_sec,
+        reverse_guard_lookback_sec=args.reverse_guard_lookback_sec,
+        reverse_guard_btc_move=args.reverse_guard_btc_move,
+        reverse_guard_require_cross_open=not getattr(args, "disable_reverse_guard_require_cross_open", False),
     )
