@@ -582,7 +582,13 @@ def force_close_position(trader: Any, reason: str, close_retry_count: int = 0) -
         return
 
     if not self.dry_run:
-        if reason in {"sl", "sl_direction_change", "sl_residual"}:
+        if reason in {
+            "sl",
+            "sl_direction_change",
+            "sl_direction_confirm_mismatch",
+            "sl_last_seconds_reversal",
+            "sl_residual",
+        }:
             current_bid = min(
                 pos.last_best_bid if pos.last_best_bid else exit_price,
                 exit_price,

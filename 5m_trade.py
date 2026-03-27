@@ -782,6 +782,8 @@ class FiveMinuteUpDownTrader:
 
             window_start_ms = (now_ms // self.WINDOW_MS) * self.WINDOW_MS
             rel_sec = (now_ms - window_start_ms) / 1000.0
+            aligned_ms = (now_ms // 1000) * 1000
+            btc_age_ms = aligned_ms - (self.latest_btc_price_event_ms or 0)
 
             # --- 检测新 5m 窗口，用当前最新价格锁定开盘价（对齐回测 open_row） ---
             if self.current_window_start_ms != window_start_ms:
@@ -854,8 +856,6 @@ class FiveMinuteUpDownTrader:
                 # BTC 价格新鲜度检查（对齐回测 max_btc_age_ms）
                 # 回测用 ts_sec*1000（整秒对齐）计算 age，实盘也对齐到整秒，
                 # 避免 500ms 轮询偏移导致 age 虚高而误判 stale。
-                aligned_ms = (now_ms // 1000) * 1000
-                btc_age_ms = aligned_ms - (self.latest_btc_price_event_ms or 0)
                 if btc_age_ms > self.MAX_BTC_AGE_MS:
                     logger.warning(
                         "Skip entry: BTC price stale (age=%dms > %dms), will retry next tick",
@@ -902,10 +902,18 @@ class FiveMinuteUpDownTrader:
                 self._handle_minute4_direction_change()
 
             # --- 第4分钟方向一致性确认（不一致则平仓） ---
-            self._handle_direction_confirmation(rel_sec=rel_sec, btc_price=btc_price)
+            self._handle_direction_confirmation(
+                rel_sec=rel_sec,
+                btc_price=btc_price,
+                btc_age_ms=btc_age_ms,
+            )
 
             # --- 最后几秒加速反向风控 ---
-            self._handle_last_seconds_reverse_guard(rel_sec=rel_sec, btc_price=btc_price)
+            self._handle_last_seconds_reverse_guard(
+                rel_sec=rel_sec,
+                btc_price=btc_price,
+                btc_age_ms=btc_age_ms,
+            )
 
             # --- 第 5 分钟到期前 N 秒强制平仓 ---
             if rel_sec >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC):
@@ -1243,7 +1251,7 @@ class FiveMinuteUpDownTrader:
             )
             self._force_close_position(reason="sl_direction_change")
 
-    def _handle_direction_confirmation(self, rel_sec: float, btc_price: float) -> None:
+    def _handle_direction_confirmation(self, rel_sec: float, btc_price: float, btc_age_ms: int) -> None:
         if not self.enable_direction_confirm_close:
             return
         if self._direction_confirm_checked:
@@ -1251,7 +1259,17 @@ class FiveMinuteUpDownTrader:
         trigger_sec = 300 - self.direction_confirm_preclose_sec
         if rel_sec < trigger_sec:
             return
-        self._direction_confirm_checked = True
+        if btc_age_ms > self.MAX_BTC_AGE_MS:
+            if self._should_emit_log(
+                key=f"direction_confirm_stale:{self.current_market_slug or 'unknown'}",
+                interval_sec=2.0,
+            ):
+                logger.warning(
+                    "方向确认跳过: BTC stale (age=%dms > %dms), 等待新鲜价格后再确认",
+                    btc_age_ms,
+                    self.MAX_BTC_AGE_MS,
+                )
+            return
         if (
             not self.position
             or self.window_open_price is None
@@ -1260,6 +1278,7 @@ class FiveMinuteUpDownTrader:
             return
         if self.position.market_slug.split("-")[-1] != str(self.current_window_start_ms // 1000):
             return
+        self._direction_confirm_checked = True
 
         open_price = self.window_open_price
         if btc_price > open_price:
@@ -1287,12 +1306,14 @@ class FiveMinuteUpDownTrader:
             )
             self._force_close_position(reason="sl_direction_confirm_mismatch")
 
-    def _handle_last_seconds_reverse_guard(self, rel_sec: float, btc_price: float) -> None:
+    def _handle_last_seconds_reverse_guard(self, rel_sec: float, btc_price: float, btc_age_ms: int) -> None:
         if not self.enable_last_seconds_reverse_guard:
             return
         if self._last_seconds_reverse_guard_triggered:
             return
         if rel_sec < self.reverse_guard_start_sec:
+            return
+        if btc_age_ms > self.MAX_BTC_AGE_MS:
             return
         if (
             not self.position
