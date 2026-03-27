@@ -92,6 +92,7 @@ def _build_startup_strategy_signature(args: Any) -> str:
         f"mht={_fmt_num(args.medium_high_threshold)},"
         f"dc={int(not args.disable_direction_confirm_close)},"
         f"dcp={args.direction_confirm_preclose_sec},"
+        f"dcd={_fmt_num(args.direction_confirm_min_abs_diff)},"
         f"lrg={int(args.enable_last_seconds_reverse_guard)},"
         f"lrgs={args.reverse_guard_start_sec},"
         f"lrgl={args.reverse_guard_lookback_sec},"
@@ -136,6 +137,7 @@ class FiveMinuteUpDownTrader:
     EXPIRY_WAIT_SETTLE_MIN_PRICE = 0.60
     REPEATED_LOG_THROTTLE_SEC = 10.0
     DIRECTION_CONFIRM_PRECLOSE_SEC = 15
+    DIRECTION_CONFIRM_MIN_ABS_DIFF = 0.0
     REVERSE_GUARD_START_SEC = 295
     REVERSE_GUARD_LOOKBACK_SEC = 3
     REVERSE_GUARD_BTC_MOVE = 15.0
@@ -178,6 +180,7 @@ class FiveMinuteUpDownTrader:
         risk_diff_boost_multiplier: float = 1.40,
         cross_borderline_diff_multiplier: float = 0.0,
         direction_confirm_preclose_sec: int = DIRECTION_CONFIRM_PRECLOSE_SEC,
+        direction_confirm_min_abs_diff: float = DIRECTION_CONFIRM_MIN_ABS_DIFF,
         enable_direction_confirm_close: bool = True,
         enable_last_seconds_reverse_guard: bool = True,
         reverse_guard_start_sec: int = REVERSE_GUARD_START_SEC,
@@ -210,6 +213,8 @@ class FiveMinuteUpDownTrader:
             raise ValueError("min_hold_before_close_sec 必须大于等于 0")
         if direction_confirm_preclose_sec < 1 or direction_confirm_preclose_sec >= 300:
             raise ValueError("direction_confirm_preclose_sec 必须在 1-299 之间")
+        if direction_confirm_min_abs_diff < 0:
+            raise ValueError("direction_confirm_min_abs_diff 必须大于等于 0")
         if reverse_guard_start_sec < 1 or reverse_guard_start_sec >= 300:
             raise ValueError("reverse_guard_start_sec 必须在 1-299 之间")
         if reverse_guard_lookback_sec < 1 or reverse_guard_lookback_sec > 30:
@@ -244,6 +249,7 @@ class FiveMinuteUpDownTrader:
         self.risk_diff_boost_multiplier = float(risk_diff_boost_multiplier)
         self.cross_borderline_diff_multiplier = float(cross_borderline_diff_multiplier)
         self.direction_confirm_preclose_sec = int(direction_confirm_preclose_sec)
+        self.direction_confirm_min_abs_diff = float(direction_confirm_min_abs_diff)
         self.enable_direction_confirm_close = bool(enable_direction_confirm_close)
         self.enable_last_seconds_reverse_guard = bool(enable_last_seconds_reverse_guard)
         self.reverse_guard_start_sec = int(reverse_guard_start_sec)
@@ -1295,6 +1301,16 @@ class FiveMinuteUpDownTrader:
             return
 
         if confirm_direction != self.position.direction:
+            abs_diff = abs(btc_price - open_price)
+            if abs_diff < self.direction_confirm_min_abs_diff:
+                logger.info(
+                    "方向确认不一致但偏离不足，跳过平仓: 持仓=%s 确认=%s abs_diff=%.2f 阈值=%.2f",
+                    self.position.direction,
+                    confirm_direction,
+                    abs_diff,
+                    self.direction_confirm_min_abs_diff,
+                )
+                return
             logger.info(
                 "第 %d 分钟收盘前 %ds 方向确认不一致，触发平仓: 持仓=%s 确认=%s open=%.2f now=%.2f",
                 5,
@@ -1694,6 +1710,7 @@ def main() -> None:
                 "risk_w_stability": args.risk_w_stability,
                 "enable_direction_confirm_close": not args.disable_direction_confirm_close,
                 "direction_confirm_preclose_sec": args.direction_confirm_preclose_sec,
+                "direction_confirm_min_abs_diff": args.direction_confirm_min_abs_diff,
                 "enable_last_seconds_reverse_guard": args.enable_last_seconds_reverse_guard,
                 "reverse_guard_start_sec": args.reverse_guard_start_sec,
                 "reverse_guard_lookback_sec": args.reverse_guard_lookback_sec,

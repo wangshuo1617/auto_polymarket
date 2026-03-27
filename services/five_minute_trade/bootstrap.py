@@ -283,6 +283,12 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         help="方向一致性确认距离 5 分钟窗口结束前秒数（默认 15，即 4:45）",
     )
     parser.add_argument(
+        "--direction-confirm-min-abs-diff",
+        type=float,
+        default=0.0,
+        help="方向确认平仓的最小 |btc-open| 阈值（默认 0，单位 USD）",
+    )
+    parser.add_argument(
         "--disable-direction-confirm-close",
         action="store_true",
         default=False,
@@ -366,6 +372,7 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         risk_diff_boost_multiplier=args.risk_diff_boost_multiplier,
         cross_borderline_diff_multiplier=args.cross_borderline_diff_multiplier,
         direction_confirm_preclose_sec=args.direction_confirm_preclose_sec,
+        direction_confirm_min_abs_diff=args.direction_confirm_min_abs_diff,
         enable_direction_confirm_close=not getattr(args, "disable_direction_confirm_close", False),
         enable_last_seconds_reverse_guard=args.enable_last_seconds_reverse_guard,
         reverse_guard_start_sec=args.reverse_guard_start_sec,
