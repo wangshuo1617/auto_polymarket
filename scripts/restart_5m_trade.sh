@@ -6,60 +6,80 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-MODE="${1:---live}"
-ENTRY_MINUTE="${2:-4}"
-ENTRY_PRECLOSE_SEC="${3:-3}"
-MIN_DIRECTION_DIFF="${4:-39}"
-MAX_ENTRY_PRICE="${7:-0.98}"
-STAKE_USD="${5:-10.0}"
-MIN_HOLD_BEFORE_CLOSE_SEC="${10:-60}"
-TP_PRICE_CAP="${12:-0.97}"
-TP_VALUE_CAP="${13:-0.15}"
-SL_TO_TP_RATIO="${14:-0.9}"
-MAX_BTC_CROSS_COUNT="${16:-4}"
-MIN_ENTRY_UPDOWN_DIFF="${17:-0.38}"
-EXIT_MODE="${18:-hold}"
-MAX_AVG_BTC_DELTA="${19:-3.0}"
-MINUTE_CONSISTENCY="${20:-3}"
-ENABLE_RISK_SIZING="${21:-true}"
-RISK_MIN_STAKE_RATIO="${22:-0.20}"
-RISK_MAX_STAKE_RATIO="${23:-1.2}"
-CONFIDENCE_BOOST="${24:-true}"
-CONFIDENCE_BOOST_GE_095="${25:-1.5}"
-STAKE_CAP_VERY_HIGH="${26:-0.0}"
-STAKE_CAP_HIGH="${27:-0.50}"
-STAKE_CAP_MEDIUM_HIGH="${28:-0.50}"
-MEDIUM_HIGH_THRESHOLD="${29:-0.45}"
-RISK_W_PRICE="${30:-0.30}"
-RISK_W_DIRECTION="${31:-0.15}"
-RISK_W_STABILITY="${32:-0.55}"
-RISK_DIFF_BOOST_THRESHOLD="${33:-0.44}"
-RISK_DIFF_BOOST_MULTIPLIER="${34:-1.40}"
-CROSS_BORDERLINE_DIFF_MULTIPLIER="${35:-0.0}"
-ENABLE_DIRECTION_CONFIRM_CLOSE="${37:-true}"
-DIRECTION_CONFIRM_PRECLOSE_SEC="${36:-15}"
-DIRECTION_CONFIRM_MIN_ABS_DIFF="${43:-0.0}"
-ENABLE_LAST_SECONDS_REVERSE_GUARD="${38:-true}"
-REVERSE_GUARD_START_SEC="${39:-295}"
-REVERSE_GUARD_LOOKBACK_SEC="${40:-2}"
-REVERSE_GUARD_BTC_MOVE="${41:-15.0}"
-REVERSE_GUARD_REQUIRE_CROSS_OPEN="${42:-true}"
-ENABLE_LAST_SECONDS_POSITION_GUARD="${44:-true}"
-POSITION_GUARD_START_SEC="${45:-295}"
-POSITION_GUARD_MIN_CONSECUTIVE_SEC="${46:-2}"
+# 基础运行模式
+MODE="${1:---live}"                                  # 运行模式：--live / --dry-run
+STAKE_USD="${5:-10.0}"                              # 单笔基础仓位（USDC）
+EXIT_MODE="${16:-hold}"                             # 平仓模式：hold / tpsl
 
-REPORT_INTERVAL_SEC="${6:-3600}"
-TAKE_PROFIT_SPREAD="${8:-0.15}"
-STOP_LOSS_SPREAD="${9:--0.20}"
-TRADE_DB_PATH="${11:-}"
-TOXIC_UTC_HOURS="${15-"0,5,7,16,19"}"
+# 入场控制
+ENTRY_MINUTE="${2:-4}"                              # 入场决策分钟（1-4）
+ENTRY_PRECLOSE_SEC="${3:-3}"                        # 入场分钟收盘前秒数
+MIN_DIRECTION_DIFF="${4:-39}"                       # 最小方向差值（BTC 与开盘价）
+MAX_ENTRY_PRICE="${7:-0.98}"                        # 最大允许入场价格
+TOXIC_UTC_HOURS="${13-"0,5,7,16,19"}"              # 跳过交易的 UTC 小时列表
+MAX_BTC_CROSS_COUNT="${14:-4}"                      # BTC 跨越开盘价次数上限
+MIN_ENTRY_UPDOWN_DIFF="${15:-0.38}"                 # Polymarket UP/DOWN token的最小价差
+MAX_AVG_BTC_DELTA="${17:-3.0}"                      # ATR 波动率阈值
+MINUTE_CONSISTENCY="${18:-3}"                       # 分钟一致性检查分钟列表，逗号分隔，如1,2,3
+
+# tpsl模式平仓相关控制
+MIN_HOLD_BEFORE_CLOSE_SEC="${8:-60}"                # 最短持仓保护秒数
+TP_PRICE_CAP="${10:-0.97}"                          # TP 价格上限
+TP_VALUE_CAP="${11:-0.15}"                          # TP 收益值上限
+SL_TO_TP_RATIO="${12:-0.9}"                         # SL/TP 比例
+
+# 风险仓位管理
+ENABLE_RISK_SIZING="${19:-true}"                    # 是否启用动态仓位
+RISK_MIN_STAKE_RATIO="${20:-0.20}"                  # 动态仓位最小倍率
+RISK_MAX_STAKE_RATIO="${21:-1.2}"                   # 动态仓位最大倍率
+CONFIDENCE_BOOST="${22:-true}"                      # 是否启用高置信加仓
+CONFIDENCE_BOOST_GE_095="${23:-1.5}"                # 置信度>=0.95 加仓倍率
+STAKE_CAP_VERY_HIGH="${24:-0.0}"                    # very_high 风险仓位上限
+STAKE_CAP_HIGH="${25:-0.50}"                        # high 风险仓位上限
+STAKE_CAP_MEDIUM_HIGH="${26:-0.50}"                 # medium_high 风险仓位上限
+MEDIUM_HIGH_THRESHOLD="${27:-0.45}"                 # medium_high 阈值
+RISK_W_PRICE="${28:-0.30}"                          # 风险评分：价格权重
+RISK_W_DIRECTION="${29:-0.15}"                      # 风险评分：方向权重
+RISK_W_STABILITY="${30:-0.55}"                      # 风险评分：稳定性权重
+RISK_DIFF_BOOST_THRESHOLD="${31:-0.44}"             # risk_diff boost 启动阈值，当入场风险评分大于该值时，要求更大价差
+RISK_DIFF_BOOST_MULTIPLIER="${32:-1.40}"            # risk_diff boost 倍率
+CROSS_BORDERLINE_DIFF_MULTIPLIER="${33:-0.0}"       # cross_count 临界倍增系数，当BTC跨越开盘价次数接近上限时，要求更大价差
+
+# 方向确认风控
+ENABLE_DIRECTION_CONFIRM_CLOSE="${35:-true}"        # 是否启用方向不一致平仓
+DIRECTION_CONFIRM_PRECLOSE_SEC="${34:-15}"          # 方向确认触发秒（距5m结束）
+DIRECTION_CONFIRM_MIN_ABS_DIFF="${41:-0.0}"         # 不一致平仓最小绝对价差，确认时价格方向与持仓方向不一致，且与开盘价价差大于该值时，平仓
+ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE="${45:-true}"   # 是否启用方向确认低价差强平
+DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD="${46:-10.0}"      # 低价差强平阈值，确认时BTC价格与开盘价差值小于该值时，平仓
+
+# 终盘风控
+ENABLE_LAST_SECONDS_REVERSE_GUARD="${36:-true}"     # 是否启用终盘加速反向风控
+REVERSE_GUARD_START_SEC="${37:-295}"                # 终盘加速反向风控起始秒
+REVERSE_GUARD_LOOKBACK_SEC="${38:-2}"               # 终盘加速反向风控回看秒数
+REVERSE_GUARD_BTC_MOVE="${39:-15.0}"                # 终盘加速反向BTC移动阈值
+REVERSE_GUARD_REQUIRE_CROSS_OPEN="${40:-true}"      # 是否要求穿越开盘价才平仓
+ENABLE_LAST_SECONDS_POSITION_GUARD="${42:-true}"    # 是否启用终盘位置风控
+POSITION_GUARD_START_SEC="${43:-295}"               # 终盘位置风控起始秒
+POSITION_GUARD_MIN_CONSECUTIVE_SEC="${44:-2}"       # 终盘位置反向连续秒数
+
+# 系统控制
+REPORT_INTERVAL_SEC="${6:-3600}"                    # 报告输出间隔（秒）
+TRADE_DB_PATH="${9:-}"                              # SQLite 路径，空则走默认配置
+
+# 日志文件
 LOG_FILE="logs/5m_trade.stdout.log"
 PID_FILE="logs/5m_trade.pid"
-USAGE="./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio] [toxic_utc_hours_csv] [max_btc_cross_count] [min_entry_updown_diff] ... [direction_confirm_preclose_sec] [enable_direction_confirm_close] [enable_last_seconds_reverse_guard] [reverse_guard_start_sec] [reverse_guard_lookback_sec] [reverse_guard_btc_move] [reverse_guard_require_cross_open] [direction_confirm_min_abs_diff] [enable_last_seconds_position_guard] [position_guard_start_sec] [position_guard_min_consecutive_sec]"
+USAGE="./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio] [toxic_utc_hours_csv] [max_btc_cross_count] [min_entry_updown_diff] [exit_mode] [max_avg_btc_delta] [minute_consistency] ... [direction_confirm_low_diff_threshold]"
 
 print_usage() {
   echo "用法: $USAGE"
+  echo "提示: 详细参数说明见脚本顶部各变量旁注释。"
 }
+
+if [ "$MODE" = "-h" ] || [ "$MODE" = "--help" ]; then
+  print_usage
+  exit 0
+fi
 
 mkdir -p logs
 
@@ -101,18 +121,6 @@ fi
 
 if ! [[ "$MAX_ENTRY_PRICE" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($MAX_ENTRY_PRICE > 0)}"; then
   echo "❌ max_entry_price 必须是大于 0 的数字"
-  print_usage
-  exit 1
-fi
-
-if ! [[ "$TAKE_PROFIT_SPREAD" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
-  echo "❌ take_profit_spread 必须是数字"
-  print_usage
-  exit 1
-fi
-
-if ! [[ "$STOP_LOSS_SPREAD" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
-  echo "❌ stop_loss_spread 必须是数字"
   print_usage
   exit 1
 fi
@@ -251,6 +259,18 @@ if ! [[ "$DIRECTION_CONFIRM_MIN_ABS_DIFF" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 1
 fi
 
+if [ "$ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE" != "true" ] && [ "$ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE" != "false" ]; then
+  echo "❌ enable_direction_confirm_low_diff_close 必须是 true 或 false"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ direction_confirm_low_diff_threshold 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+
 if [ "$ENABLE_LAST_SECONDS_POSITION_GUARD" != "true" ] && [ "$ENABLE_LAST_SECONDS_POSITION_GUARD" != "false" ]; then
   echo "❌ enable_last_seconds_position_guard 必须是 true 或 false"
   print_usage
@@ -319,7 +339,6 @@ if [ -n "$TOXIC_UTC_HOURS" ]; then
 else
   echo "有毒时间段(UTC小时): 无（不跳过任何时段）"
 fi
-echo "兼容参数(当前策略未使用): take_profit_spread=$TAKE_PROFIT_SPREAD stop_loss_spread=$STOP_LOSS_SPREAD"
 echo "最短持仓保护秒数: $MIN_HOLD_BEFORE_CLOSE_SEC"
 echo "BTC越过开盘价最大次数: $MAX_BTC_CROSS_COUNT"
 echo "UP/DOWN最小价差: $MIN_ENTRY_UPDOWN_DIFF"
@@ -338,6 +357,7 @@ echo "risk_diff_boost: threshold=$RISK_DIFF_BOOST_THRESHOLD multiplier=$RISK_DIF
 echo "cross_borderline: diff_multiplier=$CROSS_BORDERLINE_DIFF_MULTIPLIER"
 echo "方向一致性确认: enable=$ENABLE_DIRECTION_CONFIRM_CLOSE preclose_sec=$DIRECTION_CONFIRM_PRECLOSE_SEC"
 echo "方向一致性确认最小偏离阈值: min_abs_diff=$DIRECTION_CONFIRM_MIN_ABS_DIFF"
+echo "方向确认低价差强平: enable=$ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE low_diff_threshold=$DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD"
 echo "终盘反向风控: enable=$ENABLE_LAST_SECONDS_REVERSE_GUARD start_sec=$REVERSE_GUARD_START_SEC lookback_sec=$REVERSE_GUARD_LOOKBACK_SEC btc_move=$REVERSE_GUARD_BTC_MOVE require_cross_open=$REVERSE_GUARD_REQUIRE_CROSS_OPEN"
 echo "终盘位置风控: enable=$ENABLE_LAST_SECONDS_POSITION_GUARD start_sec=$POSITION_GUARD_START_SEC min_consecutive_sec=$POSITION_GUARD_MIN_CONSECUTIVE_SEC"
 if [ -n "$TRADE_DB_PATH" ]; then
@@ -356,8 +376,6 @@ _build_cmd() {
     --stake-usd "$STAKE_USD"
     --report-interval-sec "$REPORT_INTERVAL_SEC"
     --max-entry-price "$MAX_ENTRY_PRICE"
-    --take-profit-spread "$TAKE_PROFIT_SPREAD"
-    --stop-loss-spread "$STOP_LOSS_SPREAD"
     --tp-price-cap "$TP_PRICE_CAP"
     --tp-value-cap "$TP_VALUE_CAP"
     --sl-to-tp-ratio "$SL_TO_TP_RATIO"
@@ -382,6 +400,7 @@ _build_cmd() {
     --cross-borderline-diff-multiplier "$CROSS_BORDERLINE_DIFF_MULTIPLIER"
     --direction-confirm-preclose-sec "$DIRECTION_CONFIRM_PRECLOSE_SEC"
     --direction-confirm-min-abs-diff "$DIRECTION_CONFIRM_MIN_ABS_DIFF"
+    --direction-confirm-low-diff-threshold "$DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD"
     --reverse-guard-start-sec "$REVERSE_GUARD_START_SEC"
     --reverse-guard-lookback-sec "$REVERSE_GUARD_LOOKBACK_SEC"
     --reverse-guard-btc-move "$REVERSE_GUARD_BTC_MOVE"
@@ -405,6 +424,10 @@ _build_cmd() {
 
   if [ "$ENABLE_DIRECTION_CONFIRM_CLOSE" = "false" ]; then
     CMD+=(--disable-direction-confirm-close)
+  fi
+
+  if [ "$ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE" = "false" ]; then
+    CMD+=(--disable-direction-confirm-low-diff-close)
   fi
 
   if [ "$ENABLE_LAST_SECONDS_REVERSE_GUARD" = "false" ]; then

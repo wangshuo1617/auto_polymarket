@@ -93,6 +93,8 @@ def _build_startup_strategy_signature(args: Any) -> str:
         f"dc={int(not args.disable_direction_confirm_close)},"
         f"dcp={args.direction_confirm_preclose_sec},"
         f"dcd={_fmt_num(args.direction_confirm_min_abs_diff)},"
+        f"dcl={int(args.enable_direction_confirm_low_diff_close)},"
+        f"dclt={_fmt_num(args.direction_confirm_low_diff_threshold)},"
         f"lrg={int(args.enable_last_seconds_reverse_guard)},"
         f"lrgs={args.reverse_guard_start_sec},"
         f"lrgl={args.reverse_guard_lookback_sec},"
@@ -141,6 +143,7 @@ class FiveMinuteUpDownTrader:
     REPEATED_LOG_THROTTLE_SEC = 10.0
     DIRECTION_CONFIRM_PRECLOSE_SEC = 15
     DIRECTION_CONFIRM_MIN_ABS_DIFF = 0.0
+    DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD = 10.0
     REVERSE_GUARD_START_SEC = 295
     REVERSE_GUARD_LOOKBACK_SEC = 3
     REVERSE_GUARD_BTC_MOVE = 15.0
@@ -186,6 +189,8 @@ class FiveMinuteUpDownTrader:
         cross_borderline_diff_multiplier: float = 0.0,
         direction_confirm_preclose_sec: int = DIRECTION_CONFIRM_PRECLOSE_SEC,
         direction_confirm_min_abs_diff: float = DIRECTION_CONFIRM_MIN_ABS_DIFF,
+        enable_direction_confirm_low_diff_close: bool = True,
+        direction_confirm_low_diff_threshold: float = DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD,
         enable_direction_confirm_close: bool = True,
         enable_last_seconds_reverse_guard: bool = True,
         reverse_guard_start_sec: int = REVERSE_GUARD_START_SEC,
@@ -223,6 +228,8 @@ class FiveMinuteUpDownTrader:
             raise ValueError("direction_confirm_preclose_sec 必须在 1-299 之间")
         if direction_confirm_min_abs_diff < 0:
             raise ValueError("direction_confirm_min_abs_diff 必须大于等于 0")
+        if direction_confirm_low_diff_threshold < 0:
+            raise ValueError("direction_confirm_low_diff_threshold 必须大于等于 0")
         if reverse_guard_start_sec < 1 or reverse_guard_start_sec >= 300:
             raise ValueError("reverse_guard_start_sec 必须在 1-299 之间")
         if reverse_guard_lookback_sec < 1 or reverse_guard_lookback_sec > 30:
@@ -262,6 +269,8 @@ class FiveMinuteUpDownTrader:
         self.cross_borderline_diff_multiplier = float(cross_borderline_diff_multiplier)
         self.direction_confirm_preclose_sec = int(direction_confirm_preclose_sec)
         self.direction_confirm_min_abs_diff = float(direction_confirm_min_abs_diff)
+        self.enable_direction_confirm_low_diff_close = bool(enable_direction_confirm_low_diff_close)
+        self.direction_confirm_low_diff_threshold = float(direction_confirm_low_diff_threshold)
         self.enable_direction_confirm_close = bool(enable_direction_confirm_close)
         self.enable_last_seconds_reverse_guard = bool(enable_last_seconds_reverse_guard)
         self.reverse_guard_start_sec = int(reverse_guard_start_sec)
@@ -1309,6 +1318,29 @@ class FiveMinuteUpDownTrader:
         self._direction_confirm_checked = True
 
         open_price = self.window_open_price
+        abs_diff = abs(btc_price - open_price)
+        if (
+            self.enable_direction_confirm_low_diff_close
+            and abs_diff < self.direction_confirm_low_diff_threshold
+        ):
+            if btc_price > open_price:
+                confirm_direction = "up"
+            elif btc_price < open_price:
+                confirm_direction = "down"
+            else:
+                confirm_direction = "flat"
+            logger.info(
+                "方向确认价差不足阈值，触发平仓: 持仓=%s 确认=%s abs_diff=%.2f 阈值=%.2f open=%.2f now=%.2f",
+                self.position.direction,
+                confirm_direction,
+                abs_diff,
+                self.direction_confirm_low_diff_threshold,
+                open_price,
+                btc_price,
+            )
+            self._force_close_position(reason="sl_direction_confirm_low_diff")
+            return
+
         if btc_price > open_price:
             confirm_direction = "up"
         elif btc_price < open_price:
@@ -1323,7 +1355,6 @@ class FiveMinuteUpDownTrader:
             return
 
         if confirm_direction != self.position.direction:
-            abs_diff = abs(btc_price - open_price)
             if abs_diff < self.direction_confirm_min_abs_diff:
                 logger.info(
                     "方向确认不一致但偏离不足，跳过平仓: 持仓=%s 确认=%s abs_diff=%.2f 阈值=%.2f",
@@ -1785,6 +1816,8 @@ def main() -> None:
                 "enable_direction_confirm_close": not args.disable_direction_confirm_close,
                 "direction_confirm_preclose_sec": args.direction_confirm_preclose_sec,
                 "direction_confirm_min_abs_diff": args.direction_confirm_min_abs_diff,
+                "enable_direction_confirm_low_diff_close": args.enable_direction_confirm_low_diff_close,
+                "direction_confirm_low_diff_threshold": args.direction_confirm_low_diff_threshold,
                 "enable_last_seconds_reverse_guard": args.enable_last_seconds_reverse_guard,
                 "reverse_guard_start_sec": args.reverse_guard_start_sec,
                 "reverse_guard_lookback_sec": args.reverse_guard_lookback_sec,

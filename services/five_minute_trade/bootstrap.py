@@ -295,6 +295,25 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         help="禁用方向一致性确认平仓（默认启用）",
     )
     parser.add_argument(
+        "--enable-direction-confirm-low-diff-close",
+        action="store_true",
+        dest="enable_direction_confirm_low_diff_close",
+        default=True,
+        help="启用方向确认低价差强平（默认启用）",
+    )
+    parser.add_argument(
+        "--disable-direction-confirm-low-diff-close",
+        action="store_false",
+        dest="enable_direction_confirm_low_diff_close",
+        help="禁用方向确认低价差强平",
+    )
+    parser.add_argument(
+        "--direction-confirm-low-diff-threshold",
+        type=float,
+        default=10.0,
+        help="方向确认低价差强平阈值：|btc-open| 小于该值则平仓（默认 10）",
+    )
+    parser.add_argument(
         "--enable-last-seconds-reverse-guard",
         action="store_true",
         dest="enable_last_seconds_reverse_guard",
@@ -398,6 +417,8 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         cross_borderline_diff_multiplier=args.cross_borderline_diff_multiplier,
         direction_confirm_preclose_sec=args.direction_confirm_preclose_sec,
         direction_confirm_min_abs_diff=args.direction_confirm_min_abs_diff,
+        enable_direction_confirm_low_diff_close=args.enable_direction_confirm_low_diff_close,
+        direction_confirm_low_diff_threshold=args.direction_confirm_low_diff_threshold,
         enable_direction_confirm_close=not getattr(args, "disable_direction_confirm_close", False),
         enable_last_seconds_reverse_guard=args.enable_last_seconds_reverse_guard,
         reverse_guard_start_sec=args.reverse_guard_start_sec,
