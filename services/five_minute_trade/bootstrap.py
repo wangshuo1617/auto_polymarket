@@ -331,6 +331,31 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="终盘反向风控不再要求价格已穿越开盘价（默认要求）",
     )
+    parser.add_argument(
+        "--enable-last-seconds-position-guard",
+        action="store_true",
+        dest="enable_last_seconds_position_guard",
+        default=True,
+        help="启用终盘位置风控（默认启用）",
+    )
+    parser.add_argument(
+        "--disable-last-seconds-position-guard",
+        action="store_false",
+        dest="enable_last_seconds_position_guard",
+        help="禁用终盘位置风控",
+    )
+    parser.add_argument(
+        "--position-guard-start-sec",
+        type=int,
+        default=298,
+        help="终盘位置风控开始秒数（窗口内，从 0 开始，默认 298）",
+    )
+    parser.add_argument(
+        "--position-guard-min-consecutive-sec",
+        type=int,
+        default=2,
+        help="终盘位置风控要求连续反向秒数（默认 2）",
+    )
     return parser
 
 
@@ -379,4 +404,7 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         reverse_guard_lookback_sec=args.reverse_guard_lookback_sec,
         reverse_guard_btc_move=args.reverse_guard_btc_move,
         reverse_guard_require_cross_open=not getattr(args, "disable_reverse_guard_require_cross_open", False),
+        enable_last_seconds_position_guard=args.enable_last_seconds_position_guard,
+        position_guard_start_sec=args.position_guard_start_sec,
+        position_guard_min_consecutive_sec=args.position_guard_min_consecutive_sec,
     )

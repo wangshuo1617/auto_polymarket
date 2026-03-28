@@ -97,7 +97,10 @@ def _build_startup_strategy_signature(args: Any) -> str:
         f"lrgs={args.reverse_guard_start_sec},"
         f"lrgl={args.reverse_guard_lookback_sec},"
         f"lrgm={_fmt_num(args.reverse_guard_btc_move)},"
-        f"lrgx={int(not args.disable_reverse_guard_require_cross_open)}"
+        f"lrgx={int(not args.disable_reverse_guard_require_cross_open)},"
+        f"lpg={int(args.enable_last_seconds_position_guard)},"
+        f"lpgs={args.position_guard_start_sec},"
+        f"lpgn={args.position_guard_min_consecutive_sec}"
     )
 
 
@@ -141,6 +144,8 @@ class FiveMinuteUpDownTrader:
     REVERSE_GUARD_START_SEC = 295
     REVERSE_GUARD_LOOKBACK_SEC = 3
     REVERSE_GUARD_BTC_MOVE = 15.0
+    POSITION_GUARD_START_SEC = 298
+    POSITION_GUARD_MIN_CONSECUTIVE_SEC = 2
 
     def __init__(
         self,
@@ -187,6 +192,9 @@ class FiveMinuteUpDownTrader:
         reverse_guard_lookback_sec: int = REVERSE_GUARD_LOOKBACK_SEC,
         reverse_guard_btc_move: float = REVERSE_GUARD_BTC_MOVE,
         reverse_guard_require_cross_open: bool = True,
+        enable_last_seconds_position_guard: bool = True,
+        position_guard_start_sec: int = POSITION_GUARD_START_SEC,
+        position_guard_min_consecutive_sec: int = POSITION_GUARD_MIN_CONSECUTIVE_SEC,
     ) -> None:
         self.stake_usd = stake_usd
         self.report_interval_sec = report_interval_sec
@@ -221,6 +229,10 @@ class FiveMinuteUpDownTrader:
             raise ValueError("reverse_guard_lookback_sec 必须在 1-30 之间")
         if reverse_guard_btc_move <= 0:
             raise ValueError("reverse_guard_btc_move 必须大于 0")
+        if position_guard_start_sec < 1 or position_guard_start_sec >= 300:
+            raise ValueError("position_guard_start_sec 必须在 1-299 之间")
+        if position_guard_min_consecutive_sec < 1 or position_guard_min_consecutive_sec > 10:
+            raise ValueError("position_guard_min_consecutive_sec 必须在 1-10 之间")
         self.entry_decision_minute = entry_decision_minute
         self.entry_preclose_seconds = entry_preclose_seconds
         self.min_direction_diff = min_direction_diff
@@ -256,6 +268,9 @@ class FiveMinuteUpDownTrader:
         self.reverse_guard_lookback_sec = int(reverse_guard_lookback_sec)
         self.reverse_guard_btc_move = float(reverse_guard_btc_move)
         self.reverse_guard_require_cross_open = bool(reverse_guard_require_cross_open)
+        self.enable_last_seconds_position_guard = bool(enable_last_seconds_position_guard)
+        self.position_guard_start_sec = int(position_guard_start_sec)
+        self.position_guard_min_consecutive_sec = int(position_guard_min_consecutive_sec)
 
         self._lock = threading.RLock()
         self._price_watcher = ChainlinkBTCPriceWatcher(callback=self._on_price_update)
@@ -282,6 +297,7 @@ class FiveMinuteUpDownTrader:
         self._minute4_recorded: bool = False
         self._direction_confirm_checked: bool = False
         self._last_seconds_reverse_guard_triggered: bool = False
+        self._last_seconds_position_guard_triggered: bool = False
 
         self.position: Optional[OpenPosition] = None
         self.trades: List[TradeRecord] = []
@@ -814,6 +830,7 @@ class FiveMinuteUpDownTrader:
                 self._minute4_recorded = False
                 self._direction_confirm_checked = False
                 self._last_seconds_reverse_guard_triggered = False
+                self._last_seconds_position_guard_triggered = False
                 slug_ts = window_start_ms // 1000
                 self.current_market_slug = f"btc-updown-5m-{slug_ts}"
                 try:
@@ -916,6 +933,11 @@ class FiveMinuteUpDownTrader:
 
             # --- 最后几秒加速反向风控 ---
             self._handle_last_seconds_reverse_guard(
+                rel_sec=rel_sec,
+                btc_price=btc_price,
+                btc_age_ms=btc_age_ms,
+            )
+            self._handle_last_seconds_position_guard(
                 rel_sec=rel_sec,
                 btc_price=btc_price,
                 btc_age_ms=btc_age_ms,
@@ -1378,6 +1400,58 @@ class FiveMinuteUpDownTrader:
         )
         self._force_close_position(reason="sl_last_seconds_reversal")
 
+    def _handle_last_seconds_position_guard(self, rel_sec: float, btc_price: float, btc_age_ms: int) -> None:
+        if not self.enable_last_seconds_position_guard:
+            return
+        if self._last_seconds_position_guard_triggered:
+            return
+        if rel_sec < self.position_guard_start_sec:
+            return
+        if btc_age_ms > self.MAX_BTC_AGE_MS:
+            return
+        if (
+            not self.position
+            or self.window_open_price is None
+            or self.current_window_start_ms is None
+        ):
+            return
+        if self.position.market_slug.split("-")[-1] != str(self.current_window_start_ms // 1000):
+            return
+
+        min_consecutive = self.position_guard_min_consecutive_sec
+        consecutive = 0
+        for sec in range(int(rel_sec), int(rel_sec) - min_consecutive, -1):
+            if sec < self.position_guard_start_sec:
+                break
+            matched = next((item for item in reversed(self._window_btc_series) if item[0] <= float(sec) + 0.25), None)
+            if matched is None:
+                break
+            if int(matched[0]) != sec:
+                break
+            sec_price = float(matched[1])
+            reversed_side = (
+                (self.position.direction == "up" and sec_price < self.window_open_price)
+                or (self.position.direction == "down" and sec_price > self.window_open_price)
+            )
+            if not reversed_side:
+                break
+            consecutive += 1
+
+        if consecutive < min_consecutive:
+            return
+
+        self._last_seconds_position_guard_triggered = True
+        logger.info(
+            "终盘位置风控触发: dir=%s rel_sec=%.1f 连续反向秒数=%d 阈值=%d open=%.2f now=%.2f",
+            self.position.direction,
+            rel_sec,
+            consecutive,
+            min_consecutive,
+            self.window_open_price,
+            btc_price,
+        )
+        self._force_close_position(reason="sl_last_seconds_position")
+
     def _handle_minute5_expiry(self) -> None:
         if self.exit_mode == "hold":
             return
@@ -1716,6 +1790,9 @@ def main() -> None:
                 "reverse_guard_lookback_sec": args.reverse_guard_lookback_sec,
                 "reverse_guard_btc_move": args.reverse_guard_btc_move,
                 "reverse_guard_require_cross_open": not args.disable_reverse_guard_require_cross_open,
+                "enable_last_seconds_position_guard": args.enable_last_seconds_position_guard,
+                "position_guard_start_sec": args.position_guard_start_sec,
+                "position_guard_min_consecutive_sec": args.position_guard_min_consecutive_sec,
             },
             pid=os.getpid(),
             hostname=socket.gethostname(),

@@ -44,6 +44,9 @@ REVERSE_GUARD_START_SEC="${39:-295}"
 REVERSE_GUARD_LOOKBACK_SEC="${40:-2}"
 REVERSE_GUARD_BTC_MOVE="${41:-15.0}"
 REVERSE_GUARD_REQUIRE_CROSS_OPEN="${42:-true}"
+ENABLE_LAST_SECONDS_POSITION_GUARD="${44:-true}"
+POSITION_GUARD_START_SEC="${45:-295}"
+POSITION_GUARD_MIN_CONSECUTIVE_SEC="${46:-2}"
 
 REPORT_INTERVAL_SEC="${6:-3600}"
 TAKE_PROFIT_SPREAD="${8:-0.15}"
@@ -52,7 +55,7 @@ TRADE_DB_PATH="${11:-}"
 TOXIC_UTC_HOURS="${15-"0,5,7,16,19"}"
 LOG_FILE="logs/5m_trade.stdout.log"
 PID_FILE="logs/5m_trade.pid"
-USAGE="./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio] [toxic_utc_hours_csv] [max_btc_cross_count] [min_entry_updown_diff] ... [direction_confirm_preclose_sec] [enable_direction_confirm_close] [enable_last_seconds_reverse_guard] [reverse_guard_start_sec] [reverse_guard_lookback_sec] [reverse_guard_btc_move] [reverse_guard_require_cross_open] [direction_confirm_min_abs_diff]"
+USAGE="./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio] [toxic_utc_hours_csv] [max_btc_cross_count] [min_entry_updown_diff] ... [direction_confirm_preclose_sec] [enable_direction_confirm_close] [enable_last_seconds_reverse_guard] [reverse_guard_start_sec] [reverse_guard_lookback_sec] [reverse_guard_btc_move] [reverse_guard_require_cross_open] [direction_confirm_min_abs_diff] [enable_last_seconds_position_guard] [position_guard_start_sec] [position_guard_min_consecutive_sec]"
 
 print_usage() {
   echo "用法: $USAGE"
@@ -248,6 +251,24 @@ if ! [[ "$DIRECTION_CONFIRM_MIN_ABS_DIFF" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 1
 fi
 
+if [ "$ENABLE_LAST_SECONDS_POSITION_GUARD" != "true" ] && [ "$ENABLE_LAST_SECONDS_POSITION_GUARD" != "false" ]; then
+  echo "❌ enable_last_seconds_position_guard 必须是 true 或 false"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$POSITION_GUARD_START_SEC" =~ ^[0-9]+$ ]] || [ "$POSITION_GUARD_START_SEC" -lt 1 ] || [ "$POSITION_GUARD_START_SEC" -gt 299 ]; then
+  echo "❌ position_guard_start_sec 必须是 1-299 的整数"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$POSITION_GUARD_MIN_CONSECUTIVE_SEC" =~ ^[0-9]+$ ]] || [ "$POSITION_GUARD_MIN_CONSECUTIVE_SEC" -lt 1 ] || [ "$POSITION_GUARD_MIN_CONSECUTIVE_SEC" -gt 10 ]; then
+  echo "❌ position_guard_min_consecutive_sec 必须是 1-10 的整数"
+  print_usage
+  exit 1
+fi
+
 if [ -n "$TOXIC_UTC_HOURS" ]; then
   IFS=',' read -r -a TOXIC_HOUR_PARTS <<< "$TOXIC_UTC_HOURS"
   for hour_part in "${TOXIC_HOUR_PARTS[@]}"; do
@@ -318,6 +339,7 @@ echo "cross_borderline: diff_multiplier=$CROSS_BORDERLINE_DIFF_MULTIPLIER"
 echo "方向一致性确认: enable=$ENABLE_DIRECTION_CONFIRM_CLOSE preclose_sec=$DIRECTION_CONFIRM_PRECLOSE_SEC"
 echo "方向一致性确认最小偏离阈值: min_abs_diff=$DIRECTION_CONFIRM_MIN_ABS_DIFF"
 echo "终盘反向风控: enable=$ENABLE_LAST_SECONDS_REVERSE_GUARD start_sec=$REVERSE_GUARD_START_SEC lookback_sec=$REVERSE_GUARD_LOOKBACK_SEC btc_move=$REVERSE_GUARD_BTC_MOVE require_cross_open=$REVERSE_GUARD_REQUIRE_CROSS_OPEN"
+echo "终盘位置风控: enable=$ENABLE_LAST_SECONDS_POSITION_GUARD start_sec=$POSITION_GUARD_START_SEC min_consecutive_sec=$POSITION_GUARD_MIN_CONSECUTIVE_SEC"
 if [ -n "$TRADE_DB_PATH" ]; then
   echo "交易数据库路径: $TRADE_DB_PATH"
 else
@@ -363,6 +385,8 @@ _build_cmd() {
     --reverse-guard-start-sec "$REVERSE_GUARD_START_SEC"
     --reverse-guard-lookback-sec "$REVERSE_GUARD_LOOKBACK_SEC"
     --reverse-guard-btc-move "$REVERSE_GUARD_BTC_MOVE"
+    --position-guard-start-sec "$POSITION_GUARD_START_SEC"
+    --position-guard-min-consecutive-sec "$POSITION_GUARD_MIN_CONSECUTIVE_SEC"
   )
 
   if [ -n "$TRADE_DB_PATH" ]; then
@@ -389,6 +413,10 @@ _build_cmd() {
 
   if [ "$REVERSE_GUARD_REQUIRE_CROSS_OPEN" = "false" ]; then
     CMD+=(--disable-reverse-guard-require-cross-open)
+  fi
+
+  if [ "$ENABLE_LAST_SECONDS_POSITION_GUARD" = "false" ]; then
+    CMD+=(--disable-last-seconds-position-guard)
   fi
 
   if [ "$MODE" != "--live" ]; then

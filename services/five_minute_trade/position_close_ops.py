@@ -587,6 +587,7 @@ def force_close_position(trader: Any, reason: str, close_retry_count: int = 0) -
             "sl_direction_change",
             "sl_direction_confirm_mismatch",
             "sl_last_seconds_reversal",
+            "sl_last_seconds_position",
             "sl_residual",
         }:
             current_bid = min(
