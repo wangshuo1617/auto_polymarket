@@ -15,6 +15,14 @@ SERVICES=(
   auto-poly-usdc-monitor
 )
 
+EXTRA_UNITS=(
+  auto-poly-btc-monitor-freshness.service
+)
+
+TIMERS=(
+  auto-poly-btc-monitor-freshness.timer
+)
+
 echo "=========================================="
 echo "安装 systemd 服务"
 echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -28,10 +36,18 @@ pkill -f "btc_1s_market_monitor.py" 2>/dev/null || true
 pkill -f "usdc_balance_monitor.py" 2>/dev/null || true
 sleep 2
 
-echo "[2/4] 复制 unit 文件到 $TARGET_DIR ..."
+echo "[2/4] 复制 unit/timer 文件到 $TARGET_DIR ..."
 for svc in "${SERVICES[@]}"; do
   cp "$SYSTEMD_DIR/$svc.service" "$TARGET_DIR/$svc.service"
   echo "  ✓ $svc.service"
+done
+for unit in "${EXTRA_UNITS[@]}"; do
+  cp "$SYSTEMD_DIR/$unit" "$TARGET_DIR/$unit"
+  echo "  ✓ $unit"
+done
+for timer in "${TIMERS[@]}"; do
+  cp "$SYSTEMD_DIR/$timer" "$TARGET_DIR/$timer"
+  echo "  ✓ $timer"
 done
 
 echo "[3/4] 重新加载 systemd 配置..."
@@ -49,6 +65,16 @@ for svc in "${SERVICES[@]}"; do
     systemctl status "$svc" --no-pager -l || true
   fi
 done
+for timer in "${TIMERS[@]}"; do
+  systemctl enable --now "$timer"
+  sleep 1
+  if systemctl is-active --quiet "$timer"; then
+    echo "  ✅ $timer 已启动"
+  else
+    echo "  ❌ $timer 启动失败"
+    systemctl status "$timer" --no-pager -l || true
+  fi
+done
 
 echo ""
 echo "=========================================="
@@ -57,4 +83,5 @@ echo "  systemctl status auto-poly-*          # 查看所有服务状态"
 echo "  systemctl restart auto-poly-5m-trade  # 重启某个服务"
 echo "  journalctl -u auto-poly-5m-trade -f   # 查看日志"
 echo "  systemctl stop auto-poly-5m-trade     # 停止某个服务"
+echo "  systemctl status auto-poly-btc-monitor-freshness.timer  # 查看看门狗状态"
 echo "=========================================="
