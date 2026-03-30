@@ -382,6 +382,14 @@ systemd 账号绑定（已内置在 service 文件）：
 - `auto-poly-app.service` 默认 `POLYMARKET_PROFILE=analyze`
 - 两者均从统一 `.env` 读取账号配置
 
+服务运维约定（重要）：
+- 后续重启相关服务请优先使用 `systemctl`，不要直接手动拉起 `uv run ...`，避免出现重复进程且确保 `Restart=` 自动拉起能力生效。
+- 常用命令示例：
+  - `sudo systemctl restart auto-poly-5m-trade.service`
+  - `sudo systemctl restart auto-poly-app.service`
+  - `sudo systemctl restart auto-poly-usdc-monitor.service`
+  - `sudo systemctl status auto-poly-5m-trade.service --no-pager`
+
 这会：
 - 连接到 Binance WebSocket
 - 实时监控 BTC/USDT 价格

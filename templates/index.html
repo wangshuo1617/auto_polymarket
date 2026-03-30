@@ -52,6 +52,15 @@
             height: 100%;
             display: block;
         }
+        .trade-chart-dot {
+            fill: #0d6efd;
+            opacity: 0.9;
+            cursor: pointer;
+        }
+        .trade-chart-dot:hover {
+            fill: #084298;
+            opacity: 1;
+        }
         .strategy-trigger-wrap {
             display: flex;
             justify-content: flex-end;
@@ -396,7 +405,9 @@
         let tradeHistoryPage = 1;
         let tradeSkipPage = 1;
         let tradeCurrentBalance = '—';
-        let tradeChartHtml = '';
+        let tradeBalanceSeriesData = [];
+        let tradeChartStart = '';
+        let tradeChartEnd = '';
         let tradeStrategyParams = {};
 
         function _fmt4(v) {
@@ -412,6 +423,72 @@
         function _fmtPct(v) {
             if (v == null || isNaN(v)) return '--';
             return (Number(v) * 100).toFixed(2) + '%';
+        }
+
+        function _fmtUtc8DateTime(ts) {
+            if (!ts) return '--';
+            const d = new Date(ts);
+            if (isNaN(d.getTime())) return String(ts);
+            const parts = new Intl.DateTimeFormat('zh-CN', {
+                timeZone: 'Asia/Shanghai',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false,
+            }).formatToParts(d);
+            const map = {};
+            parts.forEach(p => { map[p.type] = p.value; });
+            return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
+        }
+
+        function _pad2(n) {
+            return String(n).padStart(2, '0');
+        }
+
+        function _toUtc8InputValueFromMs(ms) {
+            if (ms == null || isNaN(ms)) return '';
+            const d = new Date(Number(ms) + 8 * 3600 * 1000);
+            return `${d.getUTCFullYear()}-${_pad2(d.getUTCMonth() + 1)}-${_pad2(d.getUTCDate())}T${_pad2(d.getUTCHours())}:${_pad2(d.getUTCMinutes())}`;
+        }
+
+        function _parseUtc8InputValueToMs(v) {
+            const raw = String(v || '').trim();
+            const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+            if (!m) return NaN;
+            const y = Number(m[1]);
+            const mo = Number(m[2]);
+            const d = Number(m[3]);
+            const hh = Number(m[4]);
+            const mm = Number(m[5]);
+            return Date.UTC(y, mo - 1, d, hh - 8, mm, 0, 0);
+        }
+
+        function _updateChartRangeBtnState() {
+            const startMs = _parseUtc8InputValueToMs(document.getElementById('chartRangeStart')?.value || '');
+            const endMs = _parseUtc8InputValueToMs(document.getElementById('chartRangeEnd')?.value || '');
+            const btn = document.getElementById('chartRangeBtn');
+            if (!btn) return;
+            btn.disabled = !(Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs);
+        }
+
+        function _getFilteredTradeBalanceSeries() {
+            const rows = Array.isArray(tradeBalanceSeriesData) ? tradeBalanceSeriesData : [];
+            const startMs = _parseUtc8InputValueToMs(tradeChartStart);
+            const endMs = _parseUtc8InputValueToMs(tradeChartEnd);
+            if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return rows;
+            return rows.filter((p) => {
+                const tsMs = Date.parse(String(p.ts || ''));
+                return Number.isFinite(tsMs) && tsMs >= startMs && tsMs <= endMs;
+            });
+        }
+
+        function applyTradeChartRange() {
+            tradeChartStart = document.getElementById('chartRangeStart')?.value || tradeChartStart;
+            tradeChartEnd = document.getElementById('chartRangeEnd')?.value || tradeChartEnd;
+            render5mTradeTab(tradeCurrentBalance);
         }
 
         function _escapeHtml(s) {
@@ -595,11 +672,27 @@
             const plotW = W - padL - padR;
             const plotH = H - padT - padB;
 
-            const xy = points.map((p, i) => {
+            const chartPoints = points.map((p, i) => {
                 const x = padL + (i * plotW / Math.max(1, points.length - 1));
                 const y = padT + (maxV - Number(p.balance)) * plotH / span;
-                return `${x.toFixed(2)},${y.toFixed(2)}`;
-            }).join(' ');
+                return {
+                    x: x.toFixed(2),
+                    y: y.toFixed(2),
+                    balance: Number(p.balance),
+                    ts: p.ts,
+                };
+            });
+            const xy = chartPoints.map(p => `${p.x},${p.y}`).join(' ');
+            const dots = chartPoints.map(p => {
+                const tipTime = _fmtUtc8DateTime(p.ts);
+                const tipVal = _fmt2(p.balance);
+                return `
+                    <circle class="trade-chart-dot" cx="${p.x}" cy="${p.y}" r="3.2">
+                        <title>时间(UTC+8): ${tipTime}
+余额: $${tipVal}</title>
+                    </circle>
+                `;
+            }).join('');
 
             const lastVal = Number(points[points.length - 1].balance);
             const yMin = (padT + plotH).toFixed(2);
@@ -610,6 +703,7 @@
                     <line x1="${padL}" y1="${yMax}" x2="${W - padR}" y2="${yMax}" stroke="#e9ecef" stroke-width="1" />
                     <line x1="${padL}" y1="${((padT + plotH / 2).toFixed(2))}" x2="${W - padR}" y2="${((padT + plotH / 2).toFixed(2))}" stroke="#f1f3f5" stroke-width="1" />
                     <polyline fill="none" stroke="#0d6efd" stroke-width="2.5" points="${xy}" />
+                    ${dots}
                     <text x="10" y="${yMax}" font-size="12" fill="#6c757d">${_fmt2(maxV)}</text>
                     <text x="10" y="${yMin}" font-size="12" fill="#6c757d">${_fmt2(minV)}</text>
                     <text x="${W - 150}" y="18" font-size="12" fill="#0d6efd">最新: $${_fmt2(lastVal)}</text>
@@ -617,9 +711,11 @@
             `;
         }
 
-        function render5mTradeTab(currentBalance, chartHtml) {
+        function render5mTradeTab(currentBalance) {
             const hPage = _pageSlice(tradeHistoryRowsData, tradeHistoryPage, TRADE_TABLE_PAGE_SIZE);
             tradeHistoryPage = hPage.current;
+            const filteredSeries = _getFilteredTradeBalanceSeries();
+            const chartHtml = _drawBalanceChart(filteredSeries);
             let tableRows = '';
             hPage.items.forEach(r => {
                 const pnlClass = r.pnl == null ? '' : (Number(r.pnl) >= 0 ? 'text-success' : 'text-danger');
@@ -658,6 +754,12 @@
             html += '<h2 class="h4 mb-0">Current Balance：' + (currentBalance || '—') + '</h2>';
             html += '<div style="max-width: 300px; width: 100%;">' + _renderStrategyParamsPanel(tradeStrategyParams) + '</div>';
             html += '</div>';
+            html += '<div class="d-flex align-items-center gap-2 mb-2">';
+            html += '<span class="small text-muted">图表时间段(UTC+8)</span>';
+            html += '<input type="datetime-local" class="form-control form-control-sm" style="width:190px;" id="chartRangeStart" value="' + _escapeHtml(tradeChartStart) + '" oninput="_updateChartRangeBtnState()" />';
+            html += '<input type="datetime-local" class="form-control form-control-sm" style="width:190px;" id="chartRangeEnd" value="' + _escapeHtml(tradeChartEnd) + '" oninput="_updateChartRangeBtnState()" />';
+            html += '<button class="btn btn-sm btn-outline-primary" id="chartRangeBtn" onclick="applyTradeChartRange()">应用</button>';
+            html += '</div>';
             html += '<div class="trade-chart-wrap mb-4">' + chartHtml + '</div>';
             html += '<div class="d-flex align-items-center gap-2 mb-2">';
             html += '<h3 class="h5 mb-0 me-2">历史交易</h3>';
@@ -684,18 +786,19 @@
             html += _buildPager(sPage.total, sPage.current, 'gotoTradeSkipPage');
 
             document.getElementById('trade5m-content').innerHTML = html;
+            _updateChartRangeBtnState();
             updateHistoryStatsBtnState();
             updateSkipStatsBtnState();
         }
 
         function gotoTradeHistoryPage(page) {
             tradeHistoryPage = page;
-            render5mTradeTab(tradeCurrentBalance, tradeChartHtml);
+            render5mTradeTab(tradeCurrentBalance);
         }
 
         function gotoTradeSkipPage(page) {
             tradeSkipPage = page;
-            render5mTradeTab(tradeCurrentBalance, tradeChartHtml);
+            render5mTradeTab(tradeCurrentBalance);
         }
 
         function load5mTradeTab() {
@@ -706,15 +809,26 @@
                         document.getElementById('trade5m-content').innerHTML = '<div class="alert alert-warning">' + data.error + '</div>';
                         return;
                     }
-                    const chartHtml = _drawBalanceChart(data.balance_series || []);
                     tradeHistoryRowsData = Array.isArray(data.history) ? data.history : [];
                     tradeSkipRowsData = Array.isArray(data.skipped_windows) ? data.skipped_windows : [];
+                    tradeBalanceSeriesData = Array.isArray(data.balance_series) ? data.balance_series : [];
+                    const seriesTs = tradeBalanceSeriesData
+                        .map(p => Date.parse(String(p.ts || '')))
+                        .filter(v => Number.isFinite(v));
+                    if (seriesTs.length > 0) {
+                        const endMs = Math.max(...seriesTs);
+                        const startMs = endMs - 24 * 3600 * 1000;
+                        tradeChartStart = _toUtc8InputValueFromMs(startMs);
+                        tradeChartEnd = _toUtc8InputValueFromMs(endMs);
+                    } else {
+                        tradeChartStart = '';
+                        tradeChartEnd = '';
+                    }
                     tradeHistoryPage = 1;
                     tradeSkipPage = 1;
                     tradeCurrentBalance = data.current_balance || '—';
-                    tradeChartHtml = chartHtml;
                     tradeStrategyParams = (data.strategy_params && typeof data.strategy_params === 'object') ? data.strategy_params : {};
-                    render5mTradeTab(data.current_balance || '—', chartHtml);
+                    render5mTradeTab(data.current_balance || '—');
                 })
                 .catch(error => {
                     document.getElementById('trade5m-content').innerHTML = '<div class="alert alert-danger">加载 5m_trade 失败: ' + error + '</div>';
