@@ -408,6 +408,10 @@
         let tradeBalanceSeriesData = [];
         let tradeChartStart = '';
         let tradeChartEnd = '';
+        let tradeHistoryStatStart = '';
+        let tradeHistoryStatEnd = '';
+        let tradeSkipStatStart = '';
+        let tradeSkipStatEnd = '';
         let tradeStrategyParams = {};
 
         function _fmt4(v) {
@@ -545,6 +549,18 @@
 
         function updateSkipStatsBtnState() {
             _updateStatsBtnState('skipStatStart', 'skipStatEnd', 'skipStatBtn');
+        }
+
+        function onHistoryStatInputChanged() {
+            tradeHistoryStatStart = document.getElementById('historyStatStart')?.value || tradeHistoryStatStart;
+            tradeHistoryStatEnd = document.getElementById('historyStatEnd')?.value || tradeHistoryStatEnd;
+            updateHistoryStatsBtnState();
+        }
+
+        function onSkipStatInputChanged() {
+            tradeSkipStatStart = document.getElementById('skipStatStart')?.value || tradeSkipStatStart;
+            tradeSkipStatEnd = document.getElementById('skipStatEnd')?.value || tradeSkipStatEnd;
+            updateSkipStatsBtnState();
         }
 
         function _showTradeStatsModal(title, html) {
@@ -764,8 +780,8 @@
             html += '<div class="d-flex align-items-center gap-2 mb-2">';
             html += '<h3 class="h5 mb-0 me-2">历史交易</h3>';
             html += '<div class="d-flex align-items-center gap-2 flex-nowrap">';
-            html += '<input type="datetime-local" class="form-control form-control-sm" style="width: 190px;" id="historyStatStart" oninput="updateHistoryStatsBtnState()" />';
-            html += '<input type="datetime-local" class="form-control form-control-sm" style="width: 190px;" id="historyStatEnd" oninput="updateHistoryStatsBtnState()" />';
+            html += '<input type="datetime-local" class="form-control form-control-sm" style="width: 190px;" id="historyStatStart" value="' + _escapeHtml(tradeHistoryStatStart) + '" oninput="onHistoryStatInputChanged()" />';
+            html += '<input type="datetime-local" class="form-control form-control-sm" style="width: 190px;" id="historyStatEnd" value="' + _escapeHtml(tradeHistoryStatEnd) + '" oninput="onHistoryStatInputChanged()" />';
             html += '<button class="btn btn-sm btn-outline-primary" id="historyStatBtn" onclick="openHistoryStats()" disabled>统计</button>';
             html += '</div></div>';
             html += '<div class="table-responsive"><table class="table table-sm table-bordered align-middle mb-0">';
@@ -776,8 +792,8 @@
             html += '<div class="d-flex align-items-center gap-2 mt-4 mb-2">';
             html += '<h3 class="h5 mb-0 me-2">跳过窗口及原因</h3>';
             html += '<div class="d-flex align-items-center gap-2 flex-nowrap">';
-            html += '<input type="datetime-local" class="form-control form-control-sm" style="width: 190px;" id="skipStatStart" oninput="updateSkipStatsBtnState()" />';
-            html += '<input type="datetime-local" class="form-control form-control-sm" style="width: 190px;" id="skipStatEnd" oninput="updateSkipStatsBtnState()" />';
+            html += '<input type="datetime-local" class="form-control form-control-sm" style="width: 190px;" id="skipStatStart" value="' + _escapeHtml(tradeSkipStatStart) + '" oninput="onSkipStatInputChanged()" />';
+            html += '<input type="datetime-local" class="form-control form-control-sm" style="width: 190px;" id="skipStatEnd" value="' + _escapeHtml(tradeSkipStatEnd) + '" oninput="onSkipStatInputChanged()" />';
             html += '<button class="btn btn-sm btn-outline-primary" id="skipStatBtn" onclick="openSkipStats()" disabled>统计</button>';
             html += '</div></div>';
             html += '<div class="table-responsive"><table class="table table-sm table-bordered align-middle mb-0">';
@@ -820,9 +836,17 @@
                         const startMs = endMs - 24 * 3600 * 1000;
                         tradeChartStart = _toUtc8InputValueFromMs(startMs);
                         tradeChartEnd = _toUtc8InputValueFromMs(endMs);
+                        tradeHistoryStatStart = _toUtc8InputValueFromMs(startMs);
+                        tradeHistoryStatEnd = _toUtc8InputValueFromMs(endMs);
+                        tradeSkipStatStart = _toUtc8InputValueFromMs(startMs);
+                        tradeSkipStatEnd = _toUtc8InputValueFromMs(endMs);
                     } else {
                         tradeChartStart = '';
                         tradeChartEnd = '';
+                        tradeHistoryStatStart = '';
+                        tradeHistoryStatEnd = '';
+                        tradeSkipStatStart = '';
+                        tradeSkipStatEnd = '';
                     }
                     tradeHistoryPage = 1;
                     tradeSkipPage = 1;
