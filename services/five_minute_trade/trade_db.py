@@ -235,6 +235,50 @@ class TradeSQLiteStore:
             )
             self._conn.commit()
 
+    def write_skip_event(
+        self,
+        event_time: datetime,
+        market_slug: str,
+        reason: str,
+        dry_run: bool,
+        market_id: Optional[str] = None,
+        token_id: Optional[str] = None,
+        direction: Optional[str] = None,
+        btc_price_at_trade: Optional[float] = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO trade_events (
+                    event_time,
+                    side,
+                    market_slug,
+                    market_id,
+                    token_id,
+                    direction,
+                    reason,
+                    trade_size,
+                    trade_price,
+                    btc_price_at_trade,
+                    mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self._to_utc_iso(event_time),
+                    "skip",
+                    str(market_slug or ""),
+                    str(market_id or ""),
+                    str(token_id or ""),
+                    str(direction or "na"),
+                    str(reason or "skip"),
+                    0.0,
+                    0.0,
+                    btc_price_at_trade,
+                    "dry-run" if dry_run else "live",
+                ),
+            )
+            self._conn.commit()
+
     def write_startup_event(
         self,
         start_ts_sec: int,

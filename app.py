@@ -2,9 +2,12 @@ import hmac
 import logging
 import os
 import secrets
+import sqlite3
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
 from py_clob_client.clob_types import (
@@ -31,6 +34,7 @@ from data.polymarket import (
     get_event_situation,
     get_open_orders,
     get_positions,
+    get_5m_updown_activity_history,
     buy_order,
     sell_order,
     cancel_order,
@@ -45,6 +49,9 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.getenv("DASHBOARD_HTTPS_ONLY", "false").lower() == "true"
 APP_PM_PROFILE = (os.getenv("POLYMARKET_PROFILE", "analyze") or "analyze").strip().lower()
+TRADE_PM_PROFILE = "trade"
+ET_TIMEZONE = ZoneInfo("America/New_York")
+UTC8_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def _is_authenticated() -> bool:
@@ -302,6 +309,236 @@ def _parse_cash_balance(balance_str: str) -> float:
         return float(s)
     except ValueError:
         return 0.0
+
+
+def _format_et_time(iso_text: str) -> str:
+    try:
+        dt = datetime.fromisoformat(str(iso_text).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        return dt.astimezone(ET_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+def _format_utc_time(iso_text: str) -> str:
+    try:
+        dt = datetime.fromisoformat(str(iso_text).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        return dt.astimezone(UTC8_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(iso_text or "")[:19]
+
+
+def _load_activity_exit_by_slug(profile: str) -> tuple[dict[str, float], dict[str, int]]:
+    exit_usdc_by_slug: dict[str, float] = {}
+    exit_count_by_slug: dict[str, int] = {}
+    activity = get_5m_updown_activity_history(profile=profile)
+    for item in activity:
+        if not isinstance(item, dict):
+            continue
+        slug = str(item.get("eventSlug") or item.get("slug") or "").strip().lower()
+        if not slug:
+            continue
+        event_type = str(item.get("type") or "").upper()
+        side = str(item.get("side") or "").upper()
+        if not ((event_type == "TRADE" and side == "SELL") or event_type == "REDEEM"):
+            continue
+        try:
+            usdc_size = float(item.get("usdcSize") or 0.0)
+        except Exception:
+            usdc_size = 0.0
+        if usdc_size <= 0:
+            continue
+        exit_usdc_by_slug[slug] = exit_usdc_by_slug.get(slug, 0.0) + usdc_size
+        exit_count_by_slug[slug] = exit_count_by_slug.get(slug, 0) + 1
+    return exit_usdc_by_slug, exit_count_by_slug
+
+
+def _load_trade_balance_series(conn: sqlite3.Connection, limit: int = 240) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT ts_utc, balance
+        FROM usdc_balance_snapshots
+        WHERE profile = ?
+        ORDER BY ts_utc DESC
+        LIMIT ?
+        """,
+        (TRADE_PM_PROFILE, int(limit)),
+    ).fetchall()
+    rows = list(reversed(rows))
+    result = []
+    for row in rows:
+        result.append({
+            "ts": str(row["ts_utc"]),
+            "balance": round(float(row["balance"]), 2),
+        })
+    return result
+
+
+def _load_skipped_windows(conn: sqlite3.Connection, limit: int = 80) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT event_time, market_slug, reason
+        FROM trade_events
+        WHERE mode='live'
+          AND side='skip'
+          AND market_slug LIKE 'btc-updown-5m-%'
+        ORDER BY event_time DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    result = []
+    for row in rows:
+        raw_time = str(row["event_time"] or "")
+        utc_time = _format_utc_time(raw_time)
+        result.append({
+            "window_slug": str(row["market_slug"] or ""),
+            "utc_time": utc_time,
+            "et_time": _format_et_time(raw_time),
+            "reason": str(row["reason"] or ""),
+        })
+    return result
+
+
+@app.route('/api/5m_trade_summary')
+def api_5m_trade_summary():
+    try:
+        balance_str = get_balance_allowance(profile=TRADE_PM_PROFILE)
+    except Exception as e:
+        return jsonify({"error": f"获取trade余额失败: {e}"}), 500
+
+    db_path = os.getenv("SQLITE_DB_PATH", "logs/trade.sqlite3")
+    if not os.path.isabs(db_path):
+        db_path = str((_project_root / db_path).resolve())
+
+    log_series = []
+    history_rows = []
+    skipped_windows = []
+    if os.path.exists(db_path):
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            log_series = _load_trade_balance_series(conn=conn, limit=240)
+            skipped_windows = _load_skipped_windows(conn=conn, limit=80)
+            query = """
+                SELECT
+                    market_slug,
+                    MIN(event_time) AS first_event_time,
+                    SUM(CASE WHEN side='buy' THEN 1 ELSE 0 END) AS buy_event_count,
+                    SUM(CASE WHEN side='buy' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS entry_usdc,
+                    SUM(CASE WHEN side='buy' THEN COALESCE(trade_size, 0) ELSE 0 END) AS entry_size,
+                    SUM(CASE WHEN side='buy' THEN COALESCE(notional_usdc, 0) ELSE 0 END) /
+                        NULLIF(SUM(CASE WHEN side='buy' THEN COALESCE(trade_size, 0) ELSE 0 END), 0) AS entry_price,
+                    SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS exit_usdc,
+                    SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(trade_size, 0) ELSE 0 END) AS exit_size,
+                    SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(notional_usdc, 0) ELSE 0 END) /
+                        NULLIF(SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(trade_size, 0) ELSE 0 END), 0) AS exit_price,
+                    SUM(CASE WHEN side IN ('sell','redeem') THEN 1 ELSE 0 END) AS exit_event_count,
+                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' THEN 1 ELSE 0 END) AS analyze_buy_count,
+                    SUM(CASE WHEN side IN ('sell','redeem') AND reason='analyze_backfill' THEN 1 ELSE 0 END) AS analyze_exit_count,
+                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_entry_usdc,
+                    SUM(CASE WHEN side IN ('sell','redeem') AND reason='analyze_backfill' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_exit_usdc,
+                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' THEN COALESCE(trade_size, 0) ELSE 0 END) AS analyze_entry_size,
+                    SUM(CASE WHEN side IN ('sell','redeem') AND reason='analyze_backfill' THEN COALESCE(trade_size, 0) ELSE 0 END) AS analyze_exit_size,
+                    SUM(CASE WHEN side='buy' AND (reason IS NULL OR reason!='analyze_backfill') THEN 1 ELSE 0 END) AS trade_buy_count,
+                    SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN 1 ELSE 0 END) AS trade_exit_count,
+                    SUM(CASE WHEN side='buy' AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS trade_entry_usdc,
+                    SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS trade_exit_usdc,
+                    SUM(CASE WHEN side='buy' AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_entry_size,
+                    SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_exit_size
+                FROM trade_events
+                WHERE mode='live'
+                  AND market_slug LIKE 'btc-updown-5m-%'
+                  AND side IN ('buy', 'sell', 'redeem')
+                GROUP BY market_slug
+                HAVING buy_event_count > 0
+                ORDER BY first_event_time DESC
+                LIMIT 240
+            """
+            rows = conn.execute(query).fetchall()
+            conn.close()
+
+            trade_exit_by_slug, trade_exit_count_by_slug = _load_activity_exit_by_slug(TRADE_PM_PROFILE)
+            analyze_exit_by_slug, analyze_exit_count_by_slug = _load_activity_exit_by_slug("analyze")
+
+            for row in rows:
+                slug = str(row["market_slug"] or "").strip().lower()
+                analyze_entry_usdc = float(row["analyze_entry_usdc"] or 0.0)
+                db_analyze_exit_usdc = float(row["analyze_exit_usdc"] or 0.0)
+                analyze_entry_size = float(row["analyze_entry_size"] or 0.0)
+                analyze_exit_size = float(row["analyze_exit_size"] or 0.0)
+                analyze_buy_count = int(row["analyze_buy_count"] or 0)
+                db_analyze_exit_count = int(row["analyze_exit_count"] or 0)
+
+                trade_entry_usdc = float(row["trade_entry_usdc"] or 0.0)
+                db_trade_exit_usdc = float(row["trade_exit_usdc"] or 0.0)
+                trade_entry_size = float(row["trade_entry_size"] or 0.0)
+                trade_exit_size = float(row["trade_exit_size"] or 0.0)
+                trade_buy_count = int(row["trade_buy_count"] or 0)
+                db_trade_exit_count = int(row["trade_exit_count"] or 0)
+
+                api_trade_exit_usdc = float(trade_exit_by_slug.get(slug, 0.0))
+                api_trade_exit_count = int(trade_exit_count_by_slug.get(slug, 0))
+                api_analyze_exit_usdc = float(analyze_exit_by_slug.get(slug, 0.0))
+                api_analyze_exit_count = int(analyze_exit_count_by_slug.get(slug, 0))
+
+                resolved_trade_exit_usdc = max(db_trade_exit_usdc, api_trade_exit_usdc)
+                resolved_trade_exit_count = max(db_trade_exit_count, api_trade_exit_count)
+                resolved_analyze_exit_usdc = max(db_analyze_exit_usdc, api_analyze_exit_usdc)
+                resolved_analyze_exit_count = max(db_analyze_exit_count, api_analyze_exit_count)
+
+                # 规则：
+                # - 分离前窗口（有 analyze_backfill 入场）只按 analyze 账号结算。
+                # - 分离后窗口（无 analyze_backfill 入场）按 trade 账号正常结算。
+                if analyze_buy_count > 0:
+                    entry_usdc = analyze_entry_usdc
+                    exit_usdc = resolved_analyze_exit_usdc
+                    entry_size = analyze_entry_size
+                    exit_size = analyze_exit_size
+                    unresolved = resolved_analyze_exit_count <= 0
+                else:
+                    entry_usdc = trade_entry_usdc if trade_entry_usdc > 0 else float(row["entry_usdc"] or 0.0)
+                    exit_usdc = resolved_trade_exit_usdc
+                    entry_size = trade_entry_size if trade_entry_size > 0 else float(row["entry_size"] or 0.0)
+                    exit_size = trade_exit_size
+                    unresolved = trade_buy_count > 0 and resolved_trade_exit_count <= 0
+
+                pnl = None if unresolved else round(float(exit_usdc) - float(entry_usdc), 4)
+                entry_price = None if entry_size <= 0 else round(float(entry_usdc) / float(entry_size), 4)
+                exit_price = None if unresolved or exit_size <= 0 else round(float(exit_usdc) / float(exit_size), 4)
+                if unresolved:
+                    result = "未定"
+                elif pnl > 0:
+                    result = "盈利"
+                elif pnl < 0:
+                    result = "亏损"
+                else:
+                    result = "持平"
+
+                history_rows.append({
+                    "window_slug": row["market_slug"],
+                    "utc_time": _format_utc_time(str(row["first_event_time"] or "")),
+                    "et_time": _format_et_time(str(row["first_event_time"] or "")),
+                    "result": result,
+                    "entry_price": entry_price,
+                    "entry_size": round(entry_size, 4),
+                    "entry_usdc": round(entry_usdc, 4),
+                    "exit_price": exit_price,
+                    "exit_usdc": None if unresolved else round(exit_usdc, 4),
+                    "pnl": pnl,  # unresolved 不计利润
+                })
+        except Exception as e:
+            return jsonify({"error": f"读取trade_events失败: {e}"}), 500
+
+    return jsonify({
+        "current_balance": balance_str,
+        "balance_series": log_series,
+        "history": history_rows,
+        "skipped_windows": skipped_windows,
+    })
 
 
 @app.route('/api/balance_summary')

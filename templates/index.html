@@ -39,6 +39,19 @@
             white-space: normal !important;
             word-break: break-word;
         }
+        .trade-chart-wrap {
+            border: 1px solid #dee2e6;
+            border-radius: 0.5rem;
+            background: #fff;
+            height: 280px;
+            position: relative;
+            overflow: hidden;
+        }
+        .trade-chart-svg {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
     </style>
 </head>
 <body>
@@ -63,6 +76,9 @@
             <li class="nav-item" role="presentation">
                 <button class="nav-link" id="orders-tab" data-bs-toggle="tab" data-bs-target="#orders" type="button" role="tab" aria-controls="orders" aria-selected="false">Open Orders</button>
             </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="trade5m-tab" data-bs-toggle="tab" data-bs-target="#trade5m" type="button" role="tab" aria-controls="trade5m" aria-selected="false">5m Trade</button>
+            </li>
         </ul>
         <div class="tab-content" id="myTabContent">
             <div class="tab-pane fade show active" id="events" role="tabpanel" aria-labelledby="events-tab">
@@ -73,6 +89,9 @@
             </div>
             <div class="tab-pane fade" id="orders" role="tabpanel" aria-labelledby="orders-tab">
                 <div id="orders-content">Loading...</div>
+            </div>
+            <div class="tab-pane fade" id="trade5m" role="tabpanel" aria-labelledby="trade5m-tab">
+                <div id="trade5m-content">Loading...</div>
             </div>
         </div>
     </div>
@@ -237,6 +256,30 @@
             return s;
         }
 
+        function formatTokenAmount(val) {
+            if (val == null || isNaN(val)) return '—';
+            return Number(val).toFixed(2);
+        }
+
+        function formatOrderSize(val) {
+            if (val == null) return '—';
+            const raw = String(val).trim();
+            if (!raw) return '—';
+            if (raw.includes('/')) {
+                const parts = raw.split('/');
+                if (parts.length !== 2) return raw;
+                const left = Number(parts[0]);
+                const right = Number(parts[1]);
+                if (Number.isFinite(left) && Number.isFinite(right)) {
+                    return left.toFixed(2) + '/' + right.toFixed(2);
+                }
+                return raw;
+            }
+            const n = Number(raw);
+            if (Number.isFinite(n)) return n.toFixed(2);
+            return raw;
+        }
+
         function loadPositions() {
             fetch('/api/positions')
                 .then(response => response.json())
@@ -272,7 +315,7 @@
                             const pnlClass = (p.percentPnl != null && Number(p.percentPnl) >= 0) ? 'text-success' : 'text-danger';
                             const marketId = (p.conditionId || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
                             const assetId = (p.asset || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-                            content += '<tr><td class="text-wrap-mobile">' + (p.outcome || '—') + '</td><td>' + (p.size != null ? p.size : '—') + '</td><td>' + (p.avgPrice != null ? p.avgPrice : '—') + '</td><td>' + (p.curPrice != null ? p.curPrice : '—') + '</td><td>' + formatMoney(value) + '</td><td class="' + pnlClass + '">' + formatPct(p.percentPnl) + '</td><td>';
+                            content += '<tr><td class="text-wrap-mobile">' + (p.outcome || '—') + '</td><td>' + formatTokenAmount(p.size) + '</td><td>' + (p.avgPrice != null ? p.avgPrice : '—') + '</td><td>' + (p.curPrice != null ? p.curPrice : '—') + '</td><td>' + formatMoney(value) + '</td><td class="' + pnlClass + '">' + formatPct(p.percentPnl) + '</td><td>';
                             content += '<button class="btn btn-danger btn-sm" onclick="openSellModal(\'' + marketId + '\', \'' + assetId + '\', ' + (p.curPrice != null ? p.curPrice : 0) + ')">Sell</button>';
                             content += '</td></tr>';
                         });
@@ -293,7 +336,7 @@
                     data.forEach(order => {
                         const eventName = order.event_name || '-';
                         const outcome = order.outcome || '-';
-                        content += '<tr><td class="text-wrap-mobile">' + eventName + '</td><td>' + outcome + '</td><td>' + order.side + '</td><td>' + order.size + '</td><td>' + order.price + '</td><td>';
+                        content += '<tr><td class="text-wrap-mobile">' + eventName + '</td><td>' + outcome + '</td><td>' + order.side + '</td><td>' + formatOrderSize(order.size) + '</td><td>' + order.price + '</td><td>';
                         content += '<button class="btn btn-warning btn-sm" onclick="cancelOrder(\'' + order.id + '\')">Cancel</button>';
                         content += '</td></tr>';
                     });
@@ -301,6 +344,175 @@
                     document.getElementById('orders-content').innerHTML = content;
                 })
                 .catch(error => console.error('Error loading orders:', error));
+        }
+
+        const TRADE_TABLE_PAGE_SIZE = 12;
+        let tradeHistoryRowsData = [];
+        let tradeSkipRowsData = [];
+        let tradeHistoryPage = 1;
+        let tradeSkipPage = 1;
+        let tradeCurrentBalance = '—';
+        let tradeChartHtml = '';
+
+        function _fmt4(v) {
+            if (v == null || isNaN(v)) return '--';
+            return Number(v).toFixed(4);
+        }
+
+        function _fmt2(v) {
+            if (v == null || isNaN(v)) return '--';
+            return Number(v).toFixed(2);
+        }
+
+        function _pageSlice(rows, page, pageSize) {
+            const total = Math.max(1, Math.ceil((rows || []).length / pageSize));
+            const current = Math.min(Math.max(1, page), total);
+            const start = (current - 1) * pageSize;
+            return {
+                total,
+                current,
+                items: (rows || []).slice(start, start + pageSize),
+            };
+        }
+
+        function _buildPager(total, current, handlerName) {
+            if (total <= 1) return '';
+            return `
+                <div class="d-flex justify-content-between align-items-center mt-2">
+                    <button class="btn btn-outline-secondary btn-sm" ${current <= 1 ? 'disabled' : ''} onclick="${handlerName}(${current - 1})">上一页</button>
+                    <span class="text-muted small">第 ${current} / ${total} 页</span>
+                    <button class="btn btn-outline-secondary btn-sm" ${current >= total ? 'disabled' : ''} onclick="${handlerName}(${current + 1})">下一页</button>
+                </div>
+            `;
+        }
+
+        function _drawBalanceChart(series) {
+            if (!Array.isArray(series) || series.length === 0) {
+                return '<div class="text-muted p-3">暂无余额曲线数据</div>';
+            }
+            const points = series.slice(-120);
+            const values = points.map(p => Number(p.balance)).filter(v => !isNaN(v));
+            if (values.length === 0) {
+                return '<div class="text-muted p-3">暂无有效余额数据</div>';
+            }
+            const minV = Math.min(...values);
+            const maxV = Math.max(...values);
+            const span = Math.max(0.0001, maxV - minV);
+            const W = 900;
+            const H = 260;
+            const padL = 56;
+            const padR = 16;
+            const padT = 16;
+            const padB = 28;
+            const plotW = W - padL - padR;
+            const plotH = H - padT - padB;
+
+            const xy = points.map((p, i) => {
+                const x = padL + (i * plotW / Math.max(1, points.length - 1));
+                const y = padT + (maxV - Number(p.balance)) * plotH / span;
+                return `${x.toFixed(2)},${y.toFixed(2)}`;
+            }).join(' ');
+
+            const lastVal = Number(points[points.length - 1].balance);
+            const yMin = (padT + plotH).toFixed(2);
+            const yMax = padT.toFixed(2);
+            return `
+                <svg class="trade-chart-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+                    <line x1="${padL}" y1="${yMin}" x2="${W - padR}" y2="${yMin}" stroke="#e9ecef" stroke-width="1" />
+                    <line x1="${padL}" y1="${yMax}" x2="${W - padR}" y2="${yMax}" stroke="#e9ecef" stroke-width="1" />
+                    <line x1="${padL}" y1="${((padT + plotH / 2).toFixed(2))}" x2="${W - padR}" y2="${((padT + plotH / 2).toFixed(2))}" stroke="#f1f3f5" stroke-width="1" />
+                    <polyline fill="none" stroke="#0d6efd" stroke-width="2.5" points="${xy}" />
+                    <text x="10" y="${yMax}" font-size="12" fill="#6c757d">${_fmt2(maxV)}</text>
+                    <text x="10" y="${yMin}" font-size="12" fill="#6c757d">${_fmt2(minV)}</text>
+                    <text x="${W - 150}" y="18" font-size="12" fill="#0d6efd">最新: $${_fmt2(lastVal)}</text>
+                </svg>
+            `;
+        }
+
+        function render5mTradeTab(currentBalance, chartHtml) {
+            const hPage = _pageSlice(tradeHistoryRowsData, tradeHistoryPage, TRADE_TABLE_PAGE_SIZE);
+            tradeHistoryPage = hPage.current;
+            let tableRows = '';
+            hPage.items.forEach(r => {
+                const pnlClass = r.pnl == null ? '' : (Number(r.pnl) >= 0 ? 'text-success' : 'text-danger');
+                tableRows += '<tr>';
+                tableRows += '<td>' + (r.window_slug || '--') + '</td>';
+                tableRows += '<td>' + (r.utc_time || '--') + '</td>';
+                tableRows += '<td>' + (r.result || '未定') + '</td>';
+                tableRows += '<td>' + _fmt4(r.entry_price) + '</td>';
+                tableRows += '<td>' + _fmt2(r.entry_size) + '</td>';
+                tableRows += '<td>' + _fmt2(r.entry_usdc) + '</td>';
+                tableRows += '<td>' + _fmt4(r.exit_price) + '</td>';
+                tableRows += '<td>' + _fmt2(r.exit_usdc) + '</td>';
+                tableRows += '<td class="' + pnlClass + '">' + _fmt2(r.pnl) + '</td>';
+                tableRows += '</tr>';
+            });
+            if (!tableRows) {
+                tableRows = '<tr><td colspan="9" class="text-muted">暂无交易数据</td></tr>';
+            }
+
+            const sPage = _pageSlice(tradeSkipRowsData, tradeSkipPage, TRADE_TABLE_PAGE_SIZE);
+            tradeSkipPage = sPage.current;
+            let skipRows = '';
+            sPage.items.forEach(s => {
+                skipRows += '<tr>';
+                skipRows += '<td>' + (s.window_slug || '--') + '</td>';
+                skipRows += '<td>' + (s.utc_time || '--') + '</td>';
+                skipRows += '<td class="text-wrap-mobile">' + (s.reason || '--') + '</td>';
+                skipRows += '</tr>';
+            });
+            if (!skipRows) {
+                skipRows = '<tr><td colspan="3" class="text-muted">暂无跳过窗口记录</td></tr>';
+            }
+
+            let html = '';
+            html += '<div class="mb-3"><h2 class="h4 mb-2">Current Balance：' + (currentBalance || '—') + '</h2></div>';
+            html += '<div class="trade-chart-wrap mb-4">' + chartHtml + '</div>';
+            html += '<h3 class="h5 mb-2">历史交易</h3>';
+            html += '<div class="table-responsive"><table class="table table-sm table-bordered align-middle mb-0">';
+            html += '<thead><tr><th>窗口slug</th><th>UTC+8时间</th><th>结果</th><th>入场价格</th><th>入场token量</th><th>入场金额</th><th>出场价格</th><th>出场金额</th><th>利润</th></tr></thead>';
+            html += '<tbody>' + tableRows + '</tbody></table></div>';
+            html += _buildPager(hPage.total, hPage.current, 'gotoTradeHistoryPage');
+
+            html += '<h3 class="h5 mt-4 mb-2">跳过窗口及原因</h3>';
+            html += '<div class="table-responsive"><table class="table table-sm table-bordered align-middle mb-0">';
+            html += '<thead><tr><th>窗口slug</th><th>UTC+8时间</th><th>跳过原因</th></tr></thead>';
+            html += '<tbody>' + skipRows + '</tbody></table></div>';
+            html += _buildPager(sPage.total, sPage.current, 'gotoTradeSkipPage');
+
+            document.getElementById('trade5m-content').innerHTML = html;
+        }
+
+        function gotoTradeHistoryPage(page) {
+            tradeHistoryPage = page;
+            render5mTradeTab(tradeCurrentBalance, tradeChartHtml);
+        }
+
+        function gotoTradeSkipPage(page) {
+            tradeSkipPage = page;
+            render5mTradeTab(tradeCurrentBalance, tradeChartHtml);
+        }
+
+        function load5mTradeTab() {
+            fetch('/api/5m_trade_summary')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        document.getElementById('trade5m-content').innerHTML = '<div class="alert alert-warning">' + data.error + '</div>';
+                        return;
+                    }
+                    const chartHtml = _drawBalanceChart(data.balance_series || []);
+                    tradeHistoryRowsData = Array.isArray(data.history) ? data.history : [];
+                    tradeSkipRowsData = Array.isArray(data.skipped_windows) ? data.skipped_windows : [];
+                    tradeHistoryPage = 1;
+                    tradeSkipPage = 1;
+                    tradeCurrentBalance = data.current_balance || '—';
+                    tradeChartHtml = chartHtml;
+                    render5mTradeTab(data.current_balance || '—', chartHtml);
+                })
+                .catch(error => {
+                    document.getElementById('trade5m-content').innerHTML = '<div class="alert alert-danger">加载 5m_trade 失败: ' + error + '</div>';
+                });
         }
 
         function updateAmountOrSizeLabel() {
@@ -410,6 +622,7 @@
         loadEvents();
         loadPositions();
         loadOrders();
+        load5mTradeTab();
 
         // Refresh every 30 seconds
         setInterval(() => {
@@ -418,6 +631,7 @@
             loadEvents();
             loadPositions();
             loadOrders();
+            load5mTradeTab();
         }, 30000);
     </script>
 </body>

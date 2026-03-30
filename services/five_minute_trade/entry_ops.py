@@ -138,17 +138,29 @@ def open_position(
         snapshot_received_ms = int(ws_snapshot.get("received_ms") or 0)
         quote_age_ms = now_ms - snapshot_received_ms
         if quote_age_ms > self.WS_BOOK_MAX_AGE_MS:
-            logger.warning(
-                "放弃开仓：Polymarket报价过期 (age=%dms > %dms) token=%s",
+            reason = "放弃开仓：Polymarket报价过期 (age=%dms > %dms) token=%s" % (
                 quote_age_ms,
                 self.WS_BOOK_MAX_AGE_MS,
                 token_id,
             )
+            logger.warning("%s", reason)
+            self._record_skip_window(
+                reason=reason,
+                market_slug=market_slug,
+                market_id=market_id,
+                token_id=token_id,
+                direction=direction,
+            )
             return
     else:
-        logger.warning(
-            "放弃开仓：无Polymarket WS报价数据 token=%s",
-            token_id,
+        reason = "放弃开仓：无Polymarket WS报价数据 token=%s" % (token_id,)
+        logger.warning("%s", reason)
+        self._record_skip_window(
+            reason=reason,
+            market_slug=market_slug,
+            market_id=market_id,
+            token_id=token_id,
+            direction=direction,
         )
         return
 
@@ -199,9 +211,14 @@ def open_position(
             risk_assessment.stability_risk,
         )
         if effective_stake <= 0:
-            logger.info(
-                "放弃开仓：风险等级=%s，仓位削减为0",
-                risk_assessment.risk_level,
+            reason = "放弃开仓：风险等级=%s，仓位削减为0" % (risk_assessment.risk_level,)
+            logger.info("%s", reason)
+            self._record_skip_window(
+                reason=reason,
+                market_slug=market_slug,
+                market_id=market_id,
+                token_id=token_id,
+                direction=direction,
             )
             return
 
@@ -211,10 +228,17 @@ def open_position(
         tick_size=(market_meta or {}).get("minimum_tick_size", "0.01"),
     )
     if normalized_size <= 0:
-        logger.warning(
-            "放弃开仓：归一化后下单数量为0，original=%.6f price=%.4f",
+        reason = "放弃开仓：归一化后下单数量为0，original=%.6f price=%.4f" % (
             size,
             rough_entry_price,
+        )
+        logger.warning("%s", reason)
+        self._record_skip_window(
+            reason=reason,
+            market_slug=market_slug,
+            market_id=market_id,
+            token_id=token_id,
+            direction=direction,
         )
         return
     if abs(normalized_size - size) > 1e-12:
@@ -243,28 +267,49 @@ def open_position(
     )
 
     if plan["fill_ratio"] < self.MIN_ENTRY_LIQUIDITY_FILL_RATIO:
-        logger.warning(
-            "放弃开仓：流动性不足，fill_ratio=%.2f%% 低于阈值 %.2f%%",
+        reason = "放弃开仓：流动性不足，fill_ratio=%.2f%% 低于阈值 %.2f%%" % (
             plan["fill_ratio"] * 100,
             self.MIN_ENTRY_LIQUIDITY_FILL_RATIO * 100,
+        )
+        logger.warning("%s", reason)
+        self._record_skip_window(
+            reason=reason,
+            market_slug=market_slug,
+            market_id=market_id,
+            token_id=token_id,
+            direction=direction,
         )
         return
 
     if plan["slippage_bps"] > self.MAX_ENTRY_SLIPPAGE_BPS:
-        logger.warning(
-            "放弃开仓：预估滑点过大 slippage=%.2fbps 超过阈值 %.2fbps",
+        reason = "放弃开仓：预估滑点过大 slippage=%.2fbps 超过阈值 %.2fbps" % (
             plan["slippage_bps"],
             self.MAX_ENTRY_SLIPPAGE_BPS,
+        )
+        logger.warning("%s", reason)
+        self._record_skip_window(
+            reason=reason,
+            market_slug=market_slug,
+            market_id=market_id,
+            token_id=token_id,
+            direction=direction,
         )
         return
 
     entry_price = float(plan["worst_price"])
     if best_ask_price > self.max_entry_price:
-        logger.info(
-            "放弃开仓：best_ask=%.4f 高于 MAX_ENTRY_PRICE=%.4f (worst_fill=%.4f)",
+        reason = "放弃开仓：best_ask=%.4f 高于 MAX_ENTRY_PRICE=%.4f (worst_fill=%.4f)" % (
             best_ask_price,
             self.max_entry_price,
             entry_price,
+        )
+        logger.info("%s", reason)
+        self._record_skip_window(
+            reason=reason,
+            market_slug=market_slug,
+            market_id=market_id,
+            token_id=token_id,
+            direction=direction,
         )
         return
 

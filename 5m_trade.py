@@ -25,6 +25,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
+import re
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
@@ -716,6 +717,36 @@ class FiveMinuteUpDownTrader:
         except Exception as e:
             logger.error("写入建仓记录到SQLite失败: %s", e)
 
+    def _record_skip_window(
+        self,
+        reason: str,
+        market_slug: Optional[str] = None,
+        market_id: Optional[str] = None,
+        token_id: Optional[str] = None,
+        direction: Optional[str] = None,
+    ) -> None:
+        if self._trade_db is None:
+            return
+        slug = str(market_slug or self.current_market_slug or "")
+        if not slug:
+            return
+        clean_reason = re.sub(r"\s+", " ", str(reason or "").strip())
+        if not clean_reason:
+            clean_reason = "skip"
+        try:
+            self._trade_db.write_skip_event(
+                event_time=datetime.now(timezone.utc),
+                market_slug=slug,
+                reason=clean_reason,
+                dry_run=self.dry_run,
+                market_id=market_id,
+                token_id=token_id,
+                direction=direction,
+                btc_price_at_trade=self._get_latest_btc_price_snapshot(),
+            )
+        except Exception as e:
+            logger.error("写入跳过记录到SQLite失败: %s", e)
+
     def _get_latest_btc_price_snapshot(self) -> Optional[float]:
         with self._lock:
             if self.latest_btc_price is None:
@@ -966,11 +997,12 @@ class FiveMinuteUpDownTrader:
 
         if self._is_toxic_time_regime():
             current_utc_hour = datetime.now(timezone.utc).hour
-            logger.info(
-                "Skip: Toxic Time Regime (UTC hour=%s in %s)",
+            reason = "Skip: Toxic Time Regime (UTC hour=%s in %s)" % (
                 current_utc_hour,
                 sorted(self.toxic_utc_hours),
             )
+            logger.info("%s", reason)
+            self._record_skip_window(reason=reason)
             self.window_traded = True
             return
 
@@ -980,21 +1012,23 @@ class FiveMinuteUpDownTrader:
             total_abs_delta = sum(abs(ticks[i] - ticks[i - 1]) for i in range(1, len(ticks)))
             avg_delta = total_abs_delta / (len(ticks) - 1)
             if avg_delta > self.max_avg_btc_delta:
-                logger.info(
-                    "Skip entry: avg |Δbtc|/s = %.2f (> %.2f), 窗口波动过大",
+                reason = "Skip entry: avg |Δbtc|/s = %.2f (> %.2f), 窗口波动过大" % (
                     avg_delta,
                     self.max_avg_btc_delta,
                 )
+                logger.info("%s", reason)
+                self._record_skip_window(reason=reason)
                 self.window_traded = True
                 return
 
         # BTC 越过开盘价次数检查：过多交叉说明方向不稳定
         if self.max_btc_cross_count > 0 and self._btc_cross_count > self.max_btc_cross_count:
-            logger.info(
-                "Skip entry: BTC crossed open price %d times (> %d), 方向不稳定",
+            reason = "Skip entry: BTC crossed open price %d times (> %d), 方向不稳定" % (
                 self._btc_cross_count,
                 self.max_btc_cross_count,
             )
+            logger.info("%s", reason)
+            self._record_skip_window(reason=reason)
             self.window_traded = True
             return
 
@@ -1004,35 +1038,40 @@ class FiveMinuteUpDownTrader:
         if self.min_entry_updown_diff > 0 and self.current_market_slug:
             _mi = self._market_cache.get(self.current_market_slug)
             if not _mi:
-                logger.info("Skip entry: market cache 缺失 slug=%s，无法做 UP/DOWN spread 检查", self.current_market_slug)
+                reason = "Skip entry: market cache 缺失 slug=%s，无法做 UP/DOWN spread 检查" % (self.current_market_slug,)
+                logger.info("%s", reason)
+                self._record_skip_window(reason=reason)
                 self.window_traded = True
                 return
             _up_book = self._ws_book_cache.get(str(_mi.get("up_token") or ""))
             _dn_book = self._ws_book_cache.get(str(_mi.get("down_token") or ""))
             if not _up_book or not _dn_book:
-                logger.info(
-                    "Skip entry: 订单簿缓存不完整 (up_book=%s, dn_book=%s)，无法做 UP/DOWN spread 检查",
+                reason = "Skip entry: 订单簿缓存不完整 (up_book=%s, dn_book=%s)，无法做 UP/DOWN spread 检查" % (
                     "有" if _up_book else "无",
                     "有" if _dn_book else "无",
                 )
+                logger.info("%s", reason)
+                self._record_skip_window(reason=reason)
                 self.window_traded = True
                 return
             _up_ask = self._to_positive_float(_up_book.get("best_ask"))
             _dn_ask = self._to_positive_float(_dn_book.get("best_ask"))
             if _up_ask is None or _dn_ask is None:
-                logger.info(
-                    "Skip entry: best_ask 缺失 (up_ask=%s, dn_ask=%s)，无法做 UP/DOWN spread 检查",
+                reason = "Skip entry: best_ask 缺失 (up_ask=%s, dn_ask=%s)，无法做 UP/DOWN spread 检查" % (
                     _up_ask, _dn_ask,
                 )
+                logger.info("%s", reason)
+                self._record_skip_window(reason=reason)
                 self.window_traded = True
                 return
             _ud_diff = abs(_up_ask - _dn_ask)
             if _ud_diff < self.min_entry_updown_diff:
-                logger.info(
-                    "Skip entry: UP/DOWN spread too narrow (%.4f < %.4f)",
+                reason = "Skip entry: UP/DOWN spread too narrow (%.4f < %.4f)" % (
                     _ud_diff,
                     self.min_entry_updown_diff,
                 )
+                logger.info("%s", reason)
+                self._record_skip_window(reason=reason)
                 self.window_traded = True
                 return
 
@@ -1041,15 +1080,19 @@ class FiveMinuteUpDownTrader:
         abs_diff = abs(diff)
 
         if abs_diff <= self.min_direction_diff:
-            logger.info(
-                "第 %s 分钟收盘前 %.2fs 预判价差不足，跳过本窗口交易: projected_close=%.2f open=%.2f abs_diff=%.2f 阈值=%.2f",
-                self.entry_decision_minute,
-                ms_to_close / 1000,
-                projected_close,
-                open_price,
-                abs_diff,
-                self.min_direction_diff,
+            reason = (
+                "第 %s 分钟收盘前 %.2fs 预判价差不足，跳过本窗口交易: projected_close=%.2f open=%.2f abs_diff=%.2f 阈值=%.2f"
+                % (
+                    self.entry_decision_minute,
+                    ms_to_close / 1000,
+                    projected_close,
+                    open_price,
+                    abs_diff,
+                    self.min_direction_diff,
+                )
             )
+            logger.info("%s", reason)
+            self._record_skip_window(reason=reason)
             self.window_traded = True
             return
 
@@ -1061,16 +1104,20 @@ class FiveMinuteUpDownTrader:
         ):
             border_threshold = self.min_direction_diff * self.cross_borderline_diff_multiplier
             if abs_diff <= border_threshold:
-                logger.info(
+                reason = (
                     "Skip entry: cross_borderline — cross_count=%d (>= %d), "
-                    "abs_diff=%.2f <= boosted_threshold=%.2f (base=%.2f × %.2f)",
-                    self._btc_cross_count,
-                    self.max_btc_cross_count - 1,
-                    abs_diff,
-                    border_threshold,
-                    self.min_direction_diff,
-                    self.cross_borderline_diff_multiplier,
+                    "abs_diff=%.2f <= boosted_threshold=%.2f (base=%.2f × %.2f)"
+                    % (
+                        self._btc_cross_count,
+                        self.max_btc_cross_count - 1,
+                        abs_diff,
+                        border_threshold,
+                        self.min_direction_diff,
+                        self.cross_borderline_diff_multiplier,
+                    )
                 )
+                logger.info("%s", reason)
+                self._record_skip_window(reason=reason)
                 self.window_traded = True
                 return
 
@@ -1096,16 +1143,20 @@ class FiveMinuteUpDownTrader:
             if _preflight_risk.risk_score >= self.risk_diff_boost_threshold:
                 boosted_threshold = self.min_direction_diff * self.risk_diff_boost_multiplier
                 if abs_diff <= boosted_threshold:
-                    logger.info(
+                    reason = (
                         "Skip entry: risk_diff_boost — preflight_risk=%.3f (>= %.3f), "
-                        "abs_diff=%.2f <= boosted_threshold=%.2f (base=%.2f × %.2f)",
-                        _preflight_risk.risk_score,
-                        self.risk_diff_boost_threshold,
-                        abs_diff,
-                        boosted_threshold,
-                        self.min_direction_diff,
-                        self.risk_diff_boost_multiplier,
+                        "abs_diff=%.2f <= boosted_threshold=%.2f (base=%.2f × %.2f)"
+                        % (
+                            _preflight_risk.risk_score,
+                            self.risk_diff_boost_threshold,
+                            abs_diff,
+                            boosted_threshold,
+                            self.min_direction_diff,
+                            self.risk_diff_boost_multiplier,
+                        )
                     )
+                    logger.info("%s", reason)
+                    self._record_skip_window(reason=reason)
                     self.window_traded = True
                     return
 
@@ -1114,11 +1165,12 @@ class FiveMinuteUpDownTrader:
         elif diff < 0:
             direction = "down"
         else:
-            logger.info(
-                "第 %s 分钟收盘前 %.2fs 预判价等于开盘价，跳过本窗口交易",
+            reason = "第 %s 分钟收盘前 %.2fs 预判价等于开盘价，跳过本窗口交易" % (
                 self.entry_decision_minute,
                 ms_to_close / 1000,
             )
+            logger.info("%s", reason)
+            self._record_skip_window(reason=reason)
             self.window_traded = True
             return
 
@@ -1132,10 +1184,11 @@ class FiveMinuteUpDownTrader:
                     continue
                 m_side = "up" if mc > open_price else "down" if mc < open_price else None
                 if m_side is not None and m_side != direction:
-                    logger.info(
-                        "Skip entry: 第%d分钟收盘价=%.2f 在open=%.2f的%s侧，与预判方向%s不一致",
+                    reason = "Skip entry: 第%d分钟收盘价=%.2f 在open=%.2f的%s侧，与预判方向%s不一致" % (
                         m, mc, open_price, m_side, direction,
                     )
+                    logger.info("%s", reason)
+                    self._record_skip_window(reason=reason)
                     self.window_traded = True
                     return
 
@@ -1144,15 +1197,17 @@ class FiveMinuteUpDownTrader:
             entry_ask = _up_ask if direction == "up" else _dn_ask
             other_ask = _dn_ask if direction == "up" else _up_ask
             if entry_ask <= other_ask:
-                logger.info(
-                    "Skip entry: 入场方向=%s 不是市场优势方 (entry_ask=%.4f <= other_ask=%.4f)",
+                reason = "Skip entry: 入场方向=%s 不是市场优势方 (entry_ask=%.4f <= other_ask=%.4f)" % (
                     direction, entry_ask, other_ask,
                 )
+                logger.info("%s", reason)
+                self._record_skip_window(reason=reason)
                 self.window_traded = True
                 return
 
         # DB tick 交叉验证：确保回测使用同一 DB 数据也会入场，避免误入
         if not self._validate_entry_with_db_ticks(direction):
+            self._record_skip_window(reason="Skip entry: DB交叉验证未通过")
             self.window_traded = True
             return
 
