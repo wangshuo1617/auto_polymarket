@@ -238,6 +238,7 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 * 分析 K 线趋势：BTC 是处于上升/下降通道还是震荡？
 * **趋势判断**: 结合 K 线和 资金面。判断当前是"下跌中继"、"底部反转"还是"崩盘开始"？K线是放量下跌，缩量下跌，放量上涨，缩量上涨还是其他情况？
 * **波动率测算**: 基于 K 线的高低点，估算 BTC 未来的潜在波动范围。参考 `scenario_probabilities.time_compression_note`——剩余天数越少，极端波动概率越低。
+* **时段波动结构校验**: 必须结合 `intraday_volatility_hint`，判断当前处于 ETF 交易时段/工作日非交易时段/周末时，波动风险应上调还是下调。
 * **未来路径评估**: 必须参考 `scenario_probabilities`（已内置时间压缩与波动率调节）给出三条路径概率，不要自行硬编码概率：
     * 路径A：延续下行
     * 路径B：震荡后回补
@@ -327,6 +328,8 @@ Polymarket 事件与各市场当前价格: {polymarket_event_situation}
 
 日线波动率画像(用于自适应离场): {daily_volatility_profile}
 
+时段波动提示(经验规则): {intraday_volatility_hint}
+
 未来可能性上下文(用于评估是否过早离场): {future_possibility_context}
 
 收益优化上下文(用于最大化期望收益并控制回撤): {profit_optimization_context}
@@ -357,6 +360,7 @@ def get_user_prompt(
     btc_4h_k_data: list,
     btc_1d_k_data: list,
     daily_volatility_profile: dict,
+    intraday_volatility_hint: dict,
     future_possibility_context: dict,
     profit_optimization_context: dict,
     market_sentiment_and_funding: dict,
@@ -381,6 +385,7 @@ def get_user_prompt(
         btc_4h_k_data=btc_4h_k_data,
         btc_1d_k_data=btc_1d_k_data,
         daily_volatility_profile=daily_volatility_profile,
+        intraday_volatility_hint=intraday_volatility_hint,
         future_possibility_context=future_possibility_context,
         profit_optimization_context=profit_optimization_context,
         market_sentiment_and_funding=market_sentiment_and_funding,

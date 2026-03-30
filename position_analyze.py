@@ -23,6 +23,25 @@ LAST_REPORT_PATH = Path(__file__).resolve().parent / "last_report.json"
 ET_TIMEZONE = ZoneInfo("America/New_York")
 
 
+def _build_intraday_volatility_hint() -> dict:
+    """
+    仅作为 AI 提示的时段波动经验，不在运行时重算长历史统计。
+    """
+    return {
+        "rule_of_thumb": "美股ETF交易时段（ET 09:00-16:00）BTC波动通常更大；周末通常更平静但流动性更薄。",
+        "relative_order_high_to_low": [
+            "etf_trading_hours",
+            "weekday_non_trading_hours",
+            "weekend_or_holiday",
+        ],
+        "risk_notes": [
+            "ET 09:00-10:00 常见放量波动，止损与仓位需更保守",
+            "周末虽均值波动低，但盘口深度偏薄，需防止短时异常波动",
+        ],
+        "apply_instruction": "请将该时段特征作为风险调整项，而不是单独交易信号。",
+    }
+
+
 def _load_previous_report() -> dict | None:
     """加载上一时间段的报告，供本次 AI 参考。"""
     if not LAST_REPORT_PATH.exists():
@@ -134,10 +153,14 @@ if __name__ == "__main__":
     print(f"{time_now} 比特币4h(近7天)与1d(近30天) K线数据获取完成")
 
     daily_volatility_profile = build_daily_volatility_profile(btc_1d_k_data)
+    intraday_volatility_hint = _build_intraday_volatility_hint()
     print(
         f"{time_now} 日线波动率画像完成: regime={daily_volatility_profile.get('market_regime')} "
         f"ATR%={daily_volatility_profile.get('atr_pct')} "
         f"TR分位={daily_volatility_profile.get('tr_percentile_30d')}"
+    )
+    print(
+        f"{time_now} 时段波动提示上下文已加载: order={intraday_volatility_hint.get('relative_order_high_to_low')}"
     )
 
     market_sentiment_and_funding = get_market_sentiment_and_funding()
@@ -182,6 +205,7 @@ if __name__ == "__main__":
         btc_4h_k_data,
         btc_1d_k_data,
         daily_volatility_profile,
+        intraday_volatility_hint,
         future_possibility_context,
         profit_optimization_context,
         market_sentiment_and_funding,
