@@ -202,8 +202,7 @@
         }
 
         function loadBalance() {
-            fetch('/api/balance_summary')
-                .then(response => response.json())
+            fetchJsonSafe('/api/balance_summary')
                 .then(data => {
                     if (data.error) {
                         document.getElementById('balance').innerHTML = 'Error: ' + data.error;
@@ -224,8 +223,7 @@
         }
 
         function loadBtcPrice() {
-            fetch('/api/btc_1h_kline')
-                .then(response => response.json())
+            fetchJsonSafe('/api/btc_1h_kline')
                 .then(data => {
                     if (data.error) {
                         document.getElementById('btc-price').textContent = 'BTC: Error';
@@ -247,8 +245,7 @@
         document.getElementById('btnPositionAnalyze').addEventListener('click', function() {
             const btn = this;
             btn.disabled = true;
-            fetch('/api/run_position_analyze', { method: 'POST' })
-                .then(response => response.json())
+            fetchJsonSafe('/api/run_position_analyze', { method: 'POST' })
                 .then(data => {
                     if (data.error) {
                         alert('Error: ' + data.error);
@@ -263,8 +260,7 @@
         });
 
         function loadEvents() {
-            fetch('/api/events')
-                .then(response => response.json())
+            fetchJsonSafe('/api/events')
                 .then(data => {
                     if (data.error) {
                         document.getElementById('events-content').innerHTML = 'Error: ' + data.error;
@@ -334,8 +330,7 @@
         }
 
         function loadPositions() {
-            fetch('/api/positions')
-                .then(response => response.json())
+            fetchJsonSafe('/api/positions')
                 .then(data => {
                     if (data.error) {
                         document.getElementById('positions-content').innerHTML = '<div class="alert alert-warning">' + data.error + '</div>';
@@ -382,9 +377,16 @@
         }
 
         function loadOrders() {
-            fetch('/api/open_orders')
-                .then(response => response.json())
+            fetchJsonSafe('/api/open_orders')
                 .then(data => {
+                    if (data && data.error) {
+                        document.getElementById('orders-content').innerHTML = '<div class="alert alert-warning">' + data.error + '</div>';
+                        return;
+                    }
+                    if (!Array.isArray(data)) {
+                        document.getElementById('orders-content').innerHTML = '<div class="alert alert-warning">Open orders 响应格式异常</div>';
+                        return;
+                    }
                     let content = '<div class="card shadow-sm"><div class="card-body p-2 p-md-3"><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Event</th><th>Outcome</th><th>Side</th><th>Size</th><th>Price</th><th>Actions</th></tr></thead><tbody>';
                     data.forEach(order => {
                         const eventName = order.event_name || '-';
@@ -427,6 +429,31 @@
         function _fmtPct(v) {
             if (v == null || isNaN(v)) return '--';
             return (Number(v) * 100).toFixed(2) + '%';
+        }
+
+        function _safeParseJson(text) {
+            const raw = String(text || '').trim();
+            if (!raw) return null;
+            try {
+                return JSON.parse(raw);
+            } catch (_) {
+                return null;
+            }
+        }
+
+        function fetchJsonSafe(url, options) {
+            return fetch(url, options).then(async (response) => {
+                const text = await response.text();
+                const data = _safeParseJson(text);
+                if (!response.ok) {
+                    const msg = (data && data.error) ? data.error : (`HTTP ${response.status}`);
+                    throw new Error(msg);
+                }
+                if (data == null) {
+                    throw new Error(`接口返回非JSON或空响应: ${url}`);
+                }
+                return data;
+            });
         }
 
         function _fmtUtc8DateTime(ts) {
@@ -609,7 +636,7 @@
             const btn = document.getElementById(btnId);
             if (!start || !end || end < start) return;
             if (btn) btn.disabled = true;
-            fetch('/api/5m_trade_stats', {
+            fetchJsonSafe('/api/5m_trade_stats', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -618,7 +645,6 @@
                     end_time: end,
                 }),
             })
-                .then(response => response.json())
                 .then(data => {
                     if (data.error) {
                         _showTradeStatsModal('统计结果', '<div class="alert alert-warning mb-0">' + data.error + '</div>');
@@ -852,8 +878,7 @@
         }
 
         function load5mTradeTab() {
-            fetch('/api/5m_trade_summary')
-                .then(response => response.json())
+            fetchJsonSafe('/api/5m_trade_summary')
                 .then(data => {
                     if (data.error) {
                         document.getElementById('trade5m-content').innerHTML = '<div class="alert alert-warning">' + data.error + '</div>';
@@ -933,12 +958,11 @@
 
         function cancelOrder(orderId) {
             if (confirm('Are you sure to cancel this order?')) {
-                fetch('/api/cancel', {
+                fetchJsonSafe('/api/cancel', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ order_id: orderId })
                 })
-                .then(response => response.json())
                 .then(data => {
                     alert('Order cancelled');
                     loadOrders();
@@ -975,12 +999,11 @@
             currentData.price = price;
             currentData.size = size;
             const url = currentAction === 'buy' ? '/api/buy' : '/api/sell';
-            fetch(url, {
+            fetchJsonSafe(url, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(currentData)
             })
-            .then(response => response.json())
             .then(data => {
                 if (data.error) {
                     alert('Error: ' + data.error);
