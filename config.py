@@ -62,3 +62,15 @@ SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "logs/trade.sqlite3")
 
 REPORT_INTERVAL = 3600
 GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# 邮件开关：默认关闭小时报告类邮件，只保留分析/预警邮件
+ENABLE_BTC_HOURLY_EMAIL = _env_bool("ENABLE_BTC_HOURLY_EMAIL", False)
+ENABLE_5M_TRADE_SUMMARY_EMAIL = _env_bool("ENABLE_5M_TRADE_SUMMARY_EMAIL", False)

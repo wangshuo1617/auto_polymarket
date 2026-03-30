@@ -330,7 +330,10 @@ def main():
         
         # 检查是否需要发送每小时价格报告
         current_time = time.time()
-        if current_time - last_report_time >= config.REPORT_INTERVAL:
+        if (
+            config.ENABLE_BTC_HOURLY_EMAIL
+            and current_time - last_report_time >= config.REPORT_INTERVAL
+        ):
             send_price_report(price_data)
             last_report_time = current_time
         

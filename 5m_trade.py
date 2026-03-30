@@ -29,7 +29,7 @@ import re
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
-from config import TO_EMAIL
+from config import TO_EMAIL, ENABLE_5M_TRADE_SUMMARY_EMAIL
 from data.polymarket import (
     calculate_activity_pnl_from_trade_events,
     ensure_http_keepalive,
@@ -1750,10 +1750,11 @@ class FiveMinuteUpDownTrader:
                     next_redeem_ts = self._calc_next_redeem_ts(base_ts=now)
 
             if now >= next_report_ts:
-                try:
-                    self._send_pnl_report(sender)
-                except Exception as e:
-                    logger.error("发送盈亏报告异常: %s", e)
+                if ENABLE_5M_TRADE_SUMMARY_EMAIL:
+                    try:
+                        self._send_pnl_report(sender)
+                    except Exception as e:
+                        logger.error("发送盈亏报告异常: %s", e)
                 next_report_ts = self._calc_next_hour_report_ts(base_ts=now)
 
             time.sleep(1.0)

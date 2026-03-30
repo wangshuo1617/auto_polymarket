@@ -448,6 +448,12 @@
             return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
         }
 
+        function _parseCashBalanceText(balanceText) {
+            const raw = String(balanceText || '').replace(/\$/g, '').replace(/,/g, '').trim();
+            const n = Number(raw);
+            return Number.isFinite(n) ? n : NaN;
+        }
+
         function _pad2(n) {
             return String(n).padStart(2, '0');
         }
@@ -470,6 +476,13 @@
             return Date.UTC(y, mo - 1, d, hh - 8, mm, 0, 0);
         }
 
+        function _getChartRangeMs() {
+            const startMs = _parseUtc8InputValueToMs(tradeChartStart);
+            const endMinuteMs = _parseUtc8InputValueToMs(tradeChartEnd);
+            const endMs = Number.isFinite(endMinuteMs) ? (endMinuteMs + 59 * 1000 + 999) : NaN;
+            return { startMs, endMs };
+        }
+
         function _updateChartRangeBtnState() {
             const startMs = _parseUtc8InputValueToMs(document.getElementById('chartRangeStart')?.value || '');
             const endMs = _parseUtc8InputValueToMs(document.getElementById('chartRangeEnd')?.value || '');
@@ -480,13 +493,34 @@
 
         function _getFilteredTradeBalanceSeries() {
             const rows = Array.isArray(tradeBalanceSeriesData) ? tradeBalanceSeriesData : [];
-            const startMs = _parseUtc8InputValueToMs(tradeChartStart);
-            const endMs = _parseUtc8InputValueToMs(tradeChartEnd);
+            const { startMs, endMs } = _getChartRangeMs();
             if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return rows;
             return rows.filter((p) => {
                 const tsMs = Date.parse(String(p.ts || ''));
                 return Number.isFinite(tsMs) && tsMs >= startMs && tsMs <= endMs;
             });
+        }
+
+        function _appendLiveBalancePointIfNeeded(series, currentBalanceText) {
+            const rows = Array.isArray(series) ? [...series] : [];
+            const liveBalance = _parseCashBalanceText(currentBalanceText);
+            if (!Number.isFinite(liveBalance)) return rows;
+
+            const nowMs = Date.now();
+            const { startMs, endMs } = _getChartRangeMs();
+            if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
+                if (nowMs < startMs || nowMs > endMs) return rows;
+            }
+
+            const nowIso = new Date(nowMs).toISOString();
+            const last = rows.length ? rows[rows.length - 1] : null;
+            const lastTsMs = last ? Date.parse(String(last.ts || '')) : NaN;
+            const lastBal = last ? Number(last.balance) : NaN;
+            if (Number.isFinite(lastTsMs) && Math.abs(nowMs - lastTsMs) < 5000 && Number.isFinite(lastBal) && Math.abs(lastBal - liveBalance) < 1e-9) {
+                return rows;
+            }
+            rows.push({ ts: nowIso, balance: liveBalance });
+            return rows;
         }
 
         function applyTradeChartRange() {
@@ -730,7 +764,7 @@
         function render5mTradeTab(currentBalance) {
             const hPage = _pageSlice(tradeHistoryRowsData, tradeHistoryPage, TRADE_TABLE_PAGE_SIZE);
             tradeHistoryPage = hPage.current;
-            const filteredSeries = _getFilteredTradeBalanceSeries();
+            const filteredSeries = _appendLiveBalancePointIfNeeded(_getFilteredTradeBalanceSeries(), currentBalance);
             const chartHtml = _drawBalanceChart(filteredSeries);
             let tableRows = '';
             hPage.items.forEach(r => {
@@ -832,7 +866,7 @@
                         .map(p => Date.parse(String(p.ts || '')))
                         .filter(v => Number.isFinite(v));
                     if (seriesTs.length > 0) {
-                        const endMs = Math.max(...seriesTs);
+                        const endMs = Date.now();
                         const startMs = endMs - 24 * 3600 * 1000;
                         tradeChartStart = _toUtc8InputValueFromMs(startMs);
                         tradeChartEnd = _toUtc8InputValueFromMs(endMs);
