@@ -151,6 +151,9 @@ class FiveMinuteUpDownTrader:
     REVERSE_GUARD_BTC_MOVE = 15.0
     POSITION_GUARD_START_SEC = 298
     POSITION_GUARD_MIN_CONSECUTIVE_SEC = 2
+    AUTO_REDEEM_INTERVAL_SEC = 600
+    AUTO_REDEEM_JITTER_SEC = 25
+    AUTO_REDEEM_ENTRY_GUARD_SEC = 20
 
     def __init__(
         self,
@@ -1730,19 +1733,52 @@ class FiveMinuteUpDownTrader:
 
     def _report_loop(self) -> None:
         sender = EmailSender()
+        next_report_ts = self._calc_next_hour_report_ts()
+        next_redeem_ts = self._calc_next_redeem_ts()
         while self._running:
-            self._sleep_until_next_hour()
-            if not self._running:
-                break
-            try:
-                run_auto_redeem()
-            except Exception as e:
-                logger.error("自动赎回异常: %s", e)
-            time.sleep(60)  # 赎回后稍作停顿，避免与盈亏报告争抢API资源
-            try:
-                self._send_pnl_report(sender)
-            except Exception as e:
-                logger.error("发送盈亏报告异常: %s", e)
+            now = time.time()
+
+            if now >= next_redeem_ts:
+                if self._is_near_entry_trigger_window(self.AUTO_REDEEM_ENTRY_GUARD_SEC):
+                    # 避开建仓触发附近秒段，降低与开仓路径争抢 API 资源的概率
+                    next_redeem_ts = now + 15.0
+                else:
+                    try:
+                        run_auto_redeem()
+                    except Exception as e:
+                        logger.error("自动赎回异常: %s", e)
+                    next_redeem_ts = self._calc_next_redeem_ts(base_ts=now)
+
+            if now >= next_report_ts:
+                try:
+                    self._send_pnl_report(sender)
+                except Exception as e:
+                    logger.error("发送盈亏报告异常: %s", e)
+                next_report_ts = self._calc_next_hour_report_ts(base_ts=now)
+
+            time.sleep(1.0)
+
+    def _is_near_entry_trigger_window(self, guard_sec: int) -> bool:
+        trigger_sec = self.entry_decision_minute * 60 - self.entry_preclose_seconds
+        now_in_window = int(time.time()) % 300
+        return abs(now_in_window - trigger_sec) <= int(guard_sec)
+
+    def _calc_next_redeem_ts(self, base_ts: Optional[float] = None) -> float:
+        import random
+        now = float(base_ts if base_ts is not None else time.time())
+        interval = int(self.AUTO_REDEEM_INTERVAL_SEC)
+        slot = (int(now) // interval) * interval + interval
+        jitter = random.random() * float(self.AUTO_REDEEM_JITTER_SEC)
+        return float(slot) + jitter
+
+    def _calc_next_hour_report_ts(self, base_ts: Optional[float] = None) -> float:
+        import random
+        now = float(base_ts if base_ts is not None else time.time())
+        current_hour_start = (int(now) // 3600) * 3600
+        next_hour_start = current_hour_start + 3600
+        # 整点后 30~90 秒发送小时报告，避开尖峰
+        offset = 30.0 + random.random() * 60.0
+        return float(next_hour_start) + offset
 
     def _sleep_until_next_hour(self) -> None:
         """睡眠到下一个整点后 1~2 分钟（随机偏移避免尖峰），期间每秒检查 _running。"""
