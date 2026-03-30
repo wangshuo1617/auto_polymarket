@@ -703,7 +703,21 @@ def get_event_situation(market_slug:str=None):
     result = response.json()
     polymarket_event_situation = {}
     polymarket_event_situation["event_name"] = result["title"]
-    polymarket_event_situation["markets"] = [{"question": i["question"], "outcomes": i["outcomes"], "outcomePrices": i["outcomePrices"]} for i in result["markets"]]
+    polymarket_event_situation["markets"] = [
+        {
+            "question": i.get("question"),
+            "outcomes": i.get("outcomes"),
+            "outcomePrices": i.get("outcomePrices"),
+            # 透传状态字段供上层过滤已结算市场（如存在）
+            "active": i.get("active"),
+            "status": i.get("status"),
+            "closed": i.get("closed"),
+            "resolved": i.get("resolved"),
+            "isResolved": i.get("isResolved"),
+            "endDate": i.get("endDate"),
+        }
+        for i in result["markets"]
+    ]
     return polymarket_event_situation
 
 def get_event_token_id(market_slug:str=None):

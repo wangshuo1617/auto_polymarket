@@ -5,7 +5,7 @@ Polymarket 持仓分析主入口
 import json
 import calendar
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from config import TO_EMAIL
@@ -41,6 +41,88 @@ def _build_intraday_volatility_hint() -> dict:
         ],
         "apply_instruction": "请将该时段特征作为风险调整项，而不是单独交易信号。",
     }
+
+
+def _is_position_settled(position: dict) -> bool:
+    """判断持仓是否已结算/到期。"""
+    try:
+        for key in ("resolved", "isResolved", "redeemed", "isRedeemed", "closed", "isClosed"):
+            if bool(position.get(key)):
+                return True
+
+        status_text = str(position.get("status") or "").strip().lower()
+        if status_text in {"resolved", "redeemed", "closed", "settled", "expired"}:
+            return True
+
+        end_date_raw = position.get("endDate")
+        if end_date_raw:
+            text = str(end_date_raw).strip()
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            end_dt = datetime.fromisoformat(text)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            if end_dt <= datetime.now(timezone.utc):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _filter_unsettled_positions(positions: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+        if _is_position_settled(p):
+            continue
+        out.append(p)
+    return out
+
+
+def _is_settled_market(market: dict) -> bool:
+    """
+    对 event 下的单个 market 做 settled 过滤。
+    仅依赖明确状态字段，避免用价格形态误判（例如 99/1 仍可能可交易）。
+    """
+    try:
+        for key in ("resolved", "isResolved", "redeemed", "isRedeemed", "closed", "isClosed"):
+            if bool(market.get(key)):
+                return True
+
+        status_text = str(market.get("status") or "").strip().lower()
+        if status_text in {"resolved", "redeemed", "closed", "settled", "expired"}:
+            return True
+
+        active_flag = market.get("active")
+        if active_flag is False:
+            return True
+
+        end_date_raw = market.get("endDate")
+        if end_date_raw:
+            text = str(end_date_raw).strip()
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            end_dt = datetime.fromisoformat(text)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            if end_dt <= datetime.now(timezone.utc):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _filter_unsettled_event_situation(event_situation: dict) -> dict:
+    if not isinstance(event_situation, dict):
+        return event_situation
+    markets = event_situation.get("markets")
+    if not isinstance(markets, list):
+        return event_situation
+    filtered_markets = [m for m in markets if isinstance(m, dict) and not _is_settled_market(m)]
+    result = dict(event_situation)
+    result["markets"] = filtered_markets
+    return result
 
 
 def _load_previous_report() -> dict | None:
@@ -144,10 +226,16 @@ if __name__ == "__main__":
     time_now = datetime.now(ET_TIMEZONE).strftime("%m-%d %H:%M")
 
     positions = get_positions(profile=ANALYZE_PROFILE)
+    positions_before_filter = len(positions)
+    positions = _filter_unsettled_positions(positions)
+    positions_filtered_out = positions_before_filter - len(positions)
     orders = get_open_orders(profile=ANALYZE_PROFILE)
     matched_results = match_orders_with_positions(orders, positions)
     formatted = format_matched_data(matched_results)
-    print(f"{time_now} Polymarket持仓情况格式化完成")
+    print(
+        f"{time_now} Polymarket持仓情况格式化完成"
+        f"（原始持仓={positions_before_filter}，已过滤结算={positions_filtered_out}，保留={len(positions)}）"
+    )
 
     btc_4h_k_data = get_4h_klines_data(limit=42)
     btc_1d_k_data = get_1d_klines_data(limit=30)
@@ -185,6 +273,9 @@ if __name__ == "__main__":
         print(f"{time_now} 已加载上一时间段报告作为参考")
 
     event_situation = get_event_situation()
+    raw_market_count = len(event_situation.get("markets", [])) if isinstance(event_situation, dict) else 0
+    event_situation = _filter_unsettled_event_situation(event_situation)
+    kept_market_count = len(event_situation.get("markets", [])) if isinstance(event_situation, dict) else 0
     usdc_balance = get_balance_allowance(profile=ANALYZE_PROFILE)
     profit_optimization_context = build_profit_optimization_context(
         polymarket_event_situation=event_situation,
@@ -198,6 +289,9 @@ if __name__ == "__main__":
         f"{time_now} 收益优化上下文完成: edge_count={profit_optimization_context.get('all_edge_count')} "
         f"top_edges={len(profit_optimization_context.get('top_edge_opportunities', []))} "
         f"portfolio_net_value={profit_optimization_context.get('portfolio_summary', {}).get('total_net_value')}"
+    )
+    print(
+        f"{time_now} Event市场过滤完成: raw={raw_market_count} kept={kept_market_count}"
     )
     print(f"{time_now} Polymarket 事件/市场现价与 USDC 余额获取完成,开始进行AI分析")
 

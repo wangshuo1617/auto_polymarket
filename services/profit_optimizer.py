@@ -251,6 +251,8 @@ def _build_position_safety_assessment(
         else:
             buffer_favorable = -safety_margin_pct
 
+        near_atr_warning = atr_distance < 1.0
+
         if buffer_favorable > 0 and buffer_favorable > max_expected_move_pct * 1.5 and days_left <= 10:
             safety_level = "safe_to_hold"
             reason = f"安全垫{buffer_favorable:.1f}%远超剩余{days_left}天最大预期波动{max_expected_move_pct:.1f}%，持有到期胜率极高"
@@ -263,6 +265,12 @@ def _build_position_safety_assessment(
         else:
             safety_level = "at_risk"
             reason = f"当前处于不利方向（缓冲{buffer_favorable:.1f}%），需紧密关注"
+
+        if near_atr_warning:
+            reason = (
+                f"{reason}；⚠ 距离关键价仅 {atr_distance:.2f} ATR（<1 ATR），"
+                "属于易触发区，建议提高监控频率并准备应急减仓/对冲。"
+            )
 
         hold_to_expiry_return_pct = None
         if cur_price_contract > 0 and cur_price_contract < 1.0:
@@ -277,6 +285,7 @@ def _build_position_safety_assessment(
             "direction": direction,
             "safety_margin_pct": round(safety_margin_pct, 2),
             "atr_distance": round(atr_distance, 2),
+            "within_one_atr_warning": near_atr_warning,
             "buffer_favorable_pct": round(buffer_favorable, 2),
             "max_expected_move_pct": round(max_expected_move_pct, 2),
             "days_left": days_left,

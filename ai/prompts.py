@@ -256,6 +256,8 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
     - 给出持有条件和阶梯止盈计划。
 * **at_risk 仓位**：
     - 可以使用紧急语气，给出明确的止损/减仓建议。
+* **ATR临界提醒（必须强调）**：若 `position_safety_assessment` 中出现 `within_one_atr_warning=true` 或 `atr_distance < 1`，
+  必须在“当前持仓与挂单分析与建议”中单独标注为高优先级风险点，并给出明确的触发价位与应急动作。
 * **Theta 成本量化**：任何减仓建议必须引用 `theta_income` 中的数据，说明"卖出 X 张将放弃每天 $Y 的 Theta 收益"。
 * **组合级风险评估**：参考 `portfolio_analysis`：
     - 识别组合结构（Short Strangle = 天然对冲），避免对单一仓位孤立恐慌。
