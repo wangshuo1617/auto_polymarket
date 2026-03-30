@@ -6,6 +6,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# Dashboard 固定使用 analyze 账号视角，避免被 .env 默认值覆盖
+export POLYMARKET_PROFILE="analyze"
+
 LOG_FILE="logs/app.log"
 PID_FILE="logs/app.pid"
 
@@ -15,6 +18,7 @@ echo "=========================================="
 echo "重启 app.py 服务"
 echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "工作目录: $PROJECT_ROOT"
+echo "账号 profile: $POLYMARKET_PROFILE"
 echo "=========================================="
 
 # --foreground 模式：前台运行，供 systemd 调用（通过环境变量 FOREGROUND=1 激活）

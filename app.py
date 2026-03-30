@@ -27,7 +27,7 @@ if str(_project_root) not in sys.path:
 
 from data.binance import get_btc_price, get_1h_klines_data
 from data.polymarket import (
-    client,
+    get_client,
     get_event_situation,
     get_open_orders,
     get_positions,
@@ -44,6 +44,7 @@ app.config["SESSION_COOKIE_NAME"] = "pm_dashboard_session"
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.getenv("DASHBOARD_HTTPS_ONLY", "false").lower() == "true"
+APP_PM_PROFILE = (os.getenv("POLYMARKET_PROFILE", "analyze") or "analyze").strip().lower()
 
 
 def _is_authenticated() -> bool:
@@ -109,7 +110,7 @@ def api_events():
 @app.route('/api/positions')
 def api_positions():
     try:
-        positions = get_positions()
+        positions = get_positions(profile=APP_PM_PROFILE)
         # Normalize and add display fields; use conditionId as market_id for sell
         def _to_float(v, default=0.0):
             try:
@@ -150,7 +151,8 @@ def api_positions():
 def api_open_orders():
     logger.info("api_open_orders requested")
     try:
-        orders = get_open_orders()
+        orders = get_open_orders(profile=APP_PM_PROFILE)
+        market_client = get_client(APP_PM_PROFILE)
 
         def _to_float(value):
             try:
@@ -180,7 +182,7 @@ def api_open_orders():
                 continue
             if market_id not in market_cache:
                 try:
-                    market = client.get_market(market_id)
+                    market = market_client.get_market(market_id)
                     market_cache[market_id] = market.get("question") or market.get("title") or ""
                 except Exception:
                     market_cache[market_id] = ""
@@ -203,7 +205,13 @@ def api_buy():
         logger.warning("api_buy missing parameters: has market_id=%s token_id=%s price=%s size=%s", bool(market_id), bool(token_id), price, size)
         return jsonify({'error': 'Missing parameters'}), 400
     try:
-        order_id = buy_order(market_id, token_id, float(price), float(size))
+        order_id = buy_order(
+            market_id,
+            token_id,
+            float(price),
+            float(size),
+            profile=APP_PM_PROFILE,
+        )
         if order_id is None:
             logger.warning("api_buy returned null order_id: market_id=%s price=%s size=%s", market_id, price, size)
             return jsonify({'error': 'Order placement failed (null order_id)', 'order_id': None}), 500
@@ -225,7 +233,14 @@ def api_sell():
         logger.warning("api_sell missing parameters: has market_id=%s token_id=%s price=%s size=%s", bool(market_id), bool(token_id), price, size)
         return jsonify({'error': 'Missing parameters'}), 400
     try:
-        order_id = sell_order(market_id, token_id, float(price), float(size), order_type= OrderType.GTC)
+        order_id = sell_order(
+            market_id,
+            token_id,
+            float(price),
+            float(size),
+            profile=APP_PM_PROFILE,
+            order_type=OrderType.GTC,
+        )
         if order_id is None:
             logger.warning("api_sell returned null order_id: market_id=%s price=%s size=%s", market_id, price, size)
             return jsonify({'error': 'Order placement failed (null order_id)', 'order_id': None}), 500
@@ -244,7 +259,7 @@ def api_cancel():
         logger.warning("api_cancel missing order_id")
         return jsonify({'error': 'Missing order_id'}), 400
     try:
-        result = cancel_order(order_id)
+        result = cancel_order(order_id, profile=APP_PM_PROFILE)
         logger.info("api_cancel success: order_id=%s result=%s", order_id, result)
         return jsonify({'result': result})
     except Exception as e:
@@ -254,7 +269,7 @@ def api_cancel():
 @app.route('/api/balance')
 def api_balance():
     try:
-        balance = get_balance_allowance()
+        balance = get_balance_allowance(profile=APP_PM_PROFILE)
         return jsonify({'balance': balance})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -293,9 +308,9 @@ def _parse_cash_balance(balance_str: str) -> float:
 def api_balance_summary():
     """Return cash balance, total position value, and profile value (cash + positions)."""
     try:
-        balance_str = get_balance_allowance()
+        balance_str = get_balance_allowance(profile=APP_PM_PROFILE)
         cash = _parse_cash_balance(balance_str)
-        positions = get_positions()
+        positions = get_positions(profile=APP_PM_PROFILE)
         position_value = 0.0
         for p in positions:
             cv = p.get("currentValue")
@@ -325,9 +340,12 @@ def api_balance_summary():
 def api_run_position_analyze():
     """Run position_analyze.py in the background."""
     try:
+        sub_env = os.environ.copy()
+        sub_env["POLYMARKET_PROFILE"] = "analyze"
         subprocess.Popen(
             [sys.executable, "position_analyze.py"],
             cwd=_project_root,
+            env=sub_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

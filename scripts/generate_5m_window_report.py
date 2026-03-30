@@ -257,7 +257,11 @@ def main() -> None:
     start_ts = int(start_utc.timestamp())
     end_ts = int(end_utc.timestamp())
     activity = get_5m_updown_activity_history(since_ts=start_ts, until_ts=end_ts)
-    pnl_summary = calculate_activity_pnl_from_trade_events(since_ts=start_ts, until_ts=end_ts)
+    pnl_summary = calculate_activity_pnl_from_trade_events(
+        since_ts=start_ts,
+        until_ts=end_ts,
+        profile="trade",
+    )
 
     activity_by_slug: Dict[str, List[Dict[str, object]]] = {}
     for item in activity:

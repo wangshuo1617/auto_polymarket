@@ -8,6 +8,43 @@ os.makedirs("output", exist_ok=True)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 POLYMARKET_KEY = os.getenv("POLYMARKET_KEY")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
+
+
+def _first_non_empty(*values: str | None) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        cleaned = str(value).strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
+# Multi-account profile configs (prefer unified .env naming)
+# 5m account envs: FIVE_M_ACCOUNT_KEY / FIVE_M_ACCOUNT_WALLET_ADDRESS
+# monthly/analyze account envs: MONTHLY_ACCOUNT_KEY / MONTHLY_ACCOUNT_WALLET_ADDRESS
+# Backward compatible aliases are still supported.
+PM_TRADE_KEY = _first_non_empty(
+    os.getenv("FIVE_M_ACCOUNT_KEY"),
+    os.getenv("PM_TRADE_KEY"),
+    POLYMARKET_KEY,
+)
+PM_TRADE_WALLET_ADDRESS = _first_non_empty(
+    os.getenv("FIVE_M_ACCOUNT_WALLET_ADDRESS"),
+    os.getenv("PM_TRADE_WALLET_ADDRESS"),
+    WALLET_ADDRESS,
+)
+PM_ANALYZE_KEY = _first_non_empty(
+    os.getenv("MONTHLY_ACCOUNT_KEY"),
+    os.getenv("PM_ANALYZE_KEY"),
+    POLYMARKET_KEY,
+)
+PM_ANALYZE_WALLET_ADDRESS = _first_non_empty(
+    os.getenv("MONTHLY_ACCOUNT_WALLET_ADDRESS"),
+    os.getenv("PM_ANALYZE_WALLET_ADDRESS"),
+    WALLET_ADDRESS,
+)
+POLYMARKET_PROFILE = _first_non_empty(os.getenv("POLYMARKET_PROFILE"), "trade") or "trade"
 TO_EMAIL = os.getenv("TO_EMAIL")
 SMTP_SERVER = os.getenv("SMTP_SERVER")
 SMTP_PORT = os.getenv("SMTP_PORT")

@@ -115,6 +115,16 @@ GOOGLE_API_KEY=your_google_api_key
 POLYMARKET_KEY=your_polymarket_private_key
 WALLET_ADDRESS=your_wallet_address
 
+# Multi-account profiles (recommended, all in .env)
+# 5m account
+FIVE_M_ACCOUNT_KEY=your_5m_private_key
+FIVE_M_ACCOUNT_WALLET_ADDRESS=your_5m_wallet_address
+# monthly account (position/monthly analyze)
+MONTHLY_ACCOUNT_KEY=your_monthly_private_key
+MONTHLY_ACCOUNT_WALLET_ADDRESS=your_monthly_wallet_address
+# process default profile: trade | analyze
+POLYMARKET_PROFILE=analyze
+
 # 邮件配置
 TO_EMAIL=recipient@example.com
 SMTP_SERVER=smtp.example.com
@@ -132,6 +142,11 @@ DASHBOARD_PORT=5000
 # 仅在你已配置 HTTPS 时设为 true
 DASHBOARD_HTTPS_ONLY=false
 ```
+
+双账号部署建议：
+- 统一放在 `.env`（Gemini、邮件、Dashboard、5m/monthly 两套账号）
+- 变量命名建议使用：`FIVE_M_ACCOUNT_*` 与 `MONTHLY_ACCOUNT_*`
+- 代码中仍兼容旧变量：`PM_TRADE_*` / `PM_ANALYZE_*`
 
 ### 4. 配置参数
 
@@ -155,6 +170,10 @@ chmod +x auto_polymarket.sh
 1. 运行持仓分析（`position_analyze.py`）
 2. 停止现有的价格监控进程（如果存在）
 3. 在后台启动新的价格监控服务
+
+账号绑定说明：
+- `position_analyze.py` / `position_analyze_gold.py` 显式使用 `analyze` profile
+- `5m_trade.py` 及 `services/five_minute_trade/*` 下单链路显式使用 `trade` profile
 
 ### 方式二：手动运行
 
@@ -357,6 +376,11 @@ uv run app.py
 - 直接通过 IP 访问示例：`http://<你的公网IP>:5000`。
 - 首次访问会进入登录页，输入 `DASHBOARD_PASSWORD` 后才可使用 Dashboard 和 API。
 - 如需公网访问，建议结合云防火墙/反向代理（Nginx + HTTPS）仅开放必要端口。
+
+systemd 账号绑定（已内置在 service 文件）：
+- `auto-poly-5m-trade.service` 默认 `POLYMARKET_PROFILE=trade`
+- `auto-poly-app.service` 默认 `POLYMARKET_PROFILE=analyze`
+- 两者均从统一 `.env` 读取账号配置
 
 这会：
 - 连接到 Binance WebSocket

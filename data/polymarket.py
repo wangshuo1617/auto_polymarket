@@ -3,11 +3,13 @@ Polymarket 持仓与订单 API
 """
 import json
 import logging
+import os
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -34,31 +36,105 @@ from py_clob_client.order_builder.builder import ROUNDING_CONFIG
 from py_clob_client.order_builder.helpers import round_down
 from py_clob_client.order_builder.constants import BUY, SELL
 from datetime import datetime, timezone
-from config import POLYMARKET_KEY, WALLET_ADDRESS
+from config import (
+    POLYMARKET_KEY,
+    WALLET_ADDRESS,
+    PM_TRADE_KEY,
+    PM_TRADE_WALLET_ADDRESS,
+    PM_ANALYZE_KEY,
+    PM_ANALYZE_WALLET_ADDRESS,
+    POLYMARKET_PROFILE,
+)
 
 
 host = "https://clob.polymarket.com"
 chain_id = 137
-private_key = POLYMARKET_KEY
-funder_address = WALLET_ADDRESS
 
-_temp_client = ClobClient(
-    host,
-    key=private_key,
-    chain_id=chain_id,
-    signature_type=2,
-    funder=funder_address,
-)
-creds = _temp_client.create_or_derive_api_creds()
 
-client = ClobClient(
-    host,
-    key=private_key,
-    chain_id=chain_id,
-    signature_type=2,
-    funder=funder_address,
-    creds=creds,
-)
+@dataclass(frozen=True)
+class PolymarketContext:
+    profile: str
+    private_key: str
+    wallet_address: str
+    client: ClobClient
+
+
+_PROFILE_ENV_KEY = "POLYMARKET_PROFILE"
+_context_cache: Dict[str, PolymarketContext] = {}
+_context_lock = threading.Lock()
+
+
+def _resolve_profile(profile: Optional[str] = None) -> str:
+    resolved = (profile or os.getenv(_PROFILE_ENV_KEY) or POLYMARKET_PROFILE or "trade").strip().lower()
+    if resolved not in {"trade", "analyze"}:
+        raise ValueError(f"Unsupported polymarket profile: {resolved}")
+    return resolved
+
+
+def _resolve_credentials(profile: str) -> tuple[str, str]:
+    resolved = _resolve_profile(profile)
+    if resolved == "trade":
+        private_key = (PM_TRADE_KEY or "").strip()
+        wallet = (PM_TRADE_WALLET_ADDRESS or "").strip()
+    else:
+        private_key = (PM_ANALYZE_KEY or "").strip()
+        wallet = (PM_ANALYZE_WALLET_ADDRESS or "").strip()
+
+    if not private_key:
+        private_key = (POLYMARKET_KEY or "").strip()
+    if not wallet:
+        wallet = (WALLET_ADDRESS or "").strip()
+
+    if not private_key:
+        raise ValueError(f"Missing private key for polymarket profile={resolved}")
+    if not wallet:
+        raise ValueError(f"Missing wallet address for polymarket profile={resolved}")
+    return private_key, wallet
+
+
+def get_polymarket_context(profile: Optional[str] = None) -> PolymarketContext:
+    resolved = _resolve_profile(profile)
+    with _context_lock:
+        cached = _context_cache.get(resolved)
+        if cached is not None:
+            return cached
+
+        private_key, wallet = _resolve_credentials(resolved)
+        temp_client = ClobClient(
+            host,
+            key=private_key,
+            chain_id=chain_id,
+            signature_type=2,
+            funder=wallet,
+        )
+        creds = temp_client.create_or_derive_api_creds()
+        profile_client = ClobClient(
+            host,
+            key=private_key,
+            chain_id=chain_id,
+            signature_type=2,
+            funder=wallet,
+            creds=creds,
+        )
+        ctx = PolymarketContext(
+            profile=resolved,
+            private_key=private_key,
+            wallet_address=wallet,
+            client=profile_client,
+        )
+        _context_cache[resolved] = ctx
+        return ctx
+
+
+def get_client(profile: Optional[str] = None) -> ClobClient:
+    return get_polymarket_context(profile).client
+
+
+# Backward-compatible default client/wallet for legacy call sites
+_default_ctx = get_polymarket_context()
+client = _default_ctx.client
+funder_address = _default_ctx.wallet_address
+private_key = _default_ctx.private_key
 
 _market_meta_cache: Dict[str, Dict[str, Any]] = {}
 _token_order_meta_cache: Dict[str, Dict[str, Any]] = {}
@@ -86,16 +162,17 @@ def _configure_clob_http_client() -> None:
             pass
 
 
-def _get_clob_cache(attr_name: str) -> Dict[str, Any]:
-    cache = getattr(client, attr_name, None)
+def _get_clob_cache(clob_client: ClobClient, attr_name: str) -> Dict[str, Any]:
+    cache = getattr(clob_client, attr_name, None)
     if isinstance(cache, dict):
         return cache
     cache = {}
-    setattr(client, attr_name, cache)
+    setattr(clob_client, attr_name, cache)
     return cache
 
 
 def _cache_token_order_metadata(
+    clob_client: ClobClient,
     token_id: str,
     minimum_tick_size: Optional[Any] = None,
     neg_risk: Optional[bool] = None,
@@ -106,9 +183,9 @@ def _cache_token_order_metadata(
         return {}
 
     record = _token_order_meta_cache.setdefault(token, {})
-    tick_cache = _get_clob_cache("_ClobClient__tick_sizes")
-    neg_risk_cache = _get_clob_cache("_ClobClient__neg_risk")
-    fee_rate_cache = _get_clob_cache("_ClobClient__fee_rates")
+    tick_cache = _get_clob_cache(clob_client, "_ClobClient__tick_sizes")
+    neg_risk_cache = _get_clob_cache(clob_client, "_ClobClient__neg_risk")
+    fee_rate_cache = _get_clob_cache(clob_client, "_ClobClient__fee_rates")
 
     if minimum_tick_size is not None:
         tick_size_str = str(minimum_tick_size)
@@ -128,7 +205,7 @@ def _cache_token_order_metadata(
     return record
 
 
-def _get_cached_fee_rate_bps(token_id: str) -> int:
+def _get_cached_fee_rate_bps(clob_client: ClobClient, token_id: str) -> int:
     token = str(token_id or "")
     if not token:
         return 0
@@ -139,7 +216,7 @@ def _get_cached_fee_rate_bps(token_id: str) -> int:
         except Exception:
             return 0
 
-    fee_rate_cache = _get_clob_cache("_ClobClient__fee_rates")
+    fee_rate_cache = _get_clob_cache(clob_client, "_ClobClient__fee_rates")
     if token in fee_rate_cache:
         try:
             return int(fee_rate_cache.get(token) or 0)
@@ -225,15 +302,17 @@ def _extract_execution_price_from_order(order_payload: Dict[str, Any]) -> Option
 
 def _wait_order_execution_price(
     order_id: str,
+    profile: Optional[str] = None,
     max_attempts: int = 8,
     sleep_sec: float = 0.25,
 ) -> Optional[float]:
     if not order_id:
         return None
 
+    clob_client = get_client(profile)
     for attempt in range(max(1, int(max_attempts))):
         try:
-            detail = client.get_order(order_id)
+            detail = clob_client.get_order(order_id)
             price = _extract_execution_price_from_order(detail)
             if price is not None:
                 return price
@@ -285,9 +364,10 @@ def _clamp_order_price(price: float, tick_size: Any) -> float:
     return float(clamped)
 
 
-def get_conditional_token_balance(token_id: str) -> float:
+def get_conditional_token_balance(token_id: str, profile: Optional[str] = None) -> float:
+    clob_client = get_client(profile)
     try:
-        response = client.get_balance_allowance(
+        response = clob_client.get_balance_allowance(
             BalanceAllowanceParams(
                 asset_type=AssetType.CONDITIONAL,
                 token_id=str(token_id),
@@ -308,9 +388,11 @@ def get_conditional_token_balance(token_id: str) -> float:
 
 def prefetch_order_metadata_for_tokens(
     token_ids: List[str],
+    profile: Optional[str] = None,
     market_meta: Optional[Dict[str, Any]] = None,
     refresh_fee_rate: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
+    clob_client = get_client(profile)
     result: Dict[str, Dict[str, Any]] = {}
     minimum_tick_size = None
     neg_risk = None
@@ -324,7 +406,8 @@ def prefetch_order_metadata_for_tokens(
             continue
 
         _cache_token_order_metadata(
-            token,
+            clob_client=clob_client,
+            token_id=token,
             minimum_tick_size=minimum_tick_size,
             neg_risk=neg_risk,
         )
@@ -332,19 +415,20 @@ def prefetch_order_metadata_for_tokens(
         fee_rate_bps: Optional[int] = None
         if refresh_fee_rate:
             try:
-                fee_rate_bps = int(client.get_fee_rate_bps(token) or 0)
+                fee_rate_bps = int(clob_client.get_fee_rate_bps(token) or 0)
             except Exception as e:
                 logger.warning(
                     "prefetch fee_rate failed, fallback to cached/default: token_id=%s error=%s",
                     _token_id_short(token),
                     e,
                 )
-                fee_rate_bps = _get_cached_fee_rate_bps(token)
+                fee_rate_bps = _get_cached_fee_rate_bps(clob_client, token)
         else:
-            fee_rate_bps = _get_cached_fee_rate_bps(token)
+            fee_rate_bps = _get_cached_fee_rate_bps(clob_client, token)
 
         meta = _cache_token_order_metadata(
-            token,
+            clob_client=clob_client,
+            token_id=token,
             minimum_tick_size=minimum_tick_size,
             neg_risk=neg_risk,
             fee_rate_bps=fee_rate_bps,
@@ -388,21 +472,23 @@ def ensure_http_keepalive(interval_sec: int = 20) -> None:
         _http_keepalive_started = True
 
 
-def get_positions() -> list:
+def get_positions(profile: Optional[str] = None) -> list:
     """获取 Polymarket 持仓"""
+    wallet_address = get_polymarket_context(profile).wallet_address
     position_url = "https://data-api.polymarket.com/positions"
-    params = {"user": WALLET_ADDRESS}
+    params = {"user": wallet_address}
     response = requests.get(position_url, params=params)
     response.raise_for_status()
     result = response.json()
     return [i for i in result if i["curPrice"] != 0]
 
 
-def get_open_orders() -> list:
+def get_open_orders(profile: Optional[str] = None) -> list:
     """获取未成交挂单"""
+    clob_client = get_client(profile)
     logger.info("get_open_orders called")
     try:
-        response = client.get_orders()
+        response = clob_client.get_orders()
         count = len(response) if isinstance(response, list) else "non-list"
         logger.info("get_open_orders success: count=%s", count)
         return response
@@ -418,11 +504,16 @@ def _token_id_short(tid: str) -> str:
     return f"{tid[:8]}...{tid[-4:]}"
 
 
-def get_market_metadata(market_id: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+def get_market_metadata(
+    market_id: str,
+    force_refresh: bool = False,
+    profile: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """
     获取并缓存 market 下单所需元信息，减少下单时延。
     返回字段：minimum_tick_size, neg_risk
     """
+    clob_client = get_client(profile)
     if not market_id:
         return None
 
@@ -434,7 +525,7 @@ def get_market_metadata(market_id: str, force_refresh: bool = False) -> Optional
 
     t0 = time.perf_counter()
     try:
-        market = client.get_market(market_id)
+        market = clob_client.get_market(market_id)
         meta = {
             "minimum_tick_size": market.get("minimum_tick_size"),
             "neg_risk": market.get("neg_risk", False),
@@ -453,10 +544,12 @@ def buy_order(
     token_id: str,
     price: float,
     size: float = 5.0,
+    profile: Optional[str] = None,
     market_meta: Optional[Dict[str, Any]] = None,
 ):
+    clob_client = get_client(profile)
     logger.info("buy_order called: market_id=%s token_id=%s price=%s size=%s", market_id, _token_id_short(token_id), price, size)
-    meta = market_meta or get_market_metadata(market_id)
+    meta = market_meta or get_market_metadata(market_id, profile=profile)
     if not meta or meta.get("minimum_tick_size") is None:
         logger.error("buy_order missing market metadata: market_id=%s", market_id)
         return None
@@ -479,13 +572,14 @@ def buy_order(
         )
     prefetch_order_metadata_for_tokens(
         token_ids=[token_id],
+        profile=profile,
         market_meta=meta,
         refresh_fee_rate=False,
     )
-    fee_rate_bps = _get_cached_fee_rate_bps(token_id)
+    fee_rate_bps = _get_cached_fee_rate_bps(clob_client, token_id)
     submit_t0 = time.perf_counter()
     try:
-        response = client.create_and_post_order(
+        response = clob_client.create_and_post_order(
             OrderArgs(
                 token_id=token_id,
                 price=price,
@@ -512,11 +606,13 @@ def sell_order(
     token_id: str,
     price: float,
     size: float = 5.0,
+    profile: Optional[str] = None,
     market_meta: Optional[Dict[str, Any]] = None,
     order_type: OrderType = OrderType.FAK,  # <--- 核心新增：默认使用 FAK 拒绝挂单被套
 ):
+    clob_client = get_client(profile)
     logger.info("sell_order called: market_id=%s token_id=%s price=%s size=%s type=%s", market_id, _token_id_short(token_id), price, size, order_type)
-    meta = market_meta or get_market_metadata(market_id)
+    meta = market_meta or get_market_metadata(market_id, profile=profile)
     if not meta or meta.get("minimum_tick_size") is None:
         return None
 
@@ -526,12 +622,12 @@ def sell_order(
 
     normalized_price = _clamp_order_price(price=float(price), tick_size=meta["minimum_tick_size"])
     
-    prefetch_order_metadata_for_tokens(token_ids=[token_id], market_meta=meta, refresh_fee_rate=False)
-    fee_rate_bps = _get_cached_fee_rate_bps(token_id)
+    prefetch_order_metadata_for_tokens(token_ids=[token_id], profile=profile, market_meta=meta, refresh_fee_rate=False)
+    fee_rate_bps = _get_cached_fee_rate_bps(clob_client, token_id)
 
     def _submit_once(submit_size: float):
         # 核心修改：拆分 create 和 post，强行注入 order_type
-        signed_order = client.create_order(
+        signed_order = clob_client.create_order(
             OrderArgs(
                 token_id=token_id,
                 price=normalized_price,
@@ -544,7 +640,7 @@ def sell_order(
                 neg_risk=bool(meta.get("neg_risk", False)),
             ),
         )
-        return client.post_order(signed_order, orderType=order_type)
+        return clob_client.post_order(signed_order, orderType=order_type)
 
     submit_t0 = time.perf_counter()
     try:
@@ -561,7 +657,7 @@ def sell_order(
 
         # --- 救回那段死代码：自动降量重试机制 ---
         logger.warning("sell_order 触发余额不足，尝试去链上核实真实余额并重试...")
-        available_balance = get_conditional_token_balance(token_id)
+        available_balance = get_conditional_token_balance(token_id, profile=profile)
         retry_size = normalize_order_size(
             size=min(normalized_size, available_balance),
             tick_size=meta["minimum_tick_size"],
@@ -579,15 +675,17 @@ def sell_order(
             logger.exception("sell_order 降量重试依然失败: %s", retry_err)
             return None
 
-def cancel_order(order_id: str):
-    return client.cancel(order_id)
+def cancel_order(order_id: str, profile: Optional[str] = None):
+    clob_client = get_client(profile)
+    return clob_client.cancel(order_id)
 
 
-def get_order_detail(order_id: str) -> Optional[Dict[str, Any]]:
+def get_order_detail(order_id: str, profile: Optional[str] = None) -> Optional[Dict[str, Any]]:
     if not order_id:
         return None
+    clob_client = get_client(profile)
     try:
-        detail = client.get_order(order_id)
+        detail = clob_client.get_order(order_id)
         if isinstance(detail, dict):
             return detail
         return None
@@ -642,18 +740,21 @@ def get_event_token_id(market_slug:str=None):
     ]
     return polymarket_event_situation
 
-def get_order_book(token_id: str):
-    return client.get_order_book(token_id)
+def get_order_book(token_id: str, profile: Optional[str] = None):
+    clob_client = get_client(profile)
+    return clob_client.get_order_book(token_id)
 
-def get_balance_allowance() -> str:
+def get_balance_allowance(profile: Optional[str] = None) -> str:
     """返回当前可用 USDC 余额，如 $123.45"""
-    response = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+    clob_client = get_client(profile)
+    response = clob_client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
     balance = int(response.get("balance", 0)) / 10**6
     return f"${balance:.2f}"
 
-def get_activity_history(market_id: str) -> List[Dict[str, Any]]:
+def get_activity_history(market_id: str, profile: Optional[str] = None) -> List[Dict[str, Any]]:
+    wallet_address = get_polymarket_context(profile).wallet_address
     url = "https://data-api.polymarket.com/activity"
-    params = {"market": str(market_id), "user": WALLET_ADDRESS}
+    params = {"market": str(market_id), "user": wallet_address}
     
     try:
         response = requests.get(url, params=params)
@@ -664,9 +765,14 @@ def get_activity_history(market_id: str) -> List[Dict[str, Any]]:
         logger.warning("get_activity_history failed: market_id=%s error=%s", market_id, e)
         return []
 
-def get_5m_updown_activity_history(since_ts: Optional[int] = None, until_ts: Optional[int] = None) -> List[Dict[str, Any]]:
+def get_5m_updown_activity_history(
+    since_ts: Optional[int] = None,
+    until_ts: Optional[int] = None,
+    profile: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    wallet_address = get_polymarket_context(profile).wallet_address
     url = "https://data-api.polymarket.com/activity"
-    params = {"user": WALLET_ADDRESS,"limit": 1000,"start": since_ts, "end": until_ts}
+    params = {"user": wallet_address, "limit": 1000, "start": since_ts, "end": until_ts}
     try:
         response = requests.get(url, params=params)
         response.raise_for_status()
@@ -709,7 +815,8 @@ def _round2(value: float) -> float:
 
 def calculate_activity_pnl_from_trade_events(
     since_ts: int,
-    until_ts: Optional[int] = None
+    until_ts: Optional[int] = None,
+    profile: Optional[str] = None,
 ) -> Dict[str, Any]:
     """统计给定时间区间内 5m up/down activity 的 USDC 收益。
 
@@ -725,7 +832,11 @@ def calculate_activity_pnl_from_trade_events(
     """
     since_ts = int(since_ts)
     until_ts_int = int(until_ts) if until_ts is not None else None
-    batch = get_5m_updown_activity_history(since_ts=since_ts, until_ts=until_ts_int)
+    batch = get_5m_updown_activity_history(
+        since_ts=since_ts,
+        until_ts=until_ts_int,
+        profile=profile,
+    )
     if not isinstance(batch, list):
         batch = []
 

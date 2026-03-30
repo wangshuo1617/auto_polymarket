@@ -61,6 +61,7 @@ from services.five_minute_trade.watchers import (
 )
 
 logger = logging.getLogger(__name__)
+TRADE_PROFILE = "trade"
 
 
 def _fmt_num(value: float) -> str:
@@ -1726,12 +1727,14 @@ class FiveMinuteUpDownTrader:
         try:
             api_pnl_hourly = calculate_activity_pnl_from_trade_events(
                 since_ts=hourly_since_ts, until_ts=now_ts,
+                profile=TRADE_PROFILE,
             )
         except Exception as e:
             logger.warning("拉取本小时API实盘盈亏失败: %s", e)
         try:
             api_pnl_cumulative = calculate_activity_pnl_from_trade_events(
                 since_ts=cumulative_since_ts, until_ts=now_ts,
+                profile=TRADE_PROFILE,
             )
         except Exception as e:
             logger.warning("拉取累计API实盘盈亏失败: %s", e)

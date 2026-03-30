@@ -27,6 +27,7 @@ from services.volatility import build_daily_volatility_profile
 
 LAST_REPORT_PATH = Path(__file__).resolve().parent / "last_report_gold.json"
 ET_TIMEZONE = ZoneInfo("America/New_York")
+ANALYZE_PROFILE = "analyze"
 
 DEFAULT_GOLD_SLUG_PATTERN = "will-gold-gc-hit-by-end-of-{month}"
 
@@ -163,8 +164,8 @@ if __name__ == "__main__":
         event_token_info = {}
         gold_condition_ids = set()
 
-    positions = get_positions()
-    orders = get_open_orders()
+    positions = get_positions(profile=ANALYZE_PROFILE)
+    orders = get_open_orders(profile=ANALYZE_PROFILE)
     if gold_condition_ids:
         positions, orders = _filter_gold_positions_and_orders(
             positions, orders, gold_condition_ids,
@@ -199,7 +200,7 @@ if __name__ == "__main__":
         print(f"{time_now} 获取黄金 event 现价失败: {e}，使用空事件")
         event_situation = {"event_name": gold_slug, "markets": []}
 
-    usdc_balance = get_balance_allowance()
+    usdc_balance = get_balance_allowance(profile=ANALYZE_PROFILE)
 
     previous_report = _load_previous_report()
     if previous_report:

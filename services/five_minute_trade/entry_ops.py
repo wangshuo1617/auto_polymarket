@@ -16,6 +16,7 @@ from .risk_sizing import RiskAssessment, assess_risk
 from .watchers import PolymarketAssetPriceWatcher
 
 logger = logging.getLogger(__name__)
+TRADE_PROFILE = "trade"
 
 
 def select_market_and_tokens(trader: Any, market_slug: str) -> Dict[str, Any]:
@@ -58,13 +59,14 @@ def select_market_and_tokens(trader: Any, market_slug: str) -> Dict[str, Any]:
     market_id = result["market_id"]
     if market_id:
         meta_t0 = time.perf_counter()
-        result["market_meta"] = get_market_metadata(market_id)
+        result["market_meta"] = get_market_metadata(market_id, profile=TRADE_PROFILE)
         meta_ms = (time.perf_counter() - meta_t0) * 1000
         self._record_latency("market_meta_fetch", meta_ms)
 
         prefetch_t0 = time.perf_counter()
         prefetch_order_metadata_for_tokens(
             token_ids=[str(result["up_token"]), str(result["down_token"])],
+            profile=TRADE_PROFILE,
             market_meta=result["market_meta"],
             refresh_fee_rate=True,
         )
@@ -307,6 +309,7 @@ def open_position(
             token_id,
             sweep_entry_price,
             size,
+            profile=TRADE_PROFILE,
             market_meta=market_meta,
         )
         submit_ms = (time.perf_counter() - submit_t0) * 1000

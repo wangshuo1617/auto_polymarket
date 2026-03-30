@@ -24,12 +24,15 @@ from config import (
     BUILDER_API_KEY,
     BUILDER_PASSPHRASE,
     BUILDER_SECRET,
-    POLYMARKET_KEY,
-    WALLET_ADDRESS,
 )
-from data.polymarket import client as clob_client, get_5m_updown_activity_history
+from data.polymarket import (
+    get_client,
+    get_polymarket_context,
+    get_5m_updown_activity_history,
+)
 
 logger = logging.getLogger(__name__)
+TRADE_PROFILE = "trade"
 
 # ---------------------------------------------------------------------------
 # 合约常量
@@ -47,6 +50,7 @@ _REDEEM_SELECTOR = bytes.fromhex("01b7037c")
 
 def _build_relay_client() -> RelayClient:
     """构建并返回 gasless Relayer 客户端（Safe Wallet 模式）。"""
+    trade_ctx = get_polymarket_context(TRADE_PROFILE)
     creds = BuilderApiKeyCreds(
         key=BUILDER_API_KEY,
         secret=BUILDER_SECRET,
@@ -56,7 +60,7 @@ def _build_relay_client() -> RelayClient:
     return RelayClient(
         relayer_url=RELAYER_URL,
         chain_id=CHAIN_ID,
-        private_key=POLYMARKET_KEY,
+        private_key=trade_ctx.private_key,
         builder_config=builder_config,
         relay_tx_type=RelayerTxType.SAFE,
     )
@@ -80,7 +84,11 @@ def find_unredeemed_markets(lookback_sec: int = LOOKBACK_SECONDS) -> list[dict]:
     """
     now = int(time.time())
     since_ts = now - lookback_sec
-    activities = get_5m_updown_activity_history(since_ts=since_ts, until_ts=now)
+    activities = get_5m_updown_activity_history(
+        since_ts=since_ts,
+        until_ts=now,
+        profile=TRADE_PROFILE,
+    )
     logger.info("auto_redeem: 过去 %d 秒获取到 %d 条 activity", lookback_sec, len(activities))
 
     by_condition: dict[str, dict] = {}
@@ -142,7 +150,8 @@ def run_auto_redeem(lookback_sec: int = LOOKBACK_SECONDS) -> int:
 
     relay_client = _build_relay_client()
     safe_addr = relay_client.get_expected_safe()
-    logger.info("auto_redeem: 使用 gasless relayer, Safe=%s WALLET_ADDRESS=%s", safe_addr, WALLET_ADDRESS)
+    trade_wallet = get_polymarket_context(TRADE_PROFILE).wallet_address
+    logger.info("auto_redeem: 使用 gasless relayer, Safe=%s WALLET_ADDRESS=%s", safe_addr, trade_wallet)
 
     success_count = 0
     for market in unredeemed:
@@ -162,6 +171,7 @@ def run_auto_redeem(lookback_sec: int = LOOKBACK_SECONDS) -> int:
 
 def _is_market_resolved(condition_id: str) -> bool:
     """通过 CLOB API 检查市场是否已 resolved（任一 token 的 winner=True）。"""
+    clob_client = get_client(TRADE_PROFILE)
     try:
         market = clob_client.get_market(condition_id)
         tokens = market.get("tokens", [])
@@ -174,11 +184,12 @@ if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    trade_wallet = get_polymarket_context(TRADE_PROFILE).wallet_address
     client = _build_relay_client()
     safe_addr = client.get_expected_safe()
     print(f"Safe wallet: {safe_addr}")
-    print(f"WALLET_ADDRESS: {WALLET_ADDRESS}")
-    if safe_addr.lower() != (WALLET_ADDRESS or "").lower():
+    print(f"WALLET_ADDRESS: {trade_wallet}")
+    if safe_addr.lower() != (trade_wallet or "").lower():
         print(f"WARNING: Safe地址与WALLET_ADDRESS不匹配!")
     conditionId = "0x0548c3ba5886378f222257a73cdb0d86c1bad160eea31840c5d9b0caee24c2b5"
     market_slug = "btc-updown-5m-1774222500"

@@ -21,6 +21,7 @@ from services.volatility import build_daily_volatility_profile
 
 LAST_REPORT_PATH = Path(__file__).resolve().parent / "last_report.json"
 ET_TIMEZONE = ZoneInfo("America/New_York")
+ANALYZE_PROFILE = "analyze"
 
 
 def _build_intraday_volatility_hint() -> dict:
@@ -142,8 +143,8 @@ if __name__ == "__main__":
     email_sender = EmailSender()
     time_now = datetime.now(ET_TIMEZONE).strftime("%m-%d %H:%M")
 
-    positions = get_positions()
-    orders = get_open_orders()
+    positions = get_positions(profile=ANALYZE_PROFILE)
+    orders = get_open_orders(profile=ANALYZE_PROFILE)
     matched_results = match_orders_with_positions(orders, positions)
     formatted = format_matched_data(matched_results)
     print(f"{time_now} Polymarket持仓情况格式化完成")
@@ -184,7 +185,7 @@ if __name__ == "__main__":
         print(f"{time_now} 已加载上一时间段报告作为参考")
 
     event_situation = get_event_situation()
-    usdc_balance = get_balance_allowance()
+    usdc_balance = get_balance_allowance(profile=ANALYZE_PROFILE)
     profit_optimization_context = build_profit_optimization_context(
         polymarket_event_situation=event_situation,
         future_possibility_context=future_possibility_context,

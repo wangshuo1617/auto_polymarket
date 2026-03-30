@@ -17,6 +17,7 @@ from .models import OpenPosition
 from .watchers import PolymarketAssetPriceWatcher
 
 logger = logging.getLogger(__name__)
+TRADE_PROFILE = "trade"
 
 
 def schedule_position_balance_confirmation(
@@ -44,7 +45,7 @@ def schedule_position_balance_confirmation(
         if order_id:
             _sleep_until(match_check_delay_sec)
             try:
-                detail = get_order_detail(order_id)
+                detail = get_order_detail(order_id, profile=TRADE_PROFILE)
                 if isinstance(detail, dict):
                     matched_size = self._parse_order_matched_size(detail)
                     matched_price = self._extract_execution_price_from_order(detail)
@@ -73,7 +74,7 @@ def schedule_position_balance_confirmation(
             market_meta = market_info.get("market_meta") or {}
             tick_size = market_meta.get("minimum_tick_size", "0.01")
 
-        raw_balance = get_conditional_token_balance(token_id)
+        raw_balance = get_conditional_token_balance(token_id, profile=TRADE_PROFILE)
         confirmed_size = normalize_order_size(raw_balance, tick_size=tick_size)
 
         if confirmed_size <= 0 and matched_size > 0:
@@ -90,7 +91,7 @@ def schedule_position_balance_confirmation(
                     matched_size,
                 )
                 _sleep_until(retry_balance_delay_sec)
-            raw_balance_retry = get_conditional_token_balance(token_id)
+            raw_balance_retry = get_conditional_token_balance(token_id, profile=TRADE_PROFILE)
             confirmed_size_retry = normalize_order_size(raw_balance_retry, tick_size=tick_size)
             logger.info(
                 "建仓后余额二次确认: market=%s token=%s first=%.6f retry=%.6f raw_retry=%.6f order_id=%s retry_delay=%ss",
@@ -233,7 +234,7 @@ def schedule_post_close_balance_check(
         if order_id:
             _sleep_until(match_check_delay_sec)
             try:
-                order_detail = get_order_detail(order_id)
+                order_detail = get_order_detail(order_id, profile=TRADE_PROFILE)
                 if isinstance(order_detail, dict):
                     order_status = str(order_detail.get("status") or "").upper()
                     matched_raw = self._parse_order_matched_size(order_detail)
@@ -294,13 +295,13 @@ def schedule_post_close_balance_check(
         market_meta = market_info.get("market_meta") or {}
         tick_size = market_meta.get("minimum_tick_size", "0.01")
 
-        raw_balance = get_conditional_token_balance(closed_position.token_id)
+        raw_balance = get_conditional_token_balance(closed_position.token_id, profile=TRADE_PROFILE)
         remaining_size = normalize_order_size(raw_balance, tick_size=tick_size)
         sold_by_balance = max(0.0, target_close_size - remaining_size)
 
         if order_id:
             try:
-                refreshed_detail = get_order_detail(order_id)
+                refreshed_detail = get_order_detail(order_id, profile=TRADE_PROFILE)
                 if isinstance(refreshed_detail, dict):
                     order_detail = refreshed_detail
                     matched_raw = max(matched_raw, self._parse_order_matched_size(refreshed_detail))
@@ -483,12 +484,12 @@ def force_close_position(trader: Any, reason: str, close_retry_count: int = 0) -
     if market_info:
         market_meta = market_info.get("market_meta")
     if market_meta is None:
-        market_meta = get_market_metadata(pos.market_id)
+        market_meta = get_market_metadata(pos.market_id, profile=TRADE_PROFILE)
 
     exit_price = pos.last_best_bid
     if exit_price is None or exit_price <= 0:
         try:
-            book = get_order_book(pos.token_id)
+            book = get_order_book(pos.token_id, profile=TRADE_PROFILE)
             if book is not None:
                 bids = getattr(book, "bids", None) or []
                 if bids:
@@ -608,6 +609,7 @@ def force_close_position(trader: Any, reason: str, close_retry_count: int = 0) -
             pos.token_id,
             sweep_price,
             target_close_size,
+            profile=TRADE_PROFILE,
             market_meta=market_meta,
         )
         submit_ms = (time.perf_counter() - submit_t0) * 1000

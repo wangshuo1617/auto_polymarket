@@ -6,6 +6,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# 强制 5m 交易路径默认使用 trade 账号 profile（可由外部环境覆盖）
+export POLYMARKET_PROFILE="${POLYMARKET_PROFILE:-trade}"
+
 # 基础运行模式
 MODE="${1:---live}"                                  # 运行模式：--live / --dry-run
 STAKE_USD="${5:-10.0}"                              # 单笔基础仓位（USDC）
@@ -326,6 +329,7 @@ echo "重启 5m_trade 服务"
 echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "工作目录: $PROJECT_ROOT"
 echo "模式参数: $MODE"
+echo "账号 profile: $POLYMARKET_PROFILE"
 echo "建仓分钟: $ENTRY_MINUTE"
 echo "收盘前抢跑秒数: $ENTRY_PRECLOSE_SEC"
 echo "最小方向差值: $MIN_DIRECTION_DIFF"
