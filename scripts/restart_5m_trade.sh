@@ -74,7 +74,6 @@ POSITION_GUARD_MIN_CONSECUTIVE_SEC="${POSITION_GUARD_MIN_CONSECUTIVE_SEC:-${44:-
 
 # 系统控制
 REPORT_INTERVAL_SEC="${REPORT_INTERVAL_SEC:-${6:-3600}}"      # 报告输出间隔（秒）
-TRADE_DB_PATH="${TRADE_DB_PATH:-${9:-}}"                      # SQLite 路径，空则走默认配置
 
 # 日志文件
 LOG_FILE="logs/5m_trade.stdout.log"
@@ -371,11 +370,7 @@ echo "方向一致性确认最小偏离阈值: min_abs_diff=$DIRECTION_CONFIRM_M
 echo "方向确认低价差强平: enable=$ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE low_diff_threshold=$DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD"
 echo "终盘反向风控: enable=$ENABLE_LAST_SECONDS_REVERSE_GUARD start_sec=$REVERSE_GUARD_START_SEC lookback_sec=$REVERSE_GUARD_LOOKBACK_SEC btc_move=$REVERSE_GUARD_BTC_MOVE require_cross_open=$REVERSE_GUARD_REQUIRE_CROSS_OPEN"
 echo "终盘位置风控: enable=$ENABLE_LAST_SECONDS_POSITION_GUARD start_sec=$POSITION_GUARD_START_SEC min_consecutive_sec=$POSITION_GUARD_MIN_CONSECUTIVE_SEC"
-if [ -n "$TRADE_DB_PATH" ]; then
-  echo "交易数据库路径: $TRADE_DB_PATH"
-else
-  echo "交易数据库路径: 使用 config.SQLITE_DB_PATH"
-fi
+echo "数据库: PG_DSN 环境变量"
 echo "=========================================="
 
 _build_cmd() {
@@ -418,10 +413,6 @@ _build_cmd() {
     --position-guard-start-sec "$POSITION_GUARD_START_SEC"
     --position-guard-min-consecutive-sec "$POSITION_GUARD_MIN_CONSECUTIVE_SEC"
   )
-
-  if [ -n "$TRADE_DB_PATH" ]; then
-    CMD+=(--trade-db-path "$TRADE_DB_PATH")
-  fi
 
   CMD+=(--minute-consistency "$MINUTE_CONSISTENCY")
 

@@ -11,6 +11,7 @@ dependencies = [
     "optuna>=3.6.1",
     "pandas>=2.3.3",
     "playwright>=1.57.0",
+    "psycopg2-binary>=2.9.9",
     "py-clob-client>=0.34.5",
     "websocket-client>=1.9.0",
     "yfinance>=1.1.0",

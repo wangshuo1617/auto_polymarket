@@ -4,8 +4,6 @@ import os
 from logging.handlers import RotatingFileHandler
 from typing import Any, Type
 
-from config import SQLITE_DB_PATH
-
 from .models import ProjectDiagFilter
 
 
@@ -168,12 +166,6 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="16,19,20",
         help="UTC 小时黑名单，逗号分隔（例如 16,19,20）；传空字符串表示不跳过任何小时",
-    )
-    parser.add_argument(
-        "--trade-db-path",
-        type=str,
-        default=SQLITE_DB_PATH,
-        help="交易事件SQLite文件路径（默认读取 config.SQLITE_DB_PATH）",
     )
     parser.add_argument(
         "--enable-risk-sizing",
@@ -398,7 +390,6 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         minute_consistency=args.minute_consistency,
         exit_mode=args.exit_mode,
         toxic_utc_hours=args.toxic_utc_hours,
-        trade_db_path=args.trade_db_path,
         dry_run=args.dry_run,
         enable_risk_sizing=args.enable_risk_sizing,
         risk_min_stake_ratio=args.risk_min_stake_ratio,

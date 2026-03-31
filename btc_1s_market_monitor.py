@@ -12,14 +12,16 @@ import json
 import logging
 import os
 import queue
-import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import SQLITE_DB_PATH
+import psycopg2.extras
+
+from config import SQLITE_DB_PATH  # 迁移过渡期保留
+from data.database import get_conn
 
 from data.polymarket import (
 	client,
@@ -51,7 +53,7 @@ class PriceBookState:
 class SQLiteBatchWriter:
 	def __init__(
 		self,
-		db_path: str,
+		db_path: str = "",
 		flush_rows: int = 500,
 		flush_interval_sec: float = 1.0,
 	) -> None:
@@ -65,7 +67,6 @@ class SQLiteBatchWriter:
 	def start(self) -> None:
 		if self._running:
 			return
-		os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
 		self._running = True
 		self._thread = threading.Thread(target=self._run, daemon=True)
 		self._thread.start()
@@ -84,146 +85,58 @@ class SQLiteBatchWriter:
 		try:
 			self._queue.put(row, timeout=1)
 		except queue.Full:
-			logger.warning("SQLite 写入队列已满，丢弃 1 条记录")
-
-	def _init_db(self, conn: sqlite3.Connection) -> None:
-		conn.execute("PRAGMA journal_mode=WAL;")
-		conn.execute("PRAGMA synchronous=NORMAL;")
-		conn.execute("PRAGMA busy_timeout=5000;")
-		conn.execute("PRAGMA temp_store=MEMORY;")
-		conn.execute(
-			"""
-			CREATE TABLE IF NOT EXISTS btc_poly_1s_ticks (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				ts_sec INTEGER NOT NULL,
-				ts_utc TEXT NOT NULL,
-				market_slug TEXT NOT NULL,
-				window_start_ms INTEGER NOT NULL,
-				window_start_utc TEXT NOT NULL,
-				btc_price REAL,
-				btc_event_ms INTEGER,
-				btc_age_ms INTEGER,
-				up_token TEXT,
-				down_token TEXT,
-				market_id TEXT,
-				minimum_tick_size TEXT,
-				up_fee_rate_bps REAL,
-				down_fee_rate_bps REAL,
-				up_best_bid REAL,
-				up_best_bid_high REAL,
-				up_best_bid_low REAL,
-				up_best_ask REAL,
-				up_event_ms INTEGER,
-				up_age_ms INTEGER,
-				down_best_bid REAL,
-				down_best_bid_high REAL,
-				down_best_bid_low REAL,
-				down_best_ask REAL,
-				down_event_ms INTEGER,
-				down_age_ms INTEGER,
-				up_bids_5 TEXT,
-				up_asks_5 TEXT,
-				down_bids_5 TEXT,
-				down_asks_5 TEXT,
-				winning_direction TEXT,
-				created_at_utc TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-			)
-			"""
-		)
-		conn.execute(
-			"CREATE INDEX IF NOT EXISTS idx_btc_poly_1s_ticks_ts ON btc_poly_1s_ticks(ts_sec)"
-		)
-		conn.execute(
-			"CREATE INDEX IF NOT EXISTS idx_btc_poly_1s_ticks_market ON btc_poly_1s_ticks(market_slug)"
-		)
-		conn.execute(
-			"CREATE INDEX IF NOT EXISTS idx_btc_poly_1s_ticks_wms_wd ON btc_poly_1s_ticks(window_start_ms, winning_direction)"
-		)
-		self._ensure_table_columns(conn)
-		conn.commit()
-
-	def _ensure_table_columns(self, conn: sqlite3.Connection) -> None:
-		# Backward compatibility for existing databases created before top-5 book columns.
-		required_columns = {
-			"market_id": "TEXT",
-			"minimum_tick_size": "TEXT",
-			"up_fee_rate_bps": "REAL",
-			"down_fee_rate_bps": "REAL",
-			"up_best_bid_high": "REAL",
-			"up_best_bid_low": "REAL",
-			"down_best_bid_high": "REAL",
-			"down_best_bid_low": "REAL",
-			"up_bids_5": "TEXT",
-			"up_asks_5": "TEXT",
-			"down_bids_5": "TEXT",
-			"down_asks_5": "TEXT",
-			"winning_direction": "TEXT",
-		}
-		existing = {
-			str(row[1])
-			for row in conn.execute("PRAGMA table_info(btc_poly_1s_ticks)")
-		}
-		added: List[str] = []
-		for col_name, col_type in required_columns.items():
-			if col_name in existing:
-				continue
-			conn.execute(
-				f"ALTER TABLE btc_poly_1s_ticks ADD COLUMN {col_name} {col_type}"
-			)
-			added.append(col_name)
-		if added:
-			logger.info("btc_poly_1s_ticks 自动补齐列: %s", ",".join(added))
-			conn.commit()
+			logger.warning("PG 写入队列已满，丢弃 1 条记录")
 
 	def _flush_rows(
 		self,
-		conn: sqlite3.Connection,
 		rows: List[Tuple[Any, ...]],
 	) -> None:
 		if not rows:
 			return
 		batch_created_at_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
 		rows_with_created = [(*row, batch_created_at_utc) for row in rows]
-		conn.executemany(
-			"""
-			INSERT INTO btc_poly_1s_ticks (
-				ts_sec,
-				ts_utc,
-				market_slug,
-				window_start_ms,
-				window_start_utc,
-				btc_price,
-				btc_event_ms,
-				btc_age_ms,
-				up_token,
-				down_token,
-				market_id,
-				minimum_tick_size,
-				up_fee_rate_bps,
-				down_fee_rate_bps,
-				up_best_bid,
-				up_best_bid_high,
-				up_best_bid_low,
-				up_best_ask,
-				up_event_ms,
-				up_age_ms,
-				down_best_bid,
-				down_best_bid_high,
-				down_best_bid_low,
-				down_best_ask,
-				down_event_ms,
-				down_age_ms,
-				up_bids_5,
-				up_asks_5,
-				down_bids_5,
-				down_asks_5,
-				winning_direction,
-				created_at_utc
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			""",
-			rows_with_created,
-		)
-		conn.commit()
+		with get_conn() as conn:
+			psycopg2.extras.execute_values(
+				conn.cursor(),
+				"""
+				INSERT INTO btc_poly_1s_ticks (
+					ts_sec,
+					ts_utc,
+					market_slug,
+					window_start_ms,
+					window_start_utc,
+					btc_price,
+					btc_event_ms,
+					btc_age_ms,
+					up_token,
+					down_token,
+					market_id,
+					minimum_tick_size,
+					up_fee_rate_bps,
+					down_fee_rate_bps,
+					up_best_bid,
+					up_best_bid_high,
+					up_best_bid_low,
+					up_best_ask,
+					up_event_ms,
+					up_age_ms,
+					down_best_bid,
+					down_best_bid_high,
+					down_best_bid_low,
+					down_best_ask,
+					down_event_ms,
+					down_age_ms,
+					up_bids_5,
+					up_asks_5,
+					down_bids_5,
+					down_asks_5,
+					winning_direction,
+					created_at_utc
+				) VALUES %s
+				""",
+				rows_with_created,
+				template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+			)
 
 	@staticmethod
 	def _update_bid_extrema(state: PriceBookState, best_bid: Optional[float]) -> None:
@@ -235,13 +148,6 @@ class SQLiteBatchWriter:
 			state.best_bid_low = best_bid
 
 	def _run(self) -> None:
-		conn = sqlite3.connect(
-			self.db_path,
-			timeout=5.0,
-			check_same_thread=False,
-			isolation_level=None,
-		)
-		self._init_db(conn)
 		buffer: List[Tuple[Any, ...]] = []
 		last_flush = time.time()
 
@@ -265,18 +171,15 @@ class SQLiteBatchWriter:
 					or (buffer and (now - last_flush) >= self.flush_interval_sec)
 				)
 				if should_flush:
-					self._flush_rows(conn, buffer)
+					self._flush_rows(buffer)
 					buffer.clear()
 					last_flush = now
 
 			if buffer:
-				self._flush_rows(conn, buffer)
+				self._flush_rows(buffer)
 				buffer.clear()
 		finally:
-			try:
-				conn.close()
-			except Exception:
-				pass
+			pass
 
 
 class BTC1sMarketMonitor:
@@ -578,36 +481,35 @@ class BTC1sMarketMonitor:
 	"""
 		# --- immediate BTC-price-based resolution ---
 		try:
-			conn = sqlite3.connect(self.db_path)
-			cur = conn.execute(
-				"SELECT btc_price FROM btc_poly_1s_ticks "
-				"WHERE window_start_ms = ? AND btc_price IS NOT NULL "
-				"ORDER BY ts_sec ASC LIMIT 1",
-				(prev_window_start_ms,),
-			)
-			open_row = cur.fetchone()
-			cur = conn.execute(
-				"SELECT btc_price FROM btc_poly_1s_ticks "
-				"WHERE window_start_ms = ? AND btc_price IS NOT NULL "
-				"ORDER BY ts_sec DESC LIMIT 1",
-				(prev_window_start_ms,),
-			)
-			close_row = cur.fetchone()
-			if open_row and close_row:
-				open_price = float(open_row[0])
-				close_price = float(close_row[0])
-				winner = "up" if close_price > open_price else "down"
-				conn.execute(
-					"UPDATE btc_poly_1s_ticks SET winning_direction = ? "
-					"WHERE window_start_ms = ? AND winning_direction IS NULL",
-					(winner, prev_window_start_ms),
+			with get_conn() as conn:
+				cur = conn.cursor()
+				cur.execute(
+					"SELECT btc_price FROM btc_poly_1s_ticks "
+					"WHERE window_start_ms = %s AND btc_price IS NOT NULL "
+					"ORDER BY ts_sec ASC LIMIT 1",
+					(prev_window_start_ms,),
 				)
-				conn.commit()
-				logger.info(
-					"回填 winning_direction=%s window_start_ms=%d (open=%.2f close=%.2f)",
-					winner, prev_window_start_ms, open_price, close_price,
+				open_row = cur.fetchone()
+				cur.execute(
+					"SELECT btc_price FROM btc_poly_1s_ticks "
+					"WHERE window_start_ms = %s AND btc_price IS NOT NULL "
+					"ORDER BY ts_sec DESC LIMIT 1",
+					(prev_window_start_ms,),
 				)
-			conn.close()
+				close_row = cur.fetchone()
+				if open_row and close_row:
+					open_price = float(open_row[0])
+					close_price = float(close_row[0])
+					winner = "up" if close_price > open_price else "down"
+					cur.execute(
+						"UPDATE btc_poly_1s_ticks SET winning_direction = %s "
+						"WHERE window_start_ms = %s AND winning_direction IS NULL",
+						(winner, prev_window_start_ms),
+					)
+					logger.info(
+						"回填 winning_direction=%s window_start_ms=%d (open=%.2f close=%.2f)",
+						winner, prev_window_start_ms, open_price, close_price,
+					)
 		except Exception:
 			logger.exception("回填 winning_direction 失败 window_start_ms=%d", prev_window_start_ms)
 
@@ -674,32 +576,31 @@ class BTC1sMarketMonitor:
 				return
 
 			# Update DB — overwrite all rows for this window
-			conn = sqlite3.connect(self.db_path)
-			cur = conn.execute(
-				"SELECT winning_direction FROM btc_poly_1s_ticks "
-				"WHERE window_start_ms = ? LIMIT 1",
-				(window_start_ms,),
-			)
-			row = cur.fetchone()
-			old_winner = row[0] if row else None
+			with get_conn() as conn:
+				cur = conn.cursor()
+				cur.execute(
+					"SELECT winning_direction FROM btc_poly_1s_ticks "
+					"WHERE window_start_ms = %s LIMIT 1",
+					(window_start_ms,),
+				)
+				row = cur.fetchone()
+				old_winner = row[0] if row else None
 
-			if old_winner != api_winner:
-				conn.execute(
-					"UPDATE btc_poly_1s_ticks SET winning_direction = ? "
-					"WHERE window_start_ms = ?",
-					(api_winner, window_start_ms),
-				)
-				conn.commit()
-				logger.warning(
-					"API 验证修正 winning_direction: %s -> %s window_start_ms=%d",
-					old_winner, api_winner, window_start_ms,
-				)
-			else:
-				logger.info(
-					"API 验证 winning_direction=%s 一致 window_start_ms=%d",
-					api_winner, window_start_ms,
-				)
-			conn.close()
+				if old_winner != api_winner:
+					cur.execute(
+						"UPDATE btc_poly_1s_ticks SET winning_direction = %s "
+						"WHERE window_start_ms = %s",
+						(api_winner, window_start_ms),
+					)
+					logger.warning(
+						"API 验证修正 winning_direction: %s -> %s window_start_ms=%d",
+						old_winner, api_winner, window_start_ms,
+					)
+				else:
+					logger.info(
+						"API 验证 winning_direction=%s 一致 window_start_ms=%d",
+						api_winner, window_start_ms,
+					)
 
 		except Exception:
 			logger.exception(
@@ -961,8 +862,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="BTC 与 Polymarket 5m 市场逐秒监控")
 	parser.add_argument(
 		"--db-path",
-		default=SQLITE_DB_PATH,
-		help="SQLite 文件路径（默认读取 config.SQLITE_DB_PATH）",
+		default="",
+		help="已弃用，使用 PG_DSN 环境变量连接 PostgreSQL",
 	)
 	parser.add_argument(
 		"--symbol",

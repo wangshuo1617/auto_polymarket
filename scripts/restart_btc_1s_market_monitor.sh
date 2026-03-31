@@ -16,7 +16,7 @@ echo "=========================================="
 echo "重启 btc_1s_market_monitor 服务"
 echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "工作目录: $PROJECT_ROOT"
-echo "数据库文件: 使用 config.SQLITE_DB_PATH"
+echo "数据库: 使用 PG_DSN 环境变量"
 echo "交易对: $SYMBOL"
 echo "=========================================="
 

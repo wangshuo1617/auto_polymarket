@@ -1,10 +1,10 @@
 import logging
-import os
 import json
-import sqlite3
 import threading
 from datetime import datetime
 from typing import Any, Dict, Optional
+
+from data.database import get_conn
 
 from .models import OpenPosition, TradeRecord
 
@@ -12,102 +12,11 @@ logger = logging.getLogger(__name__)
 
 
 class TradeSQLiteStore:
-    """Persist 5m strategy entry/exit records to SQLite with WAL enabled."""
+    """Persist 5m strategy entry/exit records to PostgreSQL (TimescaleDB)."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str = "") -> None:
         self.db_path = db_path
         self._lock = threading.RLock()
-        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        self._conn = sqlite3.connect(
-            db_path,
-            timeout=5.0,
-            check_same_thread=False,
-            isolation_level=None,
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._init_db()
-
-    def _init_db(self) -> None:
-        with self._lock:
-            cur = self._conn.cursor()
-            cur.execute("PRAGMA journal_mode=WAL;")
-            cur.execute("PRAGMA synchronous=NORMAL;")
-            cur.execute("PRAGMA busy_timeout=5000;")
-            cur.execute("PRAGMA temp_store=MEMORY;")
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS trade_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    event_time TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    market_slug TEXT NOT NULL,
-                    market_id TEXT NOT NULL,
-                    token_id TEXT NOT NULL,
-                    direction TEXT NOT NULL,
-                    reason TEXT,
-                    trade_size REAL NOT NULL,
-                    trade_price REAL NOT NULL,
-                    pnl REAL,
-                    related_entry_time TEXT,
-                    stop_loss_price REAL,
-                    take_profit_price REAL,
-                    best_quote REAL,
-                    avg_fill_price REAL,
-                    full_fill INTEGER,
-                    notional_usdc REAL,
-                    expected_price REAL,
-                    slippage_leakage REAL,
-                    btc_price_at_trade REAL,
-                    order_id TEXT,
-                    mode TEXT NOT NULL DEFAULT 'live'
-                );
-                """
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_trade_events_event_time ON trade_events(event_time);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_trade_events_market_slug ON trade_events(market_slug);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_trade_events_side ON trade_events(side);"
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS trade_startups (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    start_ts_sec INTEGER NOT NULL,
-                    strategy_signature TEXT NOT NULL,
-                    mode TEXT NOT NULL,
-                    dry_run INTEGER NOT NULL,
-                    entry_minute INTEGER,
-                    entry_preclose_sec INTEGER,
-                    min_direction_diff REAL,
-                    max_entry_price REAL,
-                    stake_usd REAL,
-                    report_interval_sec INTEGER,
-                    min_hold_before_close_sec INTEGER,
-                    tp_price_cap REAL,
-                    tp_value_cap REAL,
-                    sl_to_tp_ratio REAL,
-                    toxic_utc_hours TEXT,
-                    trade_db_path TEXT,
-                    pid INTEGER,
-                    hostname TEXT,
-                    et_time_str TEXT,
-                    params_json TEXT
-                );
-                """
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_trade_startups_start_ts_sec ON trade_startups(start_ts_sec);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_trade_startups_signature ON trade_startups(strategy_signature);"
-            )
-            self._conn.commit()
 
     @staticmethod
     def _to_utc_iso(ts: datetime) -> str:
@@ -128,8 +37,8 @@ class TradeSQLiteStore:
         dry_run: bool,
         btc_price_at_trade: Optional[float],
     ) -> None:
-        with self._lock:
-            self._conn.execute(
+        with self._lock, get_conn() as conn:
+            conn.cursor().execute(
                 """
                 INSERT INTO trade_events (
                     event_time,
@@ -151,7 +60,7 @@ class TradeSQLiteStore:
                     btc_price_at_trade,
                     order_id,
                     mode
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     self._to_utc_iso(position.entry_time),
@@ -175,7 +84,6 @@ class TradeSQLiteStore:
                     "dry-run" if dry_run else "live",
                 ),
             )
-            self._conn.commit()
 
     def write_realized_trade(
         self,
@@ -184,8 +92,8 @@ class TradeSQLiteStore:
         btc_price_at_trade: Optional[float],
         order_id: Optional[str],
     ) -> None:
-        with self._lock:
-            self._conn.execute(
+        with self._lock, get_conn() as conn:
+            conn.cursor().execute(
                 """
                 INSERT INTO trade_events (
                     event_time,
@@ -208,7 +116,7 @@ class TradeSQLiteStore:
                     btc_price_at_trade,
                     order_id,
                     mode
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     self._to_utc_iso(record.exit_time),
@@ -233,7 +141,6 @@ class TradeSQLiteStore:
                     "dry-run" if dry_run else "live",
                 ),
             )
-            self._conn.commit()
 
     def write_skip_event(
         self,
@@ -246,8 +153,8 @@ class TradeSQLiteStore:
         direction: Optional[str] = None,
         btc_price_at_trade: Optional[float] = None,
     ) -> None:
-        with self._lock:
-            self._conn.execute(
+        with self._lock, get_conn() as conn:
+            conn.cursor().execute(
                 """
                 INSERT INTO trade_events (
                     event_time,
@@ -261,7 +168,7 @@ class TradeSQLiteStore:
                     trade_price,
                     btc_price_at_trade,
                     mode
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     self._to_utc_iso(event_time),
@@ -277,7 +184,6 @@ class TradeSQLiteStore:
                     "dry-run" if dry_run else "live",
                 ),
             )
-            self._conn.commit()
 
     def write_startup_event(
         self,
@@ -291,8 +197,8 @@ class TradeSQLiteStore:
     ) -> None:
         payload = json.dumps(startup_params, ensure_ascii=False, sort_keys=True)
         mode = "dry-run" if dry_run else "live"
-        with self._lock:
-            self._conn.execute(
+        with self._lock, get_conn() as conn:
+            conn.cursor().execute(
                 """
                 INSERT INTO trade_startups (
                     start_ts_sec,
@@ -315,7 +221,7 @@ class TradeSQLiteStore:
                     hostname,
                     et_time_str,
                     params_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     int(start_ts_sec),
@@ -340,7 +246,6 @@ class TradeSQLiteStore:
                     payload,
                 ),
             )
-            self._conn.commit()
 
     def delete_entry_event(
         self,
@@ -357,37 +262,36 @@ class TradeSQLiteStore:
         """
         mode = "dry-run" if dry_run else "live"
         related_entry_time = self._to_utc_iso(entry_time)
-        with self._lock:
+        with self._lock, get_conn() as conn:
+            cur = conn.cursor()
             if order_id:
-                cur = self._conn.execute(
+                cur.execute(
                     """
                     DELETE FROM trade_events
                     WHERE side='buy'
                       AND reason='entry'
-                      AND mode=?
-                      AND order_id=?
+                      AND mode=%s
+                      AND order_id=%s
                     """,
                     (mode, order_id),
                 )
                 deleted = int(cur.rowcount or 0)
                 if deleted > 0:
-                    self._conn.commit()
                     return deleted
 
-            cur = self._conn.execute(
+            cur.execute(
                 """
                 DELETE FROM trade_events
                 WHERE side='buy'
                   AND reason='entry'
-                  AND mode=?
-                  AND market_slug=?
-                  AND token_id=?
-                  AND related_entry_time=?
+                  AND mode=%s
+                  AND market_slug=%s
+                  AND token_id=%s
+                  AND related_entry_time=%s
                 """,
                 (mode, market_slug, token_id, related_entry_time),
             )
             deleted = int(cur.rowcount or 0)
-            self._conn.commit()
             return deleted
 
     def mark_entry_event_try_fail(
@@ -405,42 +309,37 @@ class TradeSQLiteStore:
         """
         mode = "dry-run" if dry_run else "live"
         related_entry_time = self._to_utc_iso(entry_time)
-        with self._lock:
+        with self._lock, get_conn() as conn:
+            cur = conn.cursor()
             if order_id:
-                cur = self._conn.execute(
+                cur.execute(
                     """
                     UPDATE trade_events
                     SET reason='entry_try_fail'
                     WHERE side='buy'
-                      AND mode=?
-                      AND order_id=?
+                      AND mode=%s
+                      AND order_id=%s
                     """,
                     (mode, order_id),
                 )
                 updated = int(cur.rowcount or 0)
                 if updated > 0:
-                    self._conn.commit()
                     return updated
 
-            cur = self._conn.execute(
+            cur.execute(
                 """
                 UPDATE trade_events
                 SET reason='entry_try_fail'
                 WHERE side='buy'
-                  AND mode=?
-                  AND market_slug=?
-                  AND token_id=?
-                  AND related_entry_time=?
+                  AND mode=%s
+                  AND market_slug=%s
+                  AND token_id=%s
+                  AND related_entry_time=%s
                 """,
                 (mode, market_slug, token_id, related_entry_time),
             )
             updated = int(cur.rowcount or 0)
-            self._conn.commit()
             return updated
 
     def close(self) -> None:
-        with self._lock:
-            try:
-                self._conn.close()
-            except Exception as e:
-                logger.warning("关闭交易SQLite连接失败: %s", e)
+        pass

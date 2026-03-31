@@ -5,7 +5,7 @@ import csv
 import json
 import math
 import os
-import sqlite3
+import psycopg2
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -529,8 +529,7 @@ def _load_windows(
     max_quote_age_ms: int,
     toxic_hours: set[int],
 ) -> Tuple[List[WindowPrepared], List[WindowQuality], int]:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(db_path)
     estimated_total_windows = _count_windows(conn, start_ts_sec, end_ts_sec)
 
     windows_data: List[WindowPrepared] = []
@@ -629,7 +628,7 @@ def _score_from_stats(stats_row: Dict[str, object], args: argparse.Namespace) ->
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Optuna hyperparameter search for 5m backtest strategy")
-    parser.add_argument("--db-path", type=str, default=os.getenv("SQLITE_DB_PATH", "logs/trade.sqlite3"))
+    parser.add_argument("--db-path", type=str, default=os.getenv("PG_DSN", ""))
     parser.add_argument("--start-ts-sec", type=int, required=True)
     parser.add_argument("--end-ts-sec", type=int, required=True)
     parser.add_argument("--trials", type=int, default=300)

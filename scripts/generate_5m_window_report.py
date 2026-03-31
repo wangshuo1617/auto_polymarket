@@ -4,7 +4,7 @@
 This script combines:
 - live-trade activity from data/polymarket.py
 - strategy skip/entry logs from logs/5m_trade.log
-- aligned BTC/Polymarket 1s snapshots from logs/trade.sqlite3
+- aligned BTC/Polymarket 1s snapshots from PostgreSQL
 
 It outputs:
 - a full per-window CSV
@@ -17,7 +17,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import sqlite3
+import os
+import psycopg2
 import sys
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
@@ -78,7 +79,7 @@ def _parse_args() -> argparse.Namespace:
         help="Explicit UTC end time, e.g. 2026-03-24T01:30:00+00:00 (default: now UTC)",
     )
     parser.add_argument("--log-path", type=str, default="logs/5m_trade.log")
-    parser.add_argument("--db-path", type=str, default="logs/trade.sqlite3")
+    parser.add_argument("--db-path", type=str, default=os.getenv("PG_DSN", ""))
     parser.add_argument("--output-dir", type=str, default="output")
     parser.add_argument(
         "--output-prefix",
@@ -240,15 +241,15 @@ def main() -> None:
     start_utc, end_utc = _resolve_time_range(args)
 
     log_path = Path(str(args.log_path)).resolve()
-    db_path = Path(str(args.db_path)).resolve()
+    db_dsn = str(args.db_path).strip()
     output_dir = Path(str(args.output_dir)).resolve()
     output_prefix = str(args.output_prefix).strip() or _default_output_prefix(start_utc, end_utc)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not log_path.exists():
         raise FileNotFoundError(f"log file not found: {log_path}")
-    if not db_path.exists():
-        raise FileNotFoundError(f"sqlite db not found: {db_path}")
+    if not db_dsn:
+        raise ValueError("--db-path (PG_DSN) is required")
 
     windows = _load_windows_from_log(log_path=log_path, start_utc=start_utc, end_utc=end_utc)
     if not windows:
@@ -270,13 +271,13 @@ def main() -> None:
             activity_by_slug.setdefault(slug, []).append(item)
     pnl_by_slug = {item["slug"]: item for item in pnl_summary["slug_summary"]}
 
-    conn = sqlite3.connect(str(db_path))
+    conn = psycopg2.connect(db_dsn)
     cur = conn.cursor()
     cur.execute(
         """
         SELECT ts_sec, btc_price, window_start_ms, up_best_ask, down_best_ask
         FROM btc_poly_1s_ticks
-        WHERE ts_sec BETWEEN ? AND ? AND btc_price IS NOT NULL
+        WHERE ts_sec BETWEEN %s AND %s AND btc_price IS NOT NULL
         ORDER BY ts_sec
         """,
         (start_ts, end_ts),
@@ -287,7 +288,7 @@ def main() -> None:
         SELECT event_time, market_slug, direction, trade_size, trade_price,
                notional_usdc, stop_loss_price, take_profit_price, btc_price_at_trade
         FROM trade_events
-        WHERE side = 'buy' AND event_time >= ? AND event_time <= ?
+        WHERE side = 'buy' AND event_time >= %s AND event_time <= %s
         ORDER BY event_time
         """,
         (start_utc.isoformat(), end_utc.isoformat()),

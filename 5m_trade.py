@@ -21,7 +21,6 @@ BTC 5m up/down 策略交易服务
 import logging
 import os
 import socket
-import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
@@ -175,7 +174,6 @@ class FiveMinuteUpDownTrader:
         minute_consistency: str = "1,2,3",
         exit_mode: str = "tpsl",
         toxic_utc_hours: Optional[str] = None,
-        trade_db_path: Optional[str] = None,
         dry_run: bool = False,
         enable_risk_sizing: bool = True,
         risk_min_stake_ratio: float = 0.15,
@@ -343,30 +341,22 @@ class FiveMinuteUpDownTrader:
         self._consecutive_stale_windows: int = 0
         self._stale_alert_sent: bool = False
         self._trade_db: Optional[TradeSQLiteStore] = None
-        if trade_db_path:
-            try:
-                self._trade_db = TradeSQLiteStore(db_path=trade_db_path)
-                logger.info("交易记录SQLite已初始化: %s (WAL)", trade_db_path)
-            except Exception as e:
-                logger.error("交易记录SQLite初始化失败，将仅保留内存/日志记录: %s", e)
-        else:
-            logger.warning("未配置 --trade-db-path，交易记录仅保留内存/日志")
+        try:
+            self._trade_db = TradeSQLiteStore()
+            logger.info("交易记录PG已初始化")
+        except Exception as e:
+            logger.error("交易记录PG初始化失败，将仅保留内存/日志记录: %s", e)
 
-        # 与回测对齐的 DB tick 交叉验证读连接
-        self._tick_reader_conn: Optional[sqlite3.Connection] = None
-        if trade_db_path:
-            try:
-                self._tick_reader_conn = sqlite3.connect(
-                    trade_db_path,
-                    timeout=2.0,
-                    check_same_thread=False,
-                    isolation_level=None,
-                )
-                self._tick_reader_conn.execute("PRAGMA journal_mode=WAL;")
-                self._tick_reader_conn.execute("PRAGMA query_only=ON;")
-                logger.info("tick交叉验证读连接已初始化: %s", trade_db_path)
-            except Exception as e:
-                logger.warning("tick交叉验证读连接初始化失败，将跳过入场交叉验证: %s", e)
+        # 与回测对齐的 DB tick 交叉验证读连接（使用 PG 连接池）
+        self._tick_reader_enabled: bool = False
+        try:
+            from data.database import get_conn as _test_conn
+            with _test_conn() as _tc:
+                _tc.cursor().execute("SELECT 1")
+            self._tick_reader_enabled = True
+            logger.info("tick交叉验证读连接已初始化(PG连接池)")
+        except Exception as e:
+            logger.warning("tick交叉验证读连接初始化失败，将跳过入场交叉验证: %s", e)
 
     def _should_emit_log(self, key: str, interval_sec: Optional[float] = None) -> bool:
         interval = (
@@ -694,12 +684,7 @@ class FiveMinuteUpDownTrader:
         if self._poly_watcher:
             self._poly_watcher.stop()
             self._poly_watcher = None
-        if self._tick_reader_conn is not None:
-            try:
-                self._tick_reader_conn.close()
-            except Exception:
-                pass
-            self._tick_reader_conn = None
+        self._tick_reader_enabled = False
         if self._trade_db is not None:
             self._trade_db.close()
 
@@ -1191,7 +1176,7 @@ class FiveMinuteUpDownTrader:
                     continue
                 m_side = "up" if mc > open_price else "down" if mc < open_price else None
                 if m_side is not None and m_side != direction:
-                    reason = "Skip entry: 第%d分钟收盘价=%.2f 在open=%.2f的%s侧，与预判方向%s不一致" % (
+                    reason = "Skip entry: 第%d分钟收盘价=%.2f 在open=%.2f的%s侧，与准备入场方向%s不一致" % (
                         m, mc, open_price, m_side, direction,
                     )
                     logger.info("%s", reason)
@@ -1249,8 +1234,7 @@ class FiveMinuteUpDownTrader:
         返回 True 表示 DB 数据也支持入场；False 表示回测不会入场，应跳过。
         DB 不可用或缺少数据时回退为 True（不拦截）。
         """
-        conn = self._tick_reader_conn
-        if conn is None or self.current_window_start_ms is None:
+        if not self._tick_reader_enabled or self.current_window_start_ms is None:
             return True
 
         window_start_sec = self.current_window_start_ms // 1000
@@ -1259,40 +1243,46 @@ class FiveMinuteUpDownTrader:
         deadline_sec = self.entry_decision_minute * 60
 
         try:
-            # open_price：窗口首条含 btc_price 的行（对齐回测 open_row）
-            row = conn.execute(
-                "SELECT btc_price FROM btc_poly_1s_ticks "
-                "WHERE market_slug = ? AND btc_price IS NOT NULL AND btc_price > 0 "
-                "ORDER BY ts_sec ASC LIMIT 1",
-                (market_slug,),
-            ).fetchone()
-            if row is None:
-                return True
-            db_open_price = float(row[0])
-
-            # decision_price：决策区间 [trigger, deadline) 的首条行（对齐回测 entry_signal_row_source=first）
-            trigger_ts = window_start_sec + trigger_sec
-            deadline_ts = window_start_sec + deadline_sec
-            row = conn.execute(
-                "SELECT btc_price FROM btc_poly_1s_ticks "
-                "WHERE market_slug = ? AND ts_sec >= ? AND ts_sec < ? "
-                "AND btc_price IS NOT NULL AND btc_price > 0 "
-                "ORDER BY ts_sec ASC LIMIT 1",
-                (market_slug, trigger_ts, deadline_ts),
-            ).fetchone()
-            if row is None:
-                # DB 可能还未写入决策秒的 tick，向前扩展 2 秒回退
-                row = conn.execute(
+            from data.database import get_conn
+            with get_conn() as conn:
+                cur = conn.cursor()
+                # open_price：窗口首条含 btc_price 的行（对齐回测 open_row）
+                cur.execute(
                     "SELECT btc_price FROM btc_poly_1s_ticks "
-                    "WHERE market_slug = ? AND ts_sec >= ? AND ts_sec < ? "
+                    "WHERE market_slug = %s AND btc_price IS NOT NULL AND btc_price > 0 "
+                    "ORDER BY ts_sec ASC LIMIT 1",
+                    (market_slug,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return True
+                db_open_price = float(row[0])
+
+                # decision_price：决策区间 [trigger, deadline) 的首条行（对齐回测 entry_signal_row_source=first）
+                trigger_ts = window_start_sec + trigger_sec
+                deadline_ts = window_start_sec + deadline_sec
+                cur.execute(
+                    "SELECT btc_price FROM btc_poly_1s_ticks "
+                    "WHERE market_slug = %s AND ts_sec >= %s AND ts_sec < %s "
                     "AND btc_price IS NOT NULL AND btc_price > 0 "
-                    "ORDER BY ts_sec DESC LIMIT 1",
-                    (market_slug, trigger_ts - 2, trigger_ts),
-                ).fetchone()
-            if row is None:
-                logger.info("DB交叉验证: 决策区间无tick数据，跳过验证 slug=%s", market_slug)
-                return True
-            db_decision_price = float(row[0])
+                    "ORDER BY ts_sec ASC LIMIT 1",
+                    (market_slug, trigger_ts, deadline_ts),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    # DB 可能还未写入决策秒的 tick，向前扩展 2 秒回退
+                    cur.execute(
+                        "SELECT btc_price FROM btc_poly_1s_ticks "
+                        "WHERE market_slug = %s AND ts_sec >= %s AND ts_sec < %s "
+                        "AND btc_price IS NOT NULL AND btc_price > 0 "
+                        "ORDER BY ts_sec DESC LIMIT 1",
+                        (market_slug, trigger_ts - 2, trigger_ts),
+                    )
+                    row = cur.fetchone()
+                if row is None:
+                    logger.info("DB交叉验证: 决策区间无tick数据，跳过验证 slug=%s", market_slug)
+                    return True
+                db_decision_price = float(row[0])
 
             db_diff = db_decision_price - db_open_price
             db_abs_diff = abs(db_diff)
@@ -1880,7 +1870,7 @@ def main() -> None:
 
     startup_store: Optional[TradeSQLiteStore] = None
     try:
-        startup_store = TradeSQLiteStore(db_path=str(args.trade_db_path))
+        startup_store = TradeSQLiteStore()
         startup_store.write_startup_event(
             start_ts_sec=startup_ts_sec,
             strategy_signature=strategy_signature,
@@ -1897,7 +1887,6 @@ def main() -> None:
                 "tp_value_cap": args.tp_value_cap,
                 "sl_to_tp_ratio": args.sl_to_tp_ratio,
                 "toxic_utc_hours": args.toxic_utc_hours,
-                "trade_db_path": args.trade_db_path,
                 "enable_risk_sizing": args.enable_risk_sizing,
                 "risk_min_stake_ratio": args.risk_min_stake_ratio,
                 "risk_max_stake_ratio": args.risk_max_stake_ratio,
@@ -1930,9 +1919,9 @@ def main() -> None:
             hostname=socket.gethostname(),
             et_time_str=_current_et_time_str(),
         )
-        logger.info("已记录启动信息到SQLite: strategy=%s", strategy_signature)
+        logger.info("已记录启动信息到PG: strategy=%s", strategy_signature)
     except Exception as e:
-        logger.error("写入启动信息到SQLite失败: %s", e)
+        logger.error("写入启动信息到PG失败: %s", e)
     finally:
         if startup_store is not None:
             startup_store.close()

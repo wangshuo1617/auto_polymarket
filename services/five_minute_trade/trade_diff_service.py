@@ -930,8 +930,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--db-path",
         type=str,
-        default="logs/trade.sqlite3",
-        help="SQLite path used by backtest (default logs/trade.sqlite3)",
+        default=os.getenv("PG_DSN", ""),
+        help="PostgreSQL DSN used by backtest (default env PG_DSN)",
     )
     parser.add_argument(
         "--backtest-script",

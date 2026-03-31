@@ -20,7 +20,7 @@ fi
 if [[ "$FAST_MODE" == "true" ]]; then
   STRATEGY=""
   SINCE_TS=""
-  DB_PATH="${2:-logs/trade.sqlite3}"
+  DB_PATH="${2:-${PG_DSN:-}}"
   UNTIL_TS="${3:-$DEFAULT_UNTIL_TS}"
   REPORT_JSON="${4:-output/5m_backtest_live_diff_report.json}"
   BACKTEST_SUMMARY_CSV="${5:-output/5m_backtest_diff_summary.csv}"
@@ -33,7 +33,7 @@ else
   STRATEGY="${1:-$DEFAULT_STRATEGY}"
   SINCE_TS="${2:-$DEFAULT_SINCE_TS}"
   UNTIL_TS="${3:-$DEFAULT_UNTIL_TS}"
-  DB_PATH="${4:-logs/trade.sqlite3}"
+  DB_PATH="${4:-${PG_DSN:-}}"
   REPORT_JSON="${5:-output/5m_backtest_live_diff_report.json}"
   BACKTEST_SUMMARY_CSV="${6:-output/5m_backtest_diff_summary.csv}"
   BACKTEST_EVENTS_CSV="${7:-output/5m_backtest_diff_trade_events.csv}"
@@ -59,13 +59,13 @@ print_usage() {
   ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476 logs/trade.sqlite3 output/report.json output/summary.csv output/events.csv 10 output/existing_backtest_events.csv
 
 示例4（自定义逐笔逐市场对比CSV输出）:
-  ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476 logs/trade.sqlite3 output/report.json output/summary.csv output/events.csv 10 "" --disable-output-timestamp output/my_trade_compare.csv
+  ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476 "\$PG_DSN" output/report.json output/summary.csv output/events.csv 10 "" --disable-output-timestamp output/my_trade_compare.csv
 
 示例5（快速模式：自动读取最近一次 live 启动策略和启动时间）:
   ./scripts/5m_trade_diff.sh --fast-live-latest
 
 示例6（快速模式 + 自定义数据库和截止时间）:
-  ./scripts/5m_trade_diff.sh --fast-live-latest logs/trade.sqlite3 1773629750
+  ./scripts/5m_trade_diff.sh --fast-live-latest "\$PG_DSN" 1773629750
 EOF
 }
 
@@ -77,19 +77,24 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 if [[ "$FAST_MODE" == "true" ]]; then
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    echo "❌ 快速模式依赖 sqlite3 命令，但当前环境未安装"
+  if ! command -v psql >/dev/null 2>&1; then
+    echo "❌ 快速模式依赖 psql 命令，但当前环境未安装"
+    exit 1
+  fi
+
+  if [[ -z "$DB_PATH" ]]; then
+    echo "❌ 快速模式需要 PG_DSN 环境变量或传入数据库连接字符串"
     exit 1
   fi
 
   set +e
-  LATEST_LIVE_ROW="$(sqlite3 -noheader -separator $'\t' "$DB_PATH" "SELECT strategy_signature, start_ts_sec FROM trade_startups WHERE mode='live' ORDER BY start_ts_sec DESC, id DESC LIMIT 1;")"
-  SQLITE_EXIT=$?
+  LATEST_LIVE_ROW="$(psql "$DB_PATH" -tAF $'\t' -c "SELECT strategy_signature, start_ts_sec FROM trade_startups WHERE mode='live' ORDER BY start_ts_sec DESC, id DESC LIMIT 1;")"
+  PSQL_EXIT=$?
   set -e
 
-  if (( SQLITE_EXIT != 0 )); then
-    echo "❌ 快速模式读取数据库失败: $DB_PATH"
-    echo "请确认 trade_startups 表存在且数据库可读"
+  if (( PSQL_EXIT != 0 )); then
+    echo "❌ 快速模式读取数据库失败"
+    echo "请确认 trade_startups 表存在且数据库可连接"
     exit 1
   fi
 

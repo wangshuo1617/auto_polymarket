@@ -4,13 +4,15 @@ import logging
 import os
 import re
 import secrets
-import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
+
+import psycopg2.extras
+from data.database import get_conn, get_cursor
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
 from py_clob_client.clob_types import (
@@ -402,17 +404,18 @@ def _load_activity_exit_by_slug(profile: str) -> tuple[dict[str, float], dict[st
     return exit_usdc_by_slug, exit_count_by_slug
 
 
-def _load_trade_balance_series(conn: sqlite3.Connection, limit: int = 2000) -> list[dict]:
-    rows = conn.execute(
+def _load_trade_balance_series(cur, limit: int = 2000) -> list[dict]:
+    cur.execute(
         """
         SELECT ts_utc, balance
         FROM usdc_balance_snapshots
-        WHERE profile = ?
+        WHERE profile = %s
         ORDER BY ts_utc DESC
-        LIMIT ?
+        LIMIT %s
         """,
         (TRADE_PM_PROFILE, int(limit)),
-    ).fetchall()
+    )
+    rows = cur.fetchall()
     rows = list(reversed(rows))
     result = []
     for row in rows:
@@ -423,9 +426,9 @@ def _load_trade_balance_series(conn: sqlite3.Connection, limit: int = 2000) -> l
     return result
 
 
-def _load_latest_trade_strategy_params(conn: sqlite3.Connection) -> dict:
+def _load_latest_trade_strategy_params(cur) -> dict:
     try:
-        row = conn.execute(
+        cur.execute(
             """
             SELECT start_ts_sec, params_json, strategy_signature, created_at
             FROM trade_startups
@@ -434,7 +437,8 @@ def _load_latest_trade_strategy_params(conn: sqlite3.Connection) -> dict:
             ORDER BY start_ts_sec DESC, id DESC
             LIMIT 1
             """
-        ).fetchone()
+        )
+        row = cur.fetchone()
     except Exception:
         return {}
 
@@ -488,51 +492,52 @@ def _extract_window_start_ms(market_slug: str) -> Optional[int]:
         return None
 
 
-def _batch_winning_directions(conn: sqlite3.Connection, window_start_ms_list: list[int]) -> dict[int, str]:
+def _batch_winning_directions(cur, window_start_ms_list: list[int]) -> dict[int, str]:
     """批量查询 btc_poly_1s_ticks 中各窗口的 winning_direction。"""
     if not window_start_ms_list:
         return {}
     result: dict[int, str] = {}
-    # SQLite 参数限制，分批查询
     batch_size = 500
     for i in range(0, len(window_start_ms_list), batch_size):
         batch = window_start_ms_list[i:i + batch_size]
-        placeholders = ",".join("?" * len(batch))
-        rows = conn.execute(
+        placeholders = ",".join(["%s"] * len(batch))
+        cur.execute(
             f"""
             SELECT window_start_ms, winning_direction
             FROM btc_poly_1s_ticks
             WHERE window_start_ms IN ({placeholders})
               AND winning_direction IS NOT NULL
-            GROUP BY window_start_ms
+            GROUP BY window_start_ms, winning_direction
             """,
             batch,
-        ).fetchall()
+        )
+        rows = cur.fetchall()
         for row in rows:
             result[int(row["window_start_ms"])] = str(row["winning_direction"])
     return result
 
 
-def _load_skipped_windows(conn: sqlite3.Connection, limit: int = 80) -> list[dict]:
-    rows = conn.execute(
+def _load_skipped_windows(cur, limit: int = 80) -> list[dict]:
+    cur.execute(
         """
         SELECT event_time, market_slug, reason, direction
         FROM trade_events
         WHERE mode='live'
           AND side='skip'
-          AND market_slug LIKE 'btc-updown-5m-%'
+          AND market_slug LIKE 'btc-updown-5m-%%'
         ORDER BY event_time DESC
-        LIMIT ?
+        LIMIT %s
         """,
         (int(limit),),
-    ).fetchall()
+    )
+    rows = cur.fetchall()
     # 批量查询实际结算方向
     window_ms_list = []
     for row in rows:
         wms = _extract_window_start_ms(str(row["market_slug"] or ""))
         if wms is not None:
             window_ms_list.append(wms)
-    winning_map = _batch_winning_directions(conn, window_ms_list)
+    winning_map = _batch_winning_directions(cur, window_ms_list)
     result = []
     for row in rows:
         raw_time = str(row["event_time"] or "")
@@ -554,7 +559,7 @@ def _load_skipped_windows(conn: sqlite3.Connection, limit: int = 80) -> list[dic
     return result
 
 
-def _build_trade_history_rows(rows: list[sqlite3.Row]) -> list[dict]:
+def _build_trade_history_rows(rows: list[dict]) -> list[dict]:
     trade_exit_by_slug, trade_exit_count_by_slug = _load_activity_exit_by_slug(TRADE_PM_PROFILE)
     analyze_exit_by_slug, analyze_exit_count_by_slug = _load_activity_exit_by_slug("analyze")
     history_rows: list[dict] = []
@@ -683,21 +688,15 @@ def api_5m_trade_summary():
     except Exception as e:
         return jsonify({"error": f"获取trade余额失败: {e}"}), 500
 
-    db_path = os.getenv("SQLITE_DB_PATH", "logs/trade.sqlite3")
-    if not os.path.isabs(db_path):
-        db_path = str((_project_root / db_path).resolve())
-
     log_series = []
     history_rows = []
     skipped_windows = []
     strategy_params = {}
-    if os.path.exists(db_path):
-        try:
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
-            log_series = _load_trade_balance_series(conn=conn)
-            skipped_windows = _load_skipped_windows(conn=conn, limit=80)
-            strategy_params = _load_latest_trade_strategy_params(conn=conn)
+    try:
+        with get_cursor() as cur:
+            log_series = _load_trade_balance_series(cur=cur)
+            skipped_windows = _load_skipped_windows(cur=cur, limit=80)
+            strategy_params = _load_latest_trade_strategy_params(cur=cur)
             query = """
                 SELECT
                     market_slug,
@@ -726,18 +725,18 @@ def api_5m_trade_summary():
                     SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_exit_size
                 FROM trade_events
                 WHERE mode='live'
-                  AND market_slug LIKE 'btc-updown-5m-%'
+                  AND market_slug LIKE 'btc-updown-5m-%%'
                   AND side IN ('buy', 'sell', 'redeem')
                 GROUP BY market_slug
-                HAVING buy_event_count > 0
-                ORDER BY first_event_time DESC
+                HAVING SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN 1 ELSE 0 END) > 0
+                ORDER BY MIN(event_time) DESC
                 LIMIT 240
             """
-            rows = conn.execute(query).fetchall()
-            conn.close()
+            cur.execute(query)
+            rows = cur.fetchall()
             history_rows = _build_trade_history_rows(rows)
-        except Exception as e:
-            return jsonify({"error": f"读取trade_events失败: {e}"}), 500
+    except Exception as e:
+        return jsonify({"error": f"读取trade_events失败: {e}"}), 500
 
     return jsonify({
         "current_balance": balance_str,
@@ -772,17 +771,10 @@ def api_5m_trade_stats():
     start_utc_iso = start_dt_utc8.astimezone(timezone.utc).isoformat()
     end_utc_iso = end_dt_utc8.astimezone(timezone.utc).isoformat()
 
-    db_path = os.getenv("SQLITE_DB_PATH", "logs/trade.sqlite3")
-    if not os.path.isabs(db_path):
-        db_path = str((_project_root / db_path).resolve())
-    if not os.path.exists(db_path):
-        return jsonify({"error": f"数据库不存在: {db_path}"}), 500
-
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
     try:
+      with get_cursor() as cur:
         if stat_type == "history":
-            rows = conn.execute(
+            cur.execute(
                 """
                 SELECT
                     market_slug,
@@ -805,16 +797,17 @@ def api_5m_trade_stats():
                     SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_exit_size
                 FROM trade_events
                 WHERE mode='live'
-                  AND market_slug LIKE 'btc-updown-5m-%'
+                  AND market_slug LIKE 'btc-updown-5m-%%'
                   AND side IN ('buy', 'sell', 'redeem')
                 GROUP BY market_slug
-                HAVING buy_event_count > 0
-                   AND first_event_time >= ?
-                   AND first_event_time <= ?
-                ORDER BY first_event_time DESC
+                HAVING SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN 1 ELSE 0 END) > 0
+                   AND MIN(event_time) >= %s
+                   AND MIN(event_time) <= %s
+                ORDER BY MIN(event_time) DESC
                 """,
                 (start_utc_iso, end_utc_iso),
-            ).fetchall()
+            )
+            rows = cur.fetchall()
 
             history_rows = _build_trade_history_rows(rows)
             trade_window_count = len(history_rows)
@@ -842,20 +835,21 @@ def api_5m_trade_stats():
                 "avg_loss": (round(loss_amount / len(loss_rows), 4) if loss_rows else None),
             })
 
-        skip_rows = conn.execute(
+        cur.execute(
             """
             SELECT reason, COUNT(*) AS cnt
             FROM trade_events
             WHERE mode='live'
               AND side='skip'
-              AND market_slug LIKE 'btc-updown-5m-%'
-              AND event_time >= ?
-              AND event_time <= ?
+              AND market_slug LIKE 'btc-updown-5m-%%'
+              AND event_time >= %s
+              AND event_time <= %s
             GROUP BY reason
             ORDER BY cnt DESC, reason ASC
             """,
             (start_utc_iso, end_utc_iso),
-        ).fetchall()
+        )
+        skip_rows = cur.fetchall()
         skip_count = int(sum(int(r["cnt"] or 0) for r in skip_rows))
         category_count: dict[str, int] = {}
         category_examples: dict[str, list[str]] = {}
@@ -870,25 +864,26 @@ def api_5m_trade_stats():
                 category_examples[category].append(reason)
 
         # 查询每条 skip 事件的 direction 和 market_slug，用于计算预测准确率
-        skip_detail_rows = conn.execute(
+        cur.execute(
             """
             SELECT market_slug, direction, reason
             FROM trade_events
             WHERE mode='live'
               AND side='skip'
-              AND market_slug LIKE 'btc-updown-5m-%'
-              AND event_time >= ?
-              AND event_time <= ?
+              AND market_slug LIKE 'btc-updown-5m-%%'
+              AND event_time >= %s
+              AND event_time <= %s
             """,
             (start_utc_iso, end_utc_iso),
-        ).fetchall()
+        )
+        skip_detail_rows = cur.fetchall()
         # 收集所有窗口的 window_start_ms
         detail_window_ms_list = []
         for dr in skip_detail_rows:
             wms = _extract_window_start_ms(str(dr["market_slug"] or ""))
             if wms is not None:
                 detail_window_ms_list.append(wms)
-        winning_map = _batch_winning_directions(conn, detail_window_ms_list)
+        winning_map = _batch_winning_directions(cur, detail_window_ms_list)
 
         # 总体预测统计
         total_correct = 0
@@ -941,8 +936,6 @@ def api_5m_trade_stats():
         })
     except Exception as e:
         return jsonify({"error": f"统计失败: {e}"}), 500
-    finally:
-        conn.close()
 
 
 @app.route('/api/balance_summary')

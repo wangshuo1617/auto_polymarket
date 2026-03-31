@@ -25,7 +25,8 @@ import itertools
 import json
 import math
 import os
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import sys
 import time
 from datetime import datetime, timezone
@@ -1604,27 +1605,29 @@ def _simulate_window(
 
 
 def _iter_window_rows(
-    conn: sqlite3.Connection,
+    conn,
     start_ts_sec: Optional[int],
     end_ts_sec: Optional[int],
 ) -> Iterable[Tuple[int, List[WindowRow]]]:
-    table_cols = {
-        str(item[1])
-        for item in conn.execute("PRAGMA table_info(btc_poly_1s_ticks)")
-    }
+    _info_cur = conn.cursor()
+    _info_cur.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'btc_poly_1s_ticks'"
+    )
+    table_cols = {str(r[0]) for r in _info_cur.fetchall()}
+    _info_cur.close()
 
     def _col_or_null(column_name: str) -> str:
         if column_name in table_cols:
             return column_name
         return f"NULL AS {column_name}"
 
-    where_clauses = ["market_slug LIKE 'btc-updown-5m-%'"]
+    where_clauses = ["market_slug LIKE 'btc-updown-5m-%%'"]
     args: List[object] = []
     if start_ts_sec is not None:
-        where_clauses.append("ts_sec >= ?")
+        where_clauses.append("ts_sec >= %s")
         args.append(start_ts_sec)
     if end_ts_sec is not None:
-        where_clauses.append("ts_sec <= ?")
+        where_clauses.append("ts_sec <= %s")
         args.append(end_ts_sec)
 
     query = f"""
@@ -1660,7 +1663,8 @@ def _iter_window_rows(
         ORDER BY window_start_ms ASC, ts_sec ASC
     """
 
-    cur = conn.execute(query, args)
+    cur = conn.cursor('backtest_window_cursor')
+    cur.execute(query, args)
 
     current_ws: Optional[int] = None
     bucket: List[WindowRow] = []
@@ -1713,17 +1717,17 @@ def _iter_window_rows(
 
 
 def _count_windows(
-    conn: sqlite3.Connection,
+    conn,
     start_ts_sec: Optional[int],
     end_ts_sec: Optional[int],
 ) -> int:
-    where_clauses = ["market_slug LIKE 'btc-updown-5m-%'"]
+    where_clauses = ["market_slug LIKE 'btc-updown-5m-%%'"]
     args: List[object] = []
     if start_ts_sec is not None:
-        where_clauses.append("ts_sec >= ?")
+        where_clauses.append("ts_sec >= %s")
         args.append(start_ts_sec)
     if end_ts_sec is not None:
-        where_clauses.append("ts_sec <= ?")
+        where_clauses.append("ts_sec <= %s")
         args.append(end_ts_sec)
 
     query = f"""
@@ -1731,7 +1735,10 @@ def _count_windows(
         FROM btc_poly_1s_ticks
         WHERE {' AND '.join(where_clauses)}
     """
-    row = conn.execute(query, args).fetchone()
+    cur = conn.cursor()
+    cur.execute(query, args)
+    row = cur.fetchone()
+    cur.close()
     return int(row[0]) if row and row[0] is not None else 0
 
 
@@ -1992,8 +1999,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--db-path",
         type=str,
-        default=os.getenv("SQLITE_DB_PATH", "logs/trade.sqlite3"),
-        help="SQLite path (default: env SQLITE_DB_PATH or logs/trade.sqlite3)",
+        default=os.getenv("PG_DSN", ""),
+        help="PostgreSQL DSN (default: env PG_DSN)",
     )
     parser.add_argument(
         "--start-ts-sec",
@@ -2246,8 +2253,7 @@ def main() -> None:
 
     params = _build_param_grid(args)
 
-    conn = sqlite3.connect(args.db_path)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(args.db_path)
     estimated_total_windows = _count_windows(conn, args.start_ts_sec, args.end_ts_sec)
 
     windows_data: List[WindowPrepared] = []
