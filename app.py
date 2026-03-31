@@ -994,6 +994,110 @@ def api_run_position_analyze():
         return jsonify({"error": str(e)}), 500
 
 
+# ---------------------------------------------------------------------------
+#  策略参数 编辑 / 保存 / 重启
+# ---------------------------------------------------------------------------
+
+# 允许从前端写入的参数白名单（key = Python 小写名，value = 对应 shell 变量名）
+_PARAM_SHELL_MAP: dict[str, str] = {
+    "entry_minute": "ENTRY_MINUTE",
+    "entry_preclose_sec": "ENTRY_PRECLOSE_SEC",
+    "min_direction_diff": "MIN_DIRECTION_DIFF",
+    "max_entry_price": "MAX_ENTRY_PRICE",
+    "stake_usd": "STAKE_USD",
+    "exit_mode": "EXIT_MODE",
+    "toxic_utc_hours": "TOXIC_UTC_HOURS",
+    "max_btc_cross_count": "MAX_BTC_CROSS_COUNT",
+    "min_entry_updown_diff": "MIN_ENTRY_UPDOWN_DIFF",
+    "max_avg_btc_delta": "MAX_AVG_BTC_DELTA",
+    "minute_consistency": "MINUTE_CONSISTENCY",
+    "min_hold_before_close_sec": "MIN_HOLD_BEFORE_CLOSE_SEC",
+    "tp_price_cap": "TP_PRICE_CAP",
+    "tp_value_cap": "TP_VALUE_CAP",
+    "sl_to_tp_ratio": "SL_TO_TP_RATIO",
+    "enable_risk_sizing": "ENABLE_RISK_SIZING",
+    "risk_min_stake_ratio": "RISK_MIN_STAKE_RATIO",
+    "risk_max_stake_ratio": "RISK_MAX_STAKE_RATIO",
+    "confidence_boost": "CONFIDENCE_BOOST",
+    "confidence_boost_ge_095": "CONFIDENCE_BOOST_GE_095",
+    "stake_cap_very_high": "STAKE_CAP_VERY_HIGH",
+    "stake_cap_high": "STAKE_CAP_HIGH",
+    "stake_cap_medium_high": "STAKE_CAP_MEDIUM_HIGH",
+    "medium_high_threshold": "MEDIUM_HIGH_THRESHOLD",
+    "risk_w_price": "RISK_W_PRICE",
+    "risk_w_direction": "RISK_W_DIRECTION",
+    "risk_w_stability": "RISK_W_STABILITY",
+    "risk_diff_boost_threshold": "RISK_DIFF_BOOST_THRESHOLD",
+    "risk_diff_boost_multiplier": "RISK_DIFF_BOOST_MULTIPLIER",
+    "cross_borderline_diff_multiplier": "CROSS_BORDERLINE_DIFF_MULTIPLIER",
+    "enable_direction_confirm_close": "ENABLE_DIRECTION_CONFIRM_CLOSE",
+    "direction_confirm_preclose_sec": "DIRECTION_CONFIRM_PRECLOSE_SEC",
+    "direction_confirm_min_abs_diff": "DIRECTION_CONFIRM_MIN_ABS_DIFF",
+    "enable_direction_confirm_low_diff_close": "ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE",
+    "direction_confirm_low_diff_threshold": "DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD",
+    "enable_last_seconds_reverse_guard": "ENABLE_LAST_SECONDS_REVERSE_GUARD",
+    "reverse_guard_start_sec": "REVERSE_GUARD_START_SEC",
+    "reverse_guard_lookback_sec": "REVERSE_GUARD_LOOKBACK_SEC",
+    "reverse_guard_btc_move": "REVERSE_GUARD_BTC_MOVE",
+    "reverse_guard_require_cross_open": "REVERSE_GUARD_REQUIRE_CROSS_OPEN",
+    "enable_last_seconds_position_guard": "ENABLE_LAST_SECONDS_POSITION_GUARD",
+    "position_guard_start_sec": "POSITION_GUARD_START_SEC",
+    "position_guard_min_consecutive_sec": "POSITION_GUARD_MIN_CONSECUTIVE_SEC",
+    "report_interval_sec": "REPORT_INTERVAL_SEC",
+    "trade_db_path": "TRADE_DB_PATH",
+}
+
+# 合法 shell 变量值的正则（防注入）
+_SAFE_VALUE_RE = re.compile(r'^[A-Za-z0-9_.,:/ -]*$')
+
+
+@app.route('/api/update_5m_trade_params', methods=['POST'])
+def api_update_5m_trade_params():
+    """将前端提交的参数写入 config/5m_trade_params.env，然后 systemctl restart。"""
+    body = request.get_json(silent=True)
+    if not body or "params" not in body:
+        return jsonify({"error": "缺少 params"}), 400
+
+    incoming: dict = body["params"]
+    lines: list[str] = []
+    for py_key, value in incoming.items():
+        shell_var = _PARAM_SHELL_MAP.get(py_key)
+        if shell_var is None:
+            continue  # 忽略白名单之外的 key
+        val_str = str(value).strip()
+        if not _SAFE_VALUE_RE.match(val_str):
+            return jsonify({"error": f"参数 {py_key} 包含非法字符"}), 400
+        lines.append(f'{shell_var}="{val_str}"')
+
+    if not lines:
+        return jsonify({"error": "无有效参数"}), 400
+
+    # 写入覆盖文件
+    config_dir = _project_root / "config"
+    config_dir.mkdir(exist_ok=True)
+    env_file = config_dir / "5m_trade_params.env"
+    try:
+        env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as e:
+        return jsonify({"error": f"写入文件失败: {e}"}), 500
+
+    # systemctl restart
+    try:
+        result = subprocess.run(
+            ["systemctl", "restart", "auto-poly-5m-trade.service"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            return jsonify({"error": f"systemctl restart 失败: {stderr}"}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "systemctl restart 超时"}), 500
+    except Exception as e:
+        return jsonify({"error": f"重启服务异常: {e}"}), 500
+
+    return jsonify({"status": "ok", "message": "参数已保存，服务已重启"})
+
+
 def _latest_report_path():
     """Return path to the most recently modified *_email.html in output/, or None."""
     output_dir = _project_root / "output"

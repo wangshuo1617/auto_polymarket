@@ -185,6 +185,8 @@
                 </div>
                 <div class="modal-body" id="strategyParamsModalBody"></div>
                 <div class="modal-footer">
+                    <button type="button" class="btn btn-primary d-none" id="strategyParamsSaveBtn" onclick="saveStrategyParams()">保存并重启</button>
+                    <button type="button" class="btn btn-outline-primary" id="strategyParamsEditBtn" onclick="toggleStrategyParamsEdit()">编辑</button>
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
                 </div>
             </div>
@@ -574,21 +576,190 @@
             return '<div class="strategy-trigger-wrap"><button class="btn btn-sm btn-outline-secondary" onclick="openStrategyParamsModal()">策略参数</button></div>';
         }
 
-        function openStrategyParamsModal() {
-            const data = (tradeStrategyParams && typeof tradeStrategyParams === 'object') ? tradeStrategyParams : {};
-            const items = Array.isArray(data.params_items) ? data.params_items : [];
-            const startedAt = data.start_time_utc8 ? _escapeHtml(data.start_time_utc8) : '--';
+        let _strategyParamsEditMode = false;
+        let _strategyParamsCurrent = {};
+
+        const _spParamMeta = {
+            entry_minute:       '入场决策分钟（1-4）',
+            entry_preclose_sec: '入场分钟收盘前秒数',
+            min_direction_diff: '最小方向差值（BTC vs 开盘价）',
+            max_entry_price:    '最大允许入场价格',
+            stake_usd:          '单笔基础仓位（USDC）',
+            exit_mode:          '平仓模式：hold / tpsl',
+            toxic_utc_hours:    '跳过交易的 UTC 小时列表',
+            max_btc_cross_count:     'BTC 跨越开盘价次数上限',
+            min_entry_updown_diff:   'UP/DOWN token 最小价差',
+            max_avg_btc_delta:       'ATR 波动率阈值',
+            minute_consistency:      '分钟一致性检查列表',
+            report_interval_sec:     '报告输出间隔（秒）',
+            trade_db_path:           'SQLite 路径',
+            min_hold_before_close_sec: '最短持仓保护秒数',
+            tp_price_cap:       'TP 价格上限',
+            tp_value_cap:       'TP 收益值上限',
+            sl_to_tp_ratio:     'SL/TP 比例',
+            enable_risk_sizing:      '是否启用动态仓位',
+            risk_min_stake_ratio:    '动态仓位最小倍率',
+            risk_max_stake_ratio:    '动态仓位最大倍率',
+            risk_diff_boost_threshold:  '风险评分高于此值时要求更大价差',
+            risk_diff_boost_multiplier: '高风险时价差倍率提升',
+            cross_borderline_diff_multiplier: 'cross接近上限时价差倍增系数',
+            stake_cap_very_high:     'very_high 风险仓位上限',
+            stake_cap_high:          'high 风险仓位上限',
+            stake_cap_medium_high:   'medium_high 风险仓位上限',
+            medium_high_threshold:   'medium_high 阈值',
+            confidence_boost_ge_095: '置信度≥0.95 加仓倍率',
+            risk_w_price:            '风险评分：价格权重',
+            risk_w_direction:        '风险评分：方向权重',
+            risk_w_stability:        '风险评分：稳定性权重',
+            enable_direction_confirm_close:          '是否启用方向不一致平仓',
+            direction_confirm_preclose_sec:          '方向确认触发秒（距5m结束）',
+            direction_confirm_min_abs_diff:          '不一致平仓最小绝对价差',
+            enable_direction_confirm_low_diff_close: '是否启用低价差强平',
+            direction_confirm_low_diff_threshold:    '低价差强平阈值',
+            enable_last_seconds_reverse_guard:  '是否启用终盘加速反向风控',
+            reverse_guard_start_sec:            '终盘反向风控起始秒',
+            reverse_guard_lookback_sec:         '终盘反向风控回看秒数',
+            reverse_guard_btc_move:             '终盘反向BTC移动阈值',
+            reverse_guard_require_cross_open:   '是否要求穿越开盘价才平仓',
+            enable_last_seconds_position_guard: '是否启用终盘位置风控',
+            position_guard_start_sec:           '终盘位置风控起始秒',
+            position_guard_min_consecutive_sec: '终盘位置反向连续秒数',
+        };
+        const _spGroups = [
+            { label: '入场控制', keys: ['entry_minute','entry_preclose_sec','min_direction_diff','max_entry_price','stake_usd','exit_mode','toxic_utc_hours','max_btc_cross_count','min_entry_updown_diff','max_avg_btc_delta','minute_consistency'] },
+            { label: 'TPSL 平仓控制', keys: ['min_hold_before_close_sec','tp_price_cap','tp_value_cap','sl_to_tp_ratio'] },
+            { label: '风险仓位管理', keys: ['enable_risk_sizing','risk_min_stake_ratio','risk_max_stake_ratio','risk_diff_boost_threshold','risk_diff_boost_multiplier','cross_borderline_diff_multiplier','stake_cap_very_high','stake_cap_high','stake_cap_medium_high','medium_high_threshold','confidence_boost_ge_095','risk_w_price','risk_w_direction','risk_w_stability'] },
+            { label: '方向确认风控', keys: ['enable_direction_confirm_close','direction_confirm_preclose_sec','direction_confirm_min_abs_diff','enable_direction_confirm_low_diff_close','direction_confirm_low_diff_threshold'] },
+            { label: '终盘风控', keys: ['enable_last_seconds_reverse_guard','reverse_guard_start_sec','reverse_guard_lookback_sec','reverse_guard_btc_move','reverse_guard_require_cross_open','enable_last_seconds_position_guard','position_guard_start_sec','position_guard_min_consecutive_sec'] },
+            { label: '系统', keys: ['report_interval_sec','trade_db_path'] },
+        ];
+        const _spBooleanParams = new Set([
+            'enable_risk_sizing','confidence_boost',
+            'enable_direction_confirm_close','enable_direction_confirm_low_diff_close',
+            'enable_last_seconds_reverse_guard','reverse_guard_require_cross_open',
+            'enable_last_seconds_position_guard',
+        ]);
+
+        function _renderStrategyTable(editing) {
+            const p = _strategyParamsCurrent;
+            const rendered = new Set();
             let rows = '';
-            items.forEach((it) => {
-                const k = it && it.name != null ? it.name : '--';
-                const v = it && it.value != null ? it.value : '--';
-                rows += '<tr><td style="width:36%"><strong>' + _escapeHtml(k) + '</strong></td><td>' + _escapeHtml(v) + '</td></tr>';
+            _spGroups.forEach(g => {
+                const groupKeys = g.keys.filter(k => k in p);
+                if (!groupKeys.length) return;
+                rows += '<tr class="table-secondary"><td colspan="3" class="fw-bold small py-1">' + _escapeHtml(g.label) + '</td></tr>';
+                groupKeys.forEach(k => {
+                    const v = p[k] != null ? String(p[k]) : '';
+                    const desc = _spParamMeta[k] || '';
+                    rows += '<tr><td style="width:34%"><strong>' + _escapeHtml(k) + '</strong></td>';
+                    if (editing) {
+                        if (_spBooleanParams.has(k)) {
+                            const isTrue = (v === 'true' || v === 'True');
+                            rows += '<td style="width:18%"><select class="form-select form-select-sm" data-param-key="' + _escapeHtml(k) + '">'
+                                + '<option value="true"' + (isTrue ? ' selected' : '') + '>true</option>'
+                                + '<option value="false"' + (!isTrue ? ' selected' : '') + '>false</option>'
+                                + '</select></td>';
+                        } else {
+                            rows += '<td style="width:18%"><input type="text" class="form-control form-control-sm" data-param-key="' + _escapeHtml(k) + '" value="' + _escapeHtml(v) + '"></td>';
+                        }
+                    } else {
+                        rows += '<td style="width:18%">' + _escapeHtml(v || '--') + '</td>';
+                    }
+                    rows += '<td class="text-muted small">' + _escapeHtml(desc) + '</td></tr>';
+                    rendered.add(k);
+                });
             });
-            if (!rows) rows = '<tr><td colspan="2" class="text-muted">无参数</td></tr>';
+            const extra = Object.keys(p).filter(k => !rendered.has(k));
+            if (extra.length) {
+                rows += '<tr class="table-secondary"><td colspan="3" class="fw-bold small py-1">其他</td></tr>';
+                extra.forEach(k => {
+                    const v = p[k] != null ? String(p[k]) : '';
+                    const desc = _spParamMeta[k] || '';
+                    rows += '<tr><td style="width:34%"><strong>' + _escapeHtml(k) + '</strong></td>';
+                    if (editing) {
+                        rows += '<td style="width:18%"><input type="text" class="form-control form-control-sm" data-param-key="' + _escapeHtml(k) + '" value="' + _escapeHtml(v) + '"></td>';
+                    } else {
+                        rows += '<td style="width:18%">' + _escapeHtml(v || '--') + '</td>';
+                    }
+                    rows += '<td class="text-muted small">' + _escapeHtml(desc) + '</td></tr>';
+                });
+            }
+            if (!rows) rows = '<tr><td colspan="3" class="text-muted">无参数</td></tr>';
+            const startedAt = (tradeStrategyParams && tradeStrategyParams.start_time_utc8) ? _escapeHtml(tradeStrategyParams.start_time_utc8) : '--';
             let html = '<div class="small text-muted mb-2">启动时间（UTC+8）：' + startedAt + '</div>';
-            html += '<div class="table-responsive"><table class="table table-sm table-bordered strategy-param-table"><tbody>' + rows + '</tbody></table></div>';
+            html += '<div class="table-responsive"><table class="table table-sm table-bordered strategy-param-table"><thead><tr><th style="width:34%">参数</th><th style="width:18%">值</th><th>说明</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
             document.getElementById('strategyParamsModalBody').innerHTML = html;
+        }
+
+        function openStrategyParamsModal() {
+            _strategyParamsEditMode = false;
+            document.getElementById('strategyParamsEditBtn').classList.remove('d-none');
+            document.getElementById('strategyParamsEditBtn').textContent = '编辑';
+            document.getElementById('strategyParamsEditBtn').classList.replace('btn-outline-secondary', 'btn-outline-primary');
+            document.getElementById('strategyParamsSaveBtn').classList.add('d-none');
+
+            const data = (tradeStrategyParams && typeof tradeStrategyParams === 'object') ? tradeStrategyParams : {};
+            const params = (data.params && typeof data.params === 'object') ? data.params : {};
+            _strategyParamsCurrent = Object.assign({}, params);
+            _renderStrategyTable(false);
             new bootstrap.Modal(document.getElementById('strategyParamsModal')).show();
+        }
+
+        function toggleStrategyParamsEdit() {
+            _strategyParamsEditMode = !_strategyParamsEditMode;
+            const editBtn = document.getElementById('strategyParamsEditBtn');
+            const saveBtn = document.getElementById('strategyParamsSaveBtn');
+            if (_strategyParamsEditMode) {
+                editBtn.textContent = '取消编辑';
+                editBtn.classList.replace('btn-outline-primary', 'btn-outline-secondary');
+                saveBtn.classList.remove('d-none');
+                _renderStrategyTable(true);
+            } else {
+                editBtn.textContent = '编辑';
+                editBtn.classList.replace('btn-outline-secondary', 'btn-outline-primary');
+                saveBtn.classList.add('d-none');
+                const data = (tradeStrategyParams && typeof tradeStrategyParams === 'object') ? tradeStrategyParams : {};
+                _strategyParamsCurrent = Object.assign({}, (data.params || {}));
+                _renderStrategyTable(false);
+            }
+        }
+
+        function saveStrategyParams() {
+            const inputs = document.querySelectorAll('#strategyParamsModalBody [data-param-key]');
+            const collected = {};
+            inputs.forEach(el => {
+                const key = el.getAttribute('data-param-key');
+                collected[key] = (el.tagName === 'SELECT') ? el.value : el.value.trim();
+            });
+            if (!Object.keys(collected).length) return;
+
+            const saveBtn = document.getElementById('strategyParamsSaveBtn');
+            saveBtn.disabled = true;
+            saveBtn.textContent = '保存中...';
+            fetchJsonSafe('/api/update_5m_trade_params', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ params: collected }),
+            }).then(data => {
+                if (data.error) {
+                    alert('保存失败: ' + data.error);
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = '保存并重启';
+                    return;
+                }
+                alert(data.message || '参数已保存，服务已重启');
+                _strategyParamsEditMode = false;
+                document.getElementById('strategyParamsEditBtn').textContent = '编辑';
+                document.getElementById('strategyParamsEditBtn').classList.replace('btn-outline-secondary', 'btn-outline-primary');
+                saveBtn.classList.add('d-none');
+                saveBtn.disabled = false;
+                saveBtn.textContent = '保存并重启';
+                const modal = bootstrap.Modal.getInstance(document.getElementById('strategyParamsModal'));
+                if (modal) modal.hide();
+            }).catch(() => {
+                saveBtn.disabled = false;
+                saveBtn.textContent = '保存并重启';
+            });
         }
 
         function _normalizeUtc8Input(raw) {

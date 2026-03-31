@@ -9,65 +9,72 @@ cd "$PROJECT_ROOT"
 # 强制 5m 交易路径默认使用 trade 账号 profile（可由外部环境覆盖）
 export POLYMARKET_PROFILE="${POLYMARKET_PROFILE:-trade}"
 
+# 加载参数覆盖文件（由 Dashboard 编辑保存）
+_OVERRIDE_FILE="$PROJECT_ROOT/config/5m_trade_params.env"
+if [ -f "$_OVERRIDE_FILE" ]; then
+  echo "[config] 加载参数覆盖文件: $_OVERRIDE_FILE"
+  source "$_OVERRIDE_FILE"
+fi
+
 # 基础运行模式
-MODE="${1:---live}"                                  # 运行模式：--live / --dry-run
-STAKE_USD="${5:-10.0}"                              # 单笔基础仓位（USDC）
-EXIT_MODE="${16:-hold}"                             # 平仓模式：hold / tpsl
+MODE="${MODE:-${1:---live}}"                                  # 运行模式：--live / --dry-run
+STAKE_USD="${STAKE_USD:-${5:-10.0}}"                          # 单笔基础仓位（USDC）
+EXIT_MODE="${EXIT_MODE:-${16:-hold}}"                         # 平仓模式：hold / tpsl
 
 # 入场控制
-ENTRY_MINUTE="${2:-4}"                              # 入场决策分钟（1-4）
-ENTRY_PRECLOSE_SEC="${3:-3}"                        # 入场分钟收盘前秒数
-MIN_DIRECTION_DIFF="${4:-39}"                       # 最小方向差值（BTC 与开盘价）
-MAX_ENTRY_PRICE="${7:-0.98}"                        # 最大允许入场价格
-TOXIC_UTC_HOURS="${13-"0,5,7,16,19"}"              # 跳过交易的 UTC 小时列表
-MAX_BTC_CROSS_COUNT="${14:-4}"                      # BTC 跨越开盘价次数上限
-MIN_ENTRY_UPDOWN_DIFF="${15:-0.38}"                 # Polymarket UP/DOWN token的最小价差
-MAX_AVG_BTC_DELTA="${17:-3.0}"                      # ATR 波动率阈值
-MINUTE_CONSISTENCY="${18:-3}"                       # 分钟一致性检查分钟列表，逗号分隔，如1,2,3
+ENTRY_MINUTE="${ENTRY_MINUTE:-${2:-4}}"                       # 入场决策分钟（1-4）
+ENTRY_PRECLOSE_SEC="${ENTRY_PRECLOSE_SEC:-${3:-3}}"           # 入场分钟收盘前秒数
+MIN_DIRECTION_DIFF="${MIN_DIRECTION_DIFF:-${4:-39}}"          # 最小方向差值（BTC 与开盘价）
+MAX_ENTRY_PRICE="${MAX_ENTRY_PRICE:-${7:-0.98}}"              # 最大允许入场价格
+TOXIC_UTC_HOURS="${TOXIC_UTC_HOURS:-${13-"0,5,7,16,19"}}"    # 跳过交易的 UTC 小时列表
+MAX_BTC_CROSS_COUNT="${MAX_BTC_CROSS_COUNT:-${14:-4}}"        # BTC 跨越开盘价次数上限
+MIN_ENTRY_UPDOWN_DIFF="${MIN_ENTRY_UPDOWN_DIFF:-${15:-0.38}}" # Polymarket UP/DOWN token的最小价差
+MAX_AVG_BTC_DELTA="${MAX_AVG_BTC_DELTA:-${17:-3.0}}"          # ATR 波动率阈值
+MINUTE_CONSISTENCY="${MINUTE_CONSISTENCY:-${18:-3}}"           # 分钟一致性检查分钟列表，逗号分隔，如1,2,3
 
 # tpsl模式平仓相关控制
-MIN_HOLD_BEFORE_CLOSE_SEC="${8:-60}"                # 最短持仓保护秒数
-TP_PRICE_CAP="${10:-0.97}"                          # TP 价格上限
-TP_VALUE_CAP="${11:-0.15}"                          # TP 收益值上限
-SL_TO_TP_RATIO="${12:-0.9}"                         # SL/TP 比例
+MIN_HOLD_BEFORE_CLOSE_SEC="${MIN_HOLD_BEFORE_CLOSE_SEC:-${8:-60}}"  # 最短持仓保护秒数
+TP_PRICE_CAP="${TP_PRICE_CAP:-${10:-0.97}}"                   # TP 价格上限
+TP_VALUE_CAP="${TP_VALUE_CAP:-${11:-0.15}}"                   # TP 收益值上限
+SL_TO_TP_RATIO="${SL_TO_TP_RATIO:-${12:-0.9}}"               # SL/TP 比例
 
 # 风险仓位管理
-ENABLE_RISK_SIZING="${19:-true}"                    # 是否启用动态仓位
-RISK_MIN_STAKE_RATIO="${20:-0.20}"                  # 动态仓位最小倍率
-RISK_MAX_STAKE_RATIO="${21:-1.2}"                   # 动态仓位最大倍率
-CONFIDENCE_BOOST="${22:-true}"                      # 是否启用高置信加仓
-CONFIDENCE_BOOST_GE_095="${23:-1.5}"                # 置信度>=0.95 加仓倍率
-STAKE_CAP_VERY_HIGH="${24:-0.0}"                    # very_high 风险仓位上限
-STAKE_CAP_HIGH="${25:-0.20}"                        # high 风险仓位上限
-STAKE_CAP_MEDIUM_HIGH="${26:-0.50}"                 # medium_high 风险仓位上限
-MEDIUM_HIGH_THRESHOLD="${27:-0.45}"                 # medium_high 阈值
-RISK_W_PRICE="${28:-0.30}"                          # 风险评分：价格权重
-RISK_W_DIRECTION="${29:-0.15}"                      # 风险评分：方向权重
-RISK_W_STABILITY="${30:-0.55}"                      # 风险评分：稳定性权重
-RISK_DIFF_BOOST_THRESHOLD="${31:-0.44}"             # risk_diff boost 启动阈值，当入场风险评分大于该值时，要求更大价差
-RISK_DIFF_BOOST_MULTIPLIER="${32:-1.40}"            # risk_diff boost 倍率
-CROSS_BORDERLINE_DIFF_MULTIPLIER="${33:-0.0}"       # cross_count 临界倍增系数，当BTC跨越开盘价次数接近上限时，要求更大价差
+ENABLE_RISK_SIZING="${ENABLE_RISK_SIZING:-${19:-true}}"       # 是否启用动态仓位
+RISK_MIN_STAKE_RATIO="${RISK_MIN_STAKE_RATIO:-${20:-0.20}}"   # 动态仓位最小倍率
+RISK_MAX_STAKE_RATIO="${RISK_MAX_STAKE_RATIO:-${21:-1.2}}"    # 动态仓位最大倍率
+CONFIDENCE_BOOST="${CONFIDENCE_BOOST:-${22:-true}}"           # 是否启用高置信加仓
+CONFIDENCE_BOOST_GE_095="${CONFIDENCE_BOOST_GE_095:-${23:-1.5}}" # 置信度>=0.95 加仓倍率
+STAKE_CAP_VERY_HIGH="${STAKE_CAP_VERY_HIGH:-${24:-0.0}}"      # very_high 风险仓位上限
+STAKE_CAP_HIGH="${STAKE_CAP_HIGH:-${25:-0.20}}"               # high 风险仓位上限
+STAKE_CAP_MEDIUM_HIGH="${STAKE_CAP_MEDIUM_HIGH:-${26:-0.50}}" # medium_high 风险仓位上限
+MEDIUM_HIGH_THRESHOLD="${MEDIUM_HIGH_THRESHOLD:-${27:-0.45}}"  # medium_high 阈值
+RISK_W_PRICE="${RISK_W_PRICE:-${28:-0.30}}"                   # 风险评分：价格权重
+RISK_W_DIRECTION="${RISK_W_DIRECTION:-${29:-0.15}}"           # 风险评分：方向权重
+RISK_W_STABILITY="${RISK_W_STABILITY:-${30:-0.55}}"           # 风险评分：稳定性权重
+RISK_DIFF_BOOST_THRESHOLD="${RISK_DIFF_BOOST_THRESHOLD:-${31:-0.44}}"     # risk_diff boost 启动阈值
+RISK_DIFF_BOOST_MULTIPLIER="${RISK_DIFF_BOOST_MULTIPLIER:-${32:-1.40}}"   # risk_diff boost 倍率
+CROSS_BORDERLINE_DIFF_MULTIPLIER="${CROSS_BORDERLINE_DIFF_MULTIPLIER:-${33:-0.0}}" # cross_count 临界倍增系数
 
 # 方向确认风控
-ENABLE_DIRECTION_CONFIRM_CLOSE="${35:-true}"        # 是否启用方向不一致平仓
-DIRECTION_CONFIRM_PRECLOSE_SEC="${34:-15}"          # 方向确认触发秒（距5m结束）
-DIRECTION_CONFIRM_MIN_ABS_DIFF="${41:-0.0}"         # 不一致平仓最小绝对价差，确认时价格方向与持仓方向不一致，且与开盘价价差大于该值时，平仓
-ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE="${45:-true}"   # 是否启用方向确认低价差强平
-DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD="${46:-10.0}"      # 低价差强平阈值，确认时BTC价格与开盘价差值小于该值时，平仓
+ENABLE_DIRECTION_CONFIRM_CLOSE="${ENABLE_DIRECTION_CONFIRM_CLOSE:-${35:-true}}"  # 是否启用方向不一致平仓
+DIRECTION_CONFIRM_PRECLOSE_SEC="${DIRECTION_CONFIRM_PRECLOSE_SEC:-${34:-15}}"    # 方向确认触发秒（距5m结束）
+DIRECTION_CONFIRM_MIN_ABS_DIFF="${DIRECTION_CONFIRM_MIN_ABS_DIFF:-${41:-0.0}}"  # 不一致平仓最小绝对价差
+ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE="${ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE:-${45:-true}}"   # 是否启用方向确认低价差强平
+DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD="${DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD:-${46:-10.0}}"         # 低价差强平阈值
 
 # 终盘风控
-ENABLE_LAST_SECONDS_REVERSE_GUARD="${36:-true}"     # 是否启用终盘加速反向风控
-REVERSE_GUARD_START_SEC="${37:-295}"                # 终盘加速反向风控起始秒
-REVERSE_GUARD_LOOKBACK_SEC="${38:-2}"               # 终盘加速反向风控回看秒数
-REVERSE_GUARD_BTC_MOVE="${39:-15.0}"                # 终盘加速反向BTC移动阈值
-REVERSE_GUARD_REQUIRE_CROSS_OPEN="${40:-true}"      # 是否要求穿越开盘价才平仓
-ENABLE_LAST_SECONDS_POSITION_GUARD="${42:-true}"    # 是否启用终盘位置风控
-POSITION_GUARD_START_SEC="${43:-295}"               # 终盘位置风控起始秒
-POSITION_GUARD_MIN_CONSECUTIVE_SEC="${44:-2}"       # 终盘位置反向连续秒数
+ENABLE_LAST_SECONDS_REVERSE_GUARD="${ENABLE_LAST_SECONDS_REVERSE_GUARD:-${36:-true}}"  # 是否启用终盘加速反向风控
+REVERSE_GUARD_START_SEC="${REVERSE_GUARD_START_SEC:-${37:-295}}"    # 终盘加速反向风控起始秒
+REVERSE_GUARD_LOOKBACK_SEC="${REVERSE_GUARD_LOOKBACK_SEC:-${38:-2}}" # 终盘加速反向风控回看秒数
+REVERSE_GUARD_BTC_MOVE="${REVERSE_GUARD_BTC_MOVE:-${39:-15.0}}"    # 终盘加速反向BTC移动阈值
+REVERSE_GUARD_REQUIRE_CROSS_OPEN="${REVERSE_GUARD_REQUIRE_CROSS_OPEN:-${40:-true}}" # 是否要求穿越开盘价才平仓
+ENABLE_LAST_SECONDS_POSITION_GUARD="${ENABLE_LAST_SECONDS_POSITION_GUARD:-${42:-true}}" # 是否启用终盘位置风控
+POSITION_GUARD_START_SEC="${POSITION_GUARD_START_SEC:-${43:-295}}"  # 终盘位置风控起始秒
+POSITION_GUARD_MIN_CONSECUTIVE_SEC="${POSITION_GUARD_MIN_CONSECUTIVE_SEC:-${44:-2}}" # 终盘位置反向连续秒数
 
 # 系统控制
-REPORT_INTERVAL_SEC="${6:-3600}"                    # 报告输出间隔（秒）
-TRADE_DB_PATH="${9:-}"                              # SQLite 路径，空则走默认配置
+REPORT_INTERVAL_SEC="${REPORT_INTERVAL_SEC:-${6:-3600}}"      # 报告输出间隔（秒）
+TRADE_DB_PATH="${TRADE_DB_PATH:-${9:-}}"                      # SQLite 路径，空则走默认配置
 
 # 日志文件
 LOG_FILE="logs/5m_trade.stdout.log"
