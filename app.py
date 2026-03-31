@@ -401,7 +401,7 @@ def _load_activity_exit_by_slug(profile: str) -> tuple[dict[str, float], dict[st
     return exit_usdc_by_slug, exit_count_by_slug
 
 
-def _load_trade_balance_series(conn: sqlite3.Connection, limit: int = 240) -> list[dict]:
+def _load_trade_balance_series(conn: sqlite3.Connection, limit: int = 2000) -> list[dict]:
     rows = conn.execute(
         """
         SELECT ts_utc, balance
@@ -694,7 +694,7 @@ def api_5m_trade_summary():
         try:
             conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row
-            log_series = _load_trade_balance_series(conn=conn, limit=240)
+            log_series = _load_trade_balance_series(conn=conn)
             skipped_windows = _load_skipped_windows(conn=conn, limit=80)
             strategy_params = _load_latest_trade_strategy_params(conn=conn)
             query = """
