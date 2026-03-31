@@ -227,15 +227,14 @@ uv run 5m_trade.py \
     --report-interval-sec 3600 \
     --max-entry-price 0.80 \
     --take-profit-spread 0.15 \
-    --stop-loss-spread -0.20 \
-    --trade-db-path logs/5m_trade.sqlite3
+    --stop-loss-spread -0.20
 ```
 
 推荐使用重启脚本：
 
 ```bash
 chmod +x scripts/restart_5m_trade.sh
-./scripts/restart_5m_trade.sh --dry-run 3 5 10 5.0 3600 0.80 0.15 -0.20 60 logs/5m_trade.sqlite3 0.95 0.15 1.333333
+./scripts/restart_5m_trade.sh --dry-run 3 5 10 5.0 3600 0.80 0.15 -0.20 60
 ```
 
 #### 生成 5m 窗口分析报表
@@ -281,12 +280,12 @@ uv run scripts/generate_5m_window_report.py \
 - `tp_value_cap`（脚本第13位参数）：动态止盈价差上限（默认 `0.15`）
 - `sl_to_tp_ratio`（脚本第14位参数）：动态止损与止盈价差倍率（默认 `1.333333`）
 - `--min-hold-before-close-sec`：最短持仓保护时间（秒，默认 `5`，`0` 表示关闭保护）
-- `--trade-db-path`：交易事件 SQLite 文件路径（例如 `logs/5m_trade.sqlite3`）
+- `--trade-db-path`：已弃用，交易数据通过 `PG_DSN` 环境变量连接 PostgreSQL
 
 重启脚本参数顺序：
 
 ```bash
-./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [trade_db_path] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]
+./scripts/restart_5m_trade.sh [--dry-run|--live] [entry_minute] [entry_preclose_sec] [min_direction_diff] [stake_usd] [report_interval_sec] [max_entry_price] [take_profit_spread] [stop_loss_spread] [min_hold_before_close_sec] [tp_price_cap] [tp_value_cap] [sl_to_tp_ratio]
 ```
 
 说明：
@@ -296,7 +295,7 @@ uv run scripts/generate_5m_window_report.py \
 切换实盘：
 
 ```bash
-./scripts/restart_5m_trade.sh --live 3 5 10 5.0 3600 0.80 0.15 -0.20 60 logs/trade.sqlite3 0.95 0.15 1.333333
+./scripts/restart_5m_trade.sh --live 3 5 10 5.0 3600 0.80 0.15 -0.20 60 0.95 0.15 1.333333
 ```
 
 #### 5m_trade 模块化说明（重构后）
@@ -311,7 +310,7 @@ uv run scripts/generate_5m_window_report.py \
 
 `btc_1s_market_monitor.py` 已直接依赖 `services.five_minute_trade.watchers.PolymarketAssetPriceWatcher`，不再通过动态加载 `5m_trade.py` 获取 watcher 类。
 
-#### 运行 BTC + Polymarket 逐秒监控（SQLite）
+#### 运行 BTC + Polymarket 逐秒监控
 
 ```bash
 uv run btc_1s_market_monitor.py --symbol btcusdt
@@ -321,12 +320,12 @@ uv run btc_1s_market_monitor.py --symbol btcusdt
 - Binance 使用 WS 维护 BTC 最新价格；
 - Polymarket 使用 WS 订阅当前 5m 市场 up/down 双边盘口；
 - 服务每秒写入一条对齐快照到 `btc_poly_1s_ticks` 表，便于后续分析；
-- 数据库路径由 `config.SQLITE_DB_PATH`（环境变量 `SQLITE_DB_PATH`）统一控制，默认 `logs/trade.sqlite3`。
+- 数据库通过 `PG_DSN` 环境变量连接 PostgreSQL (TimescaleDB)。
 
 快速查询示例：
 
 ```bash
-uv run python -c "import sqlite3; c=sqlite3.connect('logs/trade.sqlite3'); print(c.execute('SELECT * FROM btc_poly_1s_ticks ORDER BY ts_sec DESC LIMIT 5').fetchall())"
+psql "$PG_DSN" -c "SELECT * FROM btc_poly_1s_ticks ORDER BY ts_sec DESC LIMIT 5;"
 ```
 
 #### 运行 5m_trade 参数回测（网格搜索）
@@ -335,7 +334,6 @@ uv run python -c "import sqlite3; c=sqlite3.connect('logs/trade.sqlite3'); print
 
 ```bash
 uv run scripts/backtest_5m_trade_params.py \
-    --db-path logs/trade.sqlite3 \
     --entry-minute-grid 2,3,4 \
     --entry-preclose-sec-grid 4,5,6 \
     --min-direction-diff-grid 5,10,15,20 \
@@ -354,7 +352,6 @@ uv run scripts/backtest_5m_trade_params.py \
 
 ```bash
 uv run scripts/backtest_5m_trade_params.py \
-    --db-path logs/trade.sqlite3 \
     --start-ts-sec 1772700000 \
     --end-ts-sec 1772775000
 ```

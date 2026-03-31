@@ -57,10 +57,6 @@ BUILDER_SECRET = os.getenv("BUILDER_SECRET")
 BUILDER_PASSPHRASE = os.getenv("BUILDER_PASSPHRASE")
 BUILDER_ADDRESS = os.getenv("BUILDER_ADDRESS")
 
-# Shared SQLite database path used by 5m_trade and btc_1s_market_monitor.
-# 迁移过渡期保留，迁移完成后可移除。
-SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "logs/trade.sqlite3")
-
 # PostgreSQL 连接字符串 (TimescaleDB)。
 # 格式: postgresql://user:password@host:port/dbname
 PG_DSN = os.getenv("PG_DSN", "")

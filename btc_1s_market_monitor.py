@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2.extras
 
-from config import SQLITE_DB_PATH  # 迁移过渡期保留
 from data.database import get_conn
 
 from data.polymarket import (
@@ -188,17 +187,15 @@ class BTC1sMarketMonitor:
 
 	def __init__(
 		self,
-		db_path: str = SQLITE_DB_PATH,
 		symbol: str = "btcusdt",
 	) -> None:
-		self.db_path = db_path
 		self.symbol = symbol
 
 		self._lock = threading.RLock()
 		self._running = False
 		self._sampler_thread: Optional[threading.Thread] = None
 
-		self._writer = SQLiteBatchWriter(db_path=self.db_path)
+		self._writer = SQLiteBatchWriter()
 		self._btc_watcher = ChainlinkBTCPriceWatcher(
 			symbol=self.symbol,
 			callback=self._on_btc_price,

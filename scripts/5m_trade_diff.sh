@@ -56,7 +56,7 @@ print_usage() {
   ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476
 
 示例3（跳过回测，直接对比已有回测逐单CSV）:
-  ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476 logs/trade.sqlite3 output/report.json output/summary.csv output/events.csv 10 output/existing_backtest_events.csv
+  ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476 "\$PG_DSN" output/report.json output/summary.csv output/events.csv 10 output/existing_backtest_events.csv
 
 示例4（自定义逐笔逐市场对比CSV输出）:
   ./scripts/5m_trade_diff.sh "m=3,pre=4,diff=50,max=0.9,stake=10,hold=60,tp_cap=0.99,tp_val_cap=0.2,sl_ratio=1.5" 1773282300 1773294476 "\$PG_DSN" output/report.json output/summary.csv output/events.csv 10 "" --disable-output-timestamp output/my_trade_compare.csv
