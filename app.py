@@ -394,7 +394,8 @@ def _load_activity_exit_by_slug(profile: str) -> tuple[dict[str, float], dict[st
             usdc_size = float(item.get("usdcSize") or 0.0)
         except Exception:
             usdc_size = 0.0
-        if usdc_size <= 0:
+        # REDEEM 允许 usdcSize=0（代表 lost 结算归零）；SELL 仍需 > 0
+        if usdc_size <= 0 and event_type != "REDEEM":
             continue
         exit_usdc_by_slug[slug] = exit_usdc_by_slug.get(slug, 0.0) + usdc_size
         exit_count_by_slug[slug] = exit_count_by_slug.get(slug, 0) + 1
