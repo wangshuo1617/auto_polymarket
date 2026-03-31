@@ -52,11 +52,9 @@ class PriceBookState:
 class SQLiteBatchWriter:
 	def __init__(
 		self,
-		db_path: str = "",
 		flush_rows: int = 500,
 		flush_interval_sec: float = 1.0,
 	) -> None:
-		self.db_path = db_path
 		self.flush_rows = max(1, int(flush_rows))
 		self.flush_interval_sec = max(0.1, float(flush_interval_sec))
 		self._queue: "queue.Queue[Optional[Tuple[Any, ...]]]" = queue.Queue(maxsize=100000)
@@ -226,7 +224,7 @@ class BTC1sMarketMonitor:
 		self._sampler_thread = threading.Thread(target=self._sampling_loop, daemon=True)
 		self._sampler_thread.start()
 
-		logger.info("BTC1sMarketMonitor 启动完成，数据库: %s", self.db_path)
+		logger.info("BTC1sMarketMonitor 启动完成，数据库: PG_DSN")
 
 	def stop(self) -> None:
 		self._running = False
@@ -858,11 +856,6 @@ class BTC1sMarketMonitor:
 def build_arg_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="BTC 与 Polymarket 5m 市场逐秒监控")
 	parser.add_argument(
-		"--db-path",
-		default="",
-		help="已弃用，使用 PG_DSN 环境变量连接 PostgreSQL",
-	)
-	parser.add_argument(
 		"--symbol",
 		default="btcusdt",
 		help="Binance 交易对（默认: btcusdt）",
@@ -879,7 +872,7 @@ def main() -> None:
 
 	args = build_arg_parser().parse_args()
 
-	monitor = BTC1sMarketMonitor(db_path=args.db_path, symbol=args.symbol)
+	monitor = BTC1sMarketMonitor(symbol=args.symbol)
 	try:
 		monitor.start()
 		logger.info("btc_1s_market_monitor 服务已启动，按 Ctrl+C 退出")

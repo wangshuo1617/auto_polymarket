@@ -149,21 +149,60 @@ def schedule_position_balance_confirmation(
 
             if confirmed_size <= 0:
                 if matched_size > 0:
-                    logger.error("重大延迟: 引擎已成交 %.6f 但 API 余额为 0，强制保留持仓以维持风控保护！", matched_size)
-                    pos.size = normalize_order_size(matched_size * 0.985, tick_size=tick_size)
-                    if pos.actual_entry_size is None:
-                        pos.actual_entry_size = matched_size
-                    if pos.actual_entry_price is None and matched_price is not None:
-                        pos.actual_entry_price = matched_price
-                    if (
-                        pos.total_invested_usdc is None
-                        and pos.actual_entry_price is not None
-                        and pos.actual_entry_size is not None
-                        and pos.actual_entry_size > 0
-                    ):
-                        pos.total_invested_usdc = pos.actual_entry_price * pos.actual_entry_size
-                    pos.balance_confirmed = True
-                else:
+                    # 订单已 MATCHED 但余额为 0，做第三次确认（延迟 30s）
+                    logger.warning(
+                        "建仓已成交 %.6f 但余额为 0，30s 后做第三次确认: market=%s token=%s order_id=%s",
+                        matched_size, market_slug, token_id, order_id,
+                    )
+
+                # 释放锁后执行第三次确认
+                if matched_size > 0:
+                    time.sleep(30)
+                    raw_balance_3rd = get_conditional_token_balance(token_id, profile=TRADE_PROFILE)
+                    confirmed_size_3rd = normalize_order_size(raw_balance_3rd, tick_size=tick_size)
+                    logger.info(
+                        "建仓余额第三次确认: market=%s token=%s balance=%.6f raw=%.6f order_id=%s",
+                        market_slug, token_id, confirmed_size_3rd, raw_balance_3rd, order_id,
+                    )
+
+                    with self._lock:
+                        pos = self.position
+                        if pos is None or pos.market_slug != market_slug or pos.token_id != token_id:
+                            return
+
+                        if confirmed_size_3rd > 0:
+                            # 终于到账，更新持仓
+                            pos.size = confirmed_size_3rd
+                            pos.balance_confirmed = True
+                            logger.info("建仓余额第三次确认到账: market=%s size=%.6f", market_slug, confirmed_size_3rd)
+                        else:
+                            # 三次确认均为 0，判定为幽灵订单，标记失败并清理
+                            logger.error(
+                                "幽灵订单: 引擎成交 %.6f 但三次余额确认均为 0，标记失败并清理: market=%s token=%s order_id=%s",
+                                matched_size, market_slug, token_id, order_id,
+                            )
+                            if self._trade_db is not None:
+                                try:
+                                    updated = self._trade_db.mark_entry_event_try_fail(
+                                        market_slug=market_slug,
+                                        token_id=token_id,
+                                        entry_time=pos.entry_time,
+                                        order_id=order_id,
+                                        dry_run=self.dry_run,
+                                    )
+                                    logger.info(
+                                        "幽灵订单已标记失败: market=%s order_id=%s updated=%s",
+                                        market_slug, order_id, updated,
+                                    )
+                                except Exception as db_err:
+                                    logger.warning("幽灵订单标记失败异常: market=%s error=%s", market_slug, db_err)
+                            self.position = None
+                            if self._poly_watcher:
+                                self._poly_watcher.stop()
+                                self._poly_watcher = None
+                    return
+
+                if matched_size <= 0:
                     if self._trade_db is not None:
                         try:
                             updated = self._trade_db.mark_entry_event_try_fail(
@@ -174,7 +213,7 @@ def schedule_position_balance_confirmation(
                                 dry_run=self.dry_run,
                             )
                             logger.info(
-                                "建仓零成交保留SQLite entry记录并标记失败: market=%s token=%s order_id=%s updated=%s reason=entry_try_fail",
+                                "建仓零成交标记失败: market=%s token=%s order_id=%s updated=%s",
                                 market_slug,
                                 token_id,
                                 order_id,
