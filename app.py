@@ -9,6 +9,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
@@ -477,10 +478,44 @@ def _load_latest_trade_strategy_params(conn: sqlite3.Connection) -> dict:
     }
 
 
+def _extract_window_start_ms(market_slug: str) -> Optional[int]:
+    """从 market_slug (btc-updown-5m-{ts_sec}) 提取窗口起始毫秒时间戳。"""
+    try:
+        ts_sec = int(str(market_slug).split("-")[-1])
+        return ts_sec * 1000
+    except (ValueError, IndexError):
+        return None
+
+
+def _batch_winning_directions(conn: sqlite3.Connection, window_start_ms_list: list[int]) -> dict[int, str]:
+    """批量查询 btc_poly_1s_ticks 中各窗口的 winning_direction。"""
+    if not window_start_ms_list:
+        return {}
+    result: dict[int, str] = {}
+    # SQLite 参数限制，分批查询
+    batch_size = 500
+    for i in range(0, len(window_start_ms_list), batch_size):
+        batch = window_start_ms_list[i:i + batch_size]
+        placeholders = ",".join("?" * len(batch))
+        rows = conn.execute(
+            f"""
+            SELECT window_start_ms, winning_direction
+            FROM btc_poly_1s_ticks
+            WHERE window_start_ms IN ({placeholders})
+              AND winning_direction IS NOT NULL
+            GROUP BY window_start_ms
+            """,
+            batch,
+        ).fetchall()
+        for row in rows:
+            result[int(row["window_start_ms"])] = str(row["winning_direction"])
+    return result
+
+
 def _load_skipped_windows(conn: sqlite3.Connection, limit: int = 80) -> list[dict]:
     rows = conn.execute(
         """
-        SELECT event_time, market_slug, reason
+        SELECT event_time, market_slug, reason, direction
         FROM trade_events
         WHERE mode='live'
           AND side='skip'
@@ -490,15 +525,30 @@ def _load_skipped_windows(conn: sqlite3.Connection, limit: int = 80) -> list[dic
         """,
         (int(limit),),
     ).fetchall()
+    # 批量查询实际结算方向
+    window_ms_list = []
+    for row in rows:
+        wms = _extract_window_start_ms(str(row["market_slug"] or ""))
+        if wms is not None:
+            window_ms_list.append(wms)
+    winning_map = _batch_winning_directions(conn, window_ms_list)
     result = []
     for row in rows:
         raw_time = str(row["event_time"] or "")
         utc_time = _format_utc_time(raw_time)
+        slug = str(row["market_slug"] or "")
+        predicted = str(row["direction"] or "").strip().lower()
+        if predicted not in ("up", "down"):
+            predicted = ""
+        wms = _extract_window_start_ms(slug)
+        actual = winning_map.get(wms, "") if wms else ""
         result.append({
-            "window_slug": str(row["market_slug"] or ""),
+            "window_slug": slug,
             "utc_time": utc_time,
             "et_time": _format_et_time(raw_time),
             "reason": str(row["reason"] or ""),
+            "predicted_direction": predicted,
+            "actual_direction": actual,
         })
     return result
 
@@ -818,19 +868,74 @@ def api_5m_trade_stats():
             if reason not in category_examples[category] and len(category_examples[category]) < 3:
                 category_examples[category].append(reason)
 
+        # 查询每条 skip 事件的 direction 和 market_slug，用于计算预测准确率
+        skip_detail_rows = conn.execute(
+            """
+            SELECT market_slug, direction, reason
+            FROM trade_events
+            WHERE mode='live'
+              AND side='skip'
+              AND market_slug LIKE 'btc-updown-5m-%'
+              AND event_time >= ?
+              AND event_time <= ?
+            """,
+            (start_utc_iso, end_utc_iso),
+        ).fetchall()
+        # 收集所有窗口的 window_start_ms
+        detail_window_ms_list = []
+        for dr in skip_detail_rows:
+            wms = _extract_window_start_ms(str(dr["market_slug"] or ""))
+            if wms is not None:
+                detail_window_ms_list.append(wms)
+        winning_map = _batch_winning_directions(conn, detail_window_ms_list)
+
+        # 总体预测统计
+        total_correct = 0
+        total_wrong = 0
+        # 按跳过原因分类的预测统计
+        category_correct: dict[str, int] = {}
+        category_wrong: dict[str, int] = {}
+        for dr in skip_detail_rows:
+            predicted = str(dr["direction"] or "").strip().lower()
+            if predicted not in ("up", "down"):
+                continue
+            wms = _extract_window_start_ms(str(dr["market_slug"] or ""))
+            actual = winning_map.get(wms, "") if wms else ""
+            if not actual:
+                continue
+            category = _categorize_skip_reason(str(dr["reason"] or ""))
+            if predicted == actual:
+                total_correct += 1
+                category_correct[category] = category_correct.get(category, 0) + 1
+            else:
+                total_wrong += 1
+                category_wrong[category] = category_wrong.get(category, 0) + 1
+
+        total_predicted = total_correct + total_wrong
+        prediction_accuracy = (total_correct / total_predicted) if total_predicted > 0 else None
+
         reason_stats = []
         for category, cnt in sorted(category_count.items(), key=lambda x: (-x[1], x[0])):
+            c_correct = category_correct.get(category, 0)
+            c_wrong = category_wrong.get(category, 0)
+            c_total = c_correct + c_wrong
             reason_stats.append({
                 "reason": category,
                 "count": cnt,
                 "ratio": (cnt / skip_count) if skip_count > 0 else None,
                 "examples": category_examples.get(category, []),
+                "correct_count": c_correct,
+                "wrong_count": c_wrong,
+                "prediction_accuracy": (c_correct / c_total) if c_total > 0 else None,
             })
         return jsonify({
             "stat_type": "skip",
             "total_windows": total_windows,
             "skip_window_count": skip_count,
             "skip_window_ratio": (skip_count / total_windows) if total_windows > 0 else None,
+            "total_correct": total_correct,
+            "total_wrong": total_wrong,
+            "prediction_accuracy": prediction_accuracy,
             "reasons": reason_stats,
         })
     except Exception as e:

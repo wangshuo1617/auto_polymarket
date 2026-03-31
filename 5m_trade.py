@@ -998,6 +998,10 @@ class FiveMinuteUpDownTrader:
         ):
             return
 
+        # 预先计算预测方向，供所有跳过记录使用
+        _pred_diff = projected_close - self.window_open_price
+        _predicted_direction: Optional[str] = "up" if _pred_diff > 0 else ("down" if _pred_diff < 0 else None)
+
         if self._is_toxic_time_regime():
             current_utc_hour = datetime.now(timezone.utc).hour
             reason = "Skip: Toxic Time Regime (UTC hour=%s in %s)" % (
@@ -1005,7 +1009,7 @@ class FiveMinuteUpDownTrader:
                 sorted(self.toxic_utc_hours),
             )
             logger.info("%s", reason)
-            self._record_skip_window(reason=reason)
+            self._record_skip_window(reason=reason, direction=_predicted_direction)
             self.window_traded = True
             return
 
@@ -1020,7 +1024,7 @@ class FiveMinuteUpDownTrader:
                     self.max_avg_btc_delta,
                 )
                 logger.info("%s", reason)
-                self._record_skip_window(reason=reason)
+                self._record_skip_window(reason=reason, direction=_predicted_direction)
                 self.window_traded = True
                 return
 
@@ -1031,7 +1035,7 @@ class FiveMinuteUpDownTrader:
                 self.max_btc_cross_count,
             )
             logger.info("%s", reason)
-            self._record_skip_window(reason=reason)
+            self._record_skip_window(reason=reason, direction=_predicted_direction)
             self.window_traded = True
             return
 
@@ -1043,7 +1047,7 @@ class FiveMinuteUpDownTrader:
             if not _mi:
                 reason = "Skip entry: market cache 缺失 slug=%s，无法做 UP/DOWN spread 检查" % (self.current_market_slug,)
                 logger.info("%s", reason)
-                self._record_skip_window(reason=reason)
+                self._record_skip_window(reason=reason, direction=_predicted_direction)
                 self.window_traded = True
                 return
             _up_book = self._ws_book_cache.get(str(_mi.get("up_token") or ""))
@@ -1054,7 +1058,7 @@ class FiveMinuteUpDownTrader:
                     "有" if _dn_book else "无",
                 )
                 logger.info("%s", reason)
-                self._record_skip_window(reason=reason)
+                self._record_skip_window(reason=reason, direction=_predicted_direction)
                 self.window_traded = True
                 return
             _up_ask = self._to_positive_float(_up_book.get("best_ask"))
@@ -1064,7 +1068,7 @@ class FiveMinuteUpDownTrader:
                     _up_ask, _dn_ask,
                 )
                 logger.info("%s", reason)
-                self._record_skip_window(reason=reason)
+                self._record_skip_window(reason=reason, direction=_predicted_direction)
                 self.window_traded = True
                 return
             _ud_diff = abs(_up_ask - _dn_ask)
@@ -1074,7 +1078,7 @@ class FiveMinuteUpDownTrader:
                     self.min_entry_updown_diff,
                 )
                 logger.info("%s", reason)
-                self._record_skip_window(reason=reason)
+                self._record_skip_window(reason=reason, direction=_predicted_direction)
                 self.window_traded = True
                 return
 
@@ -1095,7 +1099,7 @@ class FiveMinuteUpDownTrader:
                 )
             )
             logger.info("%s", reason)
-            self._record_skip_window(reason=reason)
+            self._record_skip_window(reason=reason, direction=_predicted_direction)
             self.window_traded = True
             return
 
@@ -1120,7 +1124,7 @@ class FiveMinuteUpDownTrader:
                     )
                 )
                 logger.info("%s", reason)
-                self._record_skip_window(reason=reason)
+                self._record_skip_window(reason=reason, direction=_predicted_direction)
                 self.window_traded = True
                 return
 
@@ -1159,7 +1163,7 @@ class FiveMinuteUpDownTrader:
                         )
                     )
                     logger.info("%s", reason)
-                    self._record_skip_window(reason=reason)
+                    self._record_skip_window(reason=reason, direction=_predicted_direction)
                     self.window_traded = True
                     return
 
@@ -1173,7 +1177,7 @@ class FiveMinuteUpDownTrader:
                 ms_to_close / 1000,
             )
             logger.info("%s", reason)
-            self._record_skip_window(reason=reason)
+            self._record_skip_window(reason=reason, direction=_predicted_direction)
             self.window_traded = True
             return
 
@@ -1191,7 +1195,7 @@ class FiveMinuteUpDownTrader:
                         m, mc, open_price, m_side, direction,
                     )
                     logger.info("%s", reason)
-                    self._record_skip_window(reason=reason)
+                    self._record_skip_window(reason=reason, direction=_predicted_direction)
                     self.window_traded = True
                     return
 
@@ -1204,13 +1208,13 @@ class FiveMinuteUpDownTrader:
                     direction, entry_ask, other_ask,
                 )
                 logger.info("%s", reason)
-                self._record_skip_window(reason=reason)
+                self._record_skip_window(reason=reason, direction=_predicted_direction)
                 self.window_traded = True
                 return
 
         # DB tick 交叉验证：确保回测使用同一 DB 数据也会入场，避免误入
         if not self._validate_entry_with_db_ticks(direction):
-            self._record_skip_window(reason="Skip entry: DB交叉验证未通过")
+            self._record_skip_window(reason="Skip entry: DB交叉验证未通过", direction=_predicted_direction)
             self.window_traded = True
             return
 

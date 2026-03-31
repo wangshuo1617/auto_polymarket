@@ -136,6 +136,9 @@ class SQLiteBatchWriter:
 		conn.execute(
 			"CREATE INDEX IF NOT EXISTS idx_btc_poly_1s_ticks_market ON btc_poly_1s_ticks(market_slug)"
 		)
+		conn.execute(
+			"CREATE INDEX IF NOT EXISTS idx_btc_poly_1s_ticks_wms_wd ON btc_poly_1s_ticks(window_start_ms, winning_direction)"
+		)
 		self._ensure_table_columns(conn)
 		conn.commit()
 
