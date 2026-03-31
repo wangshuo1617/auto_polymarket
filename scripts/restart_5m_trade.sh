@@ -38,7 +38,7 @@ RISK_MAX_STAKE_RATIO="${21:-1.2}"                   # 动态仓位最大倍率
 CONFIDENCE_BOOST="${22:-true}"                      # 是否启用高置信加仓
 CONFIDENCE_BOOST_GE_095="${23:-1.5}"                # 置信度>=0.95 加仓倍率
 STAKE_CAP_VERY_HIGH="${24:-0.0}"                    # very_high 风险仓位上限
-STAKE_CAP_HIGH="${25:-0.50}"                        # high 风险仓位上限
+STAKE_CAP_HIGH="${25:-0.20}"                        # high 风险仓位上限
 STAKE_CAP_MEDIUM_HIGH="${26:-0.50}"                 # medium_high 风险仓位上限
 MEDIUM_HIGH_THRESHOLD="${27:-0.45}"                 # medium_high 阈值
 RISK_W_PRICE="${28:-0.30}"                          # 风险评分：价格权重

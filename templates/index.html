@@ -406,6 +406,7 @@
         let tradeSkipRowsData = [];
         let tradeHistoryPage = 1;
         let tradeSkipPage = 1;
+        let tradeResultFilter = 'all';
         let tradeCurrentBalance = '—';
         let tradeBalanceSeriesData = [];
         let tradeChartStart = '';
@@ -624,6 +625,13 @@
             updateSkipStatsBtnState();
         }
 
+        function onHistoryResultFilterChanged() {
+            const v = document.getElementById('historyResultFilter')?.value || 'all';
+            tradeResultFilter = v;
+            tradeHistoryPage = 1;
+            render5mTradeTab(tradeCurrentBalance);
+        }
+
         function _showTradeStatsModal(title, html) {
             document.getElementById('tradeStatsModalLabel').textContent = title;
             document.getElementById('tradeStatsModalBody').innerHTML = html;
@@ -731,7 +739,11 @@
             if (!Array.isArray(series) || series.length === 0) {
                 return '<div class="text-muted p-3">暂无余额曲线数据</div>';
             }
-            const points = series.slice(-120);
+            let points = [...series];
+            if (points.length > 800) {
+                const step = Math.ceil(points.length / 800);
+                points = points.filter((_, idx) => idx % step === 0 || idx === points.length - 1);
+            }
             const values = points.map(p => Number(p.balance)).filter(v => !isNaN(v));
             if (values.length === 0) {
                 return '<div class="text-muted p-3">暂无有效余额数据</div>';
@@ -788,7 +800,10 @@
         }
 
         function render5mTradeTab(currentBalance) {
-            const hPage = _pageSlice(tradeHistoryRowsData, tradeHistoryPage, TRADE_TABLE_PAGE_SIZE);
+            const historyFilteredRows = (tradeResultFilter === 'all')
+                ? tradeHistoryRowsData
+                : tradeHistoryRowsData.filter(r => String(r.result || '').trim() === tradeResultFilter);
+            const hPage = _pageSlice(historyFilteredRows, tradeHistoryPage, TRADE_TABLE_PAGE_SIZE);
             tradeHistoryPage = hPage.current;
             const filteredSeries = _appendLiveBalancePointIfNeeded(_getFilteredTradeBalanceSeries(), currentBalance);
             const chartHtml = _drawBalanceChart(filteredSeries);
@@ -843,6 +858,12 @@
             html += '<input type="datetime-local" class="form-control form-control-sm" style="width: 190px;" id="historyStatStart" value="' + _escapeHtml(tradeHistoryStatStart) + '" oninput="onHistoryStatInputChanged()" />';
             html += '<input type="datetime-local" class="form-control form-control-sm" style="width: 190px;" id="historyStatEnd" value="' + _escapeHtml(tradeHistoryStatEnd) + '" oninput="onHistoryStatInputChanged()" />';
             html += '<button class="btn btn-sm btn-outline-primary" id="historyStatBtn" onclick="openHistoryStats()" disabled>统计</button>';
+            html += '<select class="form-select form-select-sm" style="width: 110px;" id="historyResultFilter" onchange="onHistoryResultFilterChanged()">';
+            html += '<option value="all"' + (tradeResultFilter === 'all' ? ' selected' : '') + '>全部</option>';
+            html += '<option value="盈利"' + (tradeResultFilter === '盈利' ? ' selected' : '') + '>盈利</option>';
+            html += '<option value="亏损"' + (tradeResultFilter === '亏损' ? ' selected' : '') + '>亏损</option>';
+            html += '<option value="未定"' + (tradeResultFilter === '未定' ? ' selected' : '') + '>未定</option>';
+            html += '</select>';
             html += '</div></div>';
             html += '<div class="table-responsive"><table class="table table-sm table-bordered align-middle mb-0">';
             html += '<thead><tr><th>窗口slug</th><th>UTC+8时间</th><th>结果</th><th>入场价格</th><th>入场token量</th><th>入场金额</th><th>出场价格</th><th>出场金额</th><th>利润</th></tr></thead>';
