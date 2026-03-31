@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -480,7 +481,8 @@ def _load_latest_trade_strategy_params(conn: sqlite3.Connection) -> dict:
 def _load_skipped_windows(conn: sqlite3.Connection, limit: int = 80) -> list[dict]:
     rows = conn.execute(
         """
-        SELECT event_time, market_slug, reason
+        SELECT id, event_time, market_slug, reason, market_id,
+               direction, predicted_entry_price, predicted_entry_size, actual_outcome
         FROM trade_events
         WHERE mode='live'
           AND side='skip'
@@ -490,15 +492,25 @@ def _load_skipped_windows(conn: sqlite3.Connection, limit: int = 80) -> list[dic
         """,
         (int(limit),),
     ).fetchall()
+    row_dicts = [dict(r) for r in rows]
+    _refresh_skip_rows_actual_outcome(conn, row_dicts)
     result = []
-    for row in rows:
+    for row in row_dicts:
         raw_time = str(row["event_time"] or "")
         utc_time = _format_utc_time(raw_time)
+        pred_raw = str(row.get("direction") or "").strip().lower()
+        if pred_raw in ("", "na"):
+            pred_raw = None
+        act_raw = str(row.get("actual_outcome") or "").strip().lower()
+        if act_raw not in ("up", "down"):
+            act_raw = None
         result.append({
             "window_slug": str(row["market_slug"] or ""),
             "utc_time": utc_time,
             "et_time": _format_et_time(raw_time),
             "reason": str(row["reason"] or ""),
+            "predicted_direction": _direction_to_cn_label(pred_raw),
+            "actual_settlement_direction": _direction_to_cn_label(act_raw),
         })
     return result
 
@@ -625,6 +637,112 @@ def _categorize_skip_reason(reason: str) -> str:
     return "其他"
 
 
+def _skip_slug_window_end_ts(slug: str) -> int | None:
+    m = re.search(r"btc-updown-5m-(\d+)$", str(slug or "").strip().lower())
+    if not m:
+        return None
+    return int(m.group(1)) + 300
+
+
+def _direction_to_cn_label(code: str | None) -> str:
+    if code == "up":
+        return "涨"
+    if code == "down":
+        return "跌"
+    if code == "flat":
+        return "平"
+    return "--"
+
+
+def _clob_winner_to_updown(market_payload: dict) -> str | None:
+    tokens = market_payload.get("tokens") or []
+    for t in tokens:
+        if not isinstance(t, dict) or t.get("winner") is not True:
+            continue
+        outcome = str(t.get("outcome") or "").lower()
+        if "up" in outcome:
+            return "up"
+        if "down" in outcome:
+            return "down"
+    return None
+
+
+def _condition_id_for_btc_5m_slug(slug: str) -> str:
+    try:
+        info = get_event_token_id(slug)
+        markets = info.get("markets") or []
+        if not markets:
+            return ""
+        m0 = markets[0]
+        return str(m0.get("market_id") or m0.get("conditionId") or "").strip()
+    except Exception:
+        return ""
+
+
+def _try_resolve_skip_slug_outcome(slug: str, market_id_hint: str) -> str | None:
+    """窗口结束后从 CLOB 读取胜出方；未结算返回 None。"""
+    end_ts = _skip_slug_window_end_ts(slug)
+    if end_ts is None:
+        return None
+    if time.time() < float(end_ts) + 2.0:
+        return None
+    cid = str(market_id_hint or "").strip()
+    if not cid:
+        cid = _condition_id_for_btc_5m_slug(slug)
+    if not cid:
+        return None
+    try:
+        client = get_client(TRADE_PM_PROFILE)
+        market = client.get_market(cid)
+        if not isinstance(market, dict):
+            return None
+        return _clob_winner_to_updown(market)
+    except Exception as e:
+        logger.debug("解析跳过窗口结算方向失败 slug=%s error=%s", slug, e)
+        return None
+
+
+def _refresh_skip_rows_actual_outcome(conn: sqlite3.Connection, rows: list[dict], max_slug_lookups: int = 48) -> None:
+    now = time.time()
+    slug_pairs: list[tuple[str, str]] = []
+    seen_slugs: set[str] = set()
+    for r in rows:
+        slug = str(r.get("market_slug") or "").strip().lower()
+        if not slug or slug in seen_slugs:
+            continue
+        if str(r.get("actual_outcome") or "").strip().lower() in ("up", "down"):
+            seen_slugs.add(slug)
+            continue
+        end_ts = _skip_slug_window_end_ts(slug)
+        if end_ts is None or now < float(end_ts) + 2.0:
+            continue
+        seen_slugs.add(slug)
+        slug_pairs.append((slug, str(r.get("market_id") or "")))
+
+    for slug, mid in slug_pairs[:max_slug_lookups]:
+        out = _try_resolve_skip_slug_outcome(slug, mid)
+        if out:
+            conn.execute(
+                """
+                UPDATE trade_events
+                SET actual_outcome=?
+                WHERE side='skip' AND lower(market_slug)=? AND actual_outcome IS NULL
+                """,
+                (out, slug),
+            )
+    if slug_pairs:
+        conn.commit()
+    for r in rows:
+        if str(r.get("actual_outcome") or "").strip().lower() in ("up", "down"):
+            continue
+        one = conn.execute(
+            "SELECT actual_outcome FROM trade_events WHERE id=?",
+            (int(r["id"]),),
+        ).fetchone()
+        if one and one[0]:
+            r["actual_outcome"] = str(one[0])
+
+
 @app.route('/api/5m_trade_summary')
 def api_5m_trade_summary():
     try:
@@ -651,27 +769,27 @@ def api_5m_trade_summary():
                 SELECT
                     market_slug,
                     MIN(event_time) AS first_event_time,
-                    SUM(CASE WHEN side='buy' THEN 1 ELSE 0 END) AS buy_event_count,
-                    SUM(CASE WHEN side='buy' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS entry_usdc,
-                    SUM(CASE WHEN side='buy' THEN COALESCE(trade_size, 0) ELSE 0 END) AS entry_size,
-                    SUM(CASE WHEN side='buy' THEN COALESCE(notional_usdc, 0) ELSE 0 END) /
-                        NULLIF(SUM(CASE WHEN side='buy' THEN COALESCE(trade_size, 0) ELSE 0 END), 0) AS entry_price,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN 1 ELSE 0 END) AS buy_event_count,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS entry_usdc,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(trade_size, 0) ELSE 0 END) AS entry_size,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(notional_usdc, 0) ELSE 0 END) /
+                        NULLIF(SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(trade_size, 0) ELSE 0 END), 0) AS entry_price,
                     SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS exit_usdc,
                     SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(trade_size, 0) ELSE 0 END) AS exit_size,
                     SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(notional_usdc, 0) ELSE 0 END) /
                         NULLIF(SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(trade_size, 0) ELSE 0 END), 0) AS exit_price,
                     SUM(CASE WHEN side IN ('sell','redeem') THEN 1 ELSE 0 END) AS exit_event_count,
-                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' THEN 1 ELSE 0 END) AS analyze_buy_count,
-                    SUM(CASE WHEN side IN ('sell','redeem') AND reason='analyze_backfill' THEN 1 ELSE 0 END) AS analyze_exit_count,
-                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_entry_usdc,
-                    SUM(CASE WHEN side IN ('sell','redeem') AND reason='analyze_backfill' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_exit_usdc,
-                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' THEN COALESCE(trade_size, 0) ELSE 0 END) AS analyze_entry_size,
-                    SUM(CASE WHEN side IN ('sell','redeem') AND reason='analyze_backfill' THEN COALESCE(trade_size, 0) ELSE 0 END) AS analyze_exit_size,
-                    SUM(CASE WHEN side='buy' AND (reason IS NULL OR reason!='analyze_backfill') THEN 1 ELSE 0 END) AS trade_buy_count,
+                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN 1 ELSE 0 END) AS analyze_buy_count,
+                    SUM(CASE WHEN side IN ('sell','redeem') AND (reason='analyze_backfill' OR reason IN ('analyze_forced_loss_no_exit', 'analyze_activity_backfill_settlement')) THEN 1 ELSE 0 END) AS analyze_exit_count,
+                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_entry_usdc,
+                    SUM(CASE WHEN side IN ('sell','redeem') AND (reason='analyze_backfill' OR reason IN ('analyze_forced_loss_no_exit', 'analyze_activity_backfill_settlement')) THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_exit_usdc,
+                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(trade_size, 0) ELSE 0 END) AS analyze_entry_size,
+                    SUM(CASE WHEN side IN ('sell','redeem') AND (reason='analyze_backfill' OR reason IN ('analyze_forced_loss_no_exit', 'analyze_activity_backfill_settlement')) THEN COALESCE(trade_size, 0) ELSE 0 END) AS analyze_exit_size,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' AND (reason IS NULL OR reason!='analyze_backfill') THEN 1 ELSE 0 END) AS trade_buy_count,
                     SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN 1 ELSE 0 END) AS trade_exit_count,
-                    SUM(CASE WHEN side='buy' AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS trade_entry_usdc,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS trade_entry_usdc,
                     SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS trade_exit_usdc,
-                    SUM(CASE WHEN side='buy' AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_entry_size,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_entry_size,
                     SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_exit_size
                 FROM trade_events
                 WHERE mode='live'
@@ -736,21 +854,21 @@ def api_5m_trade_stats():
                 SELECT
                     market_slug,
                     MIN(event_time) AS first_event_time,
-                    SUM(CASE WHEN side='buy' THEN 1 ELSE 0 END) AS buy_event_count,
-                    SUM(CASE WHEN side='buy' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS entry_usdc,
-                    SUM(CASE WHEN side='buy' THEN COALESCE(trade_size, 0) ELSE 0 END) AS entry_size,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN 1 ELSE 0 END) AS buy_event_count,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS entry_usdc,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(trade_size, 0) ELSE 0 END) AS entry_size,
                     SUM(CASE WHEN side IN ('sell','redeem') THEN 1 ELSE 0 END) AS exit_event_count,
-                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' THEN 1 ELSE 0 END) AS analyze_buy_count,
-                    SUM(CASE WHEN side IN ('sell','redeem') AND reason='analyze_backfill' THEN 1 ELSE 0 END) AS analyze_exit_count,
-                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_entry_usdc,
-                    SUM(CASE WHEN side IN ('sell','redeem') AND reason='analyze_backfill' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_exit_usdc,
-                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' THEN COALESCE(trade_size, 0) ELSE 0 END) AS analyze_entry_size,
-                    SUM(CASE WHEN side IN ('sell','redeem') AND reason='analyze_backfill' THEN COALESCE(trade_size, 0) ELSE 0 END) AS analyze_exit_size,
-                    SUM(CASE WHEN side='buy' AND (reason IS NULL OR reason!='analyze_backfill') THEN 1 ELSE 0 END) AS trade_buy_count,
+                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN 1 ELSE 0 END) AS analyze_buy_count,
+                    SUM(CASE WHEN side IN ('sell','redeem') AND (reason='analyze_backfill' OR reason IN ('analyze_forced_loss_no_exit', 'analyze_activity_backfill_settlement')) THEN 1 ELSE 0 END) AS analyze_exit_count,
+                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_entry_usdc,
+                    SUM(CASE WHEN side IN ('sell','redeem') AND (reason='analyze_backfill' OR reason IN ('analyze_forced_loss_no_exit', 'analyze_activity_backfill_settlement')) THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_exit_usdc,
+                    SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(trade_size, 0) ELSE 0 END) AS analyze_entry_size,
+                    SUM(CASE WHEN side IN ('sell','redeem') AND (reason='analyze_backfill' OR reason IN ('analyze_forced_loss_no_exit', 'analyze_activity_backfill_settlement')) THEN COALESCE(trade_size, 0) ELSE 0 END) AS analyze_exit_size,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' AND (reason IS NULL OR reason!='analyze_backfill') THEN 1 ELSE 0 END) AS trade_buy_count,
                     SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN 1 ELSE 0 END) AS trade_exit_count,
-                    SUM(CASE WHEN side='buy' AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS trade_entry_usdc,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS trade_entry_usdc,
                     SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS trade_exit_usdc,
-                    SUM(CASE WHEN side='buy' AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_entry_size,
+                    SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_entry_size,
                     SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_exit_size
                 FROM trade_events
                 WHERE mode='live'
@@ -826,11 +944,64 @@ def api_5m_trade_stats():
                 "ratio": (cnt / skip_count) if skip_count > 0 else None,
                 "examples": category_examples.get(category, []),
             })
+
+        skip_detail = conn.execute(
+            """
+            SELECT id, reason, direction, actual_outcome, market_slug, market_id
+            FROM trade_events
+            WHERE mode='live'
+              AND side='skip'
+              AND market_slug LIKE 'btc-updown-5m-%'
+              AND event_time >= ?
+              AND event_time <= ?
+            """,
+            (start_utc_iso, end_utc_iso),
+        ).fetchall()
+        detail_dicts = [dict(r) for r in skip_detail]
+        _refresh_skip_rows_actual_outcome(conn, detail_dicts, max_slug_lookups=256)
+
+        by_cat_pred: dict[str, dict[str, int]] = {}
+        g_correct = 0
+        g_wrong = 0
+        for r in detail_dicts:
+            pred = str(r.get("direction") or "").strip().lower()
+            act = str(r.get("actual_outcome") or "").strip().lower()
+            if pred not in ("up", "down"):
+                continue
+            if act not in ("up", "down"):
+                continue
+            cat = _categorize_skip_reason(str(r.get("reason") or ""))
+            if cat not in by_cat_pred:
+                by_cat_pred[cat] = {"correct": 0, "wrong": 0}
+            if pred == act:
+                g_correct += 1
+                by_cat_pred[cat]["correct"] += 1
+            else:
+                g_wrong += 1
+                by_cat_pred[cat]["wrong"] += 1
+        g_settled = g_correct + g_wrong
+        g_accuracy = (g_correct / g_settled) if g_settled > 0 else None
+
+        for item in reason_stats:
+            cat = str(item.get("reason") or "")
+            pc = by_cat_pred.get(cat) or {"correct": 0, "wrong": 0}
+            c = int(pc["correct"])
+            w = int(pc["wrong"])
+            st = c + w
+            item["predict_settled_count"] = st
+            item["predict_correct_count"] = c
+            item["predict_wrong_count"] = w
+            item["predict_accuracy"] = (c / st) if st > 0 else None
+
         return jsonify({
             "stat_type": "skip",
             "total_windows": total_windows,
             "skip_window_count": skip_count,
             "skip_window_ratio": (skip_count / total_windows) if total_windows > 0 else None,
+            "skip_prediction_settled_count": g_settled,
+            "skip_prediction_correct_count": g_correct,
+            "skip_prediction_wrong_count": g_wrong,
+            "skip_prediction_accuracy": g_accuracy,
             "reasons": reason_stats,
         })
     except Exception as e:
