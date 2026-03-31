@@ -150,8 +150,6 @@ def open_position(
                 market_id=market_id,
                 token_id=token_id,
                 direction=direction,
-                predicted_entry_price=None,
-                predicted_entry_size=None,
             )
             return
     else:
@@ -163,8 +161,6 @@ def open_position(
             market_id=market_id,
             token_id=token_id,
             direction=direction,
-            predicted_entry_price=None,
-            predicted_entry_size=None,
         )
         return
 
@@ -223,8 +219,6 @@ def open_position(
                 market_id=market_id,
                 token_id=token_id,
                 direction=direction,
-                predicted_entry_price=float(rough_entry_price) if rough_entry_price else None,
-                predicted_entry_size=0.0,
             )
             return
 
@@ -245,8 +239,6 @@ def open_position(
             market_id=market_id,
             token_id=token_id,
             direction=direction,
-            predicted_entry_price=float(rough_entry_price) if rough_entry_price else None,
-            predicted_entry_size=float(size) if size else None,
         )
         return
     if abs(normalized_size - size) > 1e-12:
@@ -286,8 +278,6 @@ def open_position(
             market_id=market_id,
             token_id=token_id,
             direction=direction,
-            predicted_entry_price=float(plan["worst_price"]),
-            predicted_entry_size=float(size),
         )
         return
 
@@ -303,8 +293,6 @@ def open_position(
             market_id=market_id,
             token_id=token_id,
             direction=direction,
-            predicted_entry_price=float(plan["worst_price"]),
-            predicted_entry_size=float(size),
         )
         return
 
@@ -322,8 +310,6 @@ def open_position(
             market_id=market_id,
             token_id=token_id,
             direction=direction,
-            predicted_entry_price=float(entry_price),
-            predicted_entry_size=float(size),
         )
         return
 

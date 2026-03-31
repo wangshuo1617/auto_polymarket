@@ -73,7 +73,6 @@ class TradeSQLiteStore:
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_trade_events_side ON trade_events(side);"
             )
-            self._migrate_trade_events_columns(cur)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS trade_startups (
@@ -109,15 +108,6 @@ class TradeSQLiteStore:
                 "CREATE INDEX IF NOT EXISTS idx_trade_startups_signature ON trade_startups(strategy_signature);"
             )
             self._conn.commit()
-
-    def _migrate_trade_events_columns(self, cur: sqlite3.Cursor) -> None:
-        existing = {row[1] for row in cur.execute("PRAGMA table_info(trade_events)").fetchall()}
-        if "actual_outcome" not in existing:
-            cur.execute("ALTER TABLE trade_events ADD COLUMN actual_outcome TEXT")
-        if "predicted_entry_price" not in existing:
-            cur.execute("ALTER TABLE trade_events ADD COLUMN predicted_entry_price REAL")
-        if "predicted_entry_size" not in existing:
-            cur.execute("ALTER TABLE trade_events ADD COLUMN predicted_entry_size REAL")
 
     @staticmethod
     def _to_utc_iso(ts: datetime) -> str:
@@ -255,8 +245,6 @@ class TradeSQLiteStore:
         token_id: Optional[str] = None,
         direction: Optional[str] = None,
         btc_price_at_trade: Optional[float] = None,
-        predicted_entry_price: Optional[float] = None,
-        predicted_entry_size: Optional[float] = None,
     ) -> None:
         with self._lock:
             self._conn.execute(
@@ -272,10 +260,8 @@ class TradeSQLiteStore:
                     trade_size,
                     trade_price,
                     btc_price_at_trade,
-                    mode,
-                    predicted_entry_price,
-                    predicted_entry_size
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._to_utc_iso(event_time),
@@ -289,8 +275,6 @@ class TradeSQLiteStore:
                     0.0,
                     btc_price_at_trade,
                     "dry-run" if dry_run else "live",
-                    predicted_entry_price,
-                    predicted_entry_size,
                 ),
             )
             self._conn.commit()

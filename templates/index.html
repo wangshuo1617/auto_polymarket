@@ -679,19 +679,15 @@
                     html += '<div class="table-responsive mb-3"><table class="table table-sm table-bordered mb-0"><tbody>';
                     html += '<tr><th>跳过窗口总数</th><td>' + (data.skip_window_count ?? '--') + '</td></tr>';
                     html += '<tr><th>跳过窗口比例</th><td>' + _fmtPct(data.skip_window_ratio) + '</td></tr>';
-                    html += '<tr><th>已结算可比对预测的窗口数</th><td>' + (data.skip_prediction_settled_count ?? '--') + '</td></tr>';
-                    html += '<tr><th>预测正确窗口数</th><td>' + (data.skip_prediction_correct_count ?? '--') + '</td></tr>';
-                    html += '<tr><th>预测错误窗口数</th><td>' + (data.skip_prediction_wrong_count ?? '--') + '</td></tr>';
-                    html += '<tr><th>预测正确率</th><td>' + _fmtPct(data.skip_prediction_accuracy) + '</td></tr>';
                     html += '</tbody></table></div>';
-                    html += '<div class="table-responsive"><table class="table table-sm table-bordered mb-0"><thead><tr><th>跳过原因分类</th><th>数量</th><th>比例</th><th>预测正确</th><th>预测错误</th><th>预测正确率</th><th>示例</th></tr></thead><tbody>';
+                    html += '<div class="table-responsive"><table class="table table-sm table-bordered mb-0"><thead><tr><th>跳过原因分类</th><th>数量</th><th>比例</th><th>示例</th></tr></thead><tbody>';
                     const reasons = Array.isArray(data.reasons) ? data.reasons : [];
                     if (!reasons.length) {
-                        html += '<tr><td colspan="7" class="text-muted">该时间段无跳过记录</td></tr>';
+                        html += '<tr><td colspan="4" class="text-muted">该时间段无跳过记录</td></tr>';
                     } else {
                         reasons.forEach(r => {
                             const examples = Array.isArray(r.examples) && r.examples.length ? r.examples.join('；') : '--';
-                            html += '<tr><td>' + (r.reason || '--') + '</td><td>' + (r.count ?? '--') + '</td><td>' + _fmtPct(r.ratio) + '</td><td>' + (r.predict_correct_count ?? '--') + '</td><td>' + (r.predict_wrong_count ?? '--') + '</td><td>' + _fmtPct(r.predict_accuracy) + '</td><td class="text-wrap-mobile">' + examples + '</td></tr>';
+                            html += '<tr><td>' + (r.reason || '--') + '</td><td>' + (r.count ?? '--') + '</td><td>' + _fmtPct(r.ratio) + '</td><td class="text-wrap-mobile">' + examples + '</td></tr>';
                         });
                     }
                     html += '</tbody></table></div>';
@@ -837,13 +833,11 @@
                 skipRows += '<tr>';
                 skipRows += '<td>' + (s.window_slug || '--') + '</td>';
                 skipRows += '<td>' + (s.utc_time || '--') + '</td>';
-                skipRows += '<td>' + (s.predicted_direction != null ? s.predicted_direction : '--') + '</td>';
-                skipRows += '<td>' + (s.actual_settlement_direction != null ? s.actual_settlement_direction : '--') + '</td>';
                 skipRows += '<td class="text-wrap-mobile">' + (s.reason || '--') + '</td>';
                 skipRows += '</tr>';
             });
             if (!skipRows) {
-                skipRows = '<tr><td colspan="5" class="text-muted">暂无跳过窗口记录</td></tr>';
+                skipRows = '<tr><td colspan="3" class="text-muted">暂无跳过窗口记录</td></tr>';
             }
 
             let html = '';
@@ -884,7 +878,7 @@
             html += '<button class="btn btn-sm btn-outline-primary" id="skipStatBtn" onclick="openSkipStats()" disabled>统计</button>';
             html += '</div></div>';
             html += '<div class="table-responsive"><table class="table table-sm table-bordered align-middle mb-0">';
-            html += '<thead><tr><th>窗口slug</th><th>UTC+8时间</th><th>预测方向</th><th>实际结算方向</th><th>跳过原因</th></tr></thead>';
+            html += '<thead><tr><th>窗口slug</th><th>UTC+8时间</th><th>跳过原因</th></tr></thead>';
             html += '<tbody>' + skipRows + '</tbody></table></div>';
             html += _buildPager(sPage.total, sPage.current, 'gotoTradeSkipPage');
 
