@@ -865,7 +865,7 @@ def api_5m_trade_stats():
             category_count[category] = category_count.get(category, 0) + cnt
             if category not in category_examples:
                 category_examples[category] = []
-            if reason not in category_examples[category] and len(category_examples[category]) < 3:
+            if reason not in category_examples[category] and len(category_examples[category]) < 1:
                 category_examples[category].append(reason)
 
         # 查询每条 skip 事件的 direction 和 market_slug，用于计算预测准确率
