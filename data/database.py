@@ -210,6 +210,33 @@ _DDL_USDC_BALANCE_SNAPSHOTS_INDICES = """
 CREATE INDEX IF NOT EXISTS idx_usdc_balance_profile_ts ON usdc_balance_snapshots(profile, ts_utc);
 """
 
+_DDL_TRADE_WINDOW_SUMMARY = """
+CREATE TABLE IF NOT EXISTS trade_window_summary (
+    id SERIAL PRIMARY KEY,
+    market_slug TEXT NOT NULL UNIQUE,
+    direction TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    entry_time TIMESTAMPTZ NOT NULL,
+    entry_price DOUBLE PRECISION,
+    entry_size DOUBLE PRECISION,
+    entry_usdc DOUBLE PRECISION,
+    btc_entry_price DOUBLE PRECISION,
+    exit_time TIMESTAMPTZ,
+    exit_usdc DOUBLE PRECISION,
+    exit_reason TEXT,
+    pnl DOUBLE PRECISION,
+    mode TEXT NOT NULL DEFAULT 'live',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    settled_at TIMESTAMPTZ
+);
+"""
+
+_DDL_TRADE_WINDOW_SUMMARY_INDICES = """
+CREATE INDEX IF NOT EXISTS idx_tws_status ON trade_window_summary(status);
+CREATE INDEX IF NOT EXISTS idx_tws_entry_time ON trade_window_summary(entry_time);
+CREATE INDEX IF NOT EXISTS idx_tws_mode ON trade_window_summary(mode);
+"""
+
 
 def init_db() -> None:
     """创建全部表、索引，并将 btc_poly_1s_ticks 转为 TimescaleDB hypertable。"""
@@ -226,6 +253,8 @@ def init_db() -> None:
         cur.execute(_DDL_TRADE_STARTUPS_INDICES)
         cur.execute(_DDL_USDC_BALANCE_SNAPSHOTS)
         cur.execute(_DDL_USDC_BALANCE_SNAPSHOTS_INDICES)
+        cur.execute(_DDL_TRADE_WINDOW_SUMMARY)
+        cur.execute(_DDL_TRADE_WINDOW_SUMMARY_INDICES)
 
         # 创建 btc_poly_1s_ticks（需要先建表再转 hypertable）
         cur.execute(_DDL_BTC_POLY_1S_TICKS)
@@ -260,4 +289,4 @@ def init_db() -> None:
             """)
             logger.info("btc_poly_1s_ticks 压缩策略已启用（7天后自动压缩）")
 
-        logger.info("PostgreSQL DDL 初始化完成（4 张表）")
+        logger.info("PostgreSQL DDL 初始化完成（5 张表）")

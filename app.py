@@ -978,6 +978,222 @@ def api_5m_trade_param_schema():
     return jsonify({"groups": get_param_schema()})
 
 
+@app.route('/api/5m_trade_window_summary')
+def api_5m_trade_window_summary():
+    """返回窗口级盈亏汇总，支持 ?days=N 过滤（默认7天）。"""
+    days = int(request.args.get("days", 7))
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                SELECT market_slug, direction, status,
+                       entry_time, entry_price, entry_size, entry_usdc,
+                       btc_entry_price, exit_time, exit_usdc, exit_reason,
+                       pnl, mode, settled_at
+                FROM trade_window_summary
+                WHERE entry_time >= NOW() - INTERVAL '%s days'
+                ORDER BY entry_time DESC
+                """,
+                (days,),
+            )
+            rows = cur.fetchall()
+
+            # 统计
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END) AS won,
+                    SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END) AS lost,
+                    SUM(CASE WHEN status = 'early_exit' THEN 1 ELSE 0 END) AS early_exit,
+                    SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open,
+                    COALESCE(SUM(entry_usdc), 0) AS total_invested,
+                    COALESCE(SUM(CASE WHEN status != 'open' THEN exit_usdc ELSE 0 END), 0) AS total_returned,
+                    COALESCE(SUM(CASE WHEN status != 'open' THEN pnl ELSE 0 END), 0) AS total_pnl
+                FROM trade_window_summary
+                WHERE entry_time >= NOW() - INTERVAL '%s days'
+                """,
+                (days,),
+            )
+            stats_row = cur.fetchone()
+
+        total = int(stats_row["total"] or 0)
+        won = int(stats_row["won"] or 0)
+        lost = int(stats_row["lost"] or 0)
+        early_exit = int(stats_row["early_exit"] or 0)
+        open_cnt = int(stats_row["open"] or 0)
+        resolved = won + lost + early_exit
+        win_rate = round(won / resolved * 100, 1) if resolved > 0 else None
+
+        windows = []
+        for r in rows:
+            windows.append({
+                "market_slug": r["market_slug"],
+                "direction": r["direction"],
+                "status": r["status"],
+                "entry_time": r["entry_time"].isoformat() if r["entry_time"] else None,
+                "entry_price": r["entry_price"],
+                "entry_size": r["entry_size"],
+                "entry_usdc": round(r["entry_usdc"], 4) if r["entry_usdc"] else None,
+                "btc_entry_price": r["btc_entry_price"],
+                "exit_time": r["exit_time"].isoformat() if r["exit_time"] else None,
+                "exit_usdc": round(r["exit_usdc"], 4) if r["exit_usdc"] else None,
+                "exit_reason": r["exit_reason"],
+                "pnl": round(r["pnl"], 4) if r["pnl"] is not None else None,
+                "settled_at": r["settled_at"].isoformat() if r["settled_at"] else None,
+            })
+
+        return jsonify({
+            "windows": windows,
+            "stats": {
+                "total": total,
+                "won": won,
+                "lost": lost,
+                "early_exit": early_exit,
+                "open": open_cnt,
+                "resolved": resolved,
+                "win_rate": win_rate,
+                "total_invested": round(float(stats_row["total_invested"] or 0), 2),
+                "total_returned": round(float(stats_row["total_returned"] or 0), 2),
+                "total_pnl": round(float(stats_row["total_pnl"] or 0), 2),
+            },
+        })
+    except Exception as e:
+        logger.exception("5m_trade_window_summary 异常")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/5m_trade_window_backfill', methods=['POST'])
+def api_5m_trade_window_backfill():
+    """从现有 trade_events + Activity API 一次性回填 trade_window_summary。"""
+    try:
+        count = _backfill_window_summary()
+        return jsonify({"backfilled": count})
+    except Exception as e:
+        logger.exception("backfill 异常")
+        return jsonify({"error": str(e)}), 500
+
+
+def _backfill_window_summary() -> int:
+    """从 trade_events + Activity API 回填 trade_window_summary，跳过已存在的行。
+
+    复用 _build_trade_history_rows 的结算逻辑（处理 analyze_backfill 和 Activity API）。
+    """
+    # 用与 api_5m_trade_summary 相同的查询获取窗口聚合数据
+    with get_cursor() as cur:
+        cur.execute("""
+            SELECT
+                market_slug,
+                MIN(event_time) AS first_event_time,
+                SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN 1 ELSE 0 END) AS buy_event_count,
+                SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS entry_usdc,
+                SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(trade_size, 0) ELSE 0 END) AS entry_size,
+                SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(notional_usdc, 0) ELSE 0 END) /
+                    NULLIF(SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(trade_size, 0) ELSE 0 END), 0) AS entry_price,
+                SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS exit_usdc,
+                SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(trade_size, 0) ELSE 0 END) AS exit_size,
+                SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(notional_usdc, 0) ELSE 0 END) /
+                    NULLIF(SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(trade_size, 0) ELSE 0 END), 0) AS exit_price,
+                SUM(CASE WHEN side IN ('sell','redeem') THEN 1 ELSE 0 END) AS exit_event_count,
+                SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN 1 ELSE 0 END) AS analyze_buy_count,
+                SUM(CASE WHEN side IN ('sell','redeem') AND (reason='analyze_backfill' OR reason IN ('analyze_forced_loss_no_exit', 'analyze_activity_backfill_settlement')) THEN 1 ELSE 0 END) AS analyze_exit_count,
+                SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_entry_usdc,
+                SUM(CASE WHEN side IN ('sell','redeem') AND (reason='analyze_backfill' OR reason IN ('analyze_forced_loss_no_exit', 'analyze_activity_backfill_settlement')) THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_exit_usdc,
+                SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(trade_size, 0) ELSE 0 END) AS analyze_entry_size,
+                SUM(CASE WHEN side IN ('sell','redeem') AND (reason='analyze_backfill' OR reason IN ('analyze_forced_loss_no_exit', 'analyze_activity_backfill_settlement')) THEN COALESCE(trade_size, 0) ELSE 0 END) AS analyze_exit_size,
+                SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' AND (reason IS NULL OR reason!='analyze_backfill') THEN 1 ELSE 0 END) AS trade_buy_count,
+                SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN 1 ELSE 0 END) AS trade_exit_count,
+                SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS trade_entry_usdc,
+                SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS trade_exit_usdc,
+                SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_entry_size,
+                SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_exit_size,
+                MAX(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN direction END) AS direction,
+                MAX(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN btc_price_at_trade END) AS btc_entry_price,
+                MAX(mode) AS mode,
+                MAX(CASE WHEN side IN ('sell') AND pnl IS NOT NULL THEN reason END) AS sell_with_pnl_reason
+            FROM trade_events
+            WHERE mode='live'
+              AND market_slug LIKE 'btc-updown-5m-%%'
+              AND side IN ('buy', 'sell', 'redeem')
+            GROUP BY market_slug
+            HAVING SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN 1 ELSE 0 END) > 0
+            ORDER BY MIN(event_time)
+        """)
+        raw_rows = cur.fetchall()
+
+    # 用 _build_trade_history_rows 获取精确的 P&L 计算
+    history_rows = _build_trade_history_rows(raw_rows)
+
+    # 构建额外字段的 lookup
+    extra_by_slug = {}
+    for r in raw_rows:
+        extra_by_slug[r["market_slug"]] = {
+            "direction": r["direction"] or "na",
+            "btc_entry_price": r["btc_entry_price"],
+            "mode": r["mode"] or "live",
+            "sell_with_pnl_reason": r["sell_with_pnl_reason"],
+        }
+
+    inserted = 0
+    with get_cursor() as cur:
+        for h in history_rows:
+            slug = h["window_slug"]
+            extra = extra_by_slug.get(slug, {})
+            result = h["result"]
+            entry_usdc = float(h["entry_usdc"] or 0)
+            exit_usdc = h["exit_usdc"]
+            pnl = h["pnl"]
+
+            if result == "盈利":
+                status = "won"
+                exit_reason = "market_settle_win"
+            elif result == "亏损":
+                # 区分早期止损 vs 市场结算
+                if extra.get("sell_with_pnl_reason"):
+                    status = "early_exit"
+                    exit_reason = extra["sell_with_pnl_reason"]
+                else:
+                    status = "lost"
+                    exit_reason = "market_settle_loss"
+            elif result == "持平":
+                status = "lost"
+                exit_reason = "market_settle_breakeven"
+            else:
+                status = "open"
+                exit_reason = None
+
+            entry_size = float(h["entry_size"] or 0)
+            entry_price = float(h["entry_price"]) if h["entry_price"] else (entry_usdc / entry_size if entry_size > 0 else 0)
+
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO trade_window_summary (
+                        market_slug, direction, status,
+                        entry_time, entry_price, entry_size, entry_usdc,
+                        btc_entry_price, exit_time, exit_usdc, exit_reason,
+                        pnl, mode, settled_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                              CASE WHEN %s != 'open' THEN NOW() ELSE NULL END)
+                    ON CONFLICT (market_slug) DO NOTHING
+                    """,
+                    (
+                        slug, extra.get("direction", "na"), status,
+                        h["utc_time"], entry_price, entry_size, entry_usdc,
+                        extra.get("btc_entry_price"), h["utc_time"] if status != "open" else None,
+                        exit_usdc, exit_reason, pnl,
+                        extra.get("mode", "live"), status,
+                    ),
+                )
+                if cur.rowcount and cur.rowcount > 0:
+                    inserted += 1
+            except Exception as e:
+                logger.warning("backfill %s 失败: %s", slug, e)
+
+    logger.info("backfill_window_summary: 回填 %d 个窗口", inserted)
+    return inserted
+
+
 @app.route('/api/update_5m_trade_params', methods=['POST'])
 def api_update_5m_trade_params():
     """将前端提交的参数写入 config/5m_trade_params.env，然后 systemctl restart。"""

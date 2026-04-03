@@ -54,7 +54,7 @@ from services.five_minute_trade.position_close_ops import (
 )
 from services.five_minute_trade.auto_redeem import run_auto_redeem
 from services.five_minute_trade.reporting import build_pnl_report_content_and_subject
-from services.five_minute_trade.trade_db import TradeSQLiteStore
+from services.five_minute_trade.trade_db import TradeSQLiteStore, settle_open_windows
 from services.five_minute_trade.param_registry import (
     build_startup_params,
     build_strategy_signature,
@@ -1707,6 +1707,11 @@ class FiveMinuteUpDownTrader:
                         run_auto_redeem()
                     except Exception as e:
                         logger.error("自动赎回异常: %s", e)
+                    # 结算 open 窗口
+                    try:
+                        settle_open_windows(self.trade_db)
+                    except Exception as e:
+                        logger.error("窗口结算异常: %s", e)
                     next_redeem_ts = self._calc_next_redeem_ts(base_ts=now)
 
             if now >= next_report_ts:
