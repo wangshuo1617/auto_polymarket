@@ -74,6 +74,7 @@ POSITION_GUARD_MIN_CONSECUTIVE_SEC="${POSITION_GUARD_MIN_CONSECUTIVE_SEC:-${44:-
 
 # 系统控制
 REPORT_INTERVAL_SEC="${REPORT_INTERVAL_SEC:-${6:-3600}}"      # 报告输出间隔（秒）
+ENABLE_DB_TICK_VALIDATION="${ENABLE_DB_TICK_VALIDATION:-${47:-true}}"  # 是否启用DB tick交叉验证
 
 # 日志文件
 LOG_FILE="logs/5m_trade.stdout.log"
@@ -286,6 +287,12 @@ if [ "$ENABLE_LAST_SECONDS_POSITION_GUARD" != "true" ] && [ "$ENABLE_LAST_SECOND
   exit 1
 fi
 
+if [ "$ENABLE_DB_TICK_VALIDATION" != "true" ] && [ "$ENABLE_DB_TICK_VALIDATION" != "false" ]; then
+  echo "❌ enable_db_tick_validation 必须是 true 或 false"
+  print_usage
+  exit 1
+fi
+
 if ! [[ "$POSITION_GUARD_START_SEC" =~ ^[0-9]+$ ]] || [ "$POSITION_GUARD_START_SEC" -lt 1 ] || [ "$POSITION_GUARD_START_SEC" -gt 299 ]; then
   echo "❌ position_guard_start_sec 必须是 1-299 的整数"
   print_usage
@@ -370,6 +377,7 @@ echo "方向一致性确认最小偏离阈值: min_abs_diff=$DIRECTION_CONFIRM_M
 echo "方向确认低价差强平: enable=$ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE low_diff_threshold=$DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD"
 echo "终盘反向风控: enable=$ENABLE_LAST_SECONDS_REVERSE_GUARD start_sec=$REVERSE_GUARD_START_SEC lookback_sec=$REVERSE_GUARD_LOOKBACK_SEC btc_move=$REVERSE_GUARD_BTC_MOVE require_cross_open=$REVERSE_GUARD_REQUIRE_CROSS_OPEN"
 echo "终盘位置风控: enable=$ENABLE_LAST_SECONDS_POSITION_GUARD start_sec=$POSITION_GUARD_START_SEC min_consecutive_sec=$POSITION_GUARD_MIN_CONSECUTIVE_SEC"
+echo "DB tick交叉验证: enable=$ENABLE_DB_TICK_VALIDATION"
 echo "数据库: PG_DSN 环境变量"
 echo "=========================================="
 
@@ -442,6 +450,10 @@ _build_cmd() {
 
   if [ "$ENABLE_LAST_SECONDS_POSITION_GUARD" = "false" ]; then
     CMD+=(--disable-last-seconds-position-guard)
+  fi
+
+  if [ "$ENABLE_DB_TICK_VALIDATION" = "false" ]; then
+    CMD+=(--disable-db-tick-validation)
   fi
 
   if [ "$MODE" != "--live" ]; then

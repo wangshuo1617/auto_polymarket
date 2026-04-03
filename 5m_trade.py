@@ -103,7 +103,8 @@ def _build_startup_strategy_signature(args: Any) -> str:
         f"lrgx={int(not args.disable_reverse_guard_require_cross_open)},"
         f"lpg={int(args.enable_last_seconds_position_guard)},"
         f"lpgs={args.position_guard_start_sec},"
-        f"lpgn={args.position_guard_min_consecutive_sec}"
+        f"lpgn={args.position_guard_min_consecutive_sec},"
+        f"dbtv={int(args.enable_db_tick_validation)}"
     )
 
 
@@ -132,7 +133,7 @@ class FiveMinuteUpDownTrader:
     EXIT_SWEEP_SLIPPAGE_OTHER = 0.01
     EXPIRY_BEFORE_CLOSE_SEC = 10
     TOXIC_UTC_HOURS = {16, 19, 20}
-    WS_BOOK_MAX_AGE_MS = 1200
+    WS_BOOK_MAX_AGE_MS = 3000
     MAX_BTC_AGE_MS = 3000
     MAX_ENTRY_RETRIES = 2
     MAX_BTC_CROSS_COUNT = 5
@@ -203,6 +204,7 @@ class FiveMinuteUpDownTrader:
         enable_last_seconds_position_guard: bool = True,
         position_guard_start_sec: int = POSITION_GUARD_START_SEC,
         position_guard_min_consecutive_sec: int = POSITION_GUARD_MIN_CONSECUTIVE_SEC,
+        enable_db_tick_validation: bool = True,
     ) -> None:
         self.stake_usd = stake_usd
         self.report_interval_sec = report_interval_sec
@@ -348,15 +350,19 @@ class FiveMinuteUpDownTrader:
             logger.error("交易记录PG初始化失败，将仅保留内存/日志记录: %s", e)
 
         # 与回测对齐的 DB tick 交叉验证读连接（使用 PG 连接池）
+        self.enable_db_tick_validation: bool = bool(enable_db_tick_validation)
         self._tick_reader_enabled: bool = False
-        try:
-            from data.database import get_conn as _test_conn
-            with _test_conn() as _tc:
-                _tc.cursor().execute("SELECT 1")
-            self._tick_reader_enabled = True
-            logger.info("tick交叉验证读连接已初始化(PG连接池)")
-        except Exception as e:
-            logger.warning("tick交叉验证读连接初始化失败，将跳过入场交叉验证: %s", e)
+        if not self.enable_db_tick_validation:
+            logger.info("DB tick 交叉验证已通过参数禁用")
+        else:
+            try:
+                from data.database import get_conn as _test_conn
+                with _test_conn() as _tc:
+                    _tc.cursor().execute("SELECT 1")
+                self._tick_reader_enabled = True
+                logger.info("tick交叉验证读连接已初始化(PG连接池)")
+            except Exception as e:
+                logger.warning("tick交叉验证读连接初始化失败，将跳过入场交叉验证: %s", e)
 
     def _should_emit_log(self, key: str, interval_sec: Optional[float] = None) -> bool:
         interval = (
@@ -1234,7 +1240,7 @@ class FiveMinuteUpDownTrader:
         返回 True 表示 DB 数据也支持入场；False 表示回测不会入场，应跳过。
         DB 不可用或缺少数据时回退为 True（不拦截）。
         """
-        if not self._tick_reader_enabled or self.current_window_start_ms is None:
+        if not self.enable_db_tick_validation or not self._tick_reader_enabled or self.current_window_start_ms is None:
             return True
 
         window_start_sec = self.current_window_start_ms // 1000
@@ -1883,13 +1889,19 @@ def main() -> None:
                 "stake_usd": args.stake_usd,
                 "report_interval_sec": args.report_interval_sec,
                 "min_hold_before_close_sec": args.min_hold_before_close_sec,
+                "exit_mode": args.exit_mode,
                 "tp_price_cap": args.tp_price_cap,
                 "tp_value_cap": args.tp_value_cap,
                 "sl_to_tp_ratio": args.sl_to_tp_ratio,
                 "toxic_utc_hours": args.toxic_utc_hours,
+                "max_btc_cross_count": args.max_btc_cross_count,
+                "min_entry_updown_diff": args.min_entry_updown_diff,
+                "max_avg_btc_delta": args.max_avg_btc_delta,
+                "minute_consistency": args.minute_consistency,
                 "enable_risk_sizing": args.enable_risk_sizing,
                 "risk_min_stake_ratio": args.risk_min_stake_ratio,
                 "risk_max_stake_ratio": args.risk_max_stake_ratio,
+                "confidence_boost": not getattr(args, "disable_confidence_boost", False),
                 "risk_diff_boost_threshold": args.risk_diff_boost_threshold,
                 "risk_diff_boost_multiplier": args.risk_diff_boost_multiplier,
                 "cross_borderline_diff_multiplier": args.cross_borderline_diff_multiplier,
@@ -1914,6 +1926,7 @@ def main() -> None:
                 "enable_last_seconds_position_guard": args.enable_last_seconds_position_guard,
                 "position_guard_start_sec": args.position_guard_start_sec,
                 "position_guard_min_consecutive_sec": args.position_guard_min_consecutive_sec,
+                "enable_db_tick_validation": args.enable_db_tick_validation,
             },
             pid=os.getpid(),
             hostname=socket.gethostname(),

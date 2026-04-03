@@ -70,6 +70,11 @@ STRATEGY_PARAM_DISPLAY_ORDER = [
     "tp_value_cap",
     "sl_to_tp_ratio",
     "toxic_utc_hours",
+    "max_btc_cross_count",
+    "min_entry_updown_diff",
+    "max_avg_btc_delta",
+    "minute_consistency",
+    "enable_db_tick_validation",
     "trade_db_path",
     "enable_risk_sizing",
     "risk_min_stake_ratio",
@@ -81,6 +86,7 @@ STRATEGY_PARAM_DISPLAY_ORDER = [
     "stake_cap_high",
     "stake_cap_medium_high",
     "medium_high_threshold",
+    "confidence_boost",
     "confidence_boost_ge_095",
     "risk_w_price",
     "risk_w_direction",
@@ -676,6 +682,8 @@ def _categorize_skip_reason(reason: str) -> str:
         return "订单簿缓存不完整"
     if "market cache 缺失" in text:
         return "市场缓存缺失"
+    if "报价过期" in text or "无Polymarket WS报价数据" in text:
+        return "报价过期"
     if re.search(r"skip entry", lower):
         return "其他策略拦截"
     return "其他"
@@ -1041,6 +1049,7 @@ _PARAM_SHELL_MAP: dict[str, str] = {
     "enable_last_seconds_position_guard": "ENABLE_LAST_SECONDS_POSITION_GUARD",
     "position_guard_start_sec": "POSITION_GUARD_START_SEC",
     "position_guard_min_consecutive_sec": "POSITION_GUARD_MIN_CONSECUTIVE_SEC",
+    "enable_db_tick_validation": "ENABLE_DB_TICK_VALIDATION",
     "report_interval_sec": "REPORT_INTERVAL_SEC",
     "trade_db_path": "TRADE_DB_PATH",
 }

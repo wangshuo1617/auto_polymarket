@@ -279,7 +279,12 @@
                         return;
                     }
                     let content = '<h2 class="h4 mb-3 text-wrap-mobile">' + data.event_name + '</h2>';
-                    data.markets.forEach(market => {
+                    // 按 question 中的 BTC 目标价格由高到低排列
+                    const markets = (data.markets || []).slice().sort((a, b) => {
+                        const extract = q => { const m = q.match(/\$([\d,]+)/); return m ? parseInt(m[1].replace(/,/g, ''), 10) : 0; };
+                        return extract(b.question) - extract(a.question);
+                    });
+                    markets.forEach(market => {
                         const hasSettledPrice = (market.outcomePrices || []).some(price => Number(price) === 1);
                         if (hasSettledPrice) {
                             return;
@@ -618,6 +623,7 @@
             stake_cap_medium_high:   'medium_high 风险仓位上限',
             medium_high_threshold:   'medium_high 阈值',
             confidence_boost_ge_095: '置信度≥0.95 加仓倍率',
+            confidence_boost:       '是否启用高置信加仓',
             risk_w_price:            '风险评分：价格权重',
             risk_w_direction:        '风险评分：方向权重',
             risk_w_stability:        '风险评分：稳定性权重',
@@ -634,11 +640,12 @@
             enable_last_seconds_position_guard: '是否启用终盘位置风控',
             position_guard_start_sec:           '终盘位置风控起始秒',
             position_guard_min_consecutive_sec: '终盘位置反向连续秒数',
+            enable_db_tick_validation:          '是否启用DB tick交叉验证',
         };
         const _spGroups = [
-            { label: '入场控制', keys: ['entry_minute','entry_preclose_sec','min_direction_diff','max_entry_price','stake_usd','exit_mode','toxic_utc_hours','max_btc_cross_count','min_entry_updown_diff','max_avg_btc_delta','minute_consistency'] },
+            { label: '入场控制', keys: ['entry_minute','entry_preclose_sec','min_direction_diff','max_entry_price','stake_usd','exit_mode','toxic_utc_hours','max_btc_cross_count','min_entry_updown_diff','max_avg_btc_delta','minute_consistency','enable_db_tick_validation'] },
             { label: 'TPSL 平仓控制', keys: ['min_hold_before_close_sec','tp_price_cap','tp_value_cap','sl_to_tp_ratio'] },
-            { label: '风险仓位管理', keys: ['enable_risk_sizing','risk_min_stake_ratio','risk_max_stake_ratio','risk_diff_boost_threshold','risk_diff_boost_multiplier','cross_borderline_diff_multiplier','stake_cap_very_high','stake_cap_high','stake_cap_medium_high','medium_high_threshold','confidence_boost_ge_095','risk_w_price','risk_w_direction','risk_w_stability'] },
+            { label: '风险仓位管理', keys: ['enable_risk_sizing','risk_min_stake_ratio','risk_max_stake_ratio','risk_diff_boost_threshold','risk_diff_boost_multiplier','cross_borderline_diff_multiplier','stake_cap_very_high','stake_cap_high','stake_cap_medium_high','medium_high_threshold','confidence_boost','confidence_boost_ge_095','risk_w_price','risk_w_direction','risk_w_stability'] },
             { label: '方向确认风控', keys: ['enable_direction_confirm_close','direction_confirm_preclose_sec','direction_confirm_min_abs_diff','enable_direction_confirm_low_diff_close','direction_confirm_low_diff_threshold'] },
             { label: '终盘风控', keys: ['enable_last_seconds_reverse_guard','reverse_guard_start_sec','reverse_guard_lookback_sec','reverse_guard_btc_move','reverse_guard_require_cross_open','enable_last_seconds_position_guard','position_guard_start_sec','position_guard_min_consecutive_sec'] },
             { label: '系统', keys: ['report_interval_sec','trade_db_path'] },
@@ -647,8 +654,18 @@
             'enable_risk_sizing','confidence_boost',
             'enable_direction_confirm_close','enable_direction_confirm_low_diff_close',
             'enable_last_seconds_reverse_guard','reverse_guard_require_cross_open',
-            'enable_last_seconds_position_guard',
+            'enable_last_seconds_position_guard','enable_db_tick_validation',
         ]);
+        // 已知参数的默认值，确保旧版启动记录中缺失的新参数也能在弹窗中显示
+        const _spParamDefaults = {
+            enable_db_tick_validation: 'true',
+            max_btc_cross_count: '4',
+            min_entry_updown_diff: '0.38',
+            max_avg_btc_delta: '3.0',
+            minute_consistency: '3',
+            exit_mode: 'hold',
+            confidence_boost: 'true',
+        };
 
         function _renderStrategyTable(editing) {
             const p = _strategyParamsCurrent;
@@ -710,7 +727,7 @@
 
             const data = (tradeStrategyParams && typeof tradeStrategyParams === 'object') ? tradeStrategyParams : {};
             const params = (data.params && typeof data.params === 'object') ? data.params : {};
-            _strategyParamsCurrent = Object.assign({}, params);
+            _strategyParamsCurrent = Object.assign({}, _spParamDefaults, params);
             _renderStrategyTable(false);
             new bootstrap.Modal(document.getElementById('strategyParamsModal')).show();
         }
@@ -729,7 +746,7 @@
                 editBtn.classList.replace('btn-outline-secondary', 'btn-outline-primary');
                 saveBtn.classList.add('d-none');
                 const data = (tradeStrategyParams && typeof tradeStrategyParams === 'object') ? tradeStrategyParams : {};
-                _strategyParamsCurrent = Object.assign({}, (data.params || {}));
+                _strategyParamsCurrent = Object.assign({}, _spParamDefaults, (data.params || {}));
                 _renderStrategyTable(false);
             }
         }

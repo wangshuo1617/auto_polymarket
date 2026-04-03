@@ -343,6 +343,19 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         help="终盘反向风控不再要求价格已穿越开盘价（默认要求）",
     )
     parser.add_argument(
+        "--enable-db-tick-validation",
+        action="store_true",
+        dest="enable_db_tick_validation",
+        default=True,
+        help="启用 DB tick 交叉验证（默认启用）",
+    )
+    parser.add_argument(
+        "--disable-db-tick-validation",
+        action="store_false",
+        dest="enable_db_tick_validation",
+        help="禁用 DB tick 交叉验证",
+    )
+    parser.add_argument(
         "--enable-last-seconds-position-guard",
         action="store_true",
         dest="enable_last_seconds_position_guard",
@@ -416,6 +429,7 @@ def create_trader_from_args(args: argparse.Namespace, trader_cls: Type[Any]) -> 
         reverse_guard_lookback_sec=args.reverse_guard_lookback_sec,
         reverse_guard_btc_move=args.reverse_guard_btc_move,
         reverse_guard_require_cross_open=not getattr(args, "disable_reverse_guard_require_cross_open", False),
+        enable_db_tick_validation=args.enable_db_tick_validation,
         enable_last_seconds_position_guard=args.enable_last_seconds_position_guard,
         position_guard_start_sec=args.position_guard_start_sec,
         position_guard_min_consecutive_sec=args.position_guard_min_consecutive_sec,
