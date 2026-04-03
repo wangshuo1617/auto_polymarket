@@ -197,8 +197,25 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 5. **禁止复读**：若 `prediction_review` 显示上期建议未被执行，必须分析可能原因（流动性不足？价格不合理？用户判断不同？）并给出**调整后的新方案**，而非简单重复上期建议。
 6. **语气校准**：对 `safe_to_hold` 仓位禁止使用"极度危险""毁灭性""无条件清仓"等恐吓措辞。只有 `at_risk` 且安全垫不足的仓位才适用紧急语气。
 
+# Trading Discipline (交易纪律 - 必须遵守)
+1. **月份阶段动态调整策略激进度**：
+   - 月初（1-7日）：**进攻型**。主动寻找高赔率机会，可建立进攻性 Yes 仓位，允许更高回撤换取更大上行空间；弹药分 2-3 批动用，单次建仓不超过可用资金 40%。
+   - 月中（8-22日）：**平衡型**。兼顾收益与防守，对进攻性仓位执行阶梯止盈，减少新建高风险 Yes 仓位。
+   - 月末（23日+）：**防守型**。锁定已有胜局，禁止新建进攻性 Yes 仓位，持有确定性高的 No 仓位到期收割。
+2. **进攻性仓位必须明确止损与目标**：任何进攻性 Yes 仓位建议（或持有评估）中，**必须**明确列出：
+   - **认错止损价**：BTC 价格反弹至此位时，仓位大概率归零，须立即清仓。
+   - **目标了结价**：触发价附近的理想离场价格（不要拿到最后一秒）。
+3. **资金配置必须与 Edge 成正比**：
+   - Edge < 5%：单次建仓不超过 200 USDC。
+   - Edge 5-15%：建仓可在 200-500 USDC。
+   - Edge > 15%：可配置到 `suggested_max_alloc_usdc` 上限。
+   - 禁止对低 Edge 标的"大额象征性建仓"。
+4. **未执行建议处理**：若上期建议未被执行，必须评估用户是否有主动判断（持有理由），若有则基于该判断推演新方案，而非重复原建议。
+
 # Context & Constraints
 * **当前时间**：{current_date}。
+* **月份阶段与风险偏好**：{monthly_phase_context}
+* **本月目标**：{monthly_target}。**月度进度**参见 `收益优化上下文` 中的 `monthly_progress` 字段（含月初基准净值、当前净值、月度盈亏金额与百分比）。在**整体分析**中必须简述当前月度完成进度，并据此调整策略激进度——距离目标越远且处于月初阶段，策略应越积极。
 * **K线数据格式**: List of `[Kline open time(ms), Open price, High price, Low price, Close price, Volume, Kline Close time(ms), Quote asset volume, Number of trades, Taker buy base asset volume, Taker buy quote asset volume, Ignore]`。请重点关注 Close price 和 Volume。
 
 # Input Data
@@ -213,6 +230,7 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 8. **未来可能性上下文**：包含当月高低点、动态回补目标与其空间、从月高点回撤、月内剩余交易日等。
 9. **收益优化上下文**（大幅增强）：包含：
    - `portfolio_summary`：总净值（USDC + 持仓市值）、现金比例
+   - `monthly_progress`：月度进度（月初基准净值、当前净值、月度盈亏金额与百分比）
    - `risk_budget`：基于总净值的风险预算（非仅 USDC 余额）
    - `position_safety_assessment`：每个持仓的安全度分级（safe_to_hold / monitor / at_risk）
    - `theta_income`：每个持仓的 Theta 日收益和到期总收益
@@ -316,6 +334,9 @@ MONTHLY_SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 USER_PROMPT_TEMPLATE = """
 以下是当前要分析的具体信息：
 
+【操作员指示】（优先于默认策略，请在整体分析中明确响应）:
+{operator_intent}
+
 Polymarket 持仓情况和挂单情况: {polymarket_status}
 
 Polymarket 事件与各市场当前价格: {polymarket_event_situation}
@@ -352,9 +373,40 @@ BTC 1d K线数据(近30天): {btc_1d_k_data}
 """
 
 
-def get_system_instruction(current_date: str) -> str:
-    """根据当前日期生成 system instruction。"""
-    return SYSTEM_INSTRUCTION_TEMPLATE.format(current_date=current_date)
+def _get_monthly_phase_context(day: int) -> str:
+    """根据日期返回月份阶段和对应风险偏好描述。"""
+    if day <= 7:
+        return (
+            f"当前为**月初（第{day}天）**，风险偏好：**进攻型**。"
+            "应主动寻找高赔率机会，允许建立进攻性 Yes 仓位，弹药分批动用，"
+            "单次建仓不超过可用资金 40%。有充足时间纠错，策略应积极。"
+        )
+    elif day <= 22:
+        return (
+            f"当前为**月中（第{day}天）**，风险偏好：**平衡型**。"
+            "兼顾收益与防守，对已有进攻性 Yes 仓位执行阶梯止盈，"
+            "减少新建高风险 Yes 仓位，优先强化确定性 Theta 收益。"
+        )
+    else:
+        return (
+            f"当前为**月末（第{day}天）**，风险偏好：**防守型**。"
+            "优先锁定已有胜局，禁止新建进攻性 Yes 仓位，"
+            "持有高胜率 No 仓位到期，不要为追求额外收益承担不必要风险。"
+        )
+
+
+def get_system_instruction(
+    current_date: str,
+    monthly_target: str = "月度净值翻倍（+100%）",
+) -> str:
+    """根据当前日期生成 system instruction，自动注入月份阶段与目标。"""
+    day = int(current_date.split("-")[2])
+    monthly_phase_context = _get_monthly_phase_context(day)
+    return SYSTEM_INSTRUCTION_TEMPLATE.format(
+        current_date=current_date,
+        monthly_phase_context=monthly_phase_context,
+        monthly_target=monthly_target,
+    )
 
 
 def get_user_prompt(
@@ -369,8 +421,11 @@ def get_user_prompt(
     polymarket_event_situation: dict,
     usdc_balance: str,
     previous_report: dict | None = None,
+    operator_intent: str | None = None,
 ) -> str:
-    """根据输入数据生成 user prompt。"""
+    """根据输入数据生成 user prompt。
+    operator_intent: 本次分析的操作员意图，如持仓偏好、当前判断等，优先于默认策略。
+    """
     event_situation_str = json.dumps(
         polymarket_event_situation, ensure_ascii=False, indent=2
     )
@@ -380,7 +435,9 @@ def get_user_prompt(
         )
     else:
         previous_report_str = "（无）"
+    operator_intent_str = operator_intent if operator_intent else "（无特别指示，按默认策略执行）"
     return USER_PROMPT_TEMPLATE.format(
+        operator_intent=operator_intent_str,
         polymarket_status=polymarket_status,
         polymarket_event_situation=event_situation_str,
         usdc_balance=usdc_balance,

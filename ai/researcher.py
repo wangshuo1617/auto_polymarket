@@ -47,10 +47,14 @@ def analyze_market_with_grounding(
     polymarket_event_situation: dict,
     usdc_balance: str,
     previous_report: dict | None = None,
+    operator_intent: str | None = None,
+    monthly_target: str = "月度净值翻倍（+100%）",
 ) -> Dict[str, Any]:
     """
     Analyze the polymarket positions, orders, event situation, USDC balance, and btc 4h k data.
     previous_report: 上一时间段的报告内容，供本次输出参考与延续。
+    operator_intent: 本次分析的操作员意图，如持仓偏好、当前判断等，优先于默认策略。
+    monthly_target: 本月收益目标，用于调整策略激进度。
     """
     
     # Get current date for temporal context
@@ -67,7 +71,7 @@ def analyze_market_with_grounding(
     grounding_tool = types.Tool(google_search=types.GoogleSearch())
     
     config = types.GenerateContentConfig(
-        system_instruction=get_system_instruction(current_date),
+        system_instruction=get_system_instruction(current_date, monthly_target=monthly_target),
         tools=[grounding_tool],  # Enable Google Search Grounding
         response_schema=RESPONSE_SCHEMA,  # Structured output
         temperature=0.7,  # Balanced creativity and consistency
@@ -85,6 +89,7 @@ def analyze_market_with_grounding(
         polymarket_event_situation,
         usdc_balance,
         previous_report=previous_report,
+        operator_intent=operator_intent,
     )
 
     try:        

@@ -3,6 +3,7 @@ Polymarket 持仓分析主入口
 获取持仓、挂单、K线、市场情绪，经 AI 分析后发送邮件
 """
 import json
+import os
 import calendar
 from pathlib import Path
 from datetime import datetime, timezone
@@ -307,6 +308,7 @@ if __name__ == "__main__":
         event_situation,
         usdc_balance,
         previous_report=previous_report,
+        operator_intent=os.environ.get("OPERATOR_INTENT") or None,
     )
     warn_prices = analyze_result["预警信号"]
     for warn_price in warn_prices:

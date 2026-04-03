@@ -425,6 +425,9 @@ def prefetch_order_metadata_for_tokens(
                 fee_rate_bps = _get_cached_fee_rate_bps(clob_client, token)
         else:
             fee_rate_bps = _get_cached_fee_rate_bps(clob_client, token)
+            # 缓存未命中返回 0 时不写入，避免污染 ClobClient 内部缓存
+            if fee_rate_bps == 0:
+                fee_rate_bps = None
 
         meta = _cache_token_order_metadata(
             clob_client=clob_client,
@@ -577,6 +580,15 @@ def buy_order(
         refresh_fee_rate=False,
     )
     fee_rate_bps = _get_cached_fee_rate_bps(clob_client, token_id)
+    # 缓存未命中时主动查询 fee_rate，避免传 0 被 API 拒绝
+    if fee_rate_bps == 0:
+        try:
+            fee_rate_bps = int(clob_client.get_fee_rate_bps(token_id) or 0)
+            if fee_rate_bps > 0:
+                _cache_token_order_metadata(clob_client, token_id, fee_rate_bps=fee_rate_bps)
+                logger.info("buy_order fee_rate_bps fetched on cache miss: token_id=%s fee_rate_bps=%d", _token_id_short(token_id), fee_rate_bps)
+        except Exception as e:
+            logger.warning("buy_order get_fee_rate_bps failed: token_id=%s error=%s", _token_id_short(token_id), e)
     submit_t0 = time.perf_counter()
     try:
         response = clob_client.create_and_post_order(

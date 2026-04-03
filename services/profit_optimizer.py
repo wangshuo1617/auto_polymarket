@@ -5,12 +5,70 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from math import erf, sqrt
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 ET_TIMEZONE = ZoneInfo("America/New_York")
+_BASELINE_FILE = Path("data/monthly_baseline.json")
+logger = logging.getLogger(__name__)
+
+
+def _load_monthly_baseline() -> dict:
+    """加载月度基准净值记录文件。"""
+    if _BASELINE_FILE.exists():
+        try:
+            return json.loads(_BASELINE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_monthly_baseline(data: dict) -> None:
+    """保存月度基准净值记录文件。"""
+    try:
+        _BASELINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _BASELINE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning("保存月度基准净值失败: %s", e)
+
+
+def get_or_set_monthly_baseline(total_net_value: float) -> dict:
+    """
+    获取或初始化当月基准净值。
+    若当月尚无记录，则以当前净值作为基准自动写入。
+    返回包含基准净值和进度信息的字典。
+    """
+    now = datetime.now(ET_TIMEZONE)
+    month_key = now.strftime("%Y-%m")
+
+    baselines = _load_monthly_baseline()
+
+    if month_key not in baselines:
+        # 月初首次运行，自动记录基准
+        baselines[month_key] = {
+            "baseline_net_value": round(total_net_value, 2),
+            "recorded_at": now.isoformat(),
+        }
+        _save_monthly_baseline(baselines)
+        logger.info("月度基准净值已记录: %s = %.2f USDC", month_key, total_net_value)
+
+    baseline = baselines[month_key]
+    baseline_value = baseline["baseline_net_value"]
+    pnl = total_net_value - baseline_value
+    pnl_pct = (pnl / baseline_value * 100) if baseline_value > 0 else 0.0
+
+    return {
+        "month": month_key,
+        "baseline_net_value": baseline_value,
+        "current_net_value": round(total_net_value, 2),
+        "monthly_pnl_usdc": round(pnl, 2),
+        "monthly_pnl_pct": round(pnl_pct, 2),
+        "recorded_at": baseline["recorded_at"],
+    }
 
 
 def _to_float(value, default: float = 0.0) -> float:
@@ -615,6 +673,9 @@ def build_profit_optimization_context(
     risk_budget_ratio = 0.35
     total_risk_budget = total_net_value * risk_budget_ratio
 
+    # --- Monthly progress tracking ---
+    monthly_progress = get_or_set_monthly_baseline(total_net_value)
+
     # --- Position safety assessment ---
     position_assessments = _build_position_safety_assessment(
         positions, future_possibility_context, daily_volatility_profile, asset=asset,
@@ -701,6 +762,7 @@ def build_profit_optimization_context(
     return {
         "objective": "maximize_expected_profit_under_risk_budget",
         "portfolio_summary": portfolio,
+        "monthly_progress": monthly_progress,
         "risk_budget": {
             "basis": "total_net_value",
             "total_net_value": round(total_net_value, 2),

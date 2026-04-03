@@ -974,8 +974,12 @@ def api_balance_summary():
 def api_run_position_analyze():
     """Run position_analyze.py in the background."""
     try:
+        body = request.get_json(silent=True) or {}
+        operator_intent = (body.get("operator_intent") or "").strip()
         sub_env = os.environ.copy()
         sub_env["POLYMARKET_PROFILE"] = "analyze"
+        if operator_intent:
+            sub_env["OPERATOR_INTENT"] = operator_intent
         subprocess.Popen(
             [sys.executable, "position_analyze.py"],
             cwd=_project_root,

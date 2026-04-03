@@ -83,11 +83,16 @@
             <h1 class="dashboard-title">Polymarket Dashboard</h1>
             <a href="/logout" class="btn btn-outline-secondary btn-sm mt-1">Logout</a>
         </div>
-        <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+        <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
             <div id="balance" class="balance-chip">Loading...</div>
             <div id="btc-price" class="balance-chip">BTC: Loading...</div>
             <button type="button" class="btn btn-outline-primary btn-sm" id="btnPositionAnalyze">Position Analyze</button>
             <a href="/report/latest" target="_blank" rel="noopener" class="btn btn-outline-secondary btn-sm">Latest Report</a>
+        </div>
+        <div class="mb-3">
+            <textarea id="operatorIntent" class="form-control form-control-sm" rows="2"
+                placeholder="操作员意图（可选）：例如「我倾向于持有 Dip 65k Yes，寻找新的进攻性机会」"
+                style="font-size:0.82rem; resize:vertical;"></textarea>
         </div>
         <ul class="nav nav-tabs" id="myTab" role="tablist">
             <li class="nav-item" role="presentation">
@@ -246,8 +251,13 @@
 
         document.getElementById('btnPositionAnalyze').addEventListener('click', function() {
             const btn = this;
+            const intent = document.getElementById('operatorIntent').value.trim();
             btn.disabled = true;
-            fetchJsonSafe('/api/run_position_analyze', { method: 'POST' })
+            fetchJsonSafe('/api/run_position_analyze', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ operator_intent: intent || null })
+            })
                 .then(data => {
                     if (data.error) {
                         alert('Error: ' + data.error);
@@ -1169,6 +1179,7 @@
             document.getElementById('modeQuantity').checked = true;
             document.getElementById('amountOrSizeInput').value = '';
             document.getElementById('amountOrSizeInput').placeholder = 'Enter quantity';
+            document.getElementById('amountOrSizeInput').step = '0.01';
             updateAmountOrSizeLabel();
             new bootstrap.Modal(document.getElementById('orderModal')).show();
         }
@@ -1181,6 +1192,7 @@
             document.getElementById('modeQuantity').checked = true;
             document.getElementById('amountOrSizeInput').value = '';
             document.getElementById('amountOrSizeInput').placeholder = 'Enter quantity';
+            document.getElementById('amountOrSizeInput').step = '0.01';
             updateAmountOrSizeLabel();
             new bootstrap.Modal(document.getElementById('orderModal')).show();
         }
@@ -1220,11 +1232,11 @@
             if (isAmount) {
                 const amount = parseFloat(raw);
                 if (amount <= 0) return;
-                size = Math.floor(amount / price);
+                size = Math.round(amount / price * 100) / 100;
             } else {
-                size = Math.floor(parseFloat(raw));
+                size = Math.round(parseFloat(raw) * 100) / 100;
             }
-            if (size < 1) return;
+            if (size <= 0) return;
             currentData.price = price;
             currentData.size = size;
             const url = currentAction === 'buy' ? '/api/buy' : '/api/sell';
