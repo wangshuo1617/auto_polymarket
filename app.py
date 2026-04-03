@@ -647,6 +647,106 @@ def _categorize_skip_reason(reason: str) -> str:
     return "其他"
 
 
+# ---- 跳过原因：过滤链位置元数据 & 子维度提取 ----
+
+_FILTER_CHAIN_INFO: dict[str, dict] = {
+    "有毒时段":       {"pos": 1,  "total": 17, "level": "early",     "bk": "UTC 小时"},
+    "窗口波动过大":   {"pos": 2,  "total": 17, "level": "early",     "bk": "波动值区间"},
+    "方向不稳定":     {"pos": 3,  "total": 17, "level": "early",     "bk": "穿越次数"},
+    "市场缓存缺失":   {"pos": 4,  "total": 17, "level": "middle",    "bk": ""},
+    "订单簿缓存不完整": {"pos": 4, "total": 17, "level": "middle",   "bk": ""},
+    "盘口缺失":       {"pos": 4,  "total": 17, "level": "middle",    "bk": ""},
+    "盘口价差过窄":   {"pos": 4,  "total": 17, "level": "middle",    "bk": "价差值"},
+    "预判价差不足":   {"pos": 5,  "total": 17, "level": "middle",    "bk": "价差区间"},
+    "其他策略拦截":   {"pos": 6,  "total": 17, "level": "middle",    "bk": "子原因"},
+    "风险阈值提升拦截": {"pos": 7, "total": 17, "level": "late",     "bk": "风险分区间"},
+    "DB交叉验证失败": {"pos": 11, "total": 17, "level": "late",      "bk": ""},
+    "报价过期":       {"pos": 12, "total": 17, "level": "execution", "bk": "过期类型"},
+    "风险降仓到0":    {"pos": 14, "total": 17, "level": "execution", "bk": "风险等级"},
+    "入场价格超阈值": {"pos": 17, "total": 17, "level": "execution", "bk": ""},
+    "其他":           {"pos": 0,  "total": 17, "level": "unknown",   "bk": ""},
+}
+
+_WHAT_IF_NOTES: dict[str, str] = {
+    "early":     "检查链前端，关闭后窗口仍需通过多个后续检查才会入场。正确率为上界估计",
+    "middle":    "检查链中段，已通过部分前置检查。关闭后部分窗口仍可能被后续拦截",
+    "late":      "检查链后端，已通过大部分检查。关闭后这些窗口大概率入场，正确率接近实际胜率",
+    "execution": "已通过全部策略检查，在执行阶段被拦截。关闭后直接入场，正确率即胜率",
+    "unknown":   "",
+}
+
+
+def _extract_skip_sub_key(category: str, raw_reason: str) -> str:
+    """从原始跳过原因字符串中提取子分组键"""
+    text = str(raw_reason or "")
+    lower = text.lower()
+
+    if category == "有毒时段":
+        m = re.search(r"UTC hour=(\d+)", text)
+        return f"UTC {m.group(1)}时" if m else "--"
+
+    if category == "窗口波动过大":
+        m = re.search(r"avg \|Δbtc\|/s = ([\d.]+)", text, re.IGNORECASE)
+        if m:
+            val = float(m.group(1))
+            lo = int(val)
+            return f"{lo}.0~{lo + 1}.0"
+        return "--"
+
+    if category == "方向不稳定":
+        m = re.search(r"crossed open price (\d+) times", text)
+        return f"{m.group(1)}次" if m else "--"
+
+    if category == "盘口价差过窄":
+        m = re.search(r"spread too narrow \(([\d.]+)", text, re.IGNORECASE)
+        if m:
+            val = float(m.group(1))
+            bucket = round(int(val / 0.01) * 0.01, 2)
+            return f"{bucket:.2f}~{bucket + 0.01:.2f}"
+        return "--"
+
+    if category == "预判价差不足":
+        m = re.search(r"abs_diff=([\d.]+)", text)
+        if m:
+            val = float(m.group(1))
+            lo = int(val)
+            return f"{lo}.0~{lo + 1.0:.1f}"
+        return "--"
+
+    if category == "风险阈值提升拦截":
+        m = re.search(r"preflight_risk=([\d.]+)", text)
+        if m:
+            val = float(m.group(1))
+            lo = round(int(val / 0.1) * 0.1, 1)
+            return f"{lo:.1f}~{lo + 0.1:.1f}"
+        return "--"
+
+    if category == "风险降仓到0":
+        m = re.search(r"风险等级=(\S+)[，,]", text)
+        return m.group(1) if m else "--"
+
+    if category == "报价过期":
+        if "无Polymarket WS报价数据" in text:
+            return "无WS数据"
+        m = re.search(r"age=(\d+)ms", text)
+        if m:
+            age_s = int(m.group(1)) / 1000
+            bucket = int(age_s / 5) * 5
+            return f"{bucket}~{bucket + 5}s"
+        return "--"
+
+    if category == "其他策略拦截":
+        if "cross_borderline" in lower:
+            return "边界穿越拦截"
+        if "不一致" in text and "分钟" in text:
+            return "分钟一致性检查"
+        if "不是市场优势方" in text:
+            return "市场优势方向"
+        return "其他"
+
+    return "--"
+
+
 @app.route('/api/5m_trade_summary')
 def api_5m_trade_summary():
     try:
@@ -857,7 +957,17 @@ def api_5m_trade_stats():
         # 按跳过原因分类的预测统计
         category_correct: dict[str, int] = {}
         category_wrong: dict[str, int] = {}
+        # 子维度统计: category → sub_key → {"count", "correct", "wrong"}
+        sub_stats: dict[str, dict[str, dict[str, int]]] = {}
         for dr in skip_detail_rows:
+            raw_reason = str(dr["reason"] or "")
+            category = _categorize_skip_reason(raw_reason)
+            sub_key = _extract_skip_sub_key(category, raw_reason)
+            sub_stats.setdefault(category, {}).setdefault(
+                sub_key, {"count": 0, "correct": 0, "wrong": 0}
+            )
+            sub_stats[category][sub_key]["count"] += 1
+
             predicted = str(dr["direction"] or "").strip().lower()
             if predicted not in ("up", "down"):
                 continue
@@ -865,13 +975,14 @@ def api_5m_trade_stats():
             actual = winning_map.get(wms, "") if wms else ""
             if not actual:
                 continue
-            category = _categorize_skip_reason(str(dr["reason"] or ""))
             if predicted == actual:
                 total_correct += 1
                 category_correct[category] = category_correct.get(category, 0) + 1
+                sub_stats[category][sub_key]["correct"] += 1
             else:
                 total_wrong += 1
                 category_wrong[category] = category_wrong.get(category, 0) + 1
+                sub_stats[category][sub_key]["wrong"] += 1
 
         total_predicted = total_correct + total_wrong
         prediction_accuracy = (total_correct / total_predicted) if total_predicted > 0 else None
@@ -881,7 +992,7 @@ def api_5m_trade_stats():
             c_correct = category_correct.get(category, 0)
             c_wrong = category_wrong.get(category, 0)
             c_total = c_correct + c_wrong
-            reason_stats.append({
+            entry: dict = {
                 "reason": category,
                 "count": cnt,
                 "ratio": (cnt / skip_count) if skip_count > 0 else None,
@@ -889,7 +1000,36 @@ def api_5m_trade_stats():
                 "correct_count": c_correct,
                 "wrong_count": c_wrong,
                 "prediction_accuracy": (c_correct / c_total) if c_total > 0 else None,
-            })
+            }
+            # 子维度深度分析
+            chain_info = _FILTER_CHAIN_INFO.get(
+                category, {"pos": 0, "total": 17, "level": "unknown", "bk": ""}
+            )
+            level = chain_info["level"]
+            breakdown: list[dict] = []
+            cat_subs = sub_stats.get(category, {})
+            if cat_subs and chain_info["bk"]:
+                for sk, sv in sorted(
+                    cat_subs.items(), key=lambda x: (-x[1]["count"], x[0])
+                ):
+                    s_total = sv["correct"] + sv["wrong"]
+                    breakdown.append({
+                        "label": sk,
+                        "count": sv["count"],
+                        "correct": sv["correct"],
+                        "wrong": sv["wrong"],
+                        "accuracy": (sv["correct"] / s_total) if s_total > 0 else None,
+                    })
+            if breakdown or chain_info["pos"] > 0:
+                entry["sub_analysis"] = {
+                    "filter_position": chain_info["pos"],
+                    "filter_total": chain_info["total"],
+                    "filter_level": level,
+                    "what_if_note": _WHAT_IF_NOTES.get(level, ""),
+                    "breakdown_key": chain_info["bk"],
+                    "breakdown": breakdown,
+                }
+            reason_stats.append(entry)
         return jsonify({
             "stat_type": "skip",
             "total_windows": total_windows,
@@ -970,6 +1110,102 @@ _PARAM_SHELL_MAP: dict[str, str] = {
 
 # 合法 shell 变量值的正则（防注入）
 _SAFE_VALUE_RE = re.compile(r'^[A-Za-z0-9_.,:/ -]*$')
+
+
+@app.route('/api/5m_trade_window_detail')
+def api_5m_trade_window_detail():
+    """返回单个交易窗口的详细信息，包含BTC秒级价格走势，用于亏损交易弹窗分析。"""
+    market_slug = request.args.get("market_slug", "").strip()
+    if not market_slug:
+        return jsonify({"error": "缺少 market_slug 参数"}), 400
+
+    try:
+        with get_cursor() as cur:
+            # 从 trade_window_summary 获取交易信息
+            cur.execute(
+                """
+                SELECT direction, status, exit_reason, entry_time, exit_time,
+                       btc_entry_price, pnl
+                FROM trade_window_summary
+                WHERE market_slug = %s
+                """,
+                (market_slug,),
+            )
+            window = cur.fetchone()
+
+            # 获取结算方向
+            wms = _extract_window_start_ms(market_slug)
+            winning_direction = None
+            if wms:
+                winning_map = _batch_winning_directions(cur, [wms])
+                winning_direction = winning_map.get(wms)
+
+            # 获取BTC秒级价格走势
+            cur.execute(
+                """
+                SELECT ts_sec, btc_price
+                FROM btc_poly_1s_ticks
+                WHERE market_slug = %s
+                  AND btc_price IS NOT NULL
+                ORDER BY ts_sec ASC
+                """,
+                (market_slug,),
+            )
+            price_rows = cur.fetchall()
+
+            window_start_sec = int(market_slug.split("-")[-1])
+            prices = []
+            for pr in price_rows:
+                prices.append({
+                    "rel_sec": int(pr["ts_sec"]) - window_start_sec,
+                    "btc_price": float(pr["btc_price"]),
+                })
+
+            result = {
+                "market_slug": market_slug,
+                "winning_direction": winning_direction,
+                "prices": prices,
+                "open_btc_price": prices[0]["btc_price"] if prices else None,
+            }
+
+            if window:
+                result["direction"] = window["direction"]
+                result["status"] = window["status"]
+                result["exit_reason"] = window["exit_reason"]
+                result["btc_entry_price"] = (
+                    float(window["btc_entry_price"])
+                    if window["btc_entry_price"] is not None
+                    else None
+                )
+                result["pnl"] = (
+                    round(float(window["pnl"]), 4)
+                    if window["pnl"] is not None
+                    else None
+                )
+
+            # 从 trade_events 获取首笔买入的时间，计算入场相对秒数
+            cur.execute(
+                """
+                SELECT event_time FROM trade_events
+                WHERE market_slug = %s AND side = 'buy'
+                  AND COALESCE(reason, '') != 'entry_try_fail'
+                ORDER BY event_time ASC LIMIT 1
+                """,
+                (market_slug,),
+            )
+            buy_row = cur.fetchone()
+            if buy_row and buy_row["event_time"]:
+                from datetime import datetime as _dt, timezone as _tz
+                raw = str(buy_row["event_time"])
+                buy_dt = _dt.fromisoformat(raw)
+                if buy_dt.tzinfo is None:
+                    buy_dt = buy_dt.replace(tzinfo=_tz.utc)
+                result["entry_rel_sec"] = int(buy_dt.timestamp()) - window_start_sec
+
+            return jsonify(result)
+    except Exception as e:
+        logger.exception("5m_trade_window_detail 异常")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/5m_trade_param_schema')

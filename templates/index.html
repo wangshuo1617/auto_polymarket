@@ -198,6 +198,23 @@
         </div>
     </div>
 
+    <div class="modal fade" id="tradeWindowDetailModal" tabindex="-1" aria-labelledby="tradeWindowDetailModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="tradeWindowDetailModalLabel">交易窗口详情</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body" id="tradeWindowDetailModalBody">
+                    <div class="text-center text-muted py-4">加载中...</div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let currentAction = null;
@@ -854,14 +871,54 @@
                     html += '<tr><th>预测错误窗口数</th><td>' + (data.total_wrong ?? '--') + '</td></tr>';
                     html += '<tr><th>预测总正确率</th><td>' + _fmtPct(data.prediction_accuracy) + '</td></tr>';
                     html += '</tbody></table></div>';
-                    html += '<div class="table-responsive"><table class="table table-sm table-bordered mb-0"><thead><tr><th>跳过原因分类</th><th>数量</th><th>比例</th><th>预测正确</th><th>预测错误</th><th>正确率</th><th>示例</th></tr></thead><tbody>';
+                    html += '<div class="table-responsive"><table class="table table-sm table-bordered mb-0"><thead><tr><th>跳过原因分类</th><th>数量</th><th>比例</th><th>预测正确</th><th>预测错误</th><th>正确率</th><th>检查链</th></tr></thead><tbody>';
                     const reasons = Array.isArray(data.reasons) ? data.reasons : [];
+                    const _lvlColors = {early:'danger',middle:'warning',late:'info',execution:'success'};
+                    const _lvlLabels = {early:'前端',middle:'中段',late:'后端',execution:'执行'};
                     if (!reasons.length) {
                         html += '<tr><td colspan="7" class="text-muted">该时间段无跳过记录</td></tr>';
                     } else {
-                        reasons.forEach(r => {
-                            const examples = Array.isArray(r.examples) && r.examples.length ? r.examples.join('；') : '--';
-                            html += '<tr><td>' + (r.reason || '--') + '</td><td>' + (r.count ?? '--') + '</td><td>' + _fmtPct(r.ratio) + '</td><td>' + (r.correct_count ?? '--') + '</td><td>' + (r.wrong_count ?? '--') + '</td><td>' + _fmtPct(r.prediction_accuracy) + '</td><td class="text-wrap-mobile">' + examples + '</td></tr>';
+                        reasons.forEach((r, idx) => {
+                            const sa = r.sub_analysis;
+                            const hasDetail = sa && ((Array.isArray(sa.breakdown) && sa.breakdown.length > 0) || sa.what_if_note);
+                            const toggle = hasDetail ? '<span class="skip-toggle-icon me-1" style="font-size:0.75em">▶</span>' : '';
+                            const rowStyle = hasDetail ? ' style="cursor:pointer"' : '';
+                            const rowClick = hasDetail ? ' onclick="toggleSkipSubAnalysis(' + idx + ')"' : '';
+                            let chainBadge = '--';
+                            if (sa && sa.filter_position > 0) {
+                                const bg = _lvlColors[sa.filter_level] || 'secondary';
+                                const lb = _lvlLabels[sa.filter_level] || '?';
+                                chainBadge = '<span class="badge bg-' + bg + '">第' + sa.filter_position + '级 · ' + lb + '</span>';
+                            }
+                            html += '<tr' + rowClick + rowStyle + '>';
+                            html += '<td>' + toggle + (r.reason || '--') + '</td>';
+                            html += '<td>' + (r.count ?? '--') + '</td>';
+                            html += '<td>' + _fmtPct(r.ratio) + '</td>';
+                            html += '<td>' + (r.correct_count ?? '--') + '</td>';
+                            html += '<td>' + (r.wrong_count ?? '--') + '</td>';
+                            html += '<td>' + _fmtPct(r.prediction_accuracy) + '</td>';
+                            html += '<td>' + chainBadge + '</td>';
+                            html += '</tr>';
+                            if (hasDetail) {
+                                html += '<tr id="skipSub' + idx + '" style="display:none"><td colspan="7" class="bg-light p-2">';
+                                if (sa.what_if_note) {
+                                    html += '<div class="small text-muted mb-2"><strong>⚡ 关闭此过滤器：</strong>' + _escapeHtml(sa.what_if_note) + '</div>';
+                                }
+                                if (Array.isArray(sa.breakdown) && sa.breakdown.length > 0) {
+                                    html += '<table class="table table-sm table-bordered mb-0"><thead><tr>';
+                                    html += '<th>' + _escapeHtml(sa.breakdown_key || '子分类') + '</th>';
+                                    html += '<th>数量</th><th>预测正确</th><th>预测错误</th><th>正确率</th></tr></thead><tbody>';
+                                    sa.breakdown.forEach(b => {
+                                        html += '<tr><td>' + _escapeHtml(b.label || '--') + '</td>';
+                                        html += '<td>' + (b.count ?? '--') + '</td>';
+                                        html += '<td>' + (b.correct ?? '--') + '</td>';
+                                        html += '<td>' + (b.wrong ?? '--') + '</td>';
+                                        html += '<td>' + _fmtPct(b.accuracy) + '</td></tr>';
+                                    });
+                                    html += '</tbody></table>';
+                                }
+                                html += '</td></tr>';
+                            }
                         });
                     }
                     html += '</tbody></table></div>';
@@ -885,6 +942,18 @@
 
         function openSkipStats() {
             _openTradeStats('skip', 'skipStatStart', 'skipStatEnd', 'skipStatBtn');
+        }
+
+        function toggleSkipSubAnalysis(idx) {
+            const row = document.getElementById('skipSub' + idx);
+            if (!row) return;
+            const isHidden = row.style.display === 'none';
+            row.style.display = isHidden ? '' : 'none';
+            const parentRow = row.previousElementSibling;
+            if (parentRow) {
+                const icon = parentRow.querySelector('.skip-toggle-icon');
+                if (icon) icon.textContent = isHidden ? '▼' : '▶';
+            }
         }
 
         function _pageSlice(rows, page, pageSize) {
@@ -973,6 +1042,156 @@
             `;
         }
 
+        // ---- 亏损交易详情弹窗 ----
+        const _EXIT_REASON_LABELS = {
+            'tp': '止盈',
+            'sl': '止损',
+            'sl_direction_change': '4分钟方向变化止损',
+            'sl_direction_confirm_low_diff': '方向确认差值不足止损',
+            'sl_direction_confirm_mismatch': '方向确认不匹配止损',
+            'sl_last_seconds_reversal': '尾盘加速反向风控',
+            'sl_last_seconds_position': '尾盘位置风控',
+            'expiry': '到期平仓',
+            'market_settle_win': '市场结算（盈利）',
+            'market_settle_loss': '市场结算（亏损）',
+            'market_settle_breakeven': '市场结算（持平）',
+        };
+
+        const _TAIL_GUARD_CHECKPOINTS = [
+            { sec: 240, label: '4m方向检查', color: '#6f42c1' },
+            { sec: 285, label: '方向确认', color: '#0dcaf0' },
+            { sec: 290, label: '到期处理', color: '#ffc107' },
+            { sec: 295, label: '反向风控', color: '#fd7e14' },
+            { sec: 298, label: '位置风控', color: '#dc3545' },
+        ];
+
+        function _drawBtcDiffChart(prices, openPrice) {
+            if (!Array.isArray(prices) || prices.length < 2) {
+                return '<div class="text-muted p-3">暂无秒级BTC价格数据</div>';
+            }
+            if (openPrice == null) openPrice = prices[0].btc_price;
+            let points = prices.map(p => ({
+                sec: p.rel_sec,
+                diff: p.btc_price - openPrice,
+            }));
+            // 降采样保证渲染效率
+            if (points.length > 600) {
+                const step = Math.ceil(points.length / 600);
+                points = points.filter((_, i) => i % step === 0 || i === points.length - 1);
+            }
+            const diffs = points.map(p => p.diff);
+            const secs = points.map(p => p.sec);
+            const minD = Math.min(...diffs);
+            const maxD = Math.max(...diffs);
+            const span = Math.max(0.01, maxD - minD);
+            const minSec = Math.min(...secs);
+            const maxSec = Math.max(Math.max(...secs), 300);
+            const secSpan = Math.max(1, maxSec - minSec);
+
+            const W = 840, H = 300;
+            const padL = 66, padR = 20, padT = 24, padB = 44;
+            const plotW = W - padL - padR;
+            const plotH = H - padT - padB;
+
+            const toX = sec => padL + (sec - minSec) * plotW / secSpan;
+            const toY = diff => padT + (maxD - diff) * plotH / span;
+
+            const xy = points.map(p => `${toX(p.sec).toFixed(1)},${toY(p.diff).toFixed(1)}`).join(' ');
+
+            // 零线
+            const zeroY = toY(0).toFixed(1);
+            const zeroInRange = minD <= 0 && maxD >= 0;
+
+            // 尾盘风控检查点竖线
+            let checkpointLines = '';
+            let checkpointLabels = '';
+            _TAIL_GUARD_CHECKPOINTS.forEach(cp => {
+                if (cp.sec >= minSec && cp.sec <= maxSec) {
+                    const cx = toX(cp.sec).toFixed(1);
+                    checkpointLines += `<line x1="${cx}" y1="${padT}" x2="${cx}" y2="${padT + plotH}" stroke="${cp.color}" stroke-width="1" stroke-dasharray="4,3" opacity="0.7" />`;
+                    checkpointLabels += `<text x="${cx}" y="${H - 4}" font-size="10" fill="${cp.color}" text-anchor="middle">${cp.label}</text>`;
+                }
+            });
+
+            // X轴刻度 (每60秒)
+            let xTicks = '';
+            for (let s = 0; s <= maxSec; s += 60) {
+                if (s >= minSec && s <= maxSec) {
+                    const tx = toX(s).toFixed(1);
+                    xTicks += `<line x1="${tx}" y1="${padT + plotH}" x2="${tx}" y2="${padT + plotH + 5}" stroke="#adb5bd" stroke-width="1" />`;
+                    xTicks += `<text x="${tx}" y="${padT + plotH + 18}" font-size="11" fill="#6c757d" text-anchor="middle">${s}s</text>`;
+                }
+            }
+
+            // Y轴刻度
+            const ySteps = 5;
+            let yTicks = '';
+            for (let i = 0; i <= ySteps; i++) {
+                const val = minD + (span * i / ySteps);
+                const yy = toY(val).toFixed(1);
+                yTicks += `<line x1="${padL - 4}" y1="${yy}" x2="${padL + plotW}" y2="${yy}" stroke="#f1f3f5" stroke-width="1" />`;
+                yTicks += `<text x="${padL - 8}" y="${Number(yy) + 4}" font-size="11" fill="#6c757d" text-anchor="end">${val >= 0 ? '+' : ''}${val.toFixed(1)}</text>`;
+            }
+
+            return `
+                <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;max-height:340px;display:block;">
+                    ${yTicks}
+                    ${zeroInRange ? `<line x1="${padL}" y1="${zeroY}" x2="${padL + plotW}" y2="${zeroY}" stroke="#adb5bd" stroke-width="1" stroke-dasharray="6,3" />` : ''}
+                    ${checkpointLines}
+                    <polyline fill="none" stroke="#0d6efd" stroke-width="2" stroke-linejoin="round" points="${xy}" />
+                    ${xTicks}
+                    ${checkpointLabels}
+                    <text x="${W / 2}" y="${H - 28}" font-size="11" fill="#6c757d" text-anchor="middle">窗口时间 (秒)</text>
+                    <text x="14" y="${padT + plotH / 2}" font-size="11" fill="#6c757d" text-anchor="middle" transform="rotate(-90, 14, ${padT + plotH / 2})">BTC 差值</text>
+                </svg>
+            `;
+        }
+
+        function openTradeWindowDetail(slug) {
+            const body = document.getElementById('tradeWindowDetailModalBody');
+            body.innerHTML = '<div class="text-center text-muted py-4"><span class="spinner-border spinner-border-sm me-2"></span>加载中...</div>';
+            document.getElementById('tradeWindowDetailModalLabel').textContent = '交易窗口详情 — ' + slug;
+            new bootstrap.Modal(document.getElementById('tradeWindowDetailModal')).show();
+
+            fetchJsonSafe('/api/5m_trade_window_detail?market_slug=' + encodeURIComponent(slug))
+                .then(data => {
+                    if (data.error) {
+                        body.innerHTML = '<div class="alert alert-warning">' + _escapeHtml(data.error) + '</div>';
+                        return;
+                    }
+                    const dirLabel = (data.direction || '--').toUpperCase();
+                    const winDirLabel = (data.winning_direction || '--').toUpperCase();
+                    const exitReason = data.exit_reason || '--';
+                    const exitReasonLabel = _EXIT_REASON_LABELS[exitReason] || exitReason;
+                    const statusLabel = { won: '盈利', lost: '亏损', early_exit: '提前出场', open: '持仓中' }[data.status] || (data.status || '--');
+
+                    let html = '<div class="row mb-3">';
+                    html += '<div class="col-sm-6"><strong>入场方向：</strong><span class="badge ' + (dirLabel === 'UP' ? 'bg-success' : 'bg-danger') + '">' + dirLabel + '</span></div>';
+                    html += '<div class="col-sm-6"><strong>最终结算方向：</strong><span class="badge ' + (winDirLabel === 'UP' ? 'bg-success' : (winDirLabel === 'DOWN' ? 'bg-danger' : 'bg-secondary')) + '">' + winDirLabel + '</span></div>';
+                    html += '</div>';
+                    html += '<div class="row mb-3">';
+                    html += '<div class="col-sm-6"><strong>出场原因：</strong>' + _escapeHtml(exitReasonLabel) + '</div>';
+                    html += '<div class="col-sm-6"><strong>结果：</strong>' + _escapeHtml(statusLabel) + (data.pnl != null ? ' (' + (data.pnl >= 0 ? '+' : '') + _fmt4(data.pnl) + ' USDC)' : '') + '</div>';
+                    html += '</div>';
+                    html += '<hr/>';
+                    html += '<h6 class="mb-2">BTC 价格变化（相对入场时刻）</h6>';
+                    // 图例
+                    html += '<div class="d-flex flex-wrap gap-3 mb-2 small text-muted">';
+                    _TAIL_GUARD_CHECKPOINTS.forEach(cp => {
+                        html += '<span><span style="display:inline-block;width:14px;border-top:2px dashed ' + cp.color + ';vertical-align:middle;margin-right:4px;"></span>' + cp.label + ' (' + cp.sec + 's)</span>';
+                    });
+                    html += '</div>';
+                    // 从入场时刻开始截取价格数据
+                    const entryRelSec = data.entry_rel_sec != null ? data.entry_rel_sec : 0;
+                    const filteredPrices = data.prices.filter(p => p.rel_sec >= entryRelSec);
+                    html += _drawBtcDiffChart(filteredPrices, data.open_btc_price);
+                    body.innerHTML = html;
+                })
+                .catch(err => {
+                    body.innerHTML = '<div class="alert alert-danger">加载失败: ' + _escapeHtml(String(err)) + '</div>';
+                });
+        }
+
         function render5mTradeTab(currentBalance) {
             const historyFilteredRows = (tradeResultFilter === 'all')
                 ? tradeHistoryRowsData
@@ -984,8 +1203,13 @@
             let tableRows = '';
             hPage.items.forEach(r => {
                 const pnlClass = r.pnl == null ? '' : (Number(r.pnl) >= 0 ? 'text-success' : 'text-danger');
+                const isLoss = String(r.result || '').trim() === '亏损';
+                const slugDisplay = r.window_slug || '--';
+                const slugCell = isLoss
+                    ? '<a href="#" class="text-danger text-decoration-underline" onclick="openTradeWindowDetail(\'' + _escapeHtml(slugDisplay) + '\');return false;">' + _escapeHtml(slugDisplay) + '</a>'
+                    : _escapeHtml(slugDisplay);
                 tableRows += '<tr>';
-                tableRows += '<td>' + (r.window_slug || '--') + '</td>';
+                tableRows += '<td>' + slugCell + '</td>';
                 tableRows += '<td>' + (r.utc_time || '--') + '</td>';
                 tableRows += '<td>' + (r.result || '未定') + '</td>';
                 tableRows += '<td>' + _fmt4(r.entry_price) + '</td>';
