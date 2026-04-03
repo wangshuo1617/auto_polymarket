@@ -594,78 +594,38 @@
         let _strategyParamsEditMode = false;
         let _strategyParamsCurrent = {};
 
-        const _spParamMeta = {
-            entry_minute:       '入场决策分钟（1-4）',
-            entry_preclose_sec: '入场分钟收盘前秒数',
-            min_direction_diff: '最小方向差值（BTC vs 开盘价）',
-            max_entry_price:    '最大允许入场价格',
-            stake_usd:          '单笔基础仓位（USDC）',
-            exit_mode:          '平仓模式：hold / tpsl',
-            toxic_utc_hours:    '跳过交易的 UTC 小时列表',
-            max_btc_cross_count:     'BTC 跨越开盘价次数上限',
-            min_entry_updown_diff:   'UP/DOWN token 最小价差',
-            max_avg_btc_delta:       'ATR 波动率阈值',
-            minute_consistency:      '分钟一致性检查列表',
-            report_interval_sec:     '报告输出间隔（秒）',
-            trade_db_path:           'SQLite 路径',
-            min_hold_before_close_sec: '最短持仓保护秒数',
-            tp_price_cap:       'TP 价格上限',
-            tp_value_cap:       'TP 收益值上限',
-            sl_to_tp_ratio:     'SL/TP 比例',
-            enable_risk_sizing:      '是否启用动态仓位',
-            risk_min_stake_ratio:    '动态仓位最小倍率',
-            risk_max_stake_ratio:    '动态仓位最大倍率',
-            risk_diff_boost_threshold:  '风险评分高于此值时要求更大价差',
-            risk_diff_boost_multiplier: '高风险时价差倍率提升',
-            cross_borderline_diff_multiplier: 'cross接近上限时价差倍增系数',
-            stake_cap_very_high:     'very_high 风险仓位上限',
-            stake_cap_high:          'high 风险仓位上限',
-            stake_cap_medium_high:   'medium_high 风险仓位上限',
-            medium_high_threshold:   'medium_high 阈值',
-            confidence_boost_ge_095: '置信度≥0.95 加仓倍率',
-            confidence_boost:       '是否启用高置信加仓',
-            risk_w_price:            '风险评分：价格权重',
-            risk_w_direction:        '风险评分：方向权重',
-            risk_w_stability:        '风险评分：稳定性权重',
-            enable_direction_confirm_close:          '是否启用方向不一致平仓',
-            direction_confirm_preclose_sec:          '方向确认触发秒（距5m结束）',
-            direction_confirm_min_abs_diff:          '不一致平仓最小绝对价差',
-            enable_direction_confirm_low_diff_close: '是否启用低价差强平',
-            direction_confirm_low_diff_threshold:    '低价差强平阈值',
-            enable_last_seconds_reverse_guard:  '是否启用终盘加速反向风控',
-            reverse_guard_start_sec:            '终盘反向风控起始秒',
-            reverse_guard_lookback_sec:         '终盘反向风控回看秒数',
-            reverse_guard_btc_move:             '终盘反向BTC移动阈值',
-            reverse_guard_require_cross_open:   '是否要求穿越开盘价才平仓',
-            enable_last_seconds_position_guard: '是否启用终盘位置风控',
-            position_guard_start_sec:           '终盘位置风控起始秒',
-            position_guard_min_consecutive_sec: '终盘位置反向连续秒数',
-            enable_db_tick_validation:          '是否启用DB tick交叉验证',
-        };
-        const _spGroups = [
-            { label: '入场控制', keys: ['entry_minute','entry_preclose_sec','min_direction_diff','max_entry_price','stake_usd','exit_mode','toxic_utc_hours','max_btc_cross_count','min_entry_updown_diff','max_avg_btc_delta','minute_consistency','enable_db_tick_validation'] },
-            { label: 'TPSL 平仓控制', keys: ['min_hold_before_close_sec','tp_price_cap','tp_value_cap','sl_to_tp_ratio'] },
-            { label: '风险仓位管理', keys: ['enable_risk_sizing','risk_min_stake_ratio','risk_max_stake_ratio','risk_diff_boost_threshold','risk_diff_boost_multiplier','cross_borderline_diff_multiplier','stake_cap_very_high','stake_cap_high','stake_cap_medium_high','medium_high_threshold','confidence_boost','confidence_boost_ge_095','risk_w_price','risk_w_direction','risk_w_stability'] },
-            { label: '方向确认风控', keys: ['enable_direction_confirm_close','direction_confirm_preclose_sec','direction_confirm_min_abs_diff','enable_direction_confirm_low_diff_close','direction_confirm_low_diff_threshold'] },
-            { label: '终盘风控', keys: ['enable_last_seconds_reverse_guard','reverse_guard_start_sec','reverse_guard_lookback_sec','reverse_guard_btc_move','reverse_guard_require_cross_open','enable_last_seconds_position_guard','position_guard_start_sec','position_guard_min_consecutive_sec'] },
-            { label: '系统', keys: ['report_interval_sec','trade_db_path'] },
-        ];
-        const _spBooleanParams = new Set([
-            'enable_risk_sizing','confidence_boost',
-            'enable_direction_confirm_close','enable_direction_confirm_low_diff_close',
-            'enable_last_seconds_reverse_guard','reverse_guard_require_cross_open',
-            'enable_last_seconds_position_guard','enable_db_tick_validation',
-        ]);
-        // 已知参数的默认值，确保旧版启动记录中缺失的新参数也能在弹窗中显示
-        const _spParamDefaults = {
-            enable_db_tick_validation: 'true',
-            max_btc_cross_count: '4',
-            min_entry_updown_diff: '0.38',
-            max_avg_btc_delta: '3.0',
-            minute_consistency: '3',
-            exit_mode: 'hold',
-            confidence_boost: 'true',
-        };
+        // 参数 schema 从 API 动态加载，不再硬编码
+        let _spParamMeta = {};
+        let _spGroups = [];
+        let _spBooleanParams = new Set();
+        let _spParamDefaults = {};
+
+        function _initParamSchemaFromApi(data) {
+            _spParamMeta = {};
+            _spGroups = [];
+            _spBooleanParams = new Set();
+            _spParamDefaults = {};
+            (data.groups || []).forEach(g => {
+                const keys = [];
+                (g.params || []).forEach(p => {
+                    _spParamMeta[p.key] = p.description;
+                    keys.push(p.key);
+                    if (p.type === 'bool') _spBooleanParams.add(p.key);
+                    if (p.default != null) _spParamDefaults[p.key] = String(p.default);
+                });
+                _spGroups.push({ label: g.label, keys });
+            });
+            // trade_db_path 不在策略注册表中，手动追加
+            _spParamMeta['trade_db_path'] = 'SQLite 路径';
+            const sysGroup = _spGroups.find(g => g.label === '系统');
+            if (sysGroup) sysGroup.keys.push('trade_db_path');
+            else _spGroups.push({ label: '系统', keys: ['trade_db_path'] });
+        }
+
+        fetch('/api/5m_trade_param_schema')
+            .then(r => r.ok ? r.json() : Promise.reject(r))
+            .then(data => _initParamSchemaFromApi(data))
+            .catch(err => console.warn('加载参数schema失败:', err));
 
         function _renderStrategyTable(editing) {
             const p = _strategyParamsCurrent;

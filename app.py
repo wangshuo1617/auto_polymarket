@@ -13,6 +13,11 @@ from zoneinfo import ZoneInfo
 
 import psycopg2.extras
 from data.database import get_conn, get_cursor
+from services.five_minute_trade.param_registry import (
+    DISPLAY_ORDER as _REGISTRY_DISPLAY_ORDER,
+    PARAM_SHELL_MAP as _REGISTRY_SHELL_MAP,
+    get_param_schema,
+)
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
 from py_clob_client.clob_types import (
@@ -57,54 +62,7 @@ APP_PM_PROFILE = (os.getenv("POLYMARKET_PROFILE", "analyze") or "analyze").strip
 TRADE_PM_PROFILE = "trade"
 ET_TIMEZONE = ZoneInfo("America/New_York")
 UTC8_TIMEZONE = ZoneInfo("Asia/Shanghai")
-STRATEGY_PARAM_DISPLAY_ORDER = [
-    "entry_minute",
-    "entry_preclose_sec",
-    "min_direction_diff",
-    "max_entry_price",
-    "stake_usd",
-    "report_interval_sec",
-    "min_hold_before_close_sec",
-    "exit_mode",
-    "tp_price_cap",
-    "tp_value_cap",
-    "sl_to_tp_ratio",
-    "toxic_utc_hours",
-    "max_btc_cross_count",
-    "min_entry_updown_diff",
-    "max_avg_btc_delta",
-    "minute_consistency",
-    "enable_db_tick_validation",
-    "trade_db_path",
-    "enable_risk_sizing",
-    "risk_min_stake_ratio",
-    "risk_max_stake_ratio",
-    "risk_diff_boost_threshold",
-    "risk_diff_boost_multiplier",
-    "cross_borderline_diff_multiplier",
-    "stake_cap_very_high",
-    "stake_cap_high",
-    "stake_cap_medium_high",
-    "medium_high_threshold",
-    "confidence_boost",
-    "confidence_boost_ge_095",
-    "risk_w_price",
-    "risk_w_direction",
-    "risk_w_stability",
-    "enable_direction_confirm_close",
-    "direction_confirm_preclose_sec",
-    "direction_confirm_min_abs_diff",
-    "enable_direction_confirm_low_diff_close",
-    "direction_confirm_low_diff_threshold",
-    "enable_last_seconds_reverse_guard",
-    "reverse_guard_start_sec",
-    "reverse_guard_lookback_sec",
-    "reverse_guard_btc_move",
-    "reverse_guard_require_cross_open",
-    "enable_last_seconds_position_guard",
-    "position_guard_start_sec",
-    "position_guard_min_consecutive_sec",
-]
+STRATEGY_PARAM_DISPLAY_ORDER = _REGISTRY_DISPLAY_ORDER + ["trade_db_path"]
 
 
 def _is_authenticated() -> bool:
@@ -1006,56 +964,18 @@ def api_run_position_analyze():
 
 # 允许从前端写入的参数白名单（key = Python 小写名，value = 对应 shell 变量名）
 _PARAM_SHELL_MAP: dict[str, str] = {
-    "entry_minute": "ENTRY_MINUTE",
-    "entry_preclose_sec": "ENTRY_PRECLOSE_SEC",
-    "min_direction_diff": "MIN_DIRECTION_DIFF",
-    "max_entry_price": "MAX_ENTRY_PRICE",
-    "stake_usd": "STAKE_USD",
-    "exit_mode": "EXIT_MODE",
-    "toxic_utc_hours": "TOXIC_UTC_HOURS",
-    "max_btc_cross_count": "MAX_BTC_CROSS_COUNT",
-    "min_entry_updown_diff": "MIN_ENTRY_UPDOWN_DIFF",
-    "max_avg_btc_delta": "MAX_AVG_BTC_DELTA",
-    "minute_consistency": "MINUTE_CONSISTENCY",
-    "min_hold_before_close_sec": "MIN_HOLD_BEFORE_CLOSE_SEC",
-    "tp_price_cap": "TP_PRICE_CAP",
-    "tp_value_cap": "TP_VALUE_CAP",
-    "sl_to_tp_ratio": "SL_TO_TP_RATIO",
-    "enable_risk_sizing": "ENABLE_RISK_SIZING",
-    "risk_min_stake_ratio": "RISK_MIN_STAKE_RATIO",
-    "risk_max_stake_ratio": "RISK_MAX_STAKE_RATIO",
-    "confidence_boost": "CONFIDENCE_BOOST",
-    "confidence_boost_ge_095": "CONFIDENCE_BOOST_GE_095",
-    "stake_cap_very_high": "STAKE_CAP_VERY_HIGH",
-    "stake_cap_high": "STAKE_CAP_HIGH",
-    "stake_cap_medium_high": "STAKE_CAP_MEDIUM_HIGH",
-    "medium_high_threshold": "MEDIUM_HIGH_THRESHOLD",
-    "risk_w_price": "RISK_W_PRICE",
-    "risk_w_direction": "RISK_W_DIRECTION",
-    "risk_w_stability": "RISK_W_STABILITY",
-    "risk_diff_boost_threshold": "RISK_DIFF_BOOST_THRESHOLD",
-    "risk_diff_boost_multiplier": "RISK_DIFF_BOOST_MULTIPLIER",
-    "cross_borderline_diff_multiplier": "CROSS_BORDERLINE_DIFF_MULTIPLIER",
-    "enable_direction_confirm_close": "ENABLE_DIRECTION_CONFIRM_CLOSE",
-    "direction_confirm_preclose_sec": "DIRECTION_CONFIRM_PRECLOSE_SEC",
-    "direction_confirm_min_abs_diff": "DIRECTION_CONFIRM_MIN_ABS_DIFF",
-    "enable_direction_confirm_low_diff_close": "ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE",
-    "direction_confirm_low_diff_threshold": "DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD",
-    "enable_last_seconds_reverse_guard": "ENABLE_LAST_SECONDS_REVERSE_GUARD",
-    "reverse_guard_start_sec": "REVERSE_GUARD_START_SEC",
-    "reverse_guard_lookback_sec": "REVERSE_GUARD_LOOKBACK_SEC",
-    "reverse_guard_btc_move": "REVERSE_GUARD_BTC_MOVE",
-    "reverse_guard_require_cross_open": "REVERSE_GUARD_REQUIRE_CROSS_OPEN",
-    "enable_last_seconds_position_guard": "ENABLE_LAST_SECONDS_POSITION_GUARD",
-    "position_guard_start_sec": "POSITION_GUARD_START_SEC",
-    "position_guard_min_consecutive_sec": "POSITION_GUARD_MIN_CONSECUTIVE_SEC",
-    "enable_db_tick_validation": "ENABLE_DB_TICK_VALIDATION",
-    "report_interval_sec": "REPORT_INTERVAL_SEC",
+    **_REGISTRY_SHELL_MAP,
     "trade_db_path": "TRADE_DB_PATH",
 }
 
 # 合法 shell 变量值的正则（防注入）
 _SAFE_VALUE_RE = re.compile(r'^[A-Za-z0-9_.,:/ -]*$')
+
+
+@app.route('/api/5m_trade_param_schema')
+def api_5m_trade_param_schema():
+    """返回策略参数的完整 schema（分组、类型、默认值、描述），供前端动态渲染。"""
+    return jsonify({"groups": get_param_schema()})
 
 
 @app.route('/api/update_5m_trade_params', methods=['POST'])

@@ -55,6 +55,10 @@ from services.five_minute_trade.position_close_ops import (
 from services.five_minute_trade.auto_redeem import run_auto_redeem
 from services.five_minute_trade.reporting import build_pnl_report_content_and_subject
 from services.five_minute_trade.trade_db import TradeSQLiteStore
+from services.five_minute_trade.param_registry import (
+    build_startup_params,
+    build_strategy_signature,
+)
 from services.five_minute_trade.watchers import (
     ChainlinkBTCPriceWatcher,
     PolymarketAssetPriceWatcher,
@@ -62,50 +66,6 @@ from services.five_minute_trade.watchers import (
 
 logger = logging.getLogger(__name__)
 TRADE_PROFILE = "trade"
-
-
-def _fmt_num(value: float) -> str:
-    return f"{value:g}"
-
-
-def _build_startup_strategy_signature(args: Any) -> str:
-    return (
-        f"m={args.entry_minute},"
-        f"pre={args.entry_preclose_sec},"
-        f"diff={_fmt_num(args.min_direction_diff)},"
-        f"max={_fmt_num(args.max_entry_price)},"
-        f"stake={_fmt_num(args.stake_usd)},"
-        f"hold={args.min_hold_before_close_sec},"
-        f"tp_cap={_fmt_num(args.tp_price_cap)},"
-        f"tp_val_cap={_fmt_num(args.tp_value_cap)},"
-        f"sl_ratio={_fmt_num(args.sl_to_tp_ratio)},"
-        f"cross={args.max_btc_cross_count},"
-        f"ud_diff={_fmt_num(args.min_entry_updown_diff)},"
-        f"atr={_fmt_num(args.max_avg_btc_delta)},"
-        f"mc={args.minute_consistency},"
-        f"exit={args.exit_mode},"
-        f"risk={int(args.enable_risk_sizing)},"
-        f"rmin={_fmt_num(args.risk_min_stake_ratio)},"
-        f"rmax={_fmt_num(args.risk_max_stake_ratio)},"
-        f"rdb={_fmt_num(args.risk_diff_boost_threshold)},"
-        f"rdbm={_fmt_num(args.risk_diff_boost_multiplier)},"
-        f"cbdm={_fmt_num(args.cross_borderline_diff_multiplier)},"
-        f"mht={_fmt_num(args.medium_high_threshold)},"
-        f"dc={int(not args.disable_direction_confirm_close)},"
-        f"dcp={args.direction_confirm_preclose_sec},"
-        f"dcd={_fmt_num(args.direction_confirm_min_abs_diff)},"
-        f"dcl={int(args.enable_direction_confirm_low_diff_close)},"
-        f"dclt={_fmt_num(args.direction_confirm_low_diff_threshold)},"
-        f"lrg={int(args.enable_last_seconds_reverse_guard)},"
-        f"lrgs={args.reverse_guard_start_sec},"
-        f"lrgl={args.reverse_guard_lookback_sec},"
-        f"lrgm={_fmt_num(args.reverse_guard_btc_move)},"
-        f"lrgx={int(not args.disable_reverse_guard_require_cross_open)},"
-        f"lpg={int(args.enable_last_seconds_position_guard)},"
-        f"lpgs={args.position_guard_start_sec},"
-        f"lpgn={args.position_guard_min_consecutive_sec},"
-        f"dbtv={int(args.enable_db_tick_validation)}"
-    )
 
 
 def _current_et_time_str() -> str:
@@ -1866,7 +1826,7 @@ def main() -> None:
     args = build_trade_arg_parser().parse_args()
     configure_trade_logging()
     startup_ts_sec = int(time.time())
-    strategy_signature = _build_startup_strategy_signature(args)
+    strategy_signature = build_strategy_signature(args)
     logger.info(
         "新5m_trade服务启动 | ET时间=%s | 秒级时间戳=%s | 本次启动策略=%s",
         _current_et_time_str(),
@@ -1881,53 +1841,7 @@ def main() -> None:
             start_ts_sec=startup_ts_sec,
             strategy_signature=strategy_signature,
             dry_run=bool(args.dry_run),
-            startup_params={
-                "entry_minute": args.entry_minute,
-                "entry_preclose_sec": args.entry_preclose_sec,
-                "min_direction_diff": args.min_direction_diff,
-                "max_entry_price": args.max_entry_price,
-                "stake_usd": args.stake_usd,
-                "report_interval_sec": args.report_interval_sec,
-                "min_hold_before_close_sec": args.min_hold_before_close_sec,
-                "exit_mode": args.exit_mode,
-                "tp_price_cap": args.tp_price_cap,
-                "tp_value_cap": args.tp_value_cap,
-                "sl_to_tp_ratio": args.sl_to_tp_ratio,
-                "toxic_utc_hours": args.toxic_utc_hours,
-                "max_btc_cross_count": args.max_btc_cross_count,
-                "min_entry_updown_diff": args.min_entry_updown_diff,
-                "max_avg_btc_delta": args.max_avg_btc_delta,
-                "minute_consistency": args.minute_consistency,
-                "enable_risk_sizing": args.enable_risk_sizing,
-                "risk_min_stake_ratio": args.risk_min_stake_ratio,
-                "risk_max_stake_ratio": args.risk_max_stake_ratio,
-                "confidence_boost": not getattr(args, "disable_confidence_boost", False),
-                "risk_diff_boost_threshold": args.risk_diff_boost_threshold,
-                "risk_diff_boost_multiplier": args.risk_diff_boost_multiplier,
-                "cross_borderline_diff_multiplier": args.cross_borderline_diff_multiplier,
-                "stake_cap_very_high": args.stake_cap_very_high,
-                "stake_cap_high": args.stake_cap_high,
-                "stake_cap_medium_high": args.stake_cap_medium_high,
-                "medium_high_threshold": args.medium_high_threshold,
-                "confidence_boost_ge_095": args.confidence_boost_ge_095,
-                "risk_w_price": args.risk_w_price,
-                "risk_w_direction": args.risk_w_direction,
-                "risk_w_stability": args.risk_w_stability,
-                "enable_direction_confirm_close": not args.disable_direction_confirm_close,
-                "direction_confirm_preclose_sec": args.direction_confirm_preclose_sec,
-                "direction_confirm_min_abs_diff": args.direction_confirm_min_abs_diff,
-                "enable_direction_confirm_low_diff_close": args.enable_direction_confirm_low_diff_close,
-                "direction_confirm_low_diff_threshold": args.direction_confirm_low_diff_threshold,
-                "enable_last_seconds_reverse_guard": args.enable_last_seconds_reverse_guard,
-                "reverse_guard_start_sec": args.reverse_guard_start_sec,
-                "reverse_guard_lookback_sec": args.reverse_guard_lookback_sec,
-                "reverse_guard_btc_move": args.reverse_guard_btc_move,
-                "reverse_guard_require_cross_open": not args.disable_reverse_guard_require_cross_open,
-                "enable_last_seconds_position_guard": args.enable_last_seconds_position_guard,
-                "position_guard_start_sec": args.position_guard_start_sec,
-                "position_guard_min_consecutive_sec": args.position_guard_min_consecutive_sec,
-                "enable_db_tick_validation": args.enable_db_tick_validation,
-            },
+            startup_params=build_startup_params(args),
             pid=os.getpid(),
             hostname=socket.gethostname(),
             et_time_str=_current_et_time_str(),
