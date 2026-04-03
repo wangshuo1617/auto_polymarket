@@ -368,7 +368,12 @@
                     });
                     let content = '<h2 class="h4 mb-3 text-wrap-mobile">My Position</h2>';
                     content += '<p class="mb-3"><strong>Total position value:</strong> ' + formatMoney(totalValue) + '</p>';
-                    Object.keys(byMarket).forEach(cid => {
+                    // 按 title 中的 BTC 目标价格由高到低排列
+                    const sortedCids = Object.keys(byMarket).sort((a, b) => {
+                        const extract = t => { const m = (t || '').match(/\$([\d,]+)/); return m ? parseInt(m[1].replace(/,/g, ''), 10) : 0; };
+                        return extract(byMarket[b].title) - extract(byMarket[a].title);
+                    });
+                    sortedCids.forEach(cid => {
                         const group = byMarket[cid];
                         const safeTitle = (group.title || '—').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
                         content += '<div class="card event-card shadow-sm mb-3"><div class="card-body p-2 p-md-3">';
