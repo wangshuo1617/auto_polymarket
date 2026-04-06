@@ -1264,8 +1264,6 @@ class FiveMinuteUpDownTrader:
             return
         if rel_sec < 240:
             return
-        if self.exit_mode == "hold":
-            return
         if btc_age_ms > self.MAX_BTC_AGE_MS:
             return
         if (
