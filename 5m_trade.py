@@ -838,26 +838,26 @@ class FiveMinuteUpDownTrader:
                         e,
                     )
 
-            # --- 开盘价沉淀：等待 Chainlink 延迟价格到达后再锁定 ---
+            # --- 开盘价沉淀：等待窗口内第一个新 Chainlink 事件到达后锁定 ---
+            # 窗口边界时缓存的价格可能 stale（链上已更新但 RTDS 延迟推送），
+            # 第一个新 event 到达时即为预言机使用的开盘价，立即锁定。
             if not self._open_price_locked:
                 cur_event_ms = self.latest_btc_price_event_ms or 0
                 if cur_event_ms > self._open_price_event_ms:
                     old_open = self.window_open_price
                     self.window_open_price = btc_price
-                    self._open_price_event_ms = cur_event_ms
-                    if old_open is not None and abs(btc_price - old_open) > 0.5:
-                        logger.info(
-                            "开盘价沉淀更新: %.2f → %.2f (Δ%.2f, event_ms=%d, rel_sec=%.0f)",
-                            old_open, btc_price, btc_price - old_open,
-                            cur_event_ms, rel_sec,
-                        )
-                        # 开盘价变化后重置越线计数
-                        self._btc_cross_count = 0
-                        self._last_btc_side = None
-                if rel_sec >= self.OPEN_PRICE_SETTLE_SEC:
+                    self._open_price_locked = True
+                    self._btc_cross_count = 0
+                    self._last_btc_side = None
+                    logger.info(
+                        "开盘价沉淀完成: %.2f → %.2f (Δ%.2f, event_ms=%d, rel_sec=%.0f)",
+                        old_open, btc_price, btc_price - old_open,
+                        cur_event_ms, rel_sec,
+                    )
+                elif rel_sec >= self.OPEN_PRICE_SETTLE_SEC:
                     self._open_price_locked = True
                     logger.info(
-                        "开盘价已锁定: %.2f (settle %.0fs)", self.window_open_price, rel_sec,
+                        "开盘价沉淀超时锁定: %.2f (无新事件, %.0fs)", self.window_open_price, rel_sec,
                     )
 
             # --- 记录窗口内每秒 BTC 价格（用于 ATR 过滤）---
