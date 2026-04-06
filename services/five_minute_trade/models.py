@@ -35,7 +35,7 @@ class TradeRecord:
     pnl: float
     entry_time: datetime
     exit_time: datetime
-    reason: str  # "tp", "sl", "sl_direction_change", "expiry", "error"
+    reason: str  # "tp", "sl", "sl_last_min_proximity", "expiry", "error"
     entry_best_ask: Optional[float] = None
     entry_avg_fill_price: Optional[float] = None
     entry_full_fill: Optional[bool] = None

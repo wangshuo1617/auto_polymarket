@@ -103,9 +103,7 @@ class FiveMinuteUpDownTrader:
     EXPIRY_FORCE_CLOSE_HIGH_PRICE = 2.00
     EXPIRY_WAIT_SETTLE_MIN_PRICE = 0.60
     REPEATED_LOG_THROTTLE_SEC = 10.0
-    DIRECTION_CONFIRM_PRECLOSE_SEC = 15
-    DIRECTION_CONFIRM_MIN_ABS_DIFF = 0.0
-    DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD = 10.0
+    LAST_MIN_PROXIMITY_THRESHOLD = 10.0
     REVERSE_GUARD_START_SEC = 295
     REVERSE_GUARD_LOOKBACK_SEC = 3
     REVERSE_GUARD_BTC_MOVE = 15.0
@@ -151,11 +149,8 @@ class FiveMinuteUpDownTrader:
         risk_diff_boost_threshold: float = 0.44,
         risk_diff_boost_multiplier: float = 1.40,
         cross_borderline_diff_multiplier: float = 0.0,
-        direction_confirm_preclose_sec: int = DIRECTION_CONFIRM_PRECLOSE_SEC,
-        direction_confirm_min_abs_diff: float = DIRECTION_CONFIRM_MIN_ABS_DIFF,
-        enable_direction_confirm_low_diff_close: bool = True,
-        direction_confirm_low_diff_threshold: float = DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD,
-        enable_direction_confirm_close: bool = True,
+        enable_last_min_proximity_close: bool = True,
+        last_min_proximity_threshold: float = LAST_MIN_PROXIMITY_THRESHOLD,
         enable_last_seconds_reverse_guard: bool = True,
         reverse_guard_start_sec: int = REVERSE_GUARD_START_SEC,
         reverse_guard_lookback_sec: int = REVERSE_GUARD_LOOKBACK_SEC,
@@ -189,12 +184,8 @@ class FiveMinuteUpDownTrader:
             raise ValueError("sl_to_tp_ratio 必须大于 0")
         if min_hold_before_close_sec < 0:
             raise ValueError("min_hold_before_close_sec 必须大于等于 0")
-        if direction_confirm_preclose_sec < 1 or direction_confirm_preclose_sec >= 300:
-            raise ValueError("direction_confirm_preclose_sec 必须在 1-299 之间")
-        if direction_confirm_min_abs_diff < 0:
-            raise ValueError("direction_confirm_min_abs_diff 必须大于等于 0")
-        if direction_confirm_low_diff_threshold < 0:
-            raise ValueError("direction_confirm_low_diff_threshold 必须大于等于 0")
+        if last_min_proximity_threshold < 0:
+            raise ValueError("last_min_proximity_threshold 必须大于等于 0")
         if reverse_guard_start_sec < 1 or reverse_guard_start_sec >= 300:
             raise ValueError("reverse_guard_start_sec 必须在 1-299 之间")
         if reverse_guard_lookback_sec < 1 or reverse_guard_lookback_sec > 30:
@@ -232,11 +223,8 @@ class FiveMinuteUpDownTrader:
         self.risk_diff_boost_threshold = float(risk_diff_boost_threshold)
         self.risk_diff_boost_multiplier = float(risk_diff_boost_multiplier)
         self.cross_borderline_diff_multiplier = float(cross_borderline_diff_multiplier)
-        self.direction_confirm_preclose_sec = int(direction_confirm_preclose_sec)
-        self.direction_confirm_min_abs_diff = float(direction_confirm_min_abs_diff)
-        self.enable_direction_confirm_low_diff_close = bool(enable_direction_confirm_low_diff_close)
-        self.direction_confirm_low_diff_threshold = float(direction_confirm_low_diff_threshold)
-        self.enable_direction_confirm_close = bool(enable_direction_confirm_close)
+        self.enable_last_min_proximity_close = bool(enable_last_min_proximity_close)
+        self.last_min_proximity_threshold = float(last_min_proximity_threshold)
         self.enable_last_seconds_reverse_guard = bool(enable_last_seconds_reverse_guard)
         self.reverse_guard_start_sec = int(reverse_guard_start_sec)
         self.reverse_guard_lookback_sec = int(reverse_guard_lookback_sec)
@@ -269,7 +257,6 @@ class FiveMinuteUpDownTrader:
         self._minute2_recorded: bool = False
         self._minute3_recorded: bool = False
         self._minute4_recorded: bool = False
-        self._direction_confirm_checked: bool = False
         self._last_seconds_reverse_guard_triggered: bool = False
         self._last_seconds_position_guard_triggered: bool = False
 
@@ -823,7 +810,6 @@ class FiveMinuteUpDownTrader:
                 self._minute2_recorded = False
                 self._minute3_recorded = False
                 self._minute4_recorded = False
-                self._direction_confirm_checked = False
                 self._last_seconds_reverse_guard_triggered = False
                 self._last_seconds_position_guard_triggered = False
                 slug_ts = window_start_ms // 1000
@@ -913,14 +899,13 @@ class FiveMinuteUpDownTrader:
                 self.minute_closes[3] = btc_price
                 self._minute3_recorded = True
 
-            # --- 第 4 分钟收盘价记录 + 方向变化止损检查（对齐回测 close4_row at rel_sec >= 240）---
+            # --- 第 4 分钟收盘价记录（对齐回测 close4_row at rel_sec >= 240）---
             if rel_sec >= 240 and not self._minute4_recorded:
                 self.minute_closes[4] = btc_price
                 self._minute4_recorded = True
-                self._handle_minute4_direction_change()
 
-            # --- 第4分钟方向一致性确认（不一致则平仓） ---
-            self._handle_direction_confirmation(
+            # --- 最后一分钟开盘价接近度止损 ---
+            self._handle_last_min_proximity_close(
                 rel_sec=rel_sec,
                 btc_price=btc_price,
                 btc_age_ms=btc_age_ms,
@@ -1273,58 +1258,15 @@ class FiveMinuteUpDownTrader:
             logger.warning("DB交叉验证异常，跳过验证: %s", e)
             return True
 
-    def _handle_minute4_direction_change(self) -> None:
+    def _handle_last_min_proximity_close(self, rel_sec: float, btc_price: float, btc_age_ms: int) -> None:
+        """最后一分钟持续监控：BTC 价格触及开盘价附近时平仓。"""
+        if not self.enable_last_min_proximity_close:
+            return
+        if rel_sec < 240:
+            return
         if self.exit_mode == "hold":
             return
-        if (
-            not self.position
-            or self.current_window_start_ms is None
-            or self.window_open_price is None
-        ):
-            return
-        if self.position.market_slug.split("-")[-1] != str(
-            self.current_window_start_ms // 1000
-        ):
-            return
-
-        if self.entry_decision_minute >= 4:
-            return
-
-        open_price = self.window_open_price
-        close3 = self.minute_closes.get(3)
-        close4 = self.minute_closes.get(4)
-        if close3 is None or close4 is None:
-            return
-
-        dir3 = "up" if close3 > open_price else "down"
-        dir4 = "up" if close4 > open_price else "down"
-
-        if dir3 != dir4:
-            logger.info(
-                "第 4 分钟方向与第 3 分钟相反，触发特殊止损，dir3=%s dir4=%s",
-                dir3,
-                dir4,
-            )
-            self._force_close_position(reason="sl_direction_change")
-
-    def _handle_direction_confirmation(self, rel_sec: float, btc_price: float, btc_age_ms: int) -> None:
-        if not self.enable_direction_confirm_close:
-            return
-        if self._direction_confirm_checked:
-            return
-        trigger_sec = 300 - self.direction_confirm_preclose_sec
-        if rel_sec < trigger_sec:
-            return
         if btc_age_ms > self.MAX_BTC_AGE_MS:
-            if self._should_emit_log(
-                key=f"direction_confirm_stale:{self.current_market_slug or 'unknown'}",
-                interval_sec=2.0,
-            ):
-                logger.warning(
-                    "方向确认跳过: BTC stale (age=%dms > %dms), 等待新鲜价格后再确认",
-                    btc_age_ms,
-                    self.MAX_BTC_AGE_MS,
-                )
             return
         if (
             not self.position
@@ -1334,65 +1276,19 @@ class FiveMinuteUpDownTrader:
             return
         if self.position.market_slug.split("-")[-1] != str(self.current_window_start_ms // 1000):
             return
-        self._direction_confirm_checked = True
 
         open_price = self.window_open_price
         abs_diff = abs(btc_price - open_price)
-        if (
-            self.enable_direction_confirm_low_diff_close
-            and abs_diff < self.direction_confirm_low_diff_threshold
-        ):
-            if btc_price > open_price:
-                confirm_direction = "up"
-            elif btc_price < open_price:
-                confirm_direction = "down"
-            else:
-                confirm_direction = "flat"
+        if abs_diff <= self.last_min_proximity_threshold:
             logger.info(
-                "方向确认价差不足阈值，触发平仓: 持仓=%s 确认=%s abs_diff=%.2f 阈值=%.2f open=%.2f now=%.2f",
-                self.position.direction,
-                confirm_direction,
+                "最后一分钟触及开盘价附近，触发平仓: abs_diff=%.2f 阈值=%.2f open=%.2f now=%.2f rel_sec=%.1f",
                 abs_diff,
-                self.direction_confirm_low_diff_threshold,
+                self.last_min_proximity_threshold,
                 open_price,
                 btc_price,
-            )
-            self._force_close_position(reason="sl_direction_confirm_low_diff")
-            return
-
-        if btc_price > open_price:
-            confirm_direction = "up"
-        elif btc_price < open_price:
-            confirm_direction = "down"
-        else:
-            logger.info(
-                "方向确认时刻价格与开盘价持平，跳过平仓: rel_sec=%.1f open=%.2f now=%.2f",
                 rel_sec,
-                open_price,
-                btc_price,
             )
-            return
-
-        if confirm_direction != self.position.direction:
-            if abs_diff < self.direction_confirm_min_abs_diff:
-                logger.info(
-                    "方向确认不一致但偏离不足，跳过平仓: 持仓=%s 确认=%s abs_diff=%.2f 阈值=%.2f",
-                    self.position.direction,
-                    confirm_direction,
-                    abs_diff,
-                    self.direction_confirm_min_abs_diff,
-                )
-                return
-            logger.info(
-                "第 %d 分钟收盘前 %ds 方向确认不一致，触发平仓: 持仓=%s 确认=%s open=%.2f now=%.2f",
-                5,
-                self.direction_confirm_preclose_sec,
-                self.position.direction,
-                confirm_direction,
-                open_price,
-                btc_price,
-            )
-            self._force_close_position(reason="sl_direction_confirm_mismatch")
+            self._force_close_position(reason="sl_last_min_proximity")
 
     def _handle_last_seconds_reverse_guard(self, rel_sec: float, btc_price: float, btc_age_ms: int) -> None:
         if not self.enable_last_seconds_reverse_guard:

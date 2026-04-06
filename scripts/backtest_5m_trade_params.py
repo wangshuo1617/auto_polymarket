@@ -54,6 +54,7 @@ DEFAULT_TP_VALUE_CAP = 0.15
 DEFAULT_SL_TO_TP_RATIO = 4.0 / 3.0
 WINDOW_SECONDS = 5 * 60
 MINUTE4_CLOSE_SEC = 4 * 60
+LAST_MIN_PROXIMITY_THRESHOLD = 10.0
 LAST_NO_FILL_SETTLEMENT_SEC = WINDOW_SECONDS - 10
 EXPIRY_TRIGGER_SEC = WINDOW_SECONDS - 10
 MIN_ENTRY_LIQUIDITY_FILL_RATIO = 0.95
@@ -1381,18 +1382,12 @@ def _simulate_window(
 
     take_profit_price, stop_loss_price = _dynamic_tp_sl(entry_price_for_risk, params=params)
 
-    close3 = prepared.close3_row
-    close4 = prepared.close4_row
-    dir_change_active = False
-    if params.entry_minute <= 3 and close3 is not None and close4 is not None and close3.btc_price is not None and close4.btc_price is not None:
-        dir3 = "up" if close3.btc_price > open_row.btc_price else "down"
-        dir4 = "up" if close4.btc_price > open_row.btc_price else "down"
-        dir_change_active = dir3 != dir4
-
     entry_ts = entry_row.ts_sec
     exit_reason = "window_end"
     exit_price: Optional[float] = None
     exit_row: Optional[WindowRow] = None
+
+    open_btc_price = open_row.btc_price
 
     for r in rows:
         if r.ts_sec <= entry_ts:
@@ -1425,13 +1420,16 @@ def _simulate_window(
         if trigger_low is None:
             trigger_low = _to_positive_float(bid)
 
-        if dir_change_active and r.rel_sec >= MINUTE4_CLOSE_SEC:
-            exit_reason = "sl_direction_change"
-            if bid is not None and bid > 0 and bid_is_fresh:
-                exit_price = float(bid)
-                exit_row = r
+        # 最后一分钟开盘价接近度止损
+        if r.rel_sec >= MINUTE4_CLOSE_SEC and open_btc_price is not None and r.btc_price is not None:
+            abs_diff = abs(r.btc_price - open_btc_price)
+            if abs_diff <= LAST_MIN_PROXIMITY_THRESHOLD:
+                exit_reason = "sl_last_min_proximity"
+                if bid is not None and bid > 0 and bid_is_fresh:
+                    exit_price = float(bid)
+                    exit_row = r
+                    break
                 break
-            break
 
         if bid is not None and bid > 0 and bid_is_fresh:
             hold_sec = r.ts_sec - entry_ts

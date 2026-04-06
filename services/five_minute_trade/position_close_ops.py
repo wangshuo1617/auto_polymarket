@@ -624,9 +624,7 @@ def force_close_position(trader: Any, reason: str, close_retry_count: int = 0) -
     if not self.dry_run:
         if reason in {
             "sl",
-            "sl_direction_change",
-            "sl_direction_confirm_mismatch",
-            "sl_direction_confirm_low_diff",
+            "sl_last_min_proximity",
             "sl_last_seconds_reversal",
             "sl_last_seconds_position",
             "sl_residual",

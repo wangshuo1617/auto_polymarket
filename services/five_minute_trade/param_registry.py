@@ -16,7 +16,7 @@ from typing import Any
 GRP_ENTRY = "入场控制"
 GRP_TPSL = "TPSL 平仓控制"
 GRP_RISK = "风险仓位管理"
-GRP_DIR_CONFIRM = "方向确认风控"
+GRP_DIR_CONFIRM = "最后一分钟接近度风控"
 GRP_ENDGAME = "终盘风控"
 GRP_SYSTEM = "系统"
 
@@ -434,55 +434,28 @@ PARAM_REGISTRY: list[ParamDef] = [
         sig_key="",
     ),
 
-    # ==================== 方向确认风控 ====================
+    # ==================== 最后一分钟接近度风控 ====================
     ParamDef(
-        key="direction_confirm_close",
+        key="last_min_proximity_close",
         param_type="bool",
         default=True,
-        description="是否启用方向不一致平仓",
+        description="最后一分钟触及开盘价附近时平仓",
         group=GRP_DIR_CONFIRM,
-        shell_var="ENABLE_DIRECTION_CONFIRM_CLOSE",
-        sig_key="dc",
-        cli_flag="disable-direction-confirm-close",
+        shell_var="ENABLE_LAST_MIN_PROXIMITY_CLOSE",
+        sig_key="lmp",
+        cli_flag="disable-last-min-proximity-close",
         bool_inverted=True,
-        constructor_name="enable_direction_confirm_close",
-        startup_key="enable_direction_confirm_close",
+        constructor_name="enable_last_min_proximity_close",
+        startup_key="enable_last_min_proximity_close",
     ),
     ParamDef(
-        key="direction_confirm_preclose_sec",
-        param_type="int",
-        default=15,
-        description="方向确认触发秒（距5m结束）",
-        group=GRP_DIR_CONFIRM,
-        shell_var="DIRECTION_CONFIRM_PRECLOSE_SEC",
-        sig_key="dcp",
-    ),
-    ParamDef(
-        key="direction_confirm_min_abs_diff",
-        param_type="float",
-        default=0.0,
-        description="不一致平仓最小绝对价差",
-        group=GRP_DIR_CONFIRM,
-        shell_var="DIRECTION_CONFIRM_MIN_ABS_DIFF",
-        sig_key="dcd",
-    ),
-    ParamDef(
-        key="enable_direction_confirm_low_diff_close",
-        param_type="bool",
-        default=True,
-        description="是否启用低价差强平",
-        group=GRP_DIR_CONFIRM,
-        shell_var="ENABLE_DIRECTION_CONFIRM_LOW_DIFF_CLOSE",
-        sig_key="dcl",
-    ),
-    ParamDef(
-        key="direction_confirm_low_diff_threshold",
+        key="last_min_proximity_threshold",
         param_type="float",
         default=10.0,
-        description="低价差强平阈值",
+        description="最后一分钟平仓阈值（距开盘价$）",
         group=GRP_DIR_CONFIRM,
-        shell_var="DIRECTION_CONFIRM_LOW_DIFF_THRESHOLD",
-        sig_key="dclt",
+        shell_var="LAST_MIN_PROXIMITY_THRESHOLD",
+        sig_key="lmpt",
     ),
 
     # ==================== 终盘风控 ====================
