@@ -104,6 +104,7 @@ class FiveMinuteUpDownTrader:
     EXPIRY_WAIT_SETTLE_MIN_PRICE = 0.60
     REPEATED_LOG_THROTTLE_SEC = 10.0
     LAST_MIN_PROXIMITY_THRESHOLD = 10.0
+    OPEN_PRICE_SETTLE_SEC = 30
     REVERSE_GUARD_START_SEC = 295
     REVERSE_GUARD_LOOKBACK_SEC = 3
     REVERSE_GUARD_BTC_MOVE = 15.0
@@ -243,6 +244,8 @@ class FiveMinuteUpDownTrader:
         self.current_window_start_ms: Optional[int] = None
         self.current_market_slug: Optional[str] = None
         self.window_open_price: Optional[float] = None
+        self._open_price_locked: bool = True
+        self._open_price_event_ms: int = 0
         self.window_traded: bool = False
         self.preclose_entry_triggered: bool = False
         self._entry_attempt_count: int = 0
@@ -792,12 +795,15 @@ class FiveMinuteUpDownTrader:
             # --- 检测新 5m 窗口，用当前最新价格锁定开盘价（对齐回测 open_row） ---
             if self.current_window_start_ms != window_start_ms:
                 logger.info(
-                    "进入新 5m 窗口: start_ms=%s (clock-driven, open_price=%.2f)",
+                    "进入新 5m 窗口: start_ms=%s (clock-driven, open_price=%.2f, btc_age=%dms)",
                     window_start_ms,
                     btc_price,
+                    btc_age_ms,
                 )
                 self.current_window_start_ms = window_start_ms
                 self.window_open_price = btc_price
+                self._open_price_locked = False
+                self._open_price_event_ms = self.latest_btc_price_event_ms or 0
                 self.window_traded = False
                 self.preclose_entry_triggered = False
                 self._entry_attempt_count = 0
@@ -830,6 +836,28 @@ class FiveMinuteUpDownTrader:
                         "5m 窗口市场预热失败: slug=%s error=%s",
                         self.current_market_slug,
                         e,
+                    )
+
+            # --- 开盘价沉淀：等待 Chainlink 延迟价格到达后再锁定 ---
+            if not self._open_price_locked:
+                cur_event_ms = self.latest_btc_price_event_ms or 0
+                if cur_event_ms > self._open_price_event_ms:
+                    old_open = self.window_open_price
+                    self.window_open_price = btc_price
+                    self._open_price_event_ms = cur_event_ms
+                    if old_open is not None and abs(btc_price - old_open) > 0.5:
+                        logger.info(
+                            "开盘价沉淀更新: %.2f → %.2f (Δ%.2f, event_ms=%d, rel_sec=%.0f)",
+                            old_open, btc_price, btc_price - old_open,
+                            cur_event_ms, rel_sec,
+                        )
+                        # 开盘价变化后重置越线计数
+                        self._btc_cross_count = 0
+                        self._last_btc_side = None
+                if rel_sec >= self.OPEN_PRICE_SETTLE_SEC:
+                    self._open_price_locked = True
+                    logger.info(
+                        "开盘价已锁定: %.2f (settle %.0fs)", self.window_open_price, rel_sec,
                     )
 
             # --- 记录窗口内每秒 BTC 价格（用于 ATR 过滤）---
@@ -1603,7 +1631,7 @@ class FiveMinuteUpDownTrader:
                         logger.error("自动赎回异常: %s", e)
                     # 结算 open 窗口
                     try:
-                        settle_open_windows(self.trade_db)
+                        settle_open_windows(self._trade_db)
                     except Exception as e:
                         logger.error("窗口结算异常: %s", e)
                     next_redeem_ts = self._calc_next_redeem_ts(base_ts=now)
