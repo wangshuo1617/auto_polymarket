@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from math import erf, sqrt
+from math import erf, exp, log, sqrt
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -141,7 +141,7 @@ def _extract_strike_and_direction(question: str) -> tuple[float | None, str]:
 
     ql = q.lower()
     above_keys = ["above", "over", "greater", "at least", "reach", "hit", "higher than"]
-    below_keys = ["below", "under", "less", "at most", "lower than"]
+    below_keys = ["below", "under", "less", "at most", "lower than", "dip", "drop", "fall"]
 
     direction = "unknown"
     if any(k in ql for k in above_keys):
@@ -150,6 +150,71 @@ def _extract_strike_and_direction(question: str) -> tuple[float | None, str]:
         direction = "below"
 
     return strike, direction
+
+
+def _barrier_touch_prob(
+    current_price: float,
+    strike: float,
+    direction: str,
+    mu_daily: float,
+    sigma_daily: float,
+    days_left: int,
+) -> float:
+    """
+    首次触及概率（反射原理 / reflection principle）。
+
+    Polymarket 月度价格事件的结算规则: 月内**任何时刻**触及 strike 即算 Yes,
+    因此必须使用路径依赖的 barrier touch 概率，而非到期分布 P(S_T ≥ K)。
+
+    direction="above": P(max_{0..T} S_t >= strike)  — "reach / hit" 类问题
+    direction="below": P(min_{0..T} S_t <= strike)  — "dip / drop / fall" 类问题
+
+    基于 GBM 反射原理:
+      X_t = ln(S_t/S_0) = μ_log·t + σ·W_t
+      P(max X_t >= a) = Φ((μT-a)/(σ√T)) + exp(2μa/σ²)·Φ((-μT-a)/(σ√T))
+    """
+    if days_left <= 0 or sigma_daily <= 1e-9:
+        if direction == "above":
+            return 1.0 if current_price >= strike else 0.0
+        else:
+            return 1.0 if current_price <= strike else 0.0
+
+    # log-drift: μ_log = μ_simple - σ²/2 (Itō 修正)
+    mu_log = mu_daily - 0.5 * sigma_daily ** 2
+    T = float(days_left)
+    mu_T = mu_log * T
+    sigma_T = sigma_daily * sqrt(T)
+
+    if direction == "above":
+        if current_price >= strike:
+            return 1.0
+        # a = ln(K/S) > 0
+        a = log(strike / current_price)
+    else:
+        if current_price <= strike:
+            return 1.0
+        # 转化为上界问题: P(min X_t <= -b) = P(max(-X_t) >= b)
+        # -X_t 的 drift = -μ_log
+        a = log(current_price / strike)  # b = ln(S/K) > 0
+        mu_log = -mu_log
+        mu_T = mu_log * T
+
+    d_plus = (mu_T - a) / sigma_T
+    d_minus = (-mu_T - a) / sigma_T
+
+    if abs(mu_log) < 1e-12:
+        # 零漂移: P = 2·Φ(-a / σ√T)
+        p = 2.0 * _norm_cdf(-a / sigma_T)
+    else:
+        exp_arg = 2.0 * mu_log * a / (sigma_daily ** 2)
+        if exp_arg > 500:
+            p = 1.0
+        elif exp_arg < -500:
+            p = _norm_cdf(d_plus)
+        else:
+            p = _norm_cdf(d_plus) + exp(exp_arg) * _norm_cdf(d_minus)
+
+    return max(0.001, min(0.999, p))
 
 
 def _build_scenario_probs(
@@ -273,8 +338,10 @@ def _build_position_safety_assessment(
     future_possibility_context: dict,
     daily_volatility_profile: dict,
     asset: str = "btc",
+    drift_daily: float = 0.0,
+    sigma_daily: float = 0.018,
 ) -> list:
-    """对每个持仓评估安全度: safe_to_hold / monitor / at_risk。"""
+    """对每个持仓评估安全度: safe_to_hold / monitor / at_risk，并用 barrier 模型计算胜率。"""
     current_price = _get_current_price(future_possibility_context, asset)
     days_left = max(0, int(_to_float(future_possibility_context.get("days_left_in_month"), 0)))
     atr_pct = _to_float(daily_volatility_profile.get("atr_pct"), 2.0)
@@ -334,6 +401,14 @@ def _build_position_safety_assessment(
         if cur_price_contract > 0 and cur_price_contract < 1.0:
             hold_to_expiry_return_pct = round((1.0 - cur_price_contract) / cur_price_contract * 100.0, 2)
 
+        # 用 barrier 模型计算持仓胜率
+        model_win_prob = None
+        if direction in ("above", "below") and days_left > 0:
+            p_yes = _barrier_touch_prob(
+                current_price, strike, direction, drift_daily, sigma_daily, days_left,
+            )
+            model_win_prob = round(1.0 - p_yes if is_no else p_yes, 4)
+
         assessments.append({
             "title": title,
             "outcome": p.get("outcome", ""),
@@ -350,13 +425,14 @@ def _build_position_safety_assessment(
             "safety_level": safety_level,
             "reason": reason,
             "hold_to_expiry_return_pct": hold_to_expiry_return_pct,
+            "model_win_prob": model_win_prob,
         })
 
     return assessments
 
 
 def _build_theta_income(position_assessments: list, days_left: int) -> list:
-    """计算每个持仓的 Theta 日收益。"""
+    """计算每个持仓的 Theta 日收益（按 barrier 模型胜率折现）。"""
     theta_data = []
     for pa in position_assessments:
         size = _to_float(pa.get("size"), 0.0)
@@ -366,15 +442,19 @@ def _build_theta_income(position_assessments: list, days_left: int) -> list:
         if size <= 0 or cur_price <= 0 or cur_price >= 1.0:
             continue
 
-        theta_to_expiry = size * (1.0 - cur_price)
-        daily_theta = theta_to_expiry / max(days_left, 1)
+        theta_if_win = size * (1.0 - cur_price)
+        win_prob = _to_float(pa.get("model_win_prob"), 0.5)
+        theta_expected = theta_if_win * win_prob
+        daily_theta = theta_expected / max(days_left, 1)
 
         theta_data.append({
             "title": pa.get("title", ""),
             "outcome": pa.get("outcome", ""),
             "size": size,
             "cur_price": cur_price,
-            "theta_to_expiry_usdc": round(theta_to_expiry, 2),
+            "theta_if_win_usdc": round(theta_if_win, 2),
+            "win_probability": round(win_prob, 4),
+            "theta_to_expiry_usdc": round(theta_expected, 2),
             "daily_theta_income_usdc": round(daily_theta, 2),
             "safety_level": safety_level,
             "hold_to_expiry_return_pct": pa.get("hold_to_expiry_return_pct"),
@@ -651,18 +731,18 @@ def build_profit_optimization_context(
 
     scenario_probs = _build_scenario_probs(future_possibility_context, daily_volatility_profile)
 
-    drift_daily = _to_float(future_possibility_context.get("drawdown_from_month_high_pct"), 0.0) / 100.0 / 14.0
-    drift_daily = max(-0.01, min(0.01, -drift_daily * 0.25))
+    # 漂移: 默认 0（随机游走）。短期价格漂移无法可靠估计，
+    # 人为引入 mean-reversion / momentum 偏差反而增大误差。
+    # AI 可根据自身趋势判断在建议中做方向性调整。
+    drift_daily = 0.0
 
     sigma_daily = _to_float(daily_volatility_profile.get("realized_vol_daily_pct"), 0.0) / 100.0
     if sigma_daily <= 0:
-        sigma_daily = max(0.008, _to_float(daily_volatility_profile.get("atr_pct"), 1.8) / 100.0 * 0.6)
+        # fallback: ATR → σ 转换; 正态分布下 E[|X|] ≈ 0.8σ
+        sigma_daily = max(0.008, _to_float(daily_volatility_profile.get("atr_pct"), 1.8) / 100.0 * 0.8)
 
     days_left = max(0, int(_to_float(future_possibility_context.get("days_left_in_month"), 0)))
     current_price = _get_current_price(future_possibility_context, asset)
-
-    mu_ret = drift_daily * days_left
-    sigma_ret = max(0.01, sigma_daily * sqrt(days_left))
 
     balance = _parse_usdc_balance(usdc_balance)
 
@@ -676,15 +756,16 @@ def build_profit_optimization_context(
     # --- Monthly progress tracking ---
     monthly_progress = get_or_set_monthly_baseline(total_net_value)
 
-    # --- Position safety assessment ---
+    # --- Position safety assessment (含 barrier 模型胜率) ---
     position_assessments = _build_position_safety_assessment(
-        positions, future_possibility_context, daily_volatility_profile, asset=asset,
+        positions, future_possibility_context, daily_volatility_profile,
+        asset=asset, drift_daily=drift_daily, sigma_daily=sigma_daily,
     )
 
     # --- Theta daily income ---
     theta_income = _build_theta_income(position_assessments, days_left)
 
-    # --- Edge calculation ---
+    # --- Edge calculation (barrier touch probability) ---
     edges = []
     markets = polymarket_event_situation.get("markets", []) if isinstance(polymarket_event_situation, dict) else []
     for market in markets:
@@ -697,11 +778,10 @@ def build_profit_optimization_context(
         if current_price <= 0 or strike is None or direction == "unknown" or yes_price is None or no_price is None:
             continue
 
-        threshold_ret = strike / current_price - 1.0
-        z = (threshold_ret - mu_ret) / sigma_ret
-        p_above = max(0.001, min(0.999, 1.0 - _norm_cdf(z)))
-
-        p_yes = p_above if direction == "above" else (1.0 - p_above)
+        # 首次触及概率（barrier model）替代旧的到期分布
+        p_yes = _barrier_touch_prob(
+            current_price, strike, direction, drift_daily, sigma_daily, days_left,
+        )
         p_no = 1.0 - p_yes
 
         ev_yes = p_yes - yes_price
@@ -774,10 +854,12 @@ def build_profit_optimization_context(
         },
         "scenario_probabilities": scenario_probs,
         "distribution_assumption": {
+            "model_type": "barrier_touch_GBM_reflection",
+            "note": "使用首次触及概率（反射原理），非到期分布",
             "asset": asset,
             "days_left": days_left,
-            "mu_return": round(mu_ret, 4),
-            "sigma_return": round(sigma_ret, 4),
+            "drift_daily": round(drift_daily, 6),
+            "sigma_daily": round(sigma_daily, 6),
             "current_price": round(current_price, 2),
         },
         "position_safety_assessment": position_assessments,
