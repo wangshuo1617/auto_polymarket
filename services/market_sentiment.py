@@ -4,6 +4,7 @@
 import os
 import json
 import requests
+from pathlib import Path
 from datetime import datetime, timezone
 
 from data.binance import get_btc_price, get_binance_derivatives_data
@@ -11,7 +12,7 @@ from data.etf import ETFScraper
 from data.rsi import last_24h_rsi
 from data.defillama import StablecoinMonitor
 
-SENTIMENT_CACHE_FILE = "/root/auto_polymarket/last_market_sentiment_and_funding.json"
+SENTIMENT_CACHE_FILE = str(Path(__file__).resolve().parent.parent / "last_market_sentiment_and_funding.json")
 
 
 def get_market_sentiment_and_funding() -> dict:

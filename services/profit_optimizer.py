@@ -158,7 +158,7 @@ def _barrier_touch_prob(
     direction: str,
     mu_daily: float,
     sigma_daily: float,
-    days_left: int,
+    days_left: float,
 ) -> float:
     """
     首次触及概率（反射原理 / reflection principle）。
@@ -222,7 +222,7 @@ def _build_scenario_probs(
     daily_volatility_profile: dict,
 ) -> dict:
     drawdown = _to_float(future_possibility_context.get("drawdown_from_month_high_pct"), 0.0)
-    days_left = int(_to_float(future_possibility_context.get("days_left_in_month"), 0.0))
+    days_left = _to_float(future_possibility_context.get("days_left_in_month"), 0.0)
     regime = str(daily_volatility_profile.get("market_regime") or "unknown")
     atr_pct = max(0.2, _to_float(daily_volatility_profile.get("atr_pct"), 1.5))
     tr_percentile = _to_float(daily_volatility_profile.get("tr_percentile_30d"), 50.0)
@@ -290,7 +290,7 @@ def _build_scenario_probs(
         "range_then_reclaim": round(p_reclaim / total, 4),
         "fast_rebound": round(p_fast_rebound / total, 4),
         "time_compression_note": (
-            f"剩余{days_left}天，TR分位{tr_percentile}%"
+            f"剩余{days_left:.1f}天，TR分位{tr_percentile}%"
             + ("，时间不足已大幅压缩极端路径概率" if days_left <= 7 else "")
         ),
     }
@@ -343,7 +343,7 @@ def _build_position_safety_assessment(
 ) -> list:
     """对每个持仓评估安全度: safe_to_hold / monitor / at_risk，并用 barrier 模型计算胜率。"""
     current_price = _get_current_price(future_possibility_context, asset)
-    days_left = max(0, int(_to_float(future_possibility_context.get("days_left_in_month"), 0)))
+    days_left = max(0.0, _to_float(future_possibility_context.get("days_left_in_month"), 0))
     atr_pct = _to_float(daily_volatility_profile.get("atr_pct"), 2.0)
 
     assessments = []
@@ -380,7 +380,7 @@ def _build_position_safety_assessment(
 
         if buffer_favorable > 0 and buffer_favorable > max_expected_move_pct * 1.5 and days_left <= 10:
             safety_level = "safe_to_hold"
-            reason = f"安全垫{buffer_favorable:.1f}%远超剩余{days_left}天最大预期波动{max_expected_move_pct:.1f}%，持有到期胜率极高"
+            reason = f"安全垫{buffer_favorable:.1f}%远超剩余{days_left:.0f}天最大预期波动{max_expected_move_pct:.1f}%，持有到期胜率极高"
         elif buffer_favorable > 0 and buffer_favorable > max_expected_move_pct * 0.8:
             safety_level = "monitor"
             reason = f"安全垫{buffer_favorable:.1f}%尚可，与预期波动{max_expected_move_pct:.1f}%接近，需持续监控"
@@ -431,7 +431,7 @@ def _build_position_safety_assessment(
     return assessments
 
 
-def _build_theta_income(position_assessments: list, days_left: int) -> list:
+def _build_theta_income(position_assessments: list, days_left: float) -> list:
     """计算每个持仓的 Theta 日收益（按 barrier 模型胜率折现）。"""
     theta_data = []
     for pa in position_assessments:
@@ -550,8 +550,11 @@ def _build_portfolio_analysis(
     current_asset_price: float,
     usdc_balance: float,
     asset: str = "btc",
+    drift_daily: float = 0.0,
+    sigma_daily: float = 0.018,
+    days_left: float = 15,
 ) -> dict:
-    """组合级关联风险分析：情景矩阵、对冲结构识别。"""
+    """组合级关联风险分析：用 barrier 模型做情景矩阵、对冲结构识别。"""
     if current_asset_price <= 0:
         return {"note": f"{asset}价格无效，无法计算组合分析"}
 
@@ -573,35 +576,18 @@ def _build_portfolio_analysis(
             size = _to_float(pa.get("size"), 0.0)
             cur_price = _to_float(pa.get("cur_price"), 0.0)
 
-            if strike <= 0 or size <= 0:
+            if strike <= 0 or size <= 0 or direction not in ("above", "below"):
                 continue
 
             is_no = outcome == "no"
 
-            if direction == "above":
-                if scenario_asset >= strike:
-                    new_price = 0.01 if is_no else 0.99
-                else:
-                    dist_now = max(strike - current_asset_price, 1.0)
-                    dist_new = max(strike - scenario_asset, 0.0)
-                    ratio = min(dist_new / dist_now, 2.0)
-                    if is_no:
-                        new_price = min(0.99, cur_price + (1.0 - cur_price) * max(0, 1.0 - 1.0 / max(ratio, 0.01)) * 0.4)
-                    else:
-                        new_price = max(0.01, cur_price * ratio)
-            elif direction == "below":
-                if scenario_asset <= strike:
-                    new_price = 0.01 if is_no else 0.99
-                else:
-                    dist_now = max(current_asset_price - strike, 1.0)
-                    dist_new = max(scenario_asset - strike, 0.0)
-                    ratio = min(dist_new / dist_now, 2.0)
-                    if is_no:
-                        new_price = min(0.99, cur_price + (1.0 - cur_price) * max(0, 1.0 - 1.0 / max(ratio, 0.01)) * 0.4)
-                    else:
-                        new_price = max(0.01, cur_price * ratio)
-            else:
-                new_price = cur_price
+            # 用 barrier 模型从 scenario 价格重新算 touch 概率
+            p_yes = _barrier_touch_prob(
+                scenario_asset, strike, direction, drift_daily, sigma_daily, days_left,
+            )
+            # 合约价格 ≈ 胜率
+            new_yes_price = max(0.01, min(0.99, p_yes))
+            new_price = (1.0 - new_yes_price) if is_no else new_yes_price
 
             scenario_pnl += size * (new_price - cur_price)
 
@@ -655,7 +641,7 @@ def _build_prediction_review(
 
     overall = previous_report.get("整体分析", "")
     if overall:
-        review["previous_overall_summary"] = overall[:300] + "..." if len(overall) > 300 else overall
+        review["previous_overall_summary"] = overall
 
     warnings = previous_report.get("预警信号", [])
     if warnings and current_asset_price > 0:
@@ -741,7 +727,7 @@ def build_profit_optimization_context(
         # fallback: ATR → σ 转换; 正态分布下 E[|X|] ≈ 0.8σ
         sigma_daily = max(0.008, _to_float(daily_volatility_profile.get("atr_pct"), 1.8) / 100.0 * 0.8)
 
-    days_left = max(0, int(_to_float(future_possibility_context.get("days_left_in_month"), 0)))
+    days_left = max(0.0, _to_float(future_possibility_context.get("days_left_in_month"), 0))
     current_price = _get_current_price(future_possibility_context, asset)
 
     balance = _parse_usdc_balance(usdc_balance)
@@ -833,7 +819,8 @@ def build_profit_optimization_context(
 
     # --- Portfolio-level analysis ---
     portfolio_analysis = _build_portfolio_analysis(
-        position_assessments, current_price, balance, asset=asset,
+        position_assessments, current_price, balance,
+        asset=asset, drift_daily=drift_daily, sigma_daily=sigma_daily, days_left=days_left,
     )
 
     # --- Prediction review ---

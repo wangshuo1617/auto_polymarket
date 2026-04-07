@@ -89,12 +89,20 @@ def get_binance_derivatives_data() -> dict:
     base_url = "https://fapi.binance.com"
     params = {"symbol": "BTCUSDT"}
 
-    fr_data = requests.get(base_url + "/fapi/v1/premiumIndex", params=params).json()
-    oi_data = requests.get(base_url + "/fapi/v1/openInterest", params=params).json()
-    ls_data = requests.get(
+    fr_resp = requests.get(base_url + "/fapi/v1/premiumIndex", params=params)
+    fr_resp.raise_for_status()
+    fr_data = fr_resp.json()
+
+    oi_resp = requests.get(base_url + "/fapi/v1/openInterest", params=params)
+    oi_resp.raise_for_status()
+    oi_data = oi_resp.json()
+
+    ls_resp = requests.get(
         base_url + "/futures/data/topLongShortPositionRatio",
         params={"symbol": "BTCUSDT", "period": "5m", "limit": 1},
-    ).json()
+    )
+    ls_resp.raise_for_status()
+    ls_data = ls_resp.json()
 
     return {
         "funding_rate": float(fr_data["lastFundingRate"]),

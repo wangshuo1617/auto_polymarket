@@ -74,7 +74,8 @@ def analyze_market_with_grounding(
         system_instruction=get_system_instruction(current_date, monthly_target=monthly_target),
         tools=[grounding_tool],  # Enable Google Search Grounding
         response_schema=RESPONSE_SCHEMA,  # Structured output
-        temperature=0.7,  # Balanced creativity and consistency
+        temperature=0.4,  # 金融分析需要一致性，低温优于高温
+        max_output_tokens=8192,
     )
     
     user_prompt = get_user_prompt(
@@ -165,7 +166,8 @@ def analyze_monthly_strategy_with_grounding(
         system_instruction=get_monthly_system_instruction(current_date, target_month),
         tools=[grounding_tool],
         response_schema=MONTHLY_STRATEGY_SCHEMA,
-        temperature=0.6,
+        temperature=0.5,
+        max_output_tokens=8192,
     )
 
     user_prompt = get_monthly_user_prompt(
@@ -226,7 +228,8 @@ def analyze_gold_market_with_grounding(
         system_instruction=get_gold_system_instruction(current_date),
         tools=[grounding_tool],
         response_schema=GOLD_RESPONSE_SCHEMA,
-        temperature=0.7,
+        temperature=0.4,
+        max_output_tokens=8192,
     )
     user_prompt = get_gold_user_prompt(
         polymarket_status,

@@ -108,7 +108,7 @@ RESPONSE_SCHEMA = {
             }
         }
     },
-    "required": ["整体分析", "当前持仓与挂单分析与建议", "建仓建议", "预警信号"]
+    "required": ["整体分析", "当前持仓与挂单分析与建议", "建仓建议", "预警信号", "报告解读附录"]
 }
 
 MONTHLY_STRATEGY_SCHEMA = {
@@ -567,7 +567,7 @@ GOLD_RESPONSE_SCHEMA = {
             }
         }
     },
-    "required": ["整体分析", "当前持仓与挂单分析与建议", "建仓建议", "预警信号"]
+    "required": ["整体分析", "当前持仓与挂单分析与建议", "建仓建议", "预警信号", "报告解读附录"]
 }
 
 GOLD_SYSTEM_INSTRUCTION_TEMPLATE = """# Role

@@ -153,7 +153,9 @@ def _build_future_possibility_context(
     """构建未来可能性上下文，避免模型只按单一路径急迫离场。"""
     now = datetime.now(ET_TIMEZONE)
     days_in_month = calendar.monthrange(now.year, now.month)[1]
-    days_left_in_month = max(0, days_in_month - now.day)
+    # 包含当天剩余小时的分数天，避免最后一天 days_left=0 导致 barrier 概率失效
+    hours_left_today = (24 - now.hour) / 24.0
+    days_left_in_month = max(0, days_in_month - now.day) + hours_left_today
 
     month_high = None
     month_low = None
@@ -313,13 +315,16 @@ if __name__ == "__main__":
     warn_prices = analyze_result["预警信号"]
     for warn_price in warn_prices:
         warn_price["alert_status"] = False
-    with open("/root/auto_polymarket/price_warn_config.py", "w") as f:
+    warn_config_path = Path(__file__).resolve().parent / "price_warn_config.py"
+    with open(warn_config_path, "w") as f:
         f.write(f"WARN_PRICE = {warn_prices}")
     print(f"{time_now} AI分析完成,开始发送邮件")
 
     email_subject = f"{time_now} Polymarket持仓情况分析,当前BTC价格: {get_btc_price():,.2f}"
     email_content = generate_html_template(analyze_result)
-    with open(f"/root/auto_polymarket/output/{time_now}_email.html", "w") as f:
+    output_dir = Path(__file__).resolve().parent / "output"
+    output_dir.mkdir(exist_ok=True)
+    with open(output_dir / f"{time_now}_email.html", "w") as f:
         f.write(email_content)
     if TO_EMAIL:
         email_sender.send_html_email(TO_EMAIL, email_subject, email_content)
