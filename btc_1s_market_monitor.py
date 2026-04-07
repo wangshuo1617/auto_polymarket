@@ -147,36 +147,56 @@ class SQLiteBatchWriter:
 	def _run(self) -> None:
 		buffer: List[Tuple[Any, ...]] = []
 		last_flush = time.time()
+		consecutive_errors = 0
+		MAX_CONSECUTIVE_ERRORS = 10
+		ERROR_BACKOFF_SEC = 5.0
 
-		try:
-			while self._running:
+		while self._running:
+			try:
+				item = self._queue.get(timeout=0.2)
+			except queue.Empty:
+				item = "__EMPTY__"
+
+			now = time.time()
+
+			if item is None:
+				break
+
+			if item != "__EMPTY__":
+				buffer.append(item)
+
+			should_flush = (
+				len(buffer) >= self.flush_rows
+				or (buffer and (now - last_flush) >= self.flush_interval_sec)
+			)
+			if should_flush:
 				try:
-					item = self._queue.get(timeout=0.2)
-				except queue.Empty:
-					item = "__EMPTY__"
-
-				now = time.time()
-
-				if item is None:
-					break
-
-				if item != "__EMPTY__":
-					buffer.append(item)
-
-				should_flush = (
-					len(buffer) >= self.flush_rows
-					or (buffer and (now - last_flush) >= self.flush_interval_sec)
-				)
-				if should_flush:
 					self._flush_rows(buffer)
 					buffer.clear()
 					last_flush = now
+					consecutive_errors = 0
+				except Exception:
+					consecutive_errors += 1
+					logger.exception(
+						"PG 写入失败 (%d/%d)，丢弃 %d 条记录",
+						consecutive_errors, MAX_CONSECUTIVE_ERRORS, len(buffer),
+					)
+					buffer.clear()
+					last_flush = now
+					if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+						logger.error(
+							"PG 写入连续失败 %d 次，暂停 %.0f 秒后继续",
+							consecutive_errors, ERROR_BACKOFF_SEC,
+						)
+						time.sleep(ERROR_BACKOFF_SEC)
+						consecutive_errors = 0
 
-			if buffer:
+		# 退出前尝试最后一次 flush
+		if buffer:
+			try:
 				self._flush_rows(buffer)
-				buffer.clear()
-		finally:
-			pass
+			except Exception:
+				logger.exception("退出前最终 flush 失败，丢弃 %d 条记录", len(buffer))
 
 
 class BTC1sMarketMonitor:
@@ -458,10 +478,18 @@ class BTC1sMarketMonitor:
 			now_ms = ts_sec * 1000
 			next_second = ts_sec + 1
 
-			self._ensure_window_and_market(now_ms)
-			row = self._build_row(now_ms=now_ms, ts_sec=ts_sec)
-			if row is not None:
-				self._writer.put(row)
+			try:
+				self._ensure_window_and_market(now_ms)
+			except Exception:
+				logger.exception("_ensure_window_and_market 异常，跳过本秒采样")
+				continue
+
+			try:
+				row = self._build_row(now_ms=now_ms, ts_sec=ts_sec)
+				if row is not None:
+					self._writer.put(row)
+			except Exception:
+				logger.exception("_build_row / put 异常，跳过本秒采样")
 
 	# -- winning_direction resolution -------------------------------------------
 
