@@ -444,7 +444,6 @@ PARAM_REGISTRY: list[ParamDef] = [
         cli_flag="disable-last-min-proximity-close",
         bool_inverted=True,
         constructor_name="enable_last_min_proximity_close",
-        startup_key="enable_last_min_proximity_close",
     ),
     ParamDef(
         key="last_min_proximity_threshold",
