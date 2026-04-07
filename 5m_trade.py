@@ -1304,12 +1304,24 @@ class FiveMinuteUpDownTrader:
             return
 
         open_price = self.window_open_price
-        abs_diff = abs(btc_price - open_price)
-        if abs_diff <= self.last_min_proximity_threshold:
+        direction = self.position.direction
+        threshold = self.last_min_proximity_threshold
+        # 方向性检查：UP 入场时价格跌到 open+threshold 以下就止损，
+        # DOWN 入场时价格涨到 open-threshold 以上就止损。
+        # 这样即使价格跳过阈值区间也能捕获。
+        if direction == "up":
+            triggered = btc_price <= open_price + threshold
+        elif direction == "down":
+            triggered = btc_price >= open_price - threshold
+        else:
+            return
+        if triggered:
+            diff = btc_price - open_price
             logger.info(
-                "最后一分钟触及开盘价附近，触发平仓: abs_diff=%.2f 阈值=%.2f open=%.2f now=%.2f rel_sec=%.1f",
-                abs_diff,
-                self.last_min_proximity_threshold,
+                "最后一分钟触及开盘价附近，触发平仓: diff=%+.2f 阈值=%.2f direction=%s open=%.2f now=%.2f rel_sec=%.1f",
+                diff,
+                threshold,
+                direction,
                 open_price,
                 btc_price,
                 rel_sec,

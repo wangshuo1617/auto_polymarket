@@ -1420,10 +1420,13 @@ def _simulate_window(
         if trigger_low is None:
             trigger_low = _to_positive_float(bid)
 
-        # 最后一分钟开盘价接近度止损
+        # 最后一分钟开盘价接近度止损（方向性检查）
         if r.rel_sec >= MINUTE4_CLOSE_SEC and open_btc_price is not None and r.btc_price is not None:
-            abs_diff = abs(r.btc_price - open_btc_price)
-            if abs_diff <= LAST_MIN_PROXIMITY_THRESHOLD:
+            if direction == "up":
+                proximity_triggered = r.btc_price <= open_btc_price + LAST_MIN_PROXIMITY_THRESHOLD
+            else:
+                proximity_triggered = r.btc_price >= open_btc_price - LAST_MIN_PROXIMITY_THRESHOLD
+            if proximity_triggered:
                 exit_reason = "sl_last_min_proximity"
                 if bid is not None and bid > 0 and bid_is_fresh:
                     exit_price = float(bid)
