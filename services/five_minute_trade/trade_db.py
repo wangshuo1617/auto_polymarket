@@ -389,14 +389,41 @@ class TradeSQLiteStore:
             (entry_usdc / entry_size) if entry_size > 0 else 0.0
         )
         mode = "dry-run" if dry_run else "live"
+
+        # 构建入场诊断 JSON
+        diag: Dict[str, Any] = {}
+        if position.btc_cross_count is not None:
+            diag["btc_cross_count"] = position.btc_cross_count
+        if position.abs_btc_diff is not None:
+            diag["abs_btc_diff"] = round(position.abs_btc_diff, 4)
+        if position.risk_score is not None:
+            diag["risk_score"] = round(position.risk_score, 4)
+        if position.risk_level is not None:
+            diag["risk_level"] = position.risk_level
+        if position.risk_adjusted_stake is not None:
+            diag["risk_adjusted_stake"] = round(position.risk_adjusted_stake, 4)
+        if position.entry_price_risk is not None:
+            diag["entry_price_risk"] = round(position.entry_price_risk, 4)
+        if position.direction_risk is not None:
+            diag["direction_risk"] = round(position.direction_risk, 4)
+        if position.stability_risk is not None:
+            diag["stability_risk"] = round(position.stability_risk, 4)
+        if position.entry_best_ask is not None:
+            diag["entry_best_ask"] = position.entry_best_ask
+        if position.stop_loss_price is not None:
+            diag["stop_loss_price"] = round(position.stop_loss_price, 4)
+        if position.take_profit_price is not None:
+            diag["take_profit_price"] = round(position.take_profit_price, 4)
+        entry_diagnostics_json = json.dumps(diag, ensure_ascii=False) if diag else None
+
         with self._lock, get_conn() as conn:
             conn.cursor().execute(
                 """
                 INSERT INTO trade_window_summary (
                     market_slug, direction, status,
                     entry_time, entry_price, entry_size, entry_usdc,
-                    btc_entry_price, mode
-                ) VALUES (%s, %s, 'open', %s, %s, %s, %s, %s, %s)
+                    btc_entry_price, mode, entry_diagnostics
+                ) VALUES (%s, %s, 'open', %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (market_slug) DO NOTHING
                 """,
                 (
@@ -408,6 +435,7 @@ class TradeSQLiteStore:
                     entry_usdc,
                     btc_price_at_trade,
                     mode,
+                    entry_diagnostics_json,
                 ),
             )
 

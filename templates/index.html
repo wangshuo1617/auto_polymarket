@@ -1169,6 +1169,64 @@
                     html += '<div class="col-sm-6"><strong>出场原因：</strong>' + _escapeHtml(exitReasonLabel) + '</div>';
                     html += '<div class="col-sm-6"><strong>结果：</strong>' + _escapeHtml(statusLabel) + (data.pnl != null ? ' (' + (data.pnl >= 0 ? '+' : '') + _fmt4(data.pnl) + ' USDC)' : '') + '</div>';
                     html += '</div>';
+
+                    // 入场诊断信息
+                    const diag = data.entry_diagnostics;
+                    if (diag && typeof diag === 'object') {
+                        html += '<hr/>';
+                        html += '<h6 class="mb-2">入场条件</h6>';
+                        html += '<div class="row mb-3 small">';
+
+                        // 风险评分
+                        if (diag.risk_score != null) {
+                            const riskPct = (diag.risk_score * 100).toFixed(1);
+                            const riskColor = diag.risk_score >= 0.6 ? 'text-danger' : (diag.risk_score >= 0.35 ? 'text-warning' : 'text-success');
+                            html += '<div class="col-sm-4 mb-1"><strong>风险评分：</strong><span class="' + riskColor + ' fw-bold">' + riskPct + '%</span>';
+                            if (diag.risk_level) html += ' <span class="badge bg-secondary">' + _escapeHtml(diag.risk_level) + '</span>';
+                            html += '</div>';
+                        }
+                        // BTC穿越次数
+                        if (diag.btc_cross_count != null) {
+                            html += '<div class="col-sm-4 mb-1"><strong>BTC穿越次数：</strong>' + diag.btc_cross_count + '</div>';
+                        }
+                        // BTC价差
+                        if (diag.abs_btc_diff != null) {
+                            html += '<div class="col-sm-4 mb-1"><strong>BTC价差信号：</strong>$' + Number(diag.abs_btc_diff).toFixed(2) + '</div>';
+                        }
+                        html += '</div>';
+
+                        // 风险分量
+                        if (diag.entry_price_risk != null || diag.direction_risk != null || diag.stability_risk != null) {
+                            html += '<div class="row mb-3 small">';
+                            if (diag.entry_price_risk != null) {
+                                html += '<div class="col-sm-4 mb-1"><strong>价格风险：</strong>' + (diag.entry_price_risk * 100).toFixed(1) + '% <span class="text-muted">(权重50%)</span></div>';
+                            }
+                            if (diag.direction_risk != null) {
+                                html += '<div class="col-sm-4 mb-1"><strong>方向风险：</strong>' + (diag.direction_risk * 100).toFixed(1) + '% <span class="text-muted">(权重15%)</span></div>';
+                            }
+                            if (diag.stability_risk != null) {
+                                html += '<div class="col-sm-4 mb-1"><strong>稳定性风险：</strong>' + (diag.stability_risk * 100).toFixed(1) + '% <span class="text-muted">(权重35%)</span></div>';
+                            }
+                            html += '</div>';
+                        }
+
+                        // 交易参数
+                        html += '<div class="row mb-3 small">';
+                        if (diag.entry_best_ask != null) {
+                            html += '<div class="col-sm-4 mb-1"><strong>入场 Best Ask：</strong>' + Number(diag.entry_best_ask).toFixed(4) + '</div>';
+                        }
+                        if (diag.stop_loss_price != null) {
+                            html += '<div class="col-sm-4 mb-1"><strong>止损价：</strong>' + Number(diag.stop_loss_price).toFixed(4) + '</div>';
+                        }
+                        if (diag.take_profit_price != null) {
+                            html += '<div class="col-sm-4 mb-1"><strong>止盈价：</strong>' + Number(diag.take_profit_price).toFixed(4) + '</div>';
+                        }
+                        if (diag.risk_adjusted_stake != null) {
+                            html += '<div class="col-sm-4 mb-1"><strong>风控仓位：</strong>' + Number(diag.risk_adjusted_stake).toFixed(2) + ' USDC</div>';
+                        }
+                        html += '</div>';
+                    }
+
                     html += '<hr/>';
                     html += '<h6 class="mb-2">BTC 价格变化（相对入场时刻）</h6>';
                     // 图例
@@ -1201,9 +1259,7 @@
                 const pnlClass = r.pnl == null ? '' : (Number(r.pnl) >= 0 ? 'text-success' : 'text-danger');
                 const isLoss = String(r.result || '').trim() === '亏损';
                 const slugDisplay = r.window_slug || '--';
-                const slugCell = isLoss
-                    ? '<a href="#" class="text-danger text-decoration-underline" onclick="openTradeWindowDetail(\'' + _escapeHtml(slugDisplay) + '\');return false;">' + _escapeHtml(slugDisplay) + '</a>'
-                    : _escapeHtml(slugDisplay);
+                const slugCell = '<a href="#" class="' + (isLoss ? 'text-danger' : 'text-primary') + ' text-decoration-underline" onclick="openTradeWindowDetail(\'' + _escapeHtml(slugDisplay) + '\');return false;">' + _escapeHtml(slugDisplay) + '</a>';
                 tableRows += '<tr>';
                 tableRows += '<td>' + slugCell + '</td>';
                 tableRows += '<td>' + (r.utc_time || '--') + '</td>';

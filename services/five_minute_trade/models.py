@@ -70,3 +70,9 @@ class OpenPosition:
     risk_score: Optional[float] = None
     risk_level: Optional[str] = None
     risk_adjusted_stake: Optional[float] = None
+    # 入场诊断信息（写入 trade_window_summary.entry_diagnostics JSONB）
+    btc_cross_count: Optional[int] = None
+    abs_btc_diff: Optional[float] = None
+    entry_price_risk: Optional[float] = None
+    direction_risk: Optional[float] = None
+    stability_risk: Optional[float] = None

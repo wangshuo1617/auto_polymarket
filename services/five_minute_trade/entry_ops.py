@@ -381,6 +381,11 @@ def open_position(
         risk_score=risk_assessment.risk_score if risk_assessment else None,
         risk_level=risk_assessment.risk_level if risk_assessment else None,
         risk_adjusted_stake=risk_assessment.adjusted_stake if risk_assessment else None,
+        btc_cross_count=btc_cross_count,
+        abs_btc_diff=abs_btc_diff,
+        entry_price_risk=risk_assessment.entry_price_risk if risk_assessment else None,
+        direction_risk=risk_assessment.direction_risk if risk_assessment else None,
+        stability_risk=risk_assessment.stability_risk if risk_assessment else None,
     )
     self._persist_entry_event(position=self.position, order_id=order_id)
 

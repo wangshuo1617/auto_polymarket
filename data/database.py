@@ -227,7 +227,8 @@ CREATE TABLE IF NOT EXISTS trade_window_summary (
     pnl DOUBLE PRECISION,
     mode TEXT NOT NULL DEFAULT 'live',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    settled_at TIMESTAMPTZ
+    settled_at TIMESTAMPTZ,
+    entry_diagnostics JSONB
 );
 """
 

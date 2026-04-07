@@ -1125,7 +1125,7 @@ def api_5m_trade_window_detail():
             cur.execute(
                 """
                 SELECT direction, status, exit_reason, entry_time, exit_time,
-                       btc_entry_price, pnl
+                       btc_entry_price, pnl, entry_diagnostics
                 FROM trade_window_summary
                 WHERE market_slug = %s
                 """,
@@ -1182,6 +1182,14 @@ def api_5m_trade_window_detail():
                     if window["pnl"] is not None
                     else None
                 )
+                # 入场诊断信息
+                raw_diag = window.get("entry_diagnostics")
+                if raw_diag is not None:
+                    if isinstance(raw_diag, str):
+                        import json as _json
+                        result["entry_diagnostics"] = _json.loads(raw_diag)
+                    else:
+                        result["entry_diagnostics"] = raw_diag
 
             # 从 trade_events 获取首笔买入的时间，计算入场相对秒数
             cur.execute(
