@@ -414,6 +414,8 @@ class TradeSQLiteStore:
             diag["stop_loss_price"] = round(position.stop_loss_price, 4)
         if position.take_profit_price is not None:
             diag["take_profit_price"] = round(position.take_profit_price, 4)
+        if position.window_open_btc_price is not None:
+            diag["window_open_btc_price"] = round(position.window_open_btc_price, 2)
         entry_diagnostics_json = json.dumps(diag, ensure_ascii=False) if diag else None
 
         with self._lock, get_conn() as conn:

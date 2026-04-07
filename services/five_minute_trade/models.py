@@ -76,3 +76,4 @@ class OpenPosition:
     entry_price_risk: Optional[float] = None
     direction_risk: Optional[float] = None
     stability_risk: Optional[float] = None
+    window_open_btc_price: Optional[float] = None

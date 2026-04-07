@@ -386,6 +386,7 @@ def open_position(
         entry_price_risk=risk_assessment.entry_price_risk if risk_assessment else None,
         direction_risk=risk_assessment.direction_risk if risk_assessment else None,
         stability_risk=risk_assessment.stability_risk if risk_assessment else None,
+        window_open_btc_price=getattr(self, 'window_open_price', None),
     )
     self._persist_entry_event(position=self.position, order_id=order_id)
 

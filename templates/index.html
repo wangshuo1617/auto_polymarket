@@ -1224,11 +1224,18 @@
                         if (diag.risk_adjusted_stake != null) {
                             html += '<div class="col-sm-4 mb-1"><strong>风控仓位：</strong>' + Number(diag.risk_adjusted_stake).toFixed(2) + ' USDC</div>';
                         }
+                        if (diag.window_open_btc_price != null) {
+                            html += '<div class="col-sm-4 mb-1"><strong>窗口开盘价：</strong>$' + Number(diag.window_open_btc_price).toFixed(2) + '</div>';
+                        }
                         html += '</div>';
                     }
 
                     html += '<hr/>';
-                    html += '<h6 class="mb-2">BTC 价格变化（相对入场时刻）</h6>';
+                    // 使用策略实际沉淀的开盘价作为基准（精确匹配 sl_last_min_proximity 判定逻辑）
+                    const chartOpenPrice = (diag && diag.window_open_btc_price != null)
+                        ? diag.window_open_btc_price
+                        : data.open_btc_price;
+                    html += '<h6 class="mb-2">BTC 价格变化（相对窗口开盘价' + (chartOpenPrice != null ? ' $' + Number(chartOpenPrice).toFixed(2) : '') + '）</h6>';
                     // 图例
                     html += '<div class="d-flex flex-wrap gap-3 mb-2 small text-muted">';
                     _TAIL_GUARD_CHECKPOINTS.forEach(cp => {
@@ -1238,7 +1245,7 @@
                     // 从入场时刻开始截取价格数据
                     const entryRelSec = data.entry_rel_sec != null ? data.entry_rel_sec : 0;
                     const filteredPrices = data.prices.filter(p => p.rel_sec >= entryRelSec);
-                    html += _drawBtcDiffChart(filteredPrices, data.open_btc_price);
+                    html += _drawBtcDiffChart(filteredPrices, chartOpenPrice);
                     body.innerHTML = html;
                 })
                 .catch(err => {
