@@ -521,7 +521,7 @@ def settle_open_windows(store: TradeSQLiteStore, profile: str = "trade") -> int:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT market_slug, entry_usdc
+            SELECT market_slug, entry_usdc, direction
             FROM trade_window_summary
             WHERE status = 'open'
               AND entry_time < NOW() - INTERVAL '%s seconds'
@@ -529,7 +529,12 @@ def settle_open_windows(store: TradeSQLiteStore, profile: str = "trade") -> int:
             """,
             (_SETTLE_MIN_AGE_SEC,),
         )
-        open_windows = {row[0]: float(row[1] or 0) for row in cur.fetchall()}
+        open_windows: dict[str, dict] = {}
+        for row in cur.fetchall():
+            open_windows[row[0]] = {
+                "entry_usdc": float(row[1] or 0),
+                "direction": str(row[2] or ""),
+            }
 
     if not open_windows:
         return 0
@@ -558,41 +563,93 @@ def settle_open_windows(store: TradeSQLiteStore, profile: str = "trade") -> int:
         exit_by_slug[slug] = exit_by_slug.get(slug, 0.0) + usdc_size
 
     settled = 0
-    for slug in list(open_windows):
+    for slug, info in list(open_windows.items()):
         exit_usdc = exit_by_slug.get(slug)
-        if exit_usdc is None:
-            # Activity 中尚无记录 — 可能市场还没结算或 API 延迟
-            # 检查是否超过较长时间（30 分钟），若是则标记为 lost
-            _mark_stale_loss(store, slug, open_windows[slug])
+        if exit_usdc is not None:
+            won = exit_usdc > 0
+            if store.settle_window(slug, exit_usdc, won):
+                settled += 1
+                logger.info(
+                    "settle_open_windows: %s → %s (exit_usdc=%.4f, entry_usdc=%.4f)",
+                    slug, "won" if won else "lost", exit_usdc, info["entry_usdc"],
+                )
             continue
-        won = exit_usdc > 0
-        if store.settle_window(slug, exit_usdc, won):
-            settled += 1
+
+        # Activity 中无记录 — 通过 CLOB API 检查市场结算方向
+        result = _check_market_resolution(slug, info["direction"], profile)
+        if result == "lost":
+            if store.settle_window(slug, 0.0, won=False):
+                settled += 1
+                logger.info(
+                    "settle_open_windows: %s → lost (on-chain confirmed, entry_usdc=%.4f)",
+                    slug, info["entry_usdc"],
+                )
+        elif result == "won_pending_redeem":
             logger.info(
-                "settle_open_windows: %s → %s (exit_usdc=%.4f, entry_usdc=%.4f)",
-                slug, "won" if won else "lost", exit_usdc, open_windows[slug],
+                "settle_open_windows: %s 方向正确但尚未赎回，等待 auto_redeem",
+                slug,
             )
+        # result == "unresolved" → 市场未结算，跳过
+
     return settled
 
 
-# 超过 30 分钟仍无 activity 的窗口视为 lost（token 归零，无赎回）
-_STALE_THRESHOLD_SEC = 1800
+def _check_market_resolution(
+    slug: str, our_direction: str, profile: str
+) -> str:
+    """查 CLOB API 判断市场结算结果。
+
+    返回:
+      - "lost": 市场已结算，我们的方向输了（token 归零，不会有 redeem）
+      - "won_pending_redeem": 市场已结算，我们的方向赢了，等待 redeem
+      - "unresolved": 市场尚未结算
+    """
+    from data.polymarket import get_client
+
+    market_id = _get_condition_id_for_slug(slug, profile)
+    if not market_id:
+        return "unresolved"
+
+    try:
+        clob_client = get_client(profile)
+        market = clob_client.get_market(market_id)
+        tokens = market.get("tokens", [])
+    except Exception as e:
+        logger.warning("_check_market_resolution: CLOB 查询失败 slug=%s error=%s", slug, e)
+        return "unresolved"
+
+    if not isinstance(tokens, list):
+        return "unresolved"
+
+    winning_outcome: str | None = None
+    for t in tokens:
+        if not isinstance(t, dict):
+            continue
+        if t.get("winner") is True:
+            winning_outcome = str(t.get("outcome", "")).lower()
+            break
+
+    if winning_outcome is None:
+        return "unresolved"
+
+    our_dir = our_direction.lower().strip()
+    if our_dir == winning_outcome:
+        return "won_pending_redeem"
+    else:
+        return "lost"
 
 
-def _mark_stale_loss(store: TradeSQLiteStore, slug: str, entry_usdc: float) -> None:
-    """将超龄 open 窗口标记为 lost（无回收）。"""
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT 1 FROM trade_window_summary
-            WHERE market_slug = %s
-              AND status = 'open'
-              AND entry_time < NOW() - INTERVAL '%s seconds'
-            """,
-            (slug, _STALE_THRESHOLD_SEC),
-        )
-        if cur.fetchone() is None:
-            return  # 还没超龄
-    if store.settle_window(slug, 0.0, won=False):
-        logger.info("settle_open_windows: %s → lost (stale, entry_usdc=%.4f)", slug, entry_usdc)
+def _get_condition_id_for_slug(slug: str, profile: str) -> str | None:
+    """从 trade_events 表中查找 slug 对应的 conditionId。"""
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT market_id FROM trade_events WHERE market_slug = %s AND market_id IS NOT NULL LIMIT 1",
+                (slug,),
+            )
+            row = cur.fetchone()
+            return str(row[0]) if row else None
+    except Exception as e:
+        logger.warning("_get_condition_id_for_slug: 查询失败 slug=%s error=%s", slug, e)
+        return None
