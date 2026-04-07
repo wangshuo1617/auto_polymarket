@@ -17,7 +17,6 @@ GRP_ENTRY = "入场控制"
 GRP_TPSL = "TPSL 平仓控制"
 GRP_RISK = "风险仓位管理"
 GRP_DIR_CONFIRM = "最后一分钟接近度风控"
-GRP_ENDGAME = "终盘风控"
 GRP_SYSTEM = "系统"
 
 # 分组显示顺序
@@ -26,7 +25,6 @@ GROUP_ORDER: list[str] = [
     GRP_TPSL,
     GRP_RISK,
     GRP_DIR_CONFIRM,
-    GRP_ENDGAME,
     GRP_SYSTEM,
 ]
 
@@ -456,82 +454,6 @@ PARAM_REGISTRY: list[ParamDef] = [
         group=GRP_DIR_CONFIRM,
         shell_var="LAST_MIN_PROXIMITY_THRESHOLD",
         sig_key="lmpt",
-    ),
-
-    # ==================== 终盘风控 ====================
-    ParamDef(
-        key="enable_last_seconds_reverse_guard",
-        param_type="bool",
-        default=True,
-        description="是否启用终盘加速反向风控",
-        group=GRP_ENDGAME,
-        shell_var="ENABLE_LAST_SECONDS_REVERSE_GUARD",
-        sig_key="lrg",
-    ),
-    ParamDef(
-        key="reverse_guard_start_sec",
-        param_type="int",
-        default=295,
-        description="终盘反向风控起始秒",
-        group=GRP_ENDGAME,
-        shell_var="REVERSE_GUARD_START_SEC",
-        sig_key="lrgs",
-    ),
-    ParamDef(
-        key="reverse_guard_lookback_sec",
-        param_type="int",
-        default=3,
-        description="终盘反向风控回看秒数",
-        group=GRP_ENDGAME,
-        shell_var="REVERSE_GUARD_LOOKBACK_SEC",
-        sig_key="lrgl",
-    ),
-    ParamDef(
-        key="reverse_guard_btc_move",
-        param_type="float",
-        default=15.0,
-        description="终盘反向BTC移动阈值",
-        group=GRP_ENDGAME,
-        shell_var="REVERSE_GUARD_BTC_MOVE",
-        sig_key="lrgm",
-    ),
-    ParamDef(
-        key="reverse_guard_require_cross_open",
-        param_type="bool",
-        default=True,
-        description="是否要求穿越开盘价才平仓",
-        group=GRP_ENDGAME,
-        shell_var="REVERSE_GUARD_REQUIRE_CROSS_OPEN",
-        sig_key="lrgx",
-        cli_flag="disable-reverse-guard-require-cross-open",
-        bool_inverted=True,
-    ),
-    ParamDef(
-        key="enable_last_seconds_position_guard",
-        param_type="bool",
-        default=True,
-        description="是否启用终盘位置风控",
-        group=GRP_ENDGAME,
-        shell_var="ENABLE_LAST_SECONDS_POSITION_GUARD",
-        sig_key="lpg",
-    ),
-    ParamDef(
-        key="position_guard_start_sec",
-        param_type="int",
-        default=298,
-        description="终盘位置风控起始秒",
-        group=GRP_ENDGAME,
-        shell_var="POSITION_GUARD_START_SEC",
-        sig_key="lpgs",
-    ),
-    ParamDef(
-        key="position_guard_min_consecutive_sec",
-        param_type="int",
-        default=2,
-        description="终盘位置反向连续秒数",
-        group=GRP_ENDGAME,
-        shell_var="POSITION_GUARD_MIN_CONSECUTIVE_SEC",
-        sig_key="lpgn",
     ),
 
     # ==================== 入场控制（末尾追加） ====================

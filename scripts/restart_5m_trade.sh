@@ -59,16 +59,6 @@ CROSS_BORDERLINE_DIFF_MULTIPLIER="${CROSS_BORDERLINE_DIFF_MULTIPLIER:-${33:-0.0}
 ENABLE_LAST_MIN_PROXIMITY_CLOSE="${ENABLE_LAST_MIN_PROXIMITY_CLOSE:-${35:-true}}"  # 最后一分钟触及开盘价附近时平仓
 LAST_MIN_PROXIMITY_THRESHOLD="${LAST_MIN_PROXIMITY_THRESHOLD:-${34:-10.0}}"        # 平仓阈值（距开盘价$）
 
-# 终盘风控
-ENABLE_LAST_SECONDS_REVERSE_GUARD="${ENABLE_LAST_SECONDS_REVERSE_GUARD:-${36:-true}}"  # 是否启用终盘加速反向风控
-REVERSE_GUARD_START_SEC="${REVERSE_GUARD_START_SEC:-${37:-295}}"    # 终盘加速反向风控起始秒
-REVERSE_GUARD_LOOKBACK_SEC="${REVERSE_GUARD_LOOKBACK_SEC:-${38:-2}}" # 终盘加速反向风控回看秒数
-REVERSE_GUARD_BTC_MOVE="${REVERSE_GUARD_BTC_MOVE:-${39:-15.0}}"    # 终盘加速反向BTC移动阈值
-REVERSE_GUARD_REQUIRE_CROSS_OPEN="${REVERSE_GUARD_REQUIRE_CROSS_OPEN:-${40:-true}}" # 是否要求穿越开盘价才平仓
-ENABLE_LAST_SECONDS_POSITION_GUARD="${ENABLE_LAST_SECONDS_POSITION_GUARD:-${42:-true}}" # 是否启用终盘位置风控
-POSITION_GUARD_START_SEC="${POSITION_GUARD_START_SEC:-${43:-295}}"  # 终盘位置风控起始秒
-POSITION_GUARD_MIN_CONSECUTIVE_SEC="${POSITION_GUARD_MIN_CONSECUTIVE_SEC:-${44:-2}}" # 终盘位置反向连续秒数
-
 # 系统控制
 REPORT_INTERVAL_SEC="${REPORT_INTERVAL_SEC:-${6:-3600}}"      # 报告输出间隔（秒）
 ENABLE_DB_TICK_VALIDATION="${ENABLE_DB_TICK_VALIDATION:-${47:-true}}"  # 是否启用DB tick交叉验证
@@ -230,56 +220,8 @@ if ! [[ "$LAST_MIN_PROXIMITY_THRESHOLD" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 1
 fi
 
-if [ "$ENABLE_LAST_SECONDS_REVERSE_GUARD" != "true" ] && [ "$ENABLE_LAST_SECONDS_REVERSE_GUARD" != "false" ]; then
-  echo "❌ enable_last_seconds_reverse_guard 必须是 true 或 false"
-  print_usage
-  exit 1
-fi
-
-if ! [[ "$REVERSE_GUARD_START_SEC" =~ ^[0-9]+$ ]] || [ "$REVERSE_GUARD_START_SEC" -lt 1 ] || [ "$REVERSE_GUARD_START_SEC" -gt 299 ]; then
-  echo "❌ reverse_guard_start_sec 必须是 1-299 的整数"
-  print_usage
-  exit 1
-fi
-
-if ! [[ "$REVERSE_GUARD_LOOKBACK_SEC" =~ ^[0-9]+$ ]] || [ "$REVERSE_GUARD_LOOKBACK_SEC" -lt 1 ] || [ "$REVERSE_GUARD_LOOKBACK_SEC" -gt 30 ]; then
-  echo "❌ reverse_guard_lookback_sec 必须是 1-30 的整数"
-  print_usage
-  exit 1
-fi
-
-if ! [[ "$REVERSE_GUARD_BTC_MOVE" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($REVERSE_GUARD_BTC_MOVE > 0)}"; then
-  echo "❌ reverse_guard_btc_move 必须是大于 0 的数字"
-  print_usage
-  exit 1
-fi
-
-if [ "$REVERSE_GUARD_REQUIRE_CROSS_OPEN" != "true" ] && [ "$REVERSE_GUARD_REQUIRE_CROSS_OPEN" != "false" ]; then
-  echo "❌ reverse_guard_require_cross_open 必须是 true 或 false"
-  print_usage
-  exit 1
-fi
-
-if [ "$ENABLE_LAST_SECONDS_POSITION_GUARD" != "true" ] && [ "$ENABLE_LAST_SECONDS_POSITION_GUARD" != "false" ]; then
-  echo "❌ enable_last_seconds_position_guard 必须是 true 或 false"
-  print_usage
-  exit 1
-fi
-
 if [ "$ENABLE_DB_TICK_VALIDATION" != "true" ] && [ "$ENABLE_DB_TICK_VALIDATION" != "false" ]; then
   echo "❌ enable_db_tick_validation 必须是 true 或 false"
-  print_usage
-  exit 1
-fi
-
-if ! [[ "$POSITION_GUARD_START_SEC" =~ ^[0-9]+$ ]] || [ "$POSITION_GUARD_START_SEC" -lt 1 ] || [ "$POSITION_GUARD_START_SEC" -gt 299 ]; then
-  echo "❌ position_guard_start_sec 必须是 1-299 的整数"
-  print_usage
-  exit 1
-fi
-
-if ! [[ "$POSITION_GUARD_MIN_CONSECUTIVE_SEC" =~ ^[0-9]+$ ]] || [ "$POSITION_GUARD_MIN_CONSECUTIVE_SEC" -lt 1 ] || [ "$POSITION_GUARD_MIN_CONSECUTIVE_SEC" -gt 10 ]; then
-  echo "❌ position_guard_min_consecutive_sec 必须是 1-10 的整数"
   print_usage
   exit 1
 fi
@@ -352,8 +294,6 @@ echo "风险权重: price=$RISK_W_PRICE direction=$RISK_W_DIRECTION stability=$R
 echo "risk_diff_boost: threshold=$RISK_DIFF_BOOST_THRESHOLD multiplier=$RISK_DIFF_BOOST_MULTIPLIER"
 echo "cross_borderline: diff_multiplier=$CROSS_BORDERLINE_DIFF_MULTIPLIER"
 echo "最后一分钟接近度风控: enable=$ENABLE_LAST_MIN_PROXIMITY_CLOSE threshold=$LAST_MIN_PROXIMITY_THRESHOLD"
-echo "终盘反向风控: enable=$ENABLE_LAST_SECONDS_REVERSE_GUARD start_sec=$REVERSE_GUARD_START_SEC lookback_sec=$REVERSE_GUARD_LOOKBACK_SEC btc_move=$REVERSE_GUARD_BTC_MOVE require_cross_open=$REVERSE_GUARD_REQUIRE_CROSS_OPEN"
-echo "终盘位置风控: enable=$ENABLE_LAST_SECONDS_POSITION_GUARD start_sec=$POSITION_GUARD_START_SEC min_consecutive_sec=$POSITION_GUARD_MIN_CONSECUTIVE_SEC"
 echo "DB tick交叉验证: enable=$ENABLE_DB_TICK_VALIDATION"
 echo "数据库: PG_DSN 环境变量"
 echo "=========================================="
@@ -390,11 +330,6 @@ _build_cmd() {
     --risk-diff-boost-multiplier "$RISK_DIFF_BOOST_MULTIPLIER"
     --cross-borderline-diff-multiplier "$CROSS_BORDERLINE_DIFF_MULTIPLIER"
     --last-min-proximity-threshold "$LAST_MIN_PROXIMITY_THRESHOLD"
-    --reverse-guard-start-sec "$REVERSE_GUARD_START_SEC"
-    --reverse-guard-lookback-sec "$REVERSE_GUARD_LOOKBACK_SEC"
-    --reverse-guard-btc-move "$REVERSE_GUARD_BTC_MOVE"
-    --position-guard-start-sec "$POSITION_GUARD_START_SEC"
-    --position-guard-min-consecutive-sec "$POSITION_GUARD_MIN_CONSECUTIVE_SEC"
   )
 
   CMD+=(--minute-consistency "$MINUTE_CONSISTENCY")
@@ -409,18 +344,6 @@ _build_cmd() {
 
   if [ "$ENABLE_LAST_MIN_PROXIMITY_CLOSE" = "false" ]; then
     CMD+=(--disable-last-min-proximity-close)
-  fi
-
-  if [ "$ENABLE_LAST_SECONDS_REVERSE_GUARD" = "false" ]; then
-    CMD+=(--disable-last-seconds-reverse-guard)
-  fi
-
-  if [ "$REVERSE_GUARD_REQUIRE_CROSS_OPEN" = "false" ]; then
-    CMD+=(--disable-reverse-guard-require-cross-open)
-  fi
-
-  if [ "$ENABLE_LAST_SECONDS_POSITION_GUARD" = "false" ]; then
-    CMD+=(--disable-last-seconds-position-guard)
   fi
 
   if [ "$ENABLE_DB_TICK_VALIDATION" = "false" ]; then

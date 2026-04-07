@@ -625,8 +625,6 @@ def force_close_position(trader: Any, reason: str, close_retry_count: int = 0) -
         if reason in {
             "sl",
             "sl_last_min_proximity",
-            "sl_last_seconds_reversal",
-            "sl_last_seconds_position",
             "sl_residual",
         }:
             current_bid = min(
