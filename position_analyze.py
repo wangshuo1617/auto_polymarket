@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from config import TO_EMAIL
 from data.polymarket import get_positions, get_open_orders, get_event_situation, get_balance_allowance
 from data.binance import get_btc_price, get_4h_klines_data, get_1d_klines_data
+from data.deribit import get_btc_dvol
 from ai.researcher import analyze_market_with_grounding
 from notifications.email import EmailSender
 from notifications.html import generate_html_template
@@ -245,11 +246,16 @@ if __name__ == "__main__":
     print(f"{time_now} 比特币4h(近7天)与1d(近30天) K线数据获取完成")
 
     daily_volatility_profile = build_daily_volatility_profile(btc_1d_k_data)
+    dvol_data = get_btc_dvol()
+    if dvol_data:
+        daily_volatility_profile["iv_daily"] = dvol_data["iv_daily"]
+        daily_volatility_profile["dvol_annualized"] = dvol_data["dvol_annualized"]
     intraday_volatility_hint = _build_intraday_volatility_hint()
     print(
         f"{time_now} 日线波动率画像完成: regime={daily_volatility_profile.get('market_regime')} "
         f"ATR%={daily_volatility_profile.get('atr_pct')} "
         f"TR分位={daily_volatility_profile.get('tr_percentile_30d')}"
+        f"{f' DVOL={dvol_data[\"dvol_annualized\"]}%' if dvol_data else ' (DVOL不可用，使用ATR)'}"
     )
     print(
         f"{time_now} 时段波动提示上下文已加载: order={intraday_volatility_hint.get('relative_order_high_to_low')}"

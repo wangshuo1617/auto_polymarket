@@ -722,10 +722,15 @@ def build_profit_optimization_context(
     # AI 可根据自身趋势判断在建议中做方向性调整。
     drift_daily = 0.0
 
-    sigma_daily = _to_float(daily_volatility_profile.get("realized_vol_daily_pct"), 0.0) / 100.0
-    if sigma_daily <= 0:
-        # fallback: ATR → σ 转换; 正态分布下 E[|X|] ≈ 0.8σ
-        sigma_daily = max(0.008, _to_float(daily_volatility_profile.get("atr_pct"), 1.8) / 100.0 * 0.8)
+    # σ_daily 优先级: Deribit IV > realized vol > ATR fallback
+    iv_daily = _to_float(daily_volatility_profile.get("iv_daily"), 0.0)
+    if iv_daily > 0:
+        sigma_daily = iv_daily
+    else:
+        sigma_daily = _to_float(daily_volatility_profile.get("realized_vol_daily_pct"), 0.0) / 100.0
+        if sigma_daily <= 0:
+            # fallback: ATR → σ 转换; 正态分布下 E[|X|] ≈ 0.8σ
+            sigma_daily = max(0.008, _to_float(daily_volatility_profile.get("atr_pct"), 1.8) / 100.0 * 0.8)
 
     days_left = max(0.0, _to_float(future_possibility_context.get("days_left_in_month"), 0))
     current_price = _get_current_price(future_possibility_context, asset)
@@ -847,6 +852,7 @@ def build_profit_optimization_context(
             "days_left": days_left,
             "drift_daily": round(drift_daily, 6),
             "sigma_daily": round(sigma_daily, 6),
+            "sigma_source": "deribit_iv" if iv_daily > 0 else "realized_vol" if _to_float(daily_volatility_profile.get("realized_vol_daily_pct"), 0.0) > 0 else "atr_fallback",
             "current_price": round(current_price, 2),
         },
         "position_safety_assessment": position_assessments,
