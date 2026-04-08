@@ -623,11 +623,7 @@ def force_close_position(trader: Any, reason: str, close_retry_count: int = 0) -
 
     if not self.dry_run:
         if reason.startswith("sl"):
-            current_bid = min(
-                pos.last_best_bid if pos.last_best_bid else exit_price,
-                exit_price,
-            )
-            sweep_price = max(0.01, float(current_bid) - self.EXIT_SWEEP_SLIPPAGE_SL)
+            sweep_price = 0.01
         else:
             current_bid = exit_price
             sweep_price = max(0.01, float(current_bid) - self.EXIT_SWEEP_SLIPPAGE_OTHER)
