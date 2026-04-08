@@ -622,11 +622,7 @@ def force_close_position(trader: Any, reason: str, close_retry_count: int = 0) -
         return
 
     if not self.dry_run:
-        if reason in {
-            "sl",
-            "sl_last_min_proximity",
-            "sl_residual",
-        }:
+        if reason.startswith("sl"):
             current_bid = min(
                 pos.last_best_bid if pos.last_best_bid else exit_price,
                 exit_price,
