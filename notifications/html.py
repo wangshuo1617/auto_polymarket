@@ -14,6 +14,77 @@ def generate_overview_section(text: str) -> str:
     """
 
 
+def generate_btc_prediction_section(data: dict) -> str:
+    """Part 1.5: BTC 短期预测"""
+    if not data:
+        return ""
+
+    direction = data.get("方向判断", "")
+    confidence = data.get("置信度", "")
+    current_price = data.get("当前价格", "")
+    target_range = data.get("24h目标区间", "")
+    support = data.get("关键支撑位", "")
+    resistance = data.get("关键阻力位", "")
+    paths = data.get("路径概率", [])
+    logic = data.get("核心逻辑", "")
+    risk = data.get("风险提示", "")
+
+    # 方向颜色
+    dir_colors = {
+        "看涨": ("#10b981", "#10b98120", "📈"),
+        "看跌": ("#ef4444", "#ef444420", "📉"),
+        "震荡": ("#f59e0b", "#f59e0b20", "↔️"),
+    }
+    color, bg, icon = dir_colors.get(direction, ("#64748b", "#64748b20", "❓"))
+
+    # 置信度标签
+    conf_colors = {"高": "#10b981", "中": "#f59e0b", "低": "#ef4444"}
+    conf_color = conf_colors.get(confidence, "#64748b")
+
+    # 路径概率行
+    path_rows = ""
+    for p in paths:
+        path_rows += f"""
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #1e293b;">
+                <span style="color: #e2e8f0;">{p.get('路径', '')}</span>
+                <span style="color: #94a3b8; flex: 1; margin: 0 12px; font-size: 13px;">{p.get('描述', '')}</span>
+                <span style="color: {color}; font-weight: 600; white-space: nowrap;">{p.get('概率', '')}</span>
+            </div>"""
+
+    return f"""
+        <h2 style="color: {color};">{icon} BTC 短期预测</h2>
+        <div class="card" style="border-left: 4px solid {color};">
+            <div class="card-body">
+                <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                    <div class="status-badge" style="background: {bg}; color: {color}; font-size: 16px; padding: 6px 16px;">{direction}</div>
+                    <div class="status-badge" style="background: #334155; color: {conf_color};">置信度：{confidence}</div>
+                    <span style="color: #94a3b8;">当前 {current_price}</span>
+                </div>
+                <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 12px;">
+                    <div style="flex: 1; min-width: 140px; background: #1e293b; border-radius: 6px; padding: 10px;">
+                        <div style="color: #64748b; font-size: 12px;">24h 目标区间</div>
+                        <div style="color: #e2e8f0; font-weight: 600;">{target_range}</div>
+                    </div>
+                    <div style="flex: 1; min-width: 140px; background: #1e293b; border-radius: 6px; padding: 10px;">
+                        <div style="color: #64748b; font-size: 12px;">关键支撑</div>
+                        <div style="color: #10b981; font-weight: 600;">{support}</div>
+                    </div>
+                    <div style="flex: 1; min-width: 140px; background: #1e293b; border-radius: 6px; padding: 10px;">
+                        <div style="color: #64748b; font-size: 12px;">关键阻力</div>
+                        <div style="color: #ef4444; font-weight: 600;">{resistance}</div>
+                    </div>
+                </div>
+                <div style="margin-bottom: 12px;">
+                    <div style="color: #94a3b8; font-size: 13px; margin-bottom: 6px;">📊 路径概率</div>
+                    {path_rows}
+                </div>
+                <div class="logic-text" style="margin-bottom: 8px;">📌 核心逻辑：{logic}</div>
+                {'<div class="logic-text" style="color: #f59e0b;">⚠️ 风险提示：' + risk + '</div>' if risk else ''}
+            </div>
+        </div>
+    """
+
+
 def generate_position_and_orders_section(items: list) -> str:
     """Part 2: 当前持仓、当前挂单分析与建议（已参与的 event）"""
     if not items:
@@ -515,6 +586,8 @@ def generate_html_template(data):
         <h1>📊 Polymarket 仓位分析报告</h1>
 
         {generate_overview_section(data.get("整体分析", "") or data.get("市场与持仓快照", ""))}
+
+        {generate_btc_prediction_section(data.get("BTC短期预测", {{}}))}
 
         <h2 style="color: #10b981;">📋 二、当前持仓、当前挂单分析与建议</h2>
         {generate_position_and_orders_section(data.get('当前持仓与挂单分析与建议', []))}
