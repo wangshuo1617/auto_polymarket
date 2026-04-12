@@ -75,7 +75,7 @@ def analyze_market_with_grounding(
         tools=[grounding_tool],  # Enable Google Search Grounding
         response_schema=RESPONSE_SCHEMA,  # Structured output
         temperature=0.4,  # 金融分析需要一致性，低温优于高温
-        max_output_tokens=8192,
+        max_output_tokens=16384,
     )
     
     user_prompt = get_user_prompt(

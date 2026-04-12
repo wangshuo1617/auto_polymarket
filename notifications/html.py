@@ -587,7 +587,7 @@ def generate_html_template(data):
 
         {generate_overview_section(data.get("整体分析", "") or data.get("市场与持仓快照", ""))}
 
-        {generate_btc_prediction_section(data.get("BTC短期预测", {{}}))}
+        {generate_btc_prediction_section(data.get("BTC短期预测"))}
 
         <h2 style="color: #10b981;">📋 二、当前持仓、当前挂单分析与建议</h2>
         {generate_position_and_orders_section(data.get('当前持仓与挂单分析与建议', []))}
