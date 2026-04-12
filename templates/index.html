@@ -1474,7 +1474,7 @@
                     loadOrders();
                     loadBalance();
                 })
-                .catch(error => console.error('Error cancelling order:', error));
+                .catch(error => alert('取消失败: ' + error.message));
             }
         }
 
@@ -1520,7 +1520,7 @@
                     loadBalance();
                 }
             })
-            .catch(error => console.error('Error creating order:', error));
+            .catch(error => alert('下单失败: ' + error.message));
         });
 
         // Load data on page load
