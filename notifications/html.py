@@ -144,8 +144,58 @@ def generate_market_snapshot(snapshot_text):
     return generate_overview_section(snapshot_text)
 
 
+def generate_swing_trading_section(items: list) -> str:
+    """Part 5: 波段交易建议"""
+    if not items:
+        return '<div class="card"><div class="card-body muted">当前无合适的波段交易机会</div></div>'
+
+    strategy_colors = {
+        "方向性波段": ("#8b5cf6", "#8b5cf620"),
+        "恐慌错配": ("#ef4444", "#ef444420"),
+        "安全垫收割": ("#10b981", "#10b98120"),
+    }
+
+    html = ""
+    for item in items:
+        target = item.get("标的", "")
+        direction = item.get("方向", "")
+        strategy = item.get("策略类型", "")
+        trigger = item.get("触发条件", "")
+        price = item.get("建议价格", "")
+        position_size = item.get("建议仓位", "")
+        tp = item.get("止盈目标", "")
+        sl = item.get("止损规则", "")
+        leverage = item.get("杠杆倍数", "")
+        reason = item.get("理由", "")
+
+        color, bg = strategy_colors.get(strategy, ("#64748b", "#64748b20"))
+
+        extra = ""
+        if leverage:
+            extra += f"<div class='logic-text'>杠杆倍数：{leverage}</div>"
+        if position_size:
+            extra += f"<div class='logic-text'>建议仓位：{position_size}</div>"
+
+        html += f"""
+        <div class="card action-card">
+            <div class="card-header" style="border-left: 4px solid {color};">
+                <div class="contract-title">{target}</div>
+                <div class="status-badge" style="background: {bg}; color: {color};">{strategy}</div>
+                <div class="status-badge" style="background: #334155; color: #e2e8f0; margin-left: 4px;">{direction}</div>
+            </div>
+            <div class="card-body">
+                <div class="action-box">触发条件：{trigger}</div>
+                <div class="action-box">入场价：<strong>{price}</strong> · 止盈：{tp} · 止损：{sl}</div>
+                {extra}
+                <div class="logic-text">理由：{reason}</div>
+            </div>
+        </div>
+        """
+    return html
+
+
 def generate_interpretation_appendix(items: list) -> str:
-    """Part 5: 报告解读附录（快速执行版）"""
+    """Part 6: 报告解读附录（快速执行版）"""
     if not items:
         return ""
 
@@ -475,7 +525,10 @@ def generate_html_template(data):
         <h2 style="color: var(--accent-red);">🚨 四、预警价格及操作</h2>
         {generate_alert_rows(data.get('预警信号', []))}
 
-        <h2 style="color: #3b82f6;">🧠 五、报告解读附录</h2>
+        <h2 style="color: #8b5cf6;">📊 五、波段交易建议</h2>
+        {generate_swing_trading_section(data.get('波段交易建议', []))}
+
+        <h2 style="color: #3b82f6;">🧠 六、报告解读附录</h2>
         {generate_interpretation_appendix(data.get('报告解读附录', []))}
         
         <div style="text-align: center; margin-top: 40px; color: #475569; font-size: 12px;">

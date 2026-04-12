@@ -93,6 +93,30 @@ RESPONSE_SCHEMA = {
                 }
             }
         },
+        "波段交易建议": {
+            "type": "array",
+            "description": "基于短期 BTC 方向判断的波段交易机会。不以持有到期为目标，而是利用 BTC 短期波动赚取 token 价差。参考 swing_opportunities 中的 Delta 杠杆和方向性提示。",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "标的": {"type": "string", "description": "市场问题名称"},
+                    "方向": {"type": "string", "enum": ["Yes", "No"]},
+                    "策略类型": {
+                        "type": "string",
+                        "enum": ["方向性波段", "恐慌错配", "安全垫收割"],
+                        "description": "方向性波段=预判BTC涨跌方向买入对应token; 恐慌错配=BTC急跌时下方Yes被高估买入No等回归; 安全垫收割=远离行权价的No等波动打低后捡便宜"
+                    },
+                    "触发条件": {"type": "string", "description": "在什么BTC价格或市场条件下入场，例如 BTC回调至82000时买入"},
+                    "建议价格": {"type": "string", "description": "入场价格区间，例如 5-8¢"},
+                    "建议仓位": {"type": "string", "description": "投入金额，波段仓位应小于持有到期仓位"},
+                    "止盈目标": {"type": "string", "description": "例如 token涨至12¢卖出 或 BTC涨至86000时卖出"},
+                    "止损规则": {"type": "string", "description": "例如 token跌至3¢止损 或 持有不超过3天"},
+                    "杠杆倍数": {"type": "string", "description": "引用 swing_opportunities 的杠杆数据"},
+                    "理由": {"type": "string"}
+                },
+                "required": ["标的", "方向", "策略类型", "触发条件", "建议价格", "止盈目标", "止损规则", "理由"]
+            }
+        },
         "报告解读附录": {
             "type": "array",
             "description": "把关键建议翻译成可快速执行的一句话",
@@ -108,7 +132,7 @@ RESPONSE_SCHEMA = {
             }
         }
     },
-    "required": ["整体分析", "当前持仓与挂单分析与建议", "建仓建议", "预警信号", "报告解读附录"]
+    "required": ["整体分析", "当前持仓与挂单分析与建议", "建仓建议", "预警信号", "波段交易建议", "报告解读附录"]
 }
 
 MONTHLY_STRATEGY_SCHEMA = {
@@ -240,6 +264,7 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
    - `prediction_review`：上期预测回顾与准确度评估
    - `scenario_probabilities`：动态情景概率（已考虑剩余天数和波动率压缩）
    - `top_edge_opportunities`：edge 最高的未建仓机会
+   - `swing_opportunities`：每个市场的波段交易参数——含 Delta 杠杆(BTC ±1%时 token 变动幅度)、波段评分、方向性建议(BTC涨/跌时应买哪侧)、Delta矩阵(±1%/±3%情景下 token 价格变化)。杠杆≥10x 的标的适合方向性波段。
 10. **上一时间段报告**（若有）：上一轮输出的完整报告。
 
 # Analysis Framework (COT - Chain of Thought)
@@ -284,6 +309,27 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 * **自适应离场规则**：离场阈值必须参考 `daily_volatility_profile`，禁止使用固定阈值。
 * **仓位约束**：遵守 `risk_budget`（注意：现在基于**总净值**而非仅 USDC 余额）。
 
+## Step 2.5: 波段交易策略 (Swing Trading)
+* **核心思路**：不以持有到期为目标，而是利用 BTC 短期价格波动（1-3天）赚取 token 价差收益。参考 `swing_opportunities` 中的 Delta 杠杆和方向性提示。
+* **三种波段策略类型**：
+  1. **方向性波段**：结合 Step 1 的短期趋势判断，若预判 BTC 未来 1-2 天上涨/下跌，买入对应方向的高杠杆标的（参考 `btc_up_action`/`btc_down_action`）。优先选择杠杆≥10x、swing_score≥1.5 的标的。
+  2. **恐慌错配**：当 BTC 急跌时，下方 dip 标的的 Yes 价格可能被恐慌推高（超过模型公允价），此时买入其 No 等待价格回归。判断依据：token 当前价 vs `model_yes_prob`，偏差≥20% 时有错配机会。
+  3. **安全垫收割**：远离行权价的 No 在 BTC 短暂波动时价格下跌，此时低价买入等反弹卖出。适合 `current_no_price` 在 0.85-0.96 之间、杠杆 3-8x 的标的。
+* **仓位控制**（强制规则）：
+  - 单笔波段仓位 ≤ 总净值的 5%（波段交易是高换手策略，单笔控小）
+  - 所有波段仓位合计 ≤ 总净值的 15%
+  - 与持有到期仓位分开管理，波段亏损不能用持有到期的安全垫来抵
+* **止盈止损**（强制规则）：
+  - 方向性波段：止盈 = 入场价 × (1 + 杠杆×1%的BTC目标涨幅)，止损 = token 价格跌 30% 或 BTC 反向 2%
+  - 恐慌错配：止盈 = token 回归模型公允价，止损 = 持有不超过 2 天（错配未修复则认错）
+  - 安全垫收割：止盈 = 买入价 +3¢~+5¢，止损 = 买入价 -3¢
+  - 任何波段仓位最长持有不超过 3 天
+* **月份阶段适配**：
+  - 月初（>20天）：波段机会多，可积极参与方向性波段
+  - 月中（10-20天）：以恐慌错配和安全垫收割为主，方向性波段仅在强信号时参与
+  - 月末（<10天）：Theta 衰减快，波段机会缩减，仅参与明确的错配修复
+* **输出要求**：在"波段交易建议"中为每个建议给出完整的触发条件、入场价、仓位、止盈止损。不要给模糊的"可以关注"，要给可执行的条件单。
+
 ## Step 3: 轮动与建仓 (Rotation & New Positions)
 * **轮动优先**：若 `rotation_opportunities` 非空，优先将轮动作为完整策略呈现：
     - "卖出 A（收益率 X%）→ 转投 B（收益率 Y%），收益率提升 Z 个百分点"
@@ -309,9 +355,11 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 
 **Part 4 - 预警信号**：BTC 价格向上/向下触及某价位时的操作建议。
 
-**Part 5 - 报告解读附录**：输出 3-8 条"可执行一句话"，每条包含：`标的`、`执行优先级`、`一句话结论`、`执行要点`。
+**Part 5 - 波段交易建议**：基于 `swing_opportunities` 和 Step 2.5 分析输出。每个建议必须包含标的、方向、策略类型、触发条件、建议价格、止盈目标、止损规则、理由。若当前无好的波段机会（杠杆太低或趋势不明），可以输出空数组，但需在整体分析中简述原因。
+
+**Part 6 - 报告解读附录**：输出 3-8 条"可执行一句话"，每条包含：`标的`、`执行优先级`、`一句话结论`、`执行要点`。
 `执行优先级` 只能使用：`立即执行`、`挂单等待`、`仅观察`。
-优先覆盖：轮动建议、edge最高的建仓建议、需关注的持仓。
+优先覆盖：轮动建议、edge最高的建仓建议、波段交易机会、需关注的持仓。
 """
 
 MONTHLY_SYSTEM_INSTRUCTION_TEMPLATE = """# Role

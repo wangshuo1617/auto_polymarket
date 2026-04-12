@@ -59,6 +59,13 @@ CROSS_BORDERLINE_DIFF_MULTIPLIER="${CROSS_BORDERLINE_DIFF_MULTIPLIER:-${33:-0.0}
 ENABLE_LAST_MIN_PROXIMITY_CLOSE="${ENABLE_LAST_MIN_PROXIMITY_CLOSE:-${35:-true}}"  # 最后一分钟触及开盘价附近时平仓
 LAST_MIN_PROXIMITY_THRESHOLD="${LAST_MIN_PROXIMITY_THRESHOLD:-${34:-10.0}}"        # 平仓阈值（距开盘价$）
 
+# 最后一分钟 Token bid 急跌止损
+ENABLE_LAST_MIN_BID_DROP_CLOSE="${ENABLE_LAST_MIN_BID_DROP_CLOSE:-true}"           # 最后一分钟 Token bid 急跌时平仓
+LAST_MIN_BID_DROP_THRESHOLD="${LAST_MIN_BID_DROP_THRESHOLD:-0.30}"                 # Bid/entry 比率跌幅阈值
+LAST_MIN_BID_DROP_LOOKBACK_SEC="${LAST_MIN_BID_DROP_LOOKBACK_SEC:-1.0}"            # 急跌回看秒数
+LAST_MIN_BID_DROP_START_SEC="${LAST_MIN_BID_DROP_START_SEC:-240.0}"                # 急跌检测启用时刻（窗口内秒数）
+LAST_MIN_BID_DROP_FLOOR="${LAST_MIN_BID_DROP_FLOOR:-0.10}"                         # Bid/entry 比率下限（低于此不卖）
+
 # 系统控制
 REPORT_INTERVAL_SEC="${REPORT_INTERVAL_SEC:-${6:-3600}}"      # 报告输出间隔（秒）
 ENABLE_DB_TICK_VALIDATION="${ENABLE_DB_TICK_VALIDATION:-${47:-true}}"  # 是否启用DB tick交叉验证
@@ -220,6 +227,36 @@ if ! [[ "$LAST_MIN_PROXIMITY_THRESHOLD" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 1
 fi
 
+if [ "$ENABLE_LAST_MIN_BID_DROP_CLOSE" != "true" ] && [ "$ENABLE_LAST_MIN_BID_DROP_CLOSE" != "false" ]; then
+  echo "❌ enable_last_min_bid_drop_close 必须是 true 或 false"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$LAST_MIN_BID_DROP_THRESHOLD" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ last_min_bid_drop_threshold 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$LAST_MIN_BID_DROP_LOOKBACK_SEC" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ last_min_bid_drop_lookback_sec 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$LAST_MIN_BID_DROP_START_SEC" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ last_min_bid_drop_start_sec 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$LAST_MIN_BID_DROP_FLOOR" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ last_min_bid_drop_floor 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+
 if [ "$ENABLE_DB_TICK_VALIDATION" != "true" ] && [ "$ENABLE_DB_TICK_VALIDATION" != "false" ]; then
   echo "❌ enable_db_tick_validation 必须是 true 或 false"
   print_usage
@@ -294,6 +331,7 @@ echo "风险权重: price=$RISK_W_PRICE direction=$RISK_W_DIRECTION stability=$R
 echo "risk_diff_boost: threshold=$RISK_DIFF_BOOST_THRESHOLD multiplier=$RISK_DIFF_BOOST_MULTIPLIER"
 echo "cross_borderline: diff_multiplier=$CROSS_BORDERLINE_DIFF_MULTIPLIER"
 echo "最后一分钟接近度风控: enable=$ENABLE_LAST_MIN_PROXIMITY_CLOSE threshold=$LAST_MIN_PROXIMITY_THRESHOLD"
+echo "Token bid急跌止损: enable=$ENABLE_LAST_MIN_BID_DROP_CLOSE threshold=$LAST_MIN_BID_DROP_THRESHOLD lookback=${LAST_MIN_BID_DROP_LOOKBACK_SEC}s start=${LAST_MIN_BID_DROP_START_SEC}s floor=$LAST_MIN_BID_DROP_FLOOR"
 echo "DB tick交叉验证: enable=$ENABLE_DB_TICK_VALIDATION"
 echo "数据库: PG_DSN 环境变量"
 echo "=========================================="
@@ -330,6 +368,10 @@ _build_cmd() {
     --risk-diff-boost-multiplier "$RISK_DIFF_BOOST_MULTIPLIER"
     --cross-borderline-diff-multiplier "$CROSS_BORDERLINE_DIFF_MULTIPLIER"
     --last-min-proximity-threshold "$LAST_MIN_PROXIMITY_THRESHOLD"
+    --last-min-bid-drop-threshold "$LAST_MIN_BID_DROP_THRESHOLD"
+    --last-min-bid-drop-lookback-sec "$LAST_MIN_BID_DROP_LOOKBACK_SEC"
+    --last-min-bid-drop-start-sec "$LAST_MIN_BID_DROP_START_SEC"
+    --last-min-bid-drop-floor "$LAST_MIN_BID_DROP_FLOOR"
   )
 
   CMD+=(--minute-consistency "$MINUTE_CONSISTENCY")
@@ -344,6 +386,10 @@ _build_cmd() {
 
   if [ "$ENABLE_LAST_MIN_PROXIMITY_CLOSE" = "false" ]; then
     CMD+=(--disable-last-min-proximity-close)
+  fi
+
+  if [ "$ENABLE_LAST_MIN_BID_DROP_CLOSE" = "false" ]; then
+    CMD+=(--disable-last-min-bid-drop-close)
   fi
 
   if [ "$ENABLE_DB_TICK_VALIDATION" = "false" ]; then

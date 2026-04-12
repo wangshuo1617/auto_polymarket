@@ -23,6 +23,7 @@ import os
 import socket
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 import re
 from zoneinfo import ZoneInfo
@@ -147,6 +148,11 @@ class FiveMinuteUpDownTrader:
         cross_borderline_diff_multiplier: float = 0.0,
         enable_last_min_proximity_close: bool = True,
         last_min_proximity_threshold: float = LAST_MIN_PROXIMITY_THRESHOLD,
+        enable_last_min_bid_drop_close: bool = True,
+        last_min_bid_drop_threshold: float = 0.30,
+        last_min_bid_drop_lookback_sec: float = 1.0,
+        last_min_bid_drop_start_sec: float = 240.0,
+        last_min_bid_drop_floor: float = 0.10,
         enable_db_tick_validation: bool = True,
     ) -> None:
         self.stake_usd = stake_usd
@@ -203,6 +209,11 @@ class FiveMinuteUpDownTrader:
         self.cross_borderline_diff_multiplier = float(cross_borderline_diff_multiplier)
         self.enable_last_min_proximity_close = bool(enable_last_min_proximity_close)
         self.last_min_proximity_threshold = float(last_min_proximity_threshold)
+        self.enable_last_min_bid_drop_close = bool(enable_last_min_bid_drop_close)
+        self.last_min_bid_drop_threshold = float(last_min_bid_drop_threshold)
+        self.last_min_bid_drop_lookback_sec = float(last_min_bid_drop_lookback_sec)
+        self.last_min_bid_drop_start_sec = float(last_min_bid_drop_start_sec)
+        self.last_min_bid_drop_floor = float(last_min_bid_drop_floor)
 
         self._lock = threading.RLock()
         self._price_watcher = ChainlinkBTCPriceWatcher(callback=self._on_price_update)
@@ -232,6 +243,10 @@ class FiveMinuteUpDownTrader:
 
         self.position: Optional[OpenPosition] = None
         self.trades: List[TradeRecord] = []
+
+        # 最后一分钟 bid 急跌检测用的环形缓冲区: (timestamp_sec, bid)
+        self._bid_history: deque[tuple[float, float]] = deque(maxlen=200)
+        self._last_min_sl_fired: bool = False
 
         self._running = False
         self._report_thread: Optional[threading.Thread] = None
@@ -694,7 +709,7 @@ class FiveMinuteUpDownTrader:
             logger.warning("窗口book预订阅启动失败: slug=%s error=%s", market_slug, e)
 
     def _on_price_update(self, payload: Dict[str, Any]) -> None:
-        """由 ChainlinkBTCPriceWatcher 在每次价格跳动时回调，仅更新最新 BTC 价格。"""
+        """由 ChainlinkBTCPriceWatcher 在每次价格跳动时回调，更新最新 BTC 价格并触发事件驱动止损检查。"""
         price = payload.get("mid_price") or payload.get("last_price")
         if price is None:
             return
@@ -708,6 +723,8 @@ class FiveMinuteUpDownTrader:
         with self._lock:
             self.latest_btc_price = parsed
             self.latest_btc_price_event_ms = event_ms
+            # 事件驱动：BTC 价格变化时立即检查最后一分钟 proximity 止损
+            self._check_last_min_stop_loss_on_btc(parsed, event_ms)
 
     def _send_stale_alert(self, btc_age_ms: int) -> None:
         """连续多个窗口 BTC 价格 stale 时发送告警邮件。"""
@@ -783,6 +800,8 @@ class FiveMinuteUpDownTrader:
                 self._minute2_recorded = False
                 self._minute3_recorded = False
                 self._minute4_recorded = False
+                self._bid_history.clear()
+                self._last_min_sl_fired = False
                 slug_ts = window_start_ms // 1000
                 self.current_market_slug = f"btc-updown-5m-{slug_ts}"
                 try:
@@ -1239,6 +1258,105 @@ class FiveMinuteUpDownTrader:
             logger.warning("DB交叉验证异常，跳过验证: %s", e)
             return True
 
+    # ----------------------------------------------------------------
+    # 事件驱动最后一分钟止损（从 WS 回调直接触发）
+    # ----------------------------------------------------------------
+
+    def _check_last_min_stop_loss_on_btc(self, btc_price: float, event_ms: int) -> None:
+        """BTC 价格变化时的事件驱动 proximity 止损检查（在 _lock 内调用）。"""
+        if not self.enable_last_min_proximity_close:
+            return
+        if self._last_min_sl_fired:
+            return
+        if (
+            not self.position
+            or self.window_open_price is None
+            or self.current_window_start_ms is None
+        ):
+            return
+        if self.position.market_slug.split("-")[-1] != str(self.current_window_start_ms // 1000):
+            return
+
+        now_ms = int(time.time() * 1000)
+        rel_sec = (now_ms - self.current_window_start_ms) / 1000.0
+        if rel_sec < 240 or rel_sec >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC):
+            return
+
+        aligned_ms = (now_ms // 1000) * 1000
+        btc_age_ms = aligned_ms - (event_ms or 0)
+        if btc_age_ms > self.MAX_BTC_AGE_MS:
+            return
+
+        open_price = self.window_open_price
+        direction = self.position.direction
+        threshold = self.last_min_proximity_threshold
+        if direction == "up":
+            triggered = btc_price <= open_price + threshold
+        elif direction == "down":
+            triggered = btc_price >= open_price - threshold
+        else:
+            return
+        if triggered:
+            diff = btc_price - open_price
+            self._last_min_sl_fired = True
+            logger.info(
+                "[事件驱动] 最后一分钟proximity止损: diff=%+.2f 阈值=%.2f direction=%s open=%.2f btc=%.2f rel_sec=%.1f",
+                diff, threshold, direction, open_price, btc_price, rel_sec,
+            )
+            self._force_close_position(reason="sl_last_min_proximity")
+
+    def _check_last_min_stop_loss_on_bid(self, best_bid: float, now_sec: float) -> None:
+        """Token bid 变化时的事件驱动 bid 急跌止损检查（在 _lock 内调用）。"""
+        if not self.enable_last_min_bid_drop_close:
+            return
+        if self._last_min_sl_fired:
+            return
+        if (
+            not self.position
+            or self.current_window_start_ms is None
+        ):
+            return
+        if self.position.market_slug.split("-")[-1] != str(self.current_window_start_ms // 1000):
+            return
+
+        rel_sec = (now_sec * 1000 - self.current_window_start_ms) / 1000.0
+        if rel_sec < self.last_min_bid_drop_start_sec or rel_sec >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC):
+            return
+
+        entry_price = self.position.entry_price
+        if entry_price <= 0:
+            return
+
+        current_ratio = best_bid / entry_price
+        if current_ratio < self.last_min_bid_drop_floor:
+            return
+
+        # 在回看窗口内找到 peak ratio
+        cutoff_sec = now_sec - self.last_min_bid_drop_lookback_sec
+        peak_ratio = 0.0
+        for ts, bid in self._bid_history:
+            if ts < cutoff_sec:
+                continue
+            if ts >= now_sec:
+                break
+            ratio = bid / entry_price
+            if ratio > peak_ratio:
+                peak_ratio = ratio
+
+        if peak_ratio <= 0:
+            return
+
+        drop = peak_ratio - current_ratio
+        if drop >= self.last_min_bid_drop_threshold:
+            self._last_min_sl_fired = True
+            logger.info(
+                "[事件驱动] Token bid急跌止损: bid=%.4f entry=%.4f ratio=%.3f peak_ratio=%.3f "
+                "drop=%.3f threshold=%.3f rel_sec=%.1f",
+                best_bid, entry_price, current_ratio, peak_ratio,
+                drop, self.last_min_bid_drop_threshold, rel_sec,
+            )
+            self._force_close_position(reason="sl_last_min_bid_drop")
+
     def _handle_last_min_proximity_close(self, rel_sec: float, btc_price: float, btc_age_ms: int) -> None:
         """最后一分钟持续监控：BTC 价格触及开盘价附近时平仓。"""
         if not self.enable_last_min_proximity_close:
@@ -1395,17 +1513,21 @@ class FiveMinuteUpDownTrader:
         self,
         best_bid: float,
     ) -> None:
+        now_sec = time.time()
         with self._lock:
             if not self.position:
                 return
             self.position.last_best_bid = best_bid
+
+            # 记录 bid 历史（用于急跌检测）
+            self._bid_history.append((now_sec, best_bid))
 
             # Once the window enters the expiry last-10-seconds phase,
             # only run expiry close policy and skip TP/SL checks.
             if (
                 self.current_window_start_ms is not None
                 and self.position.market_slug.split("-")[-1] == str(self.current_window_start_ms // 1000)
-                and int((time.time() * 1000 - self.current_window_start_ms) // 1000) >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC)
+                and int((now_sec * 1000 - self.current_window_start_ms) // 1000) >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC)
             ):
                 self._handle_minute5_expiry()
                 return
@@ -1434,6 +1556,10 @@ class FiveMinuteUpDownTrader:
                     self.position.take_profit_price,
                 )
                 self._force_close_position(reason="tp")
+                return
+
+            # 事件驱动：Token bid 变化时检查最后一分钟 bid 急跌止损
+            self._check_last_min_stop_loss_on_bid(best_bid, now_sec)
 
     def _on_polymarket_book(self, snapshot: Dict[str, Any]) -> None:
         asset_id = str(snapshot.get("asset_id") or "")

@@ -455,6 +455,56 @@ PARAM_REGISTRY: list[ParamDef] = [
         sig_key="lmpt",
     ),
 
+    # ==================== 最后一分钟 Token Bid 急跌止损 ====================
+    ParamDef(
+        key="last_min_bid_drop_close",
+        param_type="bool",
+        default=True,
+        description="最后一分钟Token bid急跌时平仓",
+        group=GRP_DIR_CONFIRM,
+        shell_var="ENABLE_LAST_MIN_BID_DROP_CLOSE",
+        sig_key="lmbd",
+        cli_flag="disable-last-min-bid-drop-close",
+        bool_inverted=True,
+        constructor_name="enable_last_min_bid_drop_close",
+    ),
+    ParamDef(
+        key="last_min_bid_drop_threshold",
+        param_type="float",
+        default=0.30,
+        description="Bid/entry比率跌幅阈值",
+        group=GRP_DIR_CONFIRM,
+        shell_var="LAST_MIN_BID_DROP_THRESHOLD",
+        sig_key="lmbdt",
+    ),
+    ParamDef(
+        key="last_min_bid_drop_lookback_sec",
+        param_type="float",
+        default=1.0,
+        description="Bid急跌回看秒数",
+        group=GRP_DIR_CONFIRM,
+        shell_var="LAST_MIN_BID_DROP_LOOKBACK_SEC",
+        sig_key="lmbdl",
+    ),
+    ParamDef(
+        key="last_min_bid_drop_start_sec",
+        param_type="float",
+        default=240.0,
+        description="Bid急跌检测启用时刻（窗口内秒数）",
+        group=GRP_DIR_CONFIRM,
+        shell_var="LAST_MIN_BID_DROP_START_SEC",
+        sig_key="lmbds",
+    ),
+    ParamDef(
+        key="last_min_bid_drop_floor",
+        param_type="float",
+        default=0.10,
+        description="Bid/entry比率下限（低于此不卖）",
+        group=GRP_DIR_CONFIRM,
+        shell_var="LAST_MIN_BID_DROP_FLOOR",
+        sig_key="lmbdf",
+    ),
+
     # ==================== 入场控制（末尾追加） ====================
     ParamDef(
         key="enable_db_tick_validation",

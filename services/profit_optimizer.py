@@ -545,6 +545,163 @@ def _build_rotation_opportunities(
     return rotation_opps[:5]
 
 
+def _build_swing_opportunities(
+    markets: list,
+    current_asset_price: float,
+    drift_daily: float,
+    sigma_daily: float,
+    days_left: float,
+    held_questions: set | None = None,
+    asset: str = "btc",
+) -> list:
+    """
+    波段交易机会分析：计算每个市场 token 对 BTC 短期波动的价格敏感度 (Delta)。
+
+    不同于 hold-to-expiry 的 Edge 分析，这里关注的是：
+    - BTC 涨/跌 1-3% 时，token 价格变动多少（Delta 杠杆）
+    - 哪些 token 在短期波动中提供最大的价差收益机会
+    """
+    if current_asset_price <= 0 or days_left <= 0:
+        return []
+
+    held_questions = held_questions or set()
+    opportunities = []
+
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        question = str(market.get("question") or "")
+        strike, direction = _extract_strike_and_direction(question)
+        yes_price, no_price = _parse_market_prices(market)
+
+        if strike is None or direction == "unknown" or yes_price is None or no_price is None:
+            continue
+        if current_asset_price <= 0 or strike <= 0:
+            continue
+
+        # 基准 barrier 概率
+        p_yes_base = _barrier_touch_prob(
+            current_asset_price, strike, direction, drift_daily, sigma_daily, days_left,
+        )
+
+        # BTC ±1% / ±3% 时的 token 理论价变化
+        deltas = {}
+        for move_pct in [-3, -1, 1, 3]:
+            scenario_price = current_asset_price * (1.0 + move_pct / 100.0)
+            p_yes_scenario = _barrier_touch_prob(
+                scenario_price, strike, direction, drift_daily, sigma_daily, days_left,
+            )
+            # Yes token 价格变化
+            yes_change = p_yes_scenario - p_yes_base
+            no_change = -yes_change
+
+            deltas[f"btc_{move_pct:+d}pct"] = {
+                "yes_price_change": round(yes_change, 4),
+                "no_price_change": round(no_change, 4),
+                "yes_new_price": round(p_yes_scenario, 4),
+                "no_new_price": round(1 - p_yes_scenario, 4),
+            }
+
+        # Delta 杠杆 = token 变化% / BTC 变化%
+        # 用 ±1% 来计算标准 delta
+        yes_delta_1pct = deltas["btc_+1pct"]["yes_price_change"]
+        no_delta_1pct = deltas["btc_+1pct"]["no_price_change"]
+
+        # Delta 杠杆 = token 收益率% / BTC 收益率%
+        # BTC +1% 时 token 收益率 = delta / price，除以 BTC 的 0.01 得杠杆倍数
+        yes_leverage = abs(yes_delta_1pct / yes_price) / 0.01 if yes_price > 0.01 else 0.0
+        no_leverage = abs(no_delta_1pct / no_price) / 0.01 if no_price > 0.01 else 0.0
+
+        # 波段评分: 杠杆归一化 × sqrt(剩余天数) × 流动性因子
+        # 便宜的 token 杠杆高但流动性差，用 token 价格做平衡
+        def _swing_score(leverage: float, token_price: float) -> float:
+            if token_price < 0.04 or token_price > 0.96:
+                liquidity_penalty = 0.5
+            elif token_price < 0.08 or token_price > 0.92:
+                liquidity_penalty = 0.75
+            else:
+                liquidity_penalty = 1.0
+            time_factor = min(sqrt(days_left) / sqrt(15), 1.5)
+            # 归一化杠杆: 10x 为基准
+            normalized_leverage = min(leverage / 10.0, 5.0)
+            return round(normalized_leverage * time_factor * liquidity_penalty, 3)
+
+        yes_score = _swing_score(yes_leverage, yes_price)
+        no_score = _swing_score(no_leverage, no_price)
+
+        # 确定哪边更适合波段
+        if yes_score >= no_score:
+            best_swing_side = "Yes"
+            best_leverage = yes_leverage
+            best_score = yes_score
+            best_token_price = yes_price
+        else:
+            best_swing_side = "No"
+            best_leverage = no_leverage
+            best_score = no_score
+            best_token_price = no_price
+
+        # 方向性提示：BTC 涨时买什么，跌时买什么
+        if direction == "above":
+            btc_up_buy = "Yes"
+            btc_down_buy = "No"
+        else:
+            btc_up_buy = "No"
+            btc_down_buy = "Yes"
+
+        is_held = (strike, direction) in held_questions
+
+        opportunities.append({
+            "question": question,
+            "strike": round(strike, 2),
+            "direction": direction,
+            "is_held": is_held,
+            "current_yes_price": round(yes_price, 4),
+            "current_no_price": round(no_price, 4),
+            "model_yes_prob": round(p_yes_base, 4),
+            "delta_matrix": deltas,
+            "yes_leverage_per_1pct": round(yes_leverage, 1),
+            "no_leverage_per_1pct": round(no_leverage, 1),
+            "best_swing_side": best_swing_side,
+            "best_swing_leverage": round(best_leverage, 1),
+            "swing_score": best_score,
+            "btc_up_action": f"买入 {btc_up_buy}",
+            "btc_down_action": f"买入 {btc_down_buy}",
+            "swing_note": _swing_note(direction, strike, current_asset_price, best_leverage, days_left),
+        })
+
+    opportunities.sort(key=lambda x: x.get("swing_score", 0), reverse=True)
+    return opportunities[:10]
+
+
+def _swing_note(direction: str, strike: float, current_price: float, leverage: float, days_left: float) -> str:
+    """生成简洁的波段策略提示。"""
+    distance_pct = abs(strike - current_price) / current_price * 100
+    if distance_pct < 3:
+        proximity = "极近"
+    elif distance_pct < 8:
+        proximity = "中等"
+    else:
+        proximity = "较远"
+
+    notes = []
+    if leverage >= 20:
+        notes.append(f"超高杠杆({leverage:.0f}x)")
+    elif leverage >= 10:
+        notes.append(f"高杠杆({leverage:.0f}x)")
+    elif leverage >= 5:
+        notes.append(f"中等杠杆({leverage:.0f}x)")
+
+    notes.append(f"距行权价{distance_pct:.1f}%({proximity})")
+
+    if days_left <= 5:
+        notes.append("临近到期Theta加速衰减")
+    elif days_left <= 10:
+        notes.append("注意时间衰减")
+
+    return "；".join(notes)
+
+
 def _build_portfolio_analysis(
     position_assessments: list,
     current_asset_price: float,
@@ -822,6 +979,18 @@ def build_profit_optimization_context(
     # --- Rotation opportunities ---
     rotation_opportunities = _build_rotation_opportunities(position_assessments, edges)
 
+    # --- Swing trading opportunities (波段交易机会) ---
+    held_questions = set()
+    for pa in position_assessments:
+        s = pa.get("strike")
+        d = pa.get("direction", "")
+        if s:
+            held_questions.add((s, d))
+    swing_opportunities = _build_swing_opportunities(
+        markets, current_price, drift_daily, sigma_daily, days_left,
+        held_questions=held_questions, asset=asset,
+    )
+
     # --- Portfolio-level analysis ---
     portfolio_analysis = _build_portfolio_analysis(
         position_assessments, current_price, balance,
@@ -859,6 +1028,7 @@ def build_profit_optimization_context(
         "theta_income": theta_income,
         "portfolio_analysis": portfolio_analysis,
         "rotation_opportunities": rotation_opportunities,
+        "swing_opportunities": swing_opportunities,
         "prediction_review": prediction_review,
         "top_edge_opportunities": top_edges,
         "all_edge_count": len(edges),
