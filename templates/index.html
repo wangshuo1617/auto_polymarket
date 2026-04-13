@@ -1227,6 +1227,9 @@
                         if (diag.window_open_btc_price != null) {
                             html += '<div class="col-sm-4 mb-1"><strong>窗口开盘价：</strong>$' + Number(diag.window_open_btc_price).toFixed(2) + '</div>';
                         }
+                        if (data.close_btc_price != null) {
+                            html += '<div class="col-sm-4 mb-1"><strong>300s收盘价：</strong>$' + Number(data.close_btc_price).toFixed(2) + '</div>';
+                        }
                         html += '</div>';
                     }
 
@@ -1235,7 +1238,12 @@
                     const chartOpenPrice = (diag && diag.window_open_btc_price != null)
                         ? diag.window_open_btc_price
                         : data.open_btc_price;
-                    html += '<h6 class="mb-2">BTC 价格变化（相对窗口开盘价' + (chartOpenPrice != null ? ' $' + Number(chartOpenPrice).toFixed(2) : '') + '）</h6>';
+                    const chartClosePrice = data.close_btc_price;
+                    let priceHeader = 'BTC 价格变化（相对窗口开盘价';
+                    if (chartOpenPrice != null) priceHeader += ' $' + Number(chartOpenPrice).toFixed(2);
+                    priceHeader += '）';
+                    if (chartClosePrice != null) priceHeader += '  收盘价 $' + Number(chartClosePrice).toFixed(2);
+                    html += '<h6 class="mb-2">' + priceHeader + '</h6>';
                     // 图例
                     html += '<div class="d-flex flex-wrap gap-3 mb-2 small text-muted">';
                     _TAIL_GUARD_CHECKPOINTS.forEach(cp => {

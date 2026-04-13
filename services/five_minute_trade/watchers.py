@@ -422,6 +422,141 @@ class BinanceKline1mWatcher:
             self.ws = None
 
 
+class BinanceBTCRealtimeWatcher:
+    """订阅 BTCUSDT bookTicker + aggTrade，用于毫秒级价格前哨与成交流分析。"""
+
+    BASE_URL = "wss://stream.binance.com:9443"
+
+    def __init__(
+        self,
+        symbol: str = "btcusdt",
+        price_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        trade_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
+        self.symbol = symbol.lower()
+        self.price_callback = price_callback
+        self.trade_callback = trade_callback
+        self.ws: Optional[WebSocketApp] = None
+        self._thread: Optional[threading.Thread] = None
+        self.running = False
+        self.last_mid_price: Optional[float] = None
+        self.last_update_time: Optional[float] = None
+
+    def _on_message(self, ws: WebSocketApp, message: str) -> None:
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            return
+
+        try:
+            if isinstance(data, dict) and "stream" in data and "data" in data:
+                stream_name = data["stream"]
+                payload = data["data"]
+            else:
+                stream_name = ""
+                payload = data
+
+            if "@bookTicker" in stream_name or (
+                "b" in payload and "a" in payload and "s" in payload and "e" not in payload
+            ):
+                self._handle_book_ticker(payload)
+            elif "@aggTrade" in stream_name or payload.get("e") == "aggTrade":
+                self._handle_agg_trade(payload)
+        except Exception as e:
+            logger.error("处理 Binance 实时消息异常: %s", e)
+
+    def _handle_book_ticker(self, data: Dict) -> None:
+        try:
+            bid = float(data.get("b", 0))
+            ask = float(data.get("a", 0))
+            if bid <= 0 or ask <= 0:
+                return
+            mid = (bid + ask) / 2.0
+            self.last_mid_price = mid
+            self.last_update_time = time.time()
+
+            if self.price_callback:
+                self.price_callback({
+                    "mid_price": mid,
+                    "best_bid": bid,
+                    "best_ask": ask,
+                    "best_bid_qty": float(data.get("B", 0)),
+                    "best_ask_qty": float(data.get("A", 0)),
+                    "timestamp": self.last_update_time,
+                })
+        except Exception as e:
+            logger.error("处理 Binance bookTicker 异常: %s", e)
+
+    def _handle_agg_trade(self, data: Dict) -> None:
+        try:
+            price = float(data.get("p", 0))
+            qty = float(data.get("q", 0))
+            is_seller = bool(data.get("m", False))  # m=True → buyer is maker → seller initiated
+            event_time = int(data.get("E", 0))
+
+            if self.trade_callback:
+                self.trade_callback({
+                    "price": price,
+                    "qty": qty,
+                    "is_sell": is_seller,
+                    "event_time_ms": event_time,
+                    "timestamp": time.time(),
+                })
+        except Exception as e:
+            logger.error("处理 Binance aggTrade 异常: %s", e)
+
+    def _on_error(self, ws: WebSocketApp, error: Exception) -> None:
+        logger.error("Binance 实时 WS 错误: %s", error)
+
+    def _on_close(self, ws: WebSocketApp, code: Optional[int], msg: Optional[str]) -> None:
+        logger.warning("Binance 实时 WS 关闭: code=%s msg=%s", code, msg)
+        self.ws = None
+        if self.running:
+            time.sleep(3)
+            self._start_ws()
+
+    def _on_open(self, ws: WebSocketApp) -> None:
+        logger.info("Binance 实时 WS 已连接 (bookTicker + aggTrade)")
+
+    def _start_ws(self) -> None:
+        streams = f"{self.symbol}@bookTicker/{self.symbol}@aggTrade"
+        url = f"{self.BASE_URL}/stream?streams={streams}"
+        logger.info("连接 Binance 实时 WS: %s", url)
+        self.ws = WebSocketApp(
+            url,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+            on_open=self._on_open,
+        )
+        self.ws.run_forever(ping_interval=20, ping_timeout=10)
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self.running = True
+
+        def _run() -> None:
+            while self.running:
+                try:
+                    self._start_ws()
+                except Exception as e:
+                    logger.error("Binance 实时 WS 异常: %s", e)
+                    time.sleep(5)
+
+        self._thread = threading.Thread(target=_run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+
+
 class PolymarketAssetPriceWatcher:
     """
     订阅单个 token_id 的市场价格。

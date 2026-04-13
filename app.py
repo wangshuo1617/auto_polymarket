@@ -1141,19 +1141,19 @@ def api_5m_trade_window_detail():
                 winning_direction = winning_map.get(wms)
 
             # 获取BTC秒级价格走势
+            window_start_sec = int(market_slug.split("-")[-1])
+            # 包含 rel=300（收盘价）：该秒的 market_slug 已属于下一窗口，需按 ts_sec 补取
             cur.execute(
                 """
                 SELECT ts_sec, btc_price
                 FROM btc_poly_1s_ticks
-                WHERE market_slug = %s
+                WHERE (market_slug = %s OR ts_sec = %s)
                   AND btc_price IS NOT NULL
                 ORDER BY ts_sec ASC
                 """,
-                (market_slug,),
+                (market_slug, window_start_sec + 300),
             )
             price_rows = cur.fetchall()
-
-            window_start_sec = int(market_slug.split("-")[-1])
             prices = []
             for pr in price_rows:
                 prices.append({
@@ -1161,11 +1161,18 @@ def api_5m_trade_window_detail():
                     "btc_price": float(pr["btc_price"]),
                 })
 
+            close_btc_price = None
+            for p in reversed(prices):
+                if p["rel_sec"] == 300:
+                    close_btc_price = p["btc_price"]
+                    break
+
             result = {
                 "market_slug": market_slug,
                 "winning_direction": winning_direction,
                 "prices": prices,
                 "open_btc_price": prices[0]["btc_price"] if prices else None,
+                "close_btc_price": close_btc_price,
             }
 
             if window:

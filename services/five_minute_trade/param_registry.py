@@ -18,6 +18,7 @@ GRP_TPSL = "TPSL 平仓控制"
 GRP_RISK = "风险仓位管理"
 GRP_DIR_CONFIRM = "最后一分钟接近度风控"
 GRP_SYSTEM = "系统"
+GRP_BINANCE = "binance止损控制"
 
 # 分组显示顺序
 GROUP_ORDER: list[str] = [
@@ -25,6 +26,7 @@ GROUP_ORDER: list[str] = [
     GRP_TPSL,
     GRP_RISK,
     GRP_DIR_CONFIRM,
+    GRP_BINANCE,
     GRP_SYSTEM,
 ]
 
@@ -503,6 +505,86 @@ PARAM_REGISTRY: list[ParamDef] = [
         group=GRP_DIR_CONFIRM,
         shell_var="LAST_MIN_BID_DROP_FLOOR",
         sig_key="lmbdf",
+    ),
+
+    # ==================== Binance 前哨止损 ====================
+    ParamDef(
+        key="binance_early_sl",
+        param_type="bool",
+        default=True,
+        description="启用Binance实时价格前哨止损",
+        group=GRP_BINANCE,
+        shell_var="ENABLE_BINANCE_EARLY_SL",
+        sig_key="besl",
+        cli_flag="disable-binance-early-sl",
+        bool_inverted=True,
+        constructor_name="enable_binance_early_sl",
+    ),
+    ParamDef(
+        key="binance_sl_start_sec",
+        param_type="float",
+        default=240.0,
+        description="Binance前哨止损启用时刻（窗口内秒数）",
+        group=GRP_BINANCE,
+        shell_var="BINANCE_SL_START_SEC",
+        sig_key="bsls",
+    ),
+    ParamDef(
+        key="binance_sl_proximity",
+        param_type="float",
+        default=3.0,
+        description="Binance价格距开盘价阈值（$）",
+        group=GRP_BINANCE,
+        shell_var="BINANCE_SL_PROXIMITY",
+        sig_key="bslp",
+    ),
+    ParamDef(
+        key="binance_trade_imbalance_sl",
+        param_type="bool",
+        default=True,
+        description="启用Binance成交流不平衡止损",
+        group=GRP_BINANCE,
+        shell_var="ENABLE_BINANCE_TRADE_IMBALANCE_SL",
+        sig_key="bti",
+        cli_flag="disable-binance-trade-imbalance-sl",
+        bool_inverted=True,
+        constructor_name="enable_binance_trade_imbalance_sl",
+    ),
+    ParamDef(
+        key="binance_sl_imbalance_ratio",
+        param_type="float",
+        default=0.80,
+        description="成交流卖方占比阈值（0-1）",
+        group=GRP_BINANCE,
+        shell_var="BINANCE_SL_IMBALANCE_RATIO",
+        sig_key="bslir",
+    ),
+    ParamDef(
+        key="binance_sl_imbalance_start_sec",
+        param_type="float",
+        default=270.0,
+        description="成交流不平衡止损启用时刻（窗口内秒数）",
+        group=GRP_BINANCE,
+        shell_var="BINANCE_SL_IMBALANCE_START_SEC",
+        sig_key="bslis",
+    ),
+    ParamDef(
+        key="binance_sl_imbalance_window_sec",
+        param_type="float",
+        default=3.0,
+        description="成交流不平衡计算回看秒数",
+        group=GRP_BINANCE,
+        shell_var="BINANCE_SL_IMBALANCE_WINDOW_SEC",
+        sig_key="bsliw",
+    ),
+    ParamDef(
+        key="binance_sl_imbalance_min_proximity",
+        param_type="float",
+        default=15.0,
+        description="成交流止损需Binance价格距开盘<此值($)",
+        group=GRP_BINANCE,
+        shell_var="BINANCE_SL_IMBALANCE_MIN_PROXIMITY",
+        sig_key="bslim",
     ),
 
     # ==================== 入场控制（末尾追加） ====================

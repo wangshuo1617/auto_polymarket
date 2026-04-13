@@ -66,6 +66,16 @@ LAST_MIN_BID_DROP_LOOKBACK_SEC="${LAST_MIN_BID_DROP_LOOKBACK_SEC:-1.0}"         
 LAST_MIN_BID_DROP_START_SEC="${LAST_MIN_BID_DROP_START_SEC:-240.0}"                # 急跌检测启用时刻（窗口内秒数）
 LAST_MIN_BID_DROP_FLOOR="${LAST_MIN_BID_DROP_FLOOR:-0.10}"                         # Bid/entry 比率下限（低于此不卖）
 
+# Binance 前哨止损
+ENABLE_BINANCE_EARLY_SL="${ENABLE_BINANCE_EARLY_SL:-true}"                        # 启用Binance实时价格前哨止损
+BINANCE_SL_START_SEC="${BINANCE_SL_START_SEC:-240.0}"                             # Binance前哨止损启用时刻（窗口内秒数）
+BINANCE_SL_PROXIMITY="${BINANCE_SL_PROXIMITY:-3.0}"                               # Binance价格距开盘价阈值（$）
+ENABLE_BINANCE_TRADE_IMBALANCE_SL="${ENABLE_BINANCE_TRADE_IMBALANCE_SL:-true}"    # 启用Binance成交流不平衡止损
+BINANCE_SL_IMBALANCE_RATIO="${BINANCE_SL_IMBALANCE_RATIO:-0.80}"                  # 成交流卖方占比阈值（0-1）
+BINANCE_SL_IMBALANCE_START_SEC="${BINANCE_SL_IMBALANCE_START_SEC:-270.0}"         # 成交流不平衡止损启用时刻（窗口内秒数）
+BINANCE_SL_IMBALANCE_WINDOW_SEC="${BINANCE_SL_IMBALANCE_WINDOW_SEC:-3.0}"         # 成交流不平衡计算回看秒数
+BINANCE_SL_IMBALANCE_MIN_PROXIMITY="${BINANCE_SL_IMBALANCE_MIN_PROXIMITY:-15.0}"  # 成交流止损需价格距开盘<此值($)
+
 # 系统控制
 REPORT_INTERVAL_SEC="${REPORT_INTERVAL_SEC:-${6:-3600}}"      # 报告输出间隔（秒）
 ENABLE_DB_TICK_VALIDATION="${ENABLE_DB_TICK_VALIDATION:-${47:-true}}"  # 是否启用DB tick交叉验证
@@ -257,6 +267,31 @@ if ! [[ "$LAST_MIN_BID_DROP_FLOOR" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 1
 fi
 
+if [ "$ENABLE_BINANCE_EARLY_SL" != "true" ] && [ "$ENABLE_BINANCE_EARLY_SL" != "false" ]; then
+  echo "❌ enable_binance_early_sl 必须是 true 或 false"; print_usage; exit 1
+fi
+if ! [[ "$BINANCE_SL_START_SEC" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ binance_sl_start_sec 必须是数字"; print_usage; exit 1
+fi
+if ! [[ "$BINANCE_SL_PROXIMITY" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ binance_sl_proximity 必须是数字"; print_usage; exit 1
+fi
+if [ "$ENABLE_BINANCE_TRADE_IMBALANCE_SL" != "true" ] && [ "$ENABLE_BINANCE_TRADE_IMBALANCE_SL" != "false" ]; then
+  echo "❌ enable_binance_trade_imbalance_sl 必须是 true 或 false"; print_usage; exit 1
+fi
+if ! [[ "$BINANCE_SL_IMBALANCE_RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ binance_sl_imbalance_ratio 必须是数字"; print_usage; exit 1
+fi
+if ! [[ "$BINANCE_SL_IMBALANCE_START_SEC" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ binance_sl_imbalance_start_sec 必须是数字"; print_usage; exit 1
+fi
+if ! [[ "$BINANCE_SL_IMBALANCE_WINDOW_SEC" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ binance_sl_imbalance_window_sec 必须是数字"; print_usage; exit 1
+fi
+if ! [[ "$BINANCE_SL_IMBALANCE_MIN_PROXIMITY" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ binance_sl_imbalance_min_proximity 必须是数字"; print_usage; exit 1
+fi
+
 if [ "$ENABLE_DB_TICK_VALIDATION" != "true" ] && [ "$ENABLE_DB_TICK_VALIDATION" != "false" ]; then
   echo "❌ enable_db_tick_validation 必须是 true 或 false"
   print_usage
@@ -332,6 +367,8 @@ echo "risk_diff_boost: threshold=$RISK_DIFF_BOOST_THRESHOLD multiplier=$RISK_DIF
 echo "cross_borderline: diff_multiplier=$CROSS_BORDERLINE_DIFF_MULTIPLIER"
 echo "最后一分钟接近度风控: enable=$ENABLE_LAST_MIN_PROXIMITY_CLOSE threshold=$LAST_MIN_PROXIMITY_THRESHOLD"
 echo "Token bid急跌止损: enable=$ENABLE_LAST_MIN_BID_DROP_CLOSE threshold=$LAST_MIN_BID_DROP_THRESHOLD lookback=${LAST_MIN_BID_DROP_LOOKBACK_SEC}s start=${LAST_MIN_BID_DROP_START_SEC}s floor=$LAST_MIN_BID_DROP_FLOOR"
+echo "Binance前哨止损: enable=$ENABLE_BINANCE_EARLY_SL proximity=\$${BINANCE_SL_PROXIMITY} start=${BINANCE_SL_START_SEC}s"
+echo "Binance成交流止损: enable=$ENABLE_BINANCE_TRADE_IMBALANCE_SL ratio=$BINANCE_SL_IMBALANCE_RATIO window=${BINANCE_SL_IMBALANCE_WINDOW_SEC}s start=${BINANCE_SL_IMBALANCE_START_SEC}s min_proximity=\$${BINANCE_SL_IMBALANCE_MIN_PROXIMITY}"
 echo "DB tick交叉验证: enable=$ENABLE_DB_TICK_VALIDATION"
 echo "数据库: PG_DSN 环境变量"
 echo "=========================================="
@@ -372,6 +409,12 @@ _build_cmd() {
     --last-min-bid-drop-lookback-sec "$LAST_MIN_BID_DROP_LOOKBACK_SEC"
     --last-min-bid-drop-start-sec "$LAST_MIN_BID_DROP_START_SEC"
     --last-min-bid-drop-floor "$LAST_MIN_BID_DROP_FLOOR"
+    --binance-sl-start-sec "$BINANCE_SL_START_SEC"
+    --binance-sl-proximity "$BINANCE_SL_PROXIMITY"
+    --binance-sl-imbalance-ratio "$BINANCE_SL_IMBALANCE_RATIO"
+    --binance-sl-imbalance-start-sec "$BINANCE_SL_IMBALANCE_START_SEC"
+    --binance-sl-imbalance-window-sec "$BINANCE_SL_IMBALANCE_WINDOW_SEC"
+    --binance-sl-imbalance-min-proximity "$BINANCE_SL_IMBALANCE_MIN_PROXIMITY"
   )
 
   CMD+=(--minute-consistency "$MINUTE_CONSISTENCY")
@@ -390,6 +433,14 @@ _build_cmd() {
 
   if [ "$ENABLE_LAST_MIN_BID_DROP_CLOSE" = "false" ]; then
     CMD+=(--disable-last-min-bid-drop-close)
+  fi
+
+  if [ "$ENABLE_BINANCE_EARLY_SL" = "false" ]; then
+    CMD+=(--disable-binance-early-sl)
+  fi
+
+  if [ "$ENABLE_BINANCE_TRADE_IMBALANCE_SL" = "false" ]; then
+    CMD+=(--disable-binance-trade-imbalance-sl)
   fi
 
   if [ "$ENABLE_DB_TICK_VALIDATION" = "false" ]; then

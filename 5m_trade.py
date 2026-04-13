@@ -61,6 +61,7 @@ from services.five_minute_trade.param_registry import (
     build_strategy_signature,
 )
 from services.five_minute_trade.watchers import (
+    BinanceBTCRealtimeWatcher,
     ChainlinkBTCPriceWatcher,
     PolymarketAssetPriceWatcher,
 )
@@ -153,6 +154,14 @@ class FiveMinuteUpDownTrader:
         last_min_bid_drop_lookback_sec: float = 1.0,
         last_min_bid_drop_start_sec: float = 240.0,
         last_min_bid_drop_floor: float = 0.10,
+        enable_binance_early_sl: bool = True,
+        binance_sl_start_sec: float = 240.0,
+        binance_sl_proximity: float = 3.0,
+        enable_binance_trade_imbalance_sl: bool = True,
+        binance_sl_imbalance_ratio: float = 0.80,
+        binance_sl_imbalance_start_sec: float = 270.0,
+        binance_sl_imbalance_window_sec: float = 3.0,
+        binance_sl_imbalance_min_proximity: float = 15.0,
         enable_db_tick_validation: bool = True,
     ) -> None:
         self.stake_usd = stake_usd
@@ -214,9 +223,23 @@ class FiveMinuteUpDownTrader:
         self.last_min_bid_drop_lookback_sec = float(last_min_bid_drop_lookback_sec)
         self.last_min_bid_drop_start_sec = float(last_min_bid_drop_start_sec)
         self.last_min_bid_drop_floor = float(last_min_bid_drop_floor)
+        self.enable_binance_early_sl = bool(enable_binance_early_sl)
+        self.binance_sl_start_sec = float(binance_sl_start_sec)
+        self.binance_sl_proximity = float(binance_sl_proximity)
+        self.enable_binance_trade_imbalance_sl = bool(enable_binance_trade_imbalance_sl)
+        self.binance_sl_imbalance_ratio = float(binance_sl_imbalance_ratio)
+        self.binance_sl_imbalance_start_sec = float(binance_sl_imbalance_start_sec)
+        self.binance_sl_imbalance_window_sec = float(binance_sl_imbalance_window_sec)
+        self.binance_sl_imbalance_min_proximity = float(binance_sl_imbalance_min_proximity)
 
         self._lock = threading.RLock()
         self._price_watcher = ChainlinkBTCPriceWatcher(callback=self._on_price_update)
+        self._binance_watcher: Optional[BinanceBTCRealtimeWatcher] = None
+        if self.enable_binance_early_sl or self.enable_binance_trade_imbalance_sl:
+            self._binance_watcher = BinanceBTCRealtimeWatcher(
+                price_callback=self._on_binance_price,
+                trade_callback=self._on_binance_trade,
+            )
         self._poly_watcher: Optional[PolymarketAssetPriceWatcher] = None
         self._window_book_watcher: Optional[PolymarketAssetPriceWatcher] = None
         self._clock_thread: Optional[threading.Thread] = None
@@ -247,6 +270,10 @@ class FiveMinuteUpDownTrader:
         # 最后一分钟 bid 急跌检测用的环形缓冲区: (timestamp_sec, bid)
         self._bid_history: deque[tuple[float, float]] = deque(maxlen=200)
         self._last_min_sl_fired: bool = False
+
+        # Binance 前哨数据
+        self._binance_mid_price: Optional[float] = None
+        self._binance_trades: deque[tuple[float, float, bool]] = deque(maxlen=5000)  # (ts, qty, is_sell)
 
         self._running = False
         self._report_thread: Optional[threading.Thread] = None
@@ -605,6 +632,8 @@ class FiveMinuteUpDownTrader:
         ensure_http_keepalive(interval_sec=20)
         self._running = True
         self._price_watcher.start()
+        if self._binance_watcher:
+            self._binance_watcher.start()
         self._clock_thread = threading.Thread(target=self._clock_loop, daemon=True)
         self._clock_thread.start()
         self._report_thread = threading.Thread(
@@ -616,6 +645,9 @@ class FiveMinuteUpDownTrader:
         logger.info("停止 FiveMinuteUpDownTrader")
         self._running = False
         self._price_watcher.stop()
+        if self._binance_watcher:
+            self._binance_watcher.stop()
+            self._binance_watcher = None
         if self._window_book_watcher:
             self._window_book_watcher.stop()
             self._window_book_watcher = None
@@ -802,6 +834,7 @@ class FiveMinuteUpDownTrader:
                 self._minute4_recorded = False
                 self._bid_history.clear()
                 self._last_min_sl_fired = False
+                self._binance_trades.clear()
                 slug_ts = window_start_ms // 1000
                 self.current_market_slug = f"btc-updown-5m-{slug_ts}"
                 try:
@@ -1279,7 +1312,7 @@ class FiveMinuteUpDownTrader:
 
         now_ms = int(time.time() * 1000)
         rel_sec = (now_ms - self.current_window_start_ms) / 1000.0
-        if rel_sec < 240 or rel_sec >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC):
+        if rel_sec < 240:
             return
 
         aligned_ms = (now_ms // 1000) * 1000
@@ -1320,7 +1353,7 @@ class FiveMinuteUpDownTrader:
             return
 
         rel_sec = (now_sec * 1000 - self.current_window_start_ms) / 1000.0
-        if rel_sec < self.last_min_bid_drop_start_sec or rel_sec >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC):
+        if rel_sec < self.last_min_bid_drop_start_sec:
             return
 
         entry_price = self.position.entry_price
@@ -1356,6 +1389,135 @@ class FiveMinuteUpDownTrader:
                 drop, self.last_min_bid_drop_threshold, rel_sec,
             )
             self._force_close_position(reason="sl_last_min_bid_drop")
+
+    def _on_binance_price(self, data: Dict[str, Any]) -> None:
+        """Binance bookTicker 回调：更新中间价并检查前哨止损。"""
+        mid_price = data.get("mid_price")
+        if mid_price is None:
+            return
+        with self._lock:
+            self._binance_mid_price = mid_price
+            if not self.enable_binance_early_sl:
+                return
+            self._check_binance_proximity_sl(mid_price)
+
+    def _on_binance_trade(self, data: Dict[str, Any]) -> None:
+        """Binance aggTrade 回调：记录成交并检查成交流不平衡止损。"""
+        ts = data.get("timestamp", time.time())
+        qty = data.get("qty", 0.0)
+        is_sell = data.get("is_sell", False)
+        with self._lock:
+            self._binance_trades.append((ts, qty, is_sell))
+            if not self.enable_binance_trade_imbalance_sl:
+                return
+            self._check_binance_imbalance_sl(ts)
+
+    def _check_binance_proximity_sl(self, binance_price: float) -> None:
+        """Binance 实时价格前哨止损（在 _lock 内调用）。"""
+        if self._last_min_sl_fired:
+            return
+        if (
+            not self.position
+            or self.window_open_price is None
+            or self.current_window_start_ms is None
+        ):
+            return
+        if self.position.market_slug.split("-")[-1] != str(self.current_window_start_ms // 1000):
+            return
+
+        now_ms = int(time.time() * 1000)
+        rel_sec = (now_ms - self.current_window_start_ms) / 1000.0
+        if rel_sec < self.binance_sl_start_sec:
+            return
+
+        open_price = self.window_open_price
+        direction = self.position.direction
+        threshold = self.binance_sl_proximity
+
+        if direction == "up":
+            triggered = binance_price <= open_price + threshold
+        elif direction == "down":
+            triggered = binance_price >= open_price - threshold
+        else:
+            return
+
+        if triggered:
+            diff = binance_price - open_price
+            self._last_min_sl_fired = True
+            logger.info(
+                "[Binance前哨] proximity止损: binance=%.2f open=%.2f diff=%+.2f "
+                "threshold=%.2f direction=%s rel_sec=%.1f",
+                binance_price, open_price, diff, threshold, direction, rel_sec,
+            )
+            self._force_close_position(reason="sl_binance_proximity")
+
+    def _check_binance_imbalance_sl(self, now_sec: float) -> None:
+        """Binance 成交流不平衡止损（在 _lock 内调用）。"""
+        if self._last_min_sl_fired:
+            return
+        if (
+            not self.position
+            or self.window_open_price is None
+            or self.current_window_start_ms is None
+        ):
+            return
+        if self.position.market_slug.split("-")[-1] != str(self.current_window_start_ms // 1000):
+            return
+
+        now_ms = int(now_sec * 1000)
+        rel_sec = (now_ms - self.current_window_start_ms) / 1000.0
+        if rel_sec < self.binance_sl_imbalance_start_sec:
+            return
+
+        # 成交流需配合价格条件：Binance 价格距开盘不能太远
+        binance_price = self._binance_mid_price
+        if binance_price is None:
+            return
+        open_price = self.window_open_price
+        direction = self.position.direction
+
+        if direction == "up":
+            price_gap = binance_price - open_price
+        elif direction == "down":
+            price_gap = open_price - binance_price
+        else:
+            return
+
+        if price_gap > self.binance_sl_imbalance_min_proximity:
+            return
+
+        # 计算回看窗口内的卖方成交量占比
+        cutoff = now_sec - self.binance_sl_imbalance_window_sec
+        sell_vol = 0.0
+        buy_vol = 0.0
+        for ts, qty, is_sell in self._binance_trades:
+            if ts < cutoff:
+                continue
+            if is_sell:
+                sell_vol += qty
+            else:
+                buy_vol += qty
+        total_vol = sell_vol + buy_vol
+        if total_vol <= 0:
+            return
+
+        # 根据持仓方向判断不利的成交方向
+        if direction == "up":
+            adverse_ratio = sell_vol / total_vol
+        else:
+            adverse_ratio = buy_vol / total_vol
+
+        if adverse_ratio >= self.binance_sl_imbalance_ratio:
+            self._last_min_sl_fired = True
+            logger.info(
+                "[Binance前哨] 成交流不平衡止损: adverse_ratio=%.2f threshold=%.2f "
+                "sell_vol=%.4f buy_vol=%.4f binance=%.2f open=%.2f gap=%.2f "
+                "direction=%s rel_sec=%.1f",
+                adverse_ratio, self.binance_sl_imbalance_ratio,
+                sell_vol, buy_vol, binance_price, open_price, price_gap,
+                direction, rel_sec,
+            )
+            self._force_close_position(reason="sl_binance_trade_imbalance")
 
     def _handle_last_min_proximity_close(self, rel_sec: float, btc_price: float, btc_age_ms: int) -> None:
         """最后一分钟持续监控：BTC 价格触及开盘价附近时平仓。"""
@@ -1530,6 +1692,9 @@ class FiveMinuteUpDownTrader:
                 and int((now_sec * 1000 - self.current_window_start_ms) // 1000) >= (300 - self.EXPIRY_BEFORE_CLOSE_SEC)
             ):
                 self._handle_minute5_expiry()
+                # 尾盘止损仍然生效：expiry 未平仓时继续检查 bid 急跌
+                if self.position:
+                    self._check_last_min_stop_loss_on_bid(best_bid, now_sec)
                 return
 
             if best_bid <= self.position.stop_loss_price:
