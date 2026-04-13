@@ -1189,6 +1189,9 @@ def api_5m_trade_window_detail():
                     if window["pnl"] is not None
                     else None
                 )
+                result["exit_time"] = (
+                    str(window["exit_time"]) if window["exit_time"] is not None else None
+                )
                 # 入场诊断信息
                 raw_diag = window.get("entry_diagnostics")
                 if raw_diag is not None:
@@ -1216,6 +1219,15 @@ def api_5m_trade_window_detail():
                 if buy_dt.tzinfo is None:
                     buy_dt = buy_dt.replace(tzinfo=_tz.utc)
                 result["entry_rel_sec"] = int(buy_dt.timestamp()) - window_start_sec
+
+            # 计算出场相对秒数
+            if window and window["exit_time"] is not None:
+                from datetime import datetime as _dt2, timezone as _tz2
+                exit_raw = str(window["exit_time"])
+                exit_dt = _dt2.fromisoformat(exit_raw)
+                if exit_dt.tzinfo is None:
+                    exit_dt = exit_dt.replace(tzinfo=_tz2.utc)
+                result["exit_rel_sec"] = round(exit_dt.timestamp() - window_start_sec, 1)
 
             return jsonify(result)
     except Exception as e:

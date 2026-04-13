@@ -1053,15 +1053,9 @@
             'market_settle_breakeven': '市场结算（持平）',
         };
 
-        const _TAIL_GUARD_CHECKPOINTS = [
-            { sec: 240, label: '4m方向检查', color: '#6f42c1' },
-            { sec: 285, label: '方向确认', color: '#0dcaf0' },
-            { sec: 290, label: '到期处理', color: '#ffc107' },
-            { sec: 295, label: '反向风控', color: '#fd7e14' },
-            { sec: 298, label: '位置风控', color: '#dc3545' },
-        ];
+        const _TAIL_GUARD_CHECKPOINTS = [];
 
-        function _drawBtcDiffChart(prices, openPrice) {
+        function _drawBtcDiffChart(prices, openPrice, exitRelSec) {
             if (!Array.isArray(prices) || prices.length < 2) {
                 return '<div class="text-muted p-3">暂无秒级BTC价格数据</div>';
             }
@@ -1098,24 +1092,31 @@
             const zeroY = toY(0).toFixed(1);
             const zeroInRange = minD <= 0 && maxD >= 0;
 
-            // 尾盘风控检查点竖线
+            // 每5秒竖线网格
             let checkpointLines = '';
             let checkpointLabels = '';
-            _TAIL_GUARD_CHECKPOINTS.forEach(cp => {
-                if (cp.sec >= minSec && cp.sec <= maxSec) {
-                    const cx = toX(cp.sec).toFixed(1);
-                    checkpointLines += `<line x1="${cx}" y1="${padT}" x2="${cx}" y2="${padT + plotH}" stroke="${cp.color}" stroke-width="1" stroke-dasharray="4,3" opacity="0.7" />`;
-                    checkpointLabels += `<text x="${cx}" y="${H - 4}" font-size="10" fill="${cp.color}" text-anchor="middle">${cp.label}</text>`;
+            for (let s = Math.ceil(minSec / 5) * 5; s <= maxSec; s += 5) {
+                if (s >= minSec && s <= maxSec) {
+                    const cx = toX(s).toFixed(1);
+                    const isMajor = s % 15 === 0;
+                    const sw = isMajor ? '1' : '0.7';
+                    const clr = isMajor ? '#adb5bd' : '#ced4da';
+                    checkpointLines += `<line x1="${cx}" y1="${padT}" x2="${cx}" y2="${padT + plotH}" stroke="${clr}" stroke-width="${sw}" stroke-dasharray="3,3" />`;
+                    if (isMajor) {
+                        checkpointLabels += `<text x="${cx}" y="${padT + plotH + 18}" font-size="10" fill="#6c757d" text-anchor="middle">${s}s</text>`;
+                    }
                 }
-            });
+            }
 
-            // X轴刻度 (每60秒)
+            // X轴刻度 (每60秒，粗刻度 — 跳过已被15s网格标注的)
             let xTicks = '';
             for (let s = 0; s <= maxSec; s += 60) {
                 if (s >= minSec && s <= maxSec) {
                     const tx = toX(s).toFixed(1);
                     xTicks += `<line x1="${tx}" y1="${padT + plotH}" x2="${tx}" y2="${padT + plotH + 5}" stroke="#adb5bd" stroke-width="1" />`;
-                    xTicks += `<text x="${tx}" y="${padT + plotH + 18}" font-size="11" fill="#6c757d" text-anchor="middle">${s}s</text>`;
+                    if (s % 15 !== 0) {
+                        xTicks += `<text x="${tx}" y="${padT + plotH + 18}" font-size="11" fill="#6c757d" text-anchor="middle">${s}s</text>`;
+                    }
                 }
             }
 
@@ -1129,11 +1130,20 @@
                 yTicks += `<text x="${padL - 8}" y="${Number(yy) + 4}" font-size="11" fill="#6c757d" text-anchor="end">${val >= 0 ? '+' : ''}${val.toFixed(1)}</text>`;
             }
 
+            // 出场时间竖线
+            let exitLine = '';
+            if (exitRelSec != null && exitRelSec >= minSec && exitRelSec <= maxSec) {
+                const ex = toX(exitRelSec).toFixed(1);
+                exitLine = `<line x1="${ex}" y1="${padT}" x2="${ex}" y2="${padT + plotH}" stroke="#e83e8c" stroke-width="1.5" stroke-dasharray="5,3" opacity="0.85" />`;
+                exitLine += `<text x="${ex}" y="${padT - 6}" font-size="10" fill="#e83e8c" text-anchor="middle">出场 ${exitRelSec}s</text>`;
+            }
+
             return `
                 <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;max-height:340px;display:block;">
                     ${yTicks}
                     ${zeroInRange ? `<line x1="${padL}" y1="${zeroY}" x2="${padL + plotW}" y2="${zeroY}" stroke="#adb5bd" stroke-width="1" stroke-dasharray="6,3" />` : ''}
                     ${checkpointLines}
+                    ${exitLine}
                     <polyline fill="none" stroke="#0d6efd" stroke-width="2" stroke-linejoin="round" points="${xy}" />
                     ${xTicks}
                     ${checkpointLabels}
@@ -1166,8 +1176,13 @@
                     html += '<div class="col-sm-6"><strong>最终结算方向：</strong><span class="badge ' + (winDirLabel === 'UP' ? 'bg-success' : (winDirLabel === 'DOWN' ? 'bg-danger' : 'bg-secondary')) + '">' + winDirLabel + '</span></div>';
                     html += '</div>';
                     html += '<div class="row mb-3">';
-                    html += '<div class="col-sm-6"><strong>出场原因：</strong>' + _escapeHtml(exitReasonLabel) + '</div>';
-                    html += '<div class="col-sm-6"><strong>结果：</strong>' + _escapeHtml(statusLabel) + (data.pnl != null ? ' (' + (data.pnl >= 0 ? '+' : '') + _fmt4(data.pnl) + ' USDC)' : '') + '</div>';
+                    html += '<div class="col-sm-4"><strong>出场原因：</strong>' + _escapeHtml(exitReasonLabel) + '</div>';
+                    html += '<div class="col-sm-4"><strong>结果：</strong>' + _escapeHtml(statusLabel) + (data.pnl != null ? ' (' + (data.pnl >= 0 ? '+' : '') + _fmt4(data.pnl) + ' USDC)' : '') + '</div>';
+                    if (data.exit_time) {
+                        const etParts = data.exit_time.split(/[T ]/);
+                        const etDisplay = etParts.length >= 2 ? etParts[1].replace(/\+.*$/, '') : data.exit_time;
+                        html += '<div class="col-sm-4"><strong>出场时间：</strong>' + _escapeHtml(etDisplay) + '</div>';
+                    }
                     html += '</div>';
 
                     // 入场诊断信息
@@ -1215,12 +1230,6 @@
                         if (diag.entry_best_ask != null) {
                             html += '<div class="col-sm-4 mb-1"><strong>入场 Best Ask：</strong>' + Number(diag.entry_best_ask).toFixed(4) + '</div>';
                         }
-                        if (diag.stop_loss_price != null) {
-                            html += '<div class="col-sm-4 mb-1"><strong>止损价：</strong>' + Number(diag.stop_loss_price).toFixed(4) + '</div>';
-                        }
-                        if (diag.take_profit_price != null) {
-                            html += '<div class="col-sm-4 mb-1"><strong>止盈价：</strong>' + Number(diag.take_profit_price).toFixed(4) + '</div>';
-                        }
                         if (diag.risk_adjusted_stake != null) {
                             html += '<div class="col-sm-4 mb-1"><strong>风控仓位：</strong>' + Number(diag.risk_adjusted_stake).toFixed(2) + ' USDC</div>';
                         }
@@ -1244,16 +1253,11 @@
                     priceHeader += '）';
                     if (chartClosePrice != null) priceHeader += '  收盘价 $' + Number(chartClosePrice).toFixed(2);
                     html += '<h6 class="mb-2">' + priceHeader + '</h6>';
-                    // 图例
-                    html += '<div class="d-flex flex-wrap gap-3 mb-2 small text-muted">';
-                    _TAIL_GUARD_CHECKPOINTS.forEach(cp => {
-                        html += '<span><span style="display:inline-block;width:14px;border-top:2px dashed ' + cp.color + ';vertical-align:middle;margin-right:4px;"></span>' + cp.label + ' (' + cp.sec + 's)</span>';
-                    });
-                    html += '</div>';
+                    // （5s网格无需图例）
                     // 从入场时刻开始截取价格数据
                     const entryRelSec = data.entry_rel_sec != null ? data.entry_rel_sec : 0;
                     const filteredPrices = data.prices.filter(p => p.rel_sec >= entryRelSec);
-                    html += _drawBtcDiffChart(filteredPrices, chartOpenPrice);
+                    html += _drawBtcDiffChart(filteredPrices, chartOpenPrice, data.exit_rel_sec);
                     body.innerHTML = html;
                 })
                 .catch(err => {
