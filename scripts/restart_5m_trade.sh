@@ -80,6 +80,32 @@ BINANCE_SL_IMBALANCE_MIN_PROXIMITY="${BINANCE_SL_IMBALANCE_MIN_PROXIMITY:-15.0}"
 REPORT_INTERVAL_SEC="${REPORT_INTERVAL_SEC:-${6:-3600}}"      # 报告输出间隔（秒）
 ENABLE_DB_TICK_VALIDATION="${ENABLE_DB_TICK_VALIDATION:-${47:-true}}"  # 是否启用DB tick交叉验证
 
+# 偏离入场模式
+ENABLE_DEVIATION_ENTRY="${ENABLE_DEVIATION_ENTRY:-false}"                     # 启用偏离入场模式
+DEVIATION_ENTRY_THRESHOLD="${DEVIATION_ENTRY_THRESHOLD:-40.0}"                # BTC偏离开盘价$阈值
+DEVIATION_ENTRY_START_SEC="${DEVIATION_ENTRY_START_SEC:-60.0}"                # 偏离入场最早生效时间(窗口内秒)
+DEVIATION_ENTRY_END_SEC="${DEVIATION_ENTRY_END_SEC:-240.0}"                   # 偏离入场最晚截止时间
+
+# DCA 加仓
+ENABLE_DCA="${ENABLE_DCA:-false}"                                            # 启用DCA加仓
+DCA_MAX_ADDS="${DCA_MAX_ADDS:-4}"                                            # 最大追加次数
+DCA_INTERVAL_SEC="${DCA_INTERVAL_SEC:-15.0}"                                 # 两次DCA最小间隔(秒)
+DCA_DEVIATION_STEP="${DCA_DEVIATION_STEP:-20.0}"                             # 每次追加需额外偏离增量($)
+DCA_END_SEC="${DCA_END_SEC:-270.0}"                                          # DCA最晚截止时间
+DCA_MIN_CONFIDENCE="${DCA_MIN_CONFIDENCE:-0.3}"                              # DCA最低信心分
+DCA_W_DEVIATION="${DCA_W_DEVIATION:-0.25}"                                   # 信心权重：偏离强度
+DCA_W_ATR="${DCA_W_ATR:-0.20}"                                               # 信心权重：ATR
+DCA_W_CROSS="${DCA_W_CROSS:-0.20}"                                           # 信心权重：cross
+DCA_W_PRICE="${DCA_W_PRICE:-0.15}"                                           # 信心权重：token价格
+DCA_W_TIME="${DCA_W_TIME:-0.10}"                                             # 信心权重：剩余时间
+DCA_W_POSITION="${DCA_W_POSITION:-0.10}"                                     # 信心权重：已持仓量
+
+# 连败缩仓
+ENABLE_STREAK_SIZING="${ENABLE_STREAK_SIZING:-false}"                        # 启用连败缩仓
+STREAK_LOSS_THRESHOLD="${STREAK_LOSS_THRESHOLD:-3}"                          # 连败N次后开始缩仓
+STREAK_SHRINK_FACTOR="${STREAK_SHRINK_FACTOR:-0.5}"                          # 缩仓比例
+STREAK_MAX_SHRINKS="${STREAK_MAX_SHRINKS:-3}"                                # 最大连续缩减次数
+
 # 日志文件
 LOG_FILE="logs/5m_trade.stdout.log"
 PID_FILE="logs/5m_trade.pid"
@@ -370,6 +396,10 @@ echo "Token bid急跌止损: enable=$ENABLE_LAST_MIN_BID_DROP_CLOSE threshold=$L
 echo "Binance前哨止损: enable=$ENABLE_BINANCE_EARLY_SL proximity=\$${BINANCE_SL_PROXIMITY} start=${BINANCE_SL_START_SEC}s"
 echo "Binance成交流止损: enable=$ENABLE_BINANCE_TRADE_IMBALANCE_SL ratio=$BINANCE_SL_IMBALANCE_RATIO window=${BINANCE_SL_IMBALANCE_WINDOW_SEC}s start=${BINANCE_SL_IMBALANCE_START_SEC}s min_proximity=\$${BINANCE_SL_IMBALANCE_MIN_PROXIMITY}"
 echo "DB tick交叉验证: enable=$ENABLE_DB_TICK_VALIDATION"
+echo "偏离入场: enable=$ENABLE_DEVIATION_ENTRY threshold=\$${DEVIATION_ENTRY_THRESHOLD} start=${DEVIATION_ENTRY_START_SEC}s end=${DEVIATION_ENTRY_END_SEC}s"
+echo "DCA加仓: enable=$ENABLE_DCA max_adds=$DCA_MAX_ADDS interval=${DCA_INTERVAL_SEC}s step=\$${DCA_DEVIATION_STEP} end=${DCA_END_SEC}s min_conf=$DCA_MIN_CONFIDENCE"
+echo "DCA权重: deviation=$DCA_W_DEVIATION atr=$DCA_W_ATR cross=$DCA_W_CROSS price=$DCA_W_PRICE time=$DCA_W_TIME position=$DCA_W_POSITION"
+echo "连败缩仓: enable=$ENABLE_STREAK_SIZING threshold=$STREAK_LOSS_THRESHOLD factor=$STREAK_SHRINK_FACTOR max_shrinks=$STREAK_MAX_SHRINKS"
 echo "数据库: PG_DSN 环境变量"
 echo "=========================================="
 
@@ -415,6 +445,23 @@ _build_cmd() {
     --binance-sl-imbalance-start-sec "$BINANCE_SL_IMBALANCE_START_SEC"
     --binance-sl-imbalance-window-sec "$BINANCE_SL_IMBALANCE_WINDOW_SEC"
     --binance-sl-imbalance-min-proximity "$BINANCE_SL_IMBALANCE_MIN_PROXIMITY"
+    --deviation-entry-threshold "$DEVIATION_ENTRY_THRESHOLD"
+    --deviation-entry-start-sec "$DEVIATION_ENTRY_START_SEC"
+    --deviation-entry-end-sec "$DEVIATION_ENTRY_END_SEC"
+    --dca-max-adds "$DCA_MAX_ADDS"
+    --dca-interval-sec "$DCA_INTERVAL_SEC"
+    --dca-deviation-step "$DCA_DEVIATION_STEP"
+    --dca-end-sec "$DCA_END_SEC"
+    --dca-min-confidence "$DCA_MIN_CONFIDENCE"
+    --dca-w-deviation "$DCA_W_DEVIATION"
+    --dca-w-atr "$DCA_W_ATR"
+    --dca-w-cross "$DCA_W_CROSS"
+    --dca-w-price "$DCA_W_PRICE"
+    --dca-w-time "$DCA_W_TIME"
+    --dca-w-position "$DCA_W_POSITION"
+    --streak-loss-threshold "$STREAK_LOSS_THRESHOLD"
+    --streak-shrink-factor "$STREAK_SHRINK_FACTOR"
+    --streak-max-shrinks "$STREAK_MAX_SHRINKS"
   )
 
   CMD+=(--minute-consistency "$MINUTE_CONSISTENCY")
@@ -445,6 +492,18 @@ _build_cmd() {
 
   if [ "$ENABLE_DB_TICK_VALIDATION" = "false" ]; then
     CMD+=(--disable-db-tick-validation)
+  fi
+
+  if [ "$ENABLE_DEVIATION_ENTRY" = "true" ]; then
+    CMD+=(--enable-deviation-entry)
+  fi
+
+  if [ "$ENABLE_DCA" = "true" ]; then
+    CMD+=(--enable-dca)
+  fi
+
+  if [ "$ENABLE_STREAK_SIZING" = "true" ]; then
+    CMD+=(--enable-streak-sizing)
   fi
 
   if [ "$MODE" != "--live" ]; then

@@ -175,7 +175,9 @@ def open_position(
 
     # --- Risk-based position sizing ---
     risk_assessment = None
-    effective_stake = self.stake_usd
+    # 连败缩仓先于 risk_sizing 生效
+    effective_stake = self._compute_effective_stake() if hasattr(self, '_compute_effective_stake') else self.stake_usd
+    base_stake_for_log = effective_stake
     if getattr(self, "enable_risk_sizing", False):
         risk_assessment = assess_risk(
             entry_price=rough_entry_price,
@@ -183,7 +185,7 @@ def open_position(
             min_direction_diff=self.min_direction_diff,
             btc_cross_count=btc_cross_count,
             max_btc_cross_count=self.max_btc_cross_count,
-            base_stake=self.stake_usd,
+            base_stake=effective_stake,
             min_stake_ratio=getattr(self, "risk_min_stake_ratio", 0.20),
             max_stake_ratio=getattr(self, "risk_max_stake_ratio", 1.50),
             confidence_boost_enabled=getattr(self, "confidence_boost_enabled", True),
@@ -210,6 +212,9 @@ def open_position(
             risk_assessment.direction_risk,
             risk_assessment.stability_risk,
         )
+        if base_stake_for_log != self.stake_usd:
+            logger.info("连败缩仓: stake_usd=%.2f → effective_base=%.2f → risk_adjusted=%.2f",
+                        self.stake_usd, base_stake_for_log, effective_stake)
         if effective_stake <= 0:
             reason = "放弃开仓：风险等级=%s，仓位削减为0" % (risk_assessment.risk_level,)
             logger.info("%s", reason)

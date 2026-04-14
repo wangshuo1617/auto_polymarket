@@ -163,6 +163,29 @@ class FiveMinuteUpDownTrader:
         binance_sl_imbalance_window_sec: float = 3.0,
         binance_sl_imbalance_min_proximity: float = 15.0,
         enable_db_tick_validation: bool = True,
+        # 偏离入场
+        enable_deviation_entry: bool = False,
+        deviation_entry_threshold: float = 40.0,
+        deviation_entry_start_sec: float = 60.0,
+        deviation_entry_end_sec: float = 240.0,
+        # DCA 加仓
+        enable_dca: bool = False,
+        dca_max_adds: int = 4,
+        dca_interval_sec: float = 15.0,
+        dca_deviation_step: float = 20.0,
+        dca_end_sec: float = 270.0,
+        dca_min_confidence: float = 0.3,
+        dca_w_deviation: float = 0.25,
+        dca_w_atr: float = 0.20,
+        dca_w_cross: float = 0.20,
+        dca_w_price: float = 0.15,
+        dca_w_time: float = 0.10,
+        dca_w_position: float = 0.10,
+        # 连败缩仓
+        enable_streak_sizing: bool = False,
+        streak_loss_threshold: int = 3,
+        streak_shrink_factor: float = 0.5,
+        streak_max_shrinks: int = 3,
     ) -> None:
         self.stake_usd = stake_usd
         self.report_interval_sec = report_interval_sec
@@ -232,6 +255,32 @@ class FiveMinuteUpDownTrader:
         self.binance_sl_imbalance_window_sec = float(binance_sl_imbalance_window_sec)
         self.binance_sl_imbalance_min_proximity = float(binance_sl_imbalance_min_proximity)
 
+        # 偏离入场
+        self.enable_deviation_entry = bool(enable_deviation_entry)
+        self.deviation_entry_threshold = float(deviation_entry_threshold)
+        self.deviation_entry_start_sec = float(deviation_entry_start_sec)
+        self.deviation_entry_end_sec = float(deviation_entry_end_sec)
+
+        # DCA 加仓
+        self.enable_dca = bool(enable_dca)
+        self.dca_max_adds = int(dca_max_adds)
+        self.dca_interval_sec = float(dca_interval_sec)
+        self.dca_deviation_step = float(dca_deviation_step)
+        self.dca_end_sec = float(dca_end_sec)
+        self.dca_min_confidence = float(dca_min_confidence)
+        self.dca_w_deviation = float(dca_w_deviation)
+        self.dca_w_atr = float(dca_w_atr)
+        self.dca_w_cross = float(dca_w_cross)
+        self.dca_w_price = float(dca_w_price)
+        self.dca_w_time = float(dca_w_time)
+        self.dca_w_position = float(dca_w_position)
+
+        # 连败缩仓
+        self.enable_streak_sizing = bool(enable_streak_sizing)
+        self.streak_loss_threshold = int(streak_loss_threshold)
+        self.streak_shrink_factor = float(streak_shrink_factor)
+        self.streak_max_shrinks = int(streak_max_shrinks)
+
         self._lock = threading.RLock()
         self._price_watcher = ChainlinkBTCPriceWatcher(callback=self._on_price_update)
         self._binance_watcher: Optional[BinanceBTCRealtimeWatcher] = None
@@ -266,6 +315,14 @@ class FiveMinuteUpDownTrader:
 
         self.position: Optional[OpenPosition] = None
         self.trades: List[TradeRecord] = []
+
+        # DCA 窗口内状态
+        self._dca_add_count: int = 0
+        self._dca_last_add_sec: float = 0.0
+        self._dca_entry_abs_diff: float = 0.0  # 首次入场时的 abs_btc_diff
+
+        # 连败缩仓状态
+        self._consecutive_losses: int = 0
 
         # 最后一分钟 bid 急跌检测用的环形缓冲区: (timestamp_sec, bid)
         self._bid_history: deque[tuple[float, float]] = deque(maxlen=200)
@@ -556,6 +613,10 @@ class FiveMinuteUpDownTrader:
             record.reason,
         )
 
+        # 连败追踪（早期平仓路径）
+        is_win = pnl > 0
+        self._update_streak_on_result(is_win)
+
     @classmethod
     def _parse_toxic_utc_hours(cls, raw_value: Optional[str]) -> set[int]:
         if raw_value is None:
@@ -630,6 +691,7 @@ class FiveMinuteUpDownTrader:
         else:
             logger.info("有毒时段过滤已禁用: 不跳过任何 UTC 小时")
         ensure_http_keepalive(interval_sec=20)
+        self._restore_streak_from_db()
         self._running = True
         self._price_watcher.start()
         if self._binance_watcher:
@@ -835,6 +897,10 @@ class FiveMinuteUpDownTrader:
                 self._bid_history.clear()
                 self._last_min_sl_fired = False
                 self._binance_trades.clear()
+                # DCA 窗口重置
+                self._dca_add_count = 0
+                self._dca_last_add_sec = 0.0
+                self._dca_entry_abs_diff = 0.0
                 slug_ts = window_start_ms // 1000
                 self.current_market_slug = f"btc-updown-5m-{slug_ts}"
                 try:
@@ -894,40 +960,72 @@ class FiveMinuteUpDownTrader:
                 if _side is not None:
                     self._last_btc_side = _side
 
-            # --- 时钟驱动入场判定（对齐回测 decision_row 时间窗口）---
-            entry_trigger_sec = self.entry_decision_minute * 60 - self.entry_preclose_seconds
-            entry_deadline_sec = self.entry_decision_minute * 60
-            if (
-                not self.window_traded
-                and not self.preclose_entry_triggered
-                and entry_trigger_sec <= rel_sec < entry_deadline_sec
-            ):
-                # BTC 价格新鲜度检查（对齐回测 max_btc_age_ms）
-                # 回测用 ts_sec*1000（整秒对齐）计算 age，实盘也对齐到整秒，
-                # 避免 500ms 轮询偏移导致 age 虚高而误判 stale。
-                if btc_age_ms > self.MAX_BTC_AGE_MS:
-                    logger.warning(
-                        "Skip entry: BTC price stale (age=%dms > %dms), will retry next tick",
-                        btc_age_ms,
-                        self.MAX_BTC_AGE_MS,
+            # --- 偏离入场模式 ---
+            if self.enable_deviation_entry:
+                if (
+                    not self.window_traded
+                    and self._open_price_locked
+                    and self.window_open_price is not None
+                    and self.deviation_entry_start_sec <= rel_sec < self.deviation_entry_end_sec
+                ):
+                    if btc_age_ms > self.MAX_BTC_AGE_MS:
+                        if rel_sec >= self.deviation_entry_end_sec - 1.5:
+                            self._consecutive_stale_windows += 1
+                            if self._consecutive_stale_windows >= 3 and not self._stale_alert_sent:
+                                self._send_stale_alert(btc_age_ms)
+                                self._stale_alert_sent = True
+                    else:
+                        self._consecutive_stale_windows = 0
+                        self._stale_alert_sent = False
+                        abs_diff = abs(btc_price - self.window_open_price)
+                        if abs_diff >= self.deviation_entry_threshold:
+                            self._handle_deviation_entry(
+                                btc_price=btc_price,
+                                abs_diff=abs_diff,
+                                rel_sec=rel_sec,
+                            )
+
+                # --- DCA 加仓检查（偏离模式下，已有持仓时） ---
+                if (
+                    self.enable_dca
+                    and self.position is not None
+                    and self.window_traded
+                    and self._dca_add_count < self.dca_max_adds
+                    and rel_sec < self.dca_end_sec
+                    and self.window_open_price is not None
+                ):
+                    self._check_dca_add(btc_price=btc_price, rel_sec=rel_sec)
+
+            else:
+                # --- 原有固定时间入场判定 ---
+                entry_trigger_sec = self.entry_decision_minute * 60 - self.entry_preclose_seconds
+                entry_deadline_sec = self.entry_decision_minute * 60
+                if (
+                    not self.window_traded
+                    and not self.preclose_entry_triggered
+                    and entry_trigger_sec <= rel_sec < entry_deadline_sec
+                ):
+                    if btc_age_ms > self.MAX_BTC_AGE_MS:
+                        logger.warning(
+                            "Skip entry: BTC price stale (age=%dms > %dms), will retry next tick",
+                            btc_age_ms,
+                            self.MAX_BTC_AGE_MS,
+                        )
+                        if rel_sec >= entry_deadline_sec - 1.5:
+                            self._consecutive_stale_windows += 1
+                            if self._consecutive_stale_windows >= 3 and not self._stale_alert_sent:
+                                self._send_stale_alert(btc_age_ms)
+                                self._stale_alert_sent = True
+                        return
+                    self._consecutive_stale_windows = 0
+                    self._stale_alert_sent = False
+                    ms_to_close = int((entry_deadline_sec - rel_sec) * 1000)
+                    self._handle_entry_minute(
+                        projected_close=btc_price,
+                        ms_to_close=ms_to_close,
                     )
-                    # 在入场窗口结束时（最后一秒）判定本窗口因 stale 未交易
-                    if rel_sec >= entry_deadline_sec - 1.5:
-                        self._consecutive_stale_windows += 1
-                        if self._consecutive_stale_windows >= 3 and not self._stale_alert_sent:
-                            self._send_stale_alert(btc_age_ms)
-                            self._stale_alert_sent = True
-                    return  # 不设置 preclose_entry_triggered，下个 500ms tick 自动重试
-                # 价格恢复正常，重置连续 stale 计数
-                self._consecutive_stale_windows = 0
-                self._stale_alert_sent = False
-                ms_to_close = int((entry_deadline_sec - rel_sec) * 1000)
-                self._handle_entry_minute(
-                    projected_close=btc_price,
-                    ms_to_close=ms_to_close,
-                )
-                if self.window_traded:
-                    self.preclose_entry_triggered = True
+                    if self.window_traded:
+                        self.preclose_entry_triggered = True
 
             # --- 第 1 分钟收盘价记录 ---
             if rel_sec >= 60 and not self._minute1_recorded:
@@ -1211,6 +1309,331 @@ class FiveMinuteUpDownTrader:
                 self.window_traded = True
             else:
                 logger.warning("开仓失败（第 %d 次，将在下一 tick 重试）: %s", self._entry_attempt_count, e)
+
+    # ------------------------------------------------------------------
+    # 偏离入场
+    # ------------------------------------------------------------------
+    def _handle_deviation_entry(self, btc_price: float, abs_diff: float, rel_sec: float) -> None:
+        """偏离入场模式：BTC 偏离 ≥ threshold 时触发首次建仓。"""
+        if self.current_window_start_ms is None or self.window_open_price is None:
+            return
+
+        # toxic time 检查
+        if self._is_toxic_time_regime():
+            current_utc_hour = datetime.now(timezone.utc).hour
+            direction = "up" if btc_price > self.window_open_price else "down"
+            reason = "Skip deviation entry: Toxic Time Regime (UTC hour=%s)" % current_utc_hour
+            logger.info("%s", reason)
+            self._record_skip_window(reason=reason, direction=direction)
+            self.window_traded = True
+            return
+
+        # UP/DOWN spread 检查（保留为硬门槛）
+        if self.min_entry_updown_diff > 0 and self.current_market_slug:
+            _mi = self._market_cache.get(self.current_market_slug)
+            if _mi:
+                _up_book = self._ws_book_cache.get(str(_mi.get("up_token") or ""))
+                _dn_book = self._ws_book_cache.get(str(_mi.get("down_token") or ""))
+                if _up_book and _dn_book:
+                    _up_ask = self._to_positive_float(_up_book.get("best_ask"))
+                    _dn_ask = self._to_positive_float(_dn_book.get("best_ask"))
+                    if _up_ask is not None and _dn_ask is not None:
+                        _ud_diff = abs(_up_ask - _dn_ask)
+                        if _ud_diff < self.min_entry_updown_diff:
+                            return  # 不跳窗口，下个 tick 再检查
+
+        diff = btc_price - self.window_open_price
+        direction = "up" if diff > 0 else "down"
+
+        market_slug = self.current_market_slug or f"btc-updown-5m-{self.current_window_start_ms // 1000}"
+        logger.info(
+            "偏离入场触发: rel_sec=%.0f abs_diff=%.2f (>= %.2f) direction=%s market=%s",
+            rel_sec, abs_diff, self.deviation_entry_threshold, direction, market_slug,
+        )
+
+        try:
+            self._open_position(market_slug, direction, abs_btc_diff=abs_diff)
+            self.window_traded = True
+            self._dca_entry_abs_diff = abs_diff
+        except Exception as e:
+            self._entry_attempt_count += 1
+            if self._entry_attempt_count >= self.MAX_ENTRY_RETRIES:
+                logger.error("偏离入场开仓失败（已达重试上限 %d）: %s", self.MAX_ENTRY_RETRIES, e)
+                self.window_traded = True
+            else:
+                logger.warning("偏离入场开仓失败（第 %d 次，将在下一 tick 重试）: %s", self._entry_attempt_count, e)
+
+    # ------------------------------------------------------------------
+    # DCA 加仓
+    # ------------------------------------------------------------------
+    def _check_dca_add(self, btc_price: float, rel_sec: float) -> None:
+        """检查是否满足 DCA 加仓条件，满足则执行加仓。"""
+        if self.position is None or self.window_open_price is None:
+            return
+
+        # 时间间隔检查
+        if rel_sec - self._dca_last_add_sec < self.dca_interval_sec:
+            return
+
+        # 偏离增量检查
+        abs_diff = abs(btc_price - self.window_open_price)
+        required_diff = self.deviation_entry_threshold + (self._dca_add_count + 1) * self.dca_deviation_step
+        if abs_diff < required_diff:
+            return
+
+        # 方向一致性检查
+        current_direction = "up" if btc_price > self.window_open_price else "down"
+        if current_direction != self.position.direction:
+            return
+
+        # 计算窗口 ATR
+        atr = 0.0
+        ticks = self._window_btc_ticks
+        if len(ticks) >= 2:
+            total_abs_delta = sum(abs(ticks[i] - ticks[i - 1]) for i in range(1, len(ticks)))
+            atr = total_abs_delta / (len(ticks) - 1)
+
+        # 获取当前 token 价格
+        token_price = 0.5
+        if self.position.token_id:
+            ws_snap = self._ws_book_cache.get(self.position.token_id)
+            if ws_snap:
+                _ask = self._to_positive_float(ws_snap.get("best_ask"))
+                if _ask is not None:
+                    token_price = _ask
+
+        # 计算连败缩仓后的 effective_stake
+        effective_stake = self._compute_effective_stake()
+
+        from services.five_minute_trade.dca_sizing import compute_dca_add_size
+        decision = compute_dca_add_size(
+            base_stake=effective_stake,
+            current_abs_diff=abs_diff,
+            entry_abs_diff=self._dca_entry_abs_diff,
+            deviation_step=self.dca_deviation_step,
+            atr=atr,
+            cross_count=self._btc_cross_count,
+            token_price=token_price,
+            rel_sec=rel_sec,
+            dca_end_sec=self.dca_end_sec,
+            entry_start_sec=self.deviation_entry_start_sec,
+            dca_count=self._dca_add_count,
+            dca_max_adds=self.dca_max_adds,
+            min_confidence=self.dca_min_confidence,
+            w_deviation=self.dca_w_deviation,
+            w_atr=self.dca_w_atr,
+            w_cross=self.dca_w_cross,
+            w_price=self.dca_w_price,
+            w_time=self.dca_w_time,
+            w_position=self.dca_w_position,
+        )
+
+        if not decision.should_add:
+            logger.debug("DCA skip: %s", decision.reason)
+            return
+
+        logger.info("DCA 加仓决策: %s", decision.reason)
+        self._dca_add_position(
+            add_size_usdc=decision.add_size_usdc,
+            abs_diff=abs_diff,
+            rel_sec=rel_sec,
+            confidence=decision.confidence,
+        )
+
+    def _dca_add_position(
+        self,
+        add_size_usdc: float,
+        abs_diff: float,
+        rel_sec: float,
+        confidence: float,
+    ) -> None:
+        """执行一次 DCA 加仓：下单、更新持仓、更新 DB。"""
+        if self.position is None or not self.current_market_slug:
+            return
+
+        from data.polymarket import buy_order, normalize_order_size, get_market_metadata
+        from services.five_minute_trade.entry_ops import TRADE_PROFILE
+
+        token_id = self.position.token_id
+        market_id = self.position.market_id
+        market_info = self._market_cache.get(self.current_market_slug) or {}
+        market_meta = market_info.get("market_meta")
+
+        # 获取订单簿
+        entry_levels_payload = self._fetch_orderbook_levels(token_id=token_id, side="buy")
+        entry_levels = entry_levels_payload.get("levels") or []
+        if not entry_levels:
+            logger.warning("DCA: 订单簿无卖单，跳过")
+            return
+        best_ask = self._to_positive_float(entry_levels_payload.get("best_ask"))
+        if best_ask is None:
+            best_ask = float(entry_levels[0]["price"])
+
+        if best_ask > self.max_entry_price:
+            logger.info("DCA: best_ask=%.4f > max_entry_price=%.4f，跳过", best_ask, self.max_entry_price)
+            return
+
+        size = round(add_size_usdc / best_ask, 6)
+        normalized_size = normalize_order_size(
+            size=size,
+            tick_size=(market_meta or {}).get("minimum_tick_size", "0.01"),
+        )
+        if normalized_size <= 0:
+            logger.warning("DCA: 归一化后size为0，跳过")
+            return
+
+        plan = self._build_execution_plan(
+            token_id=token_id, side="buy", target_size=normalized_size,
+            levels_payload=entry_levels_payload,
+        )
+        if plan["fill_ratio"] < self.MIN_ENTRY_LIQUIDITY_FILL_RATIO:
+            logger.warning("DCA: 流动性不足 fill_ratio=%.2f%%", plan["fill_ratio"] * 100)
+            return
+
+        entry_price = float(plan["worst_price"])
+        logger.info(
+            "DCA #%d: market=%s token=%s price=%.4f size=%.4f usdc=%.2f conf=%.3f",
+            self._dca_add_count + 1, self.current_market_slug, token_id,
+            entry_price, normalized_size, add_size_usdc, confidence,
+        )
+
+        if self.dry_run:
+            order_id = None
+        else:
+            sweep_price = min(0.99, entry_price + self.ENTRY_SWEEP_SLIPPAGE)
+            order_id = buy_order(
+                market_id, token_id, sweep_price, normalized_size,
+                profile=TRADE_PROFILE, market_meta=market_meta,
+            )
+            if not order_id:
+                logger.warning("DCA: 买单提交失败")
+                return
+            logger.info("DCA 买单已提交: order_id=%s", order_id)
+
+        # 更新持仓
+        old_invested = self.position.total_invested_usdc or 0.0
+        old_size = self.position.actual_entry_size or self.position.size
+        add_invested = float(plan["vwap_price"]) * normalized_size
+        new_invested = old_invested + add_invested
+        new_size = old_size + normalized_size
+        new_avg_price = new_invested / new_size if new_size > 0 else entry_price
+
+        self.position.actual_entry_size = new_size
+        self.position.size = new_size
+        self.position.total_invested_usdc = new_invested
+        self.position.actual_entry_price = new_avg_price
+        self.position.entry_price = new_avg_price
+        self.position.dca_count += 1
+        self.position.dca_history.append({
+            "n": self.position.dca_count,
+            "rel_sec": round(rel_sec, 1),
+            "price": entry_price,
+            "size": normalized_size,
+            "usdc": round(add_invested, 2),
+            "confidence": round(confidence, 3),
+            "abs_diff": round(abs_diff, 2),
+        })
+
+        self._dca_add_count += 1
+        self._dca_last_add_sec = rel_sec
+
+        # 更新 DB
+        self._update_dca_in_db()
+
+        if not self.dry_run and order_id:
+            self._schedule_position_balance_confirmation(
+                market_slug=self.current_market_slug,
+                token_id=token_id,
+                order_id=order_id,
+            )
+
+    def _update_dca_in_db(self) -> None:
+        """DCA 后更新 trade_window_summary 的入场信息。"""
+        if self.position is None:
+            return
+        try:
+            from data.database import get_conn
+            import json
+            with get_conn() as conn:
+                cur = conn.cursor()
+                entry_size = self.position.actual_entry_size or self.position.size
+                entry_usdc = self.position.total_invested_usdc or 0.0
+                entry_price = (entry_usdc / entry_size) if entry_size > 0 else 0.0
+                # 更新 diagnostics 中的 dca 信息
+                diag_patch = json.dumps({
+                    "dca_count": self.position.dca_count,
+                    "dca_history": self.position.dca_history,
+                })
+                cur.execute(
+                    """
+                    UPDATE trade_window_summary
+                    SET entry_size = %s, entry_usdc = %s, entry_price = %s,
+                        entry_diagnostics = COALESCE(entry_diagnostics, '{}'::jsonb) || %s::jsonb
+                    WHERE market_slug = %s AND status = 'open'
+                    """,
+                    (entry_size, entry_usdc, entry_price, diag_patch, self.position.market_slug),
+                )
+        except Exception as e:
+            logger.warning("DCA DB更新失败: %s", e)
+
+    # ------------------------------------------------------------------
+    # 连败缩仓
+    # ------------------------------------------------------------------
+    def _compute_effective_stake(self) -> float:
+        """计算经连败缩仓调整后的 effective_stake。"""
+        stake = self.stake_usd
+        if not self.enable_streak_sizing:
+            return stake
+        if self._consecutive_losses < self.streak_loss_threshold:
+            return stake
+        shrinks = min(
+            self._consecutive_losses - self.streak_loss_threshold + 1,
+            self.streak_max_shrinks,
+        )
+        return stake * (self.streak_shrink_factor ** shrinks)
+
+    def _update_streak_on_result(self, is_win: bool) -> None:
+        """窗口结算后更新连败计数。"""
+        if is_win:
+            if self._consecutive_losses > 0:
+                logger.info("连败终止: %d → 0", self._consecutive_losses)
+            self._consecutive_losses = 0
+        else:
+            self._consecutive_losses += 1
+            logger.info("连败计数: %d", self._consecutive_losses)
+            if self.enable_streak_sizing and self._consecutive_losses >= self.streak_loss_threshold:
+                eff = self._compute_effective_stake()
+                logger.info("连败缩仓生效: consecutive=%d effective_stake=%.2f", self._consecutive_losses, eff)
+
+    def _restore_streak_from_db(self) -> None:
+        """启动时从 DB 恢复连败计数。"""
+        if not self.enable_streak_sizing:
+            return
+        try:
+            from data.database import get_conn
+            with get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT status FROM trade_window_summary
+                    WHERE mode = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    ("live" if not self.dry_run else "dry-run", 20),
+                )
+                rows = cur.fetchall()
+            count = 0
+            for (status,) in rows:
+                if status == "lost" or status == "early_exit":
+                    count += 1
+                else:
+                    break
+            self._consecutive_losses = count
+            if count > 0:
+                logger.info("从DB恢复连败计数: %d", count)
+        except Exception as e:
+            logger.warning("恢复连败计数失败: %s", e)
 
     def _validate_entry_with_db_ticks(self, direction: str) -> bool:
         """与回测对齐：读取 btc_poly_1s_ticks 中同窗口的快照，验证 BTC 价差和方向也满足入场条件。
@@ -1782,6 +2205,11 @@ class FiveMinuteUpDownTrader:
                         settle_open_windows(self._trade_db)
                     except Exception as e:
                         logger.error("窗口结算异常: %s", e)
+                    # 结算后刷新连败计数
+                    try:
+                        self._restore_streak_from_db()
+                    except Exception as e:
+                        logger.warning("结算后刷新连败计数异常: %s", e)
                     next_redeem_ts = self._calc_next_redeem_ts(base_ts=now)
 
             if now >= next_report_ts:
@@ -1899,7 +2327,7 @@ class FiveMinuteUpDownTrader:
 
 def main() -> None:
     args = build_trade_arg_parser().parse_args()
-    configure_trade_logging()
+    configure_trade_logging(log_prefix=getattr(args, 'log_prefix', '5m_trade'))
     startup_ts_sec = int(time.time())
     strategy_signature = build_strategy_signature(args)
     logger.info(

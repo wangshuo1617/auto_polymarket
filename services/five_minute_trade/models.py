@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -77,3 +77,6 @@ class OpenPosition:
     direction_risk: Optional[float] = None
     stability_risk: Optional[float] = None
     window_open_btc_price: Optional[float] = None
+    # DCA 追踪
+    dca_count: int = 0
+    dca_history: list = field(default_factory=list)

@@ -7,7 +7,7 @@ from typing import Any, Type
 from .models import ProjectDiagFilter
 
 
-def configure_trade_logging() -> None:
+def configure_trade_logging(log_prefix: str = "5m_trade") -> None:
     os.makedirs("logs", exist_ok=True)
 
     formatter = logging.Formatter(
@@ -20,7 +20,7 @@ def configure_trade_logging() -> None:
     root_logger.handlers.clear()
 
     trade_handler = RotatingFileHandler(
-        filename="logs/5m_trade.log",
+        filename=f"logs/{log_prefix}.log",
         maxBytes=50 * 1024 * 1024,
         backupCount=10,
         encoding="utf-8",
@@ -29,7 +29,7 @@ def configure_trade_logging() -> None:
     trade_handler.setFormatter(formatter)
 
     diag_handler = RotatingFileHandler(
-        filename="logs/5m_trade_diag.log",
+        filename=f"logs/{log_prefix}_diag.log",
         maxBytes=30 * 1024 * 1024,
         backupCount=5,
         encoding="utf-8",
@@ -61,6 +61,12 @@ def build_trade_arg_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="仅模拟交易，不在 Polymarket 实际下单",
+    )
+    parser.add_argument(
+        "--log-prefix",
+        type=str,
+        default="5m_trade",
+        help="日志文件前缀（默认 5m_trade → logs/5m_trade.log）",
     )
 
     for p in PARAM_REGISTRY:
