@@ -22,38 +22,29 @@ class RiskAssessment(NamedTuple):
 
 
 def compute_entry_price_risk(entry_price: float) -> float:
-    """Entry price component of risk.
+    """Entry price component of risk — inverted-U continuous model.
 
-    Calibrated via walk-forward analysis (5d-train / 3d-test / 2d-step)
-    on 443 real trades from 2026-03-07 to 2026-03-19.
+    实盘 336 笔交易回测验证：亏损集中在 0.60-0.85 "不确定区间"，
+    高价区 (0.90+) WR 极高不应惩罚，低价区 R/R 好风险低。
 
-    Consensus across all out-of-sample test windows:
-      <0.45  : WR 75%, avgPnL -1.84, stable=Mixed   → risk 1.00
-      0.45-0.60: WR 76%, avgPnL +1.20, stable=Yes(+) → risk 0.00  (best R/R)
-      0.60-0.70: WR 57%, avgPnL -0.75, stable=Mixed  → risk 0.65
-      0.70-0.80: WR 73%, avgPnL -0.22, stable=Mixed  → risk 0.45
-      0.80-0.85: WR 87%, avgPnL +1.17, stable=Yes(+) → risk 0.00  (best zone)
-      0.85-0.90: WR 79%, avgPnL -0.62, stable=Mixed  → risk 0.65
-      0.90-0.95: WR 92%, avgPnL +0.21, stable=Mixed  → risk 0.15
-      >=0.95 : WR 100%, avgPnL +0.30, stable=Yes(+) → risk 0.00  (boost)
+    Inverted-U 曲线：
+      ≤0.50: risk=0.0  (低价, 巨大 R/R 优势)
+      0.50→0.70: 线性上升至峰值 0.70
+      0.70: risk=0.70  (峰值, 方向最不确定)
+      0.70→0.95: 线性下降至 0.05
+      ≥0.95: risk=0.05 (近乎确定, confidence_boost 另行处理)
     """
     if entry_price <= 0:
         return 1.0
-    if entry_price < 0.45:
-        return 1.0   # Too few trades, wildly unstable WR
-    if entry_price < 0.60:
-        return 0.0   # Best R/R zone: high avgPnL, stably positive
+    if entry_price < 0.50:
+        return 0.0
     if entry_price < 0.70:
-        return 0.65  # Lowest WR (57%), net negative, mixed stability
-    if entry_price < 0.80:
-        return 0.45  # Marginal: WR 73% but slightly net negative
-    if entry_price < 0.85:
-        return 0.0   # Best absolute zone: WR 87%, stably positive
-    if entry_price < 0.90:
-        return 0.65  # Loss black-hole: worst net PnL despite 79% WR
+        # 上升段: 0.50→0.0, 0.70→0.70
+        return 0.70 * (entry_price - 0.50) / 0.20
     if entry_price < 0.95:
-        return 0.15  # High WR (92%), small edge; slight reduction only
-    return 0.0       # >= 0.95: 100% WR, stably positive → full boost
+        # 下降段: 0.70→0.70, 0.95→0.05
+        return 0.70 - 0.65 * (entry_price - 0.70) / 0.25
+    return 0.05
 
 
 def compute_direction_risk(

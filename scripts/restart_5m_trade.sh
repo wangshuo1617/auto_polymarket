@@ -40,17 +40,17 @@ SL_TO_TP_RATIO="${SL_TO_TP_RATIO:-${12:-0.9}}"               # SL/TP 比例
 
 # 风险仓位管理
 ENABLE_RISK_SIZING="${ENABLE_RISK_SIZING:-${19:-true}}"       # 是否启用动态仓位
-RISK_MIN_STAKE_RATIO="${RISK_MIN_STAKE_RATIO:-${20:-0.20}}"   # 动态仓位最小倍率
-RISK_MAX_STAKE_RATIO="${RISK_MAX_STAKE_RATIO:-${21:-1.2}}"    # 动态仓位最大倍率
+RISK_MIN_STAKE_RATIO="${RISK_MIN_STAKE_RATIO:-${20:-0.30}}"   # 动态仓位最小倍率
+RISK_MAX_STAKE_RATIO="${RISK_MAX_STAKE_RATIO:-${21:-1.5}}"    # 动态仓位最大倍率
 CONFIDENCE_BOOST="${CONFIDENCE_BOOST:-${22:-true}}"           # 是否启用高置信加仓
-CONFIDENCE_BOOST_GE_095="${CONFIDENCE_BOOST_GE_095:-${23:-1.5}}" # 置信度>=0.95 加仓倍率
-STAKE_CAP_VERY_HIGH="${STAKE_CAP_VERY_HIGH:-${24:-0.0}}"      # very_high 风险仓位上限
-STAKE_CAP_HIGH="${STAKE_CAP_HIGH:-${25:-0.20}}"               # high 风险仓位上限
-STAKE_CAP_MEDIUM_HIGH="${STAKE_CAP_MEDIUM_HIGH:-${26:-0.50}}" # medium_high 风险仓位上限
+CONFIDENCE_BOOST_GE_095="${CONFIDENCE_BOOST_GE_095:-${23:-1.3}}" # 置信度>=0.95 加仓倍率
+STAKE_CAP_VERY_HIGH="${STAKE_CAP_VERY_HIGH:-${24:-0.20}}"     # very_high 风险仓位上限
+STAKE_CAP_HIGH="${STAKE_CAP_HIGH:-${25:-0.50}}"               # high 风险仓位上限
+STAKE_CAP_MEDIUM_HIGH="${STAKE_CAP_MEDIUM_HIGH:-${26:-0.70}}" # medium_high 风险仓位上限
 MEDIUM_HIGH_THRESHOLD="${MEDIUM_HIGH_THRESHOLD:-${27:-0.45}}"  # medium_high 阈值
-RISK_W_PRICE="${RISK_W_PRICE:-${28:-0.30}}"                   # 风险评分：价格权重
-RISK_W_DIRECTION="${RISK_W_DIRECTION:-${29:-0.15}}"           # 风险评分：方向权重
-RISK_W_STABILITY="${RISK_W_STABILITY:-${30:-0.55}}"           # 风险评分：稳定性权重
+RISK_W_PRICE="${RISK_W_PRICE:-${28:-0.15}}"                   # 风险评分：价格权重
+RISK_W_DIRECTION="${RISK_W_DIRECTION:-${29:-0.35}}"           # 风险评分：方向权重
+RISK_W_STABILITY="${RISK_W_STABILITY:-${30:-0.50}}"           # 风险评分：稳定性权重
 RISK_DIFF_BOOST_THRESHOLD="${RISK_DIFF_BOOST_THRESHOLD:-${31:-0.44}}"     # risk_diff boost 启动阈值
 RISK_DIFF_BOOST_MULTIPLIER="${RISK_DIFF_BOOST_MULTIPLIER:-${32:-1.40}}"   # risk_diff boost 倍率
 CROSS_BORDERLINE_DIFF_MULTIPLIER="${CROSS_BORDERLINE_DIFF_MULTIPLIER:-${33:-0.0}}" # cross_count 临界倍增系数

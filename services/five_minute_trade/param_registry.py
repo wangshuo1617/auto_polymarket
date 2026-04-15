@@ -316,7 +316,7 @@ PARAM_REGISTRY: list[ParamDef] = [
     ParamDef(
         key="risk_min_stake_ratio",
         param_type="float",
-        default=0.20,
+        default=0.30,
         description="动态仓位最小倍率",
         group=GRP_RISK,
         shell_var="RISK_MIN_STAKE_RATIO",
@@ -325,7 +325,7 @@ PARAM_REGISTRY: list[ParamDef] = [
     ParamDef(
         key="risk_max_stake_ratio",
         param_type="float",
-        default=1.2,
+        default=1.5,
         description="动态仓位最大倍率",
         group=GRP_RISK,
         shell_var="RISK_MAX_STAKE_RATIO",
@@ -361,7 +361,7 @@ PARAM_REGISTRY: list[ParamDef] = [
     ParamDef(
         key="stake_cap_very_high",
         param_type="float",
-        default=0.0,
+        default=0.20,
         description="very_high 风险仓位上限",
         group=GRP_RISK,
         shell_var="STAKE_CAP_VERY_HIGH",
@@ -379,7 +379,7 @@ PARAM_REGISTRY: list[ParamDef] = [
     ParamDef(
         key="stake_cap_medium_high",
         param_type="float",
-        default=0.35,
+        default=0.70,
         description="medium_high 风险仓位上限",
         group=GRP_RISK,
         shell_var="STAKE_CAP_MEDIUM_HIGH",
@@ -408,7 +408,7 @@ PARAM_REGISTRY: list[ParamDef] = [
     ParamDef(
         key="confidence_boost_ge_095",
         param_type="float",
-        default=1.5,
+        default=1.3,
         description="置信度≥0.95 加仓倍率",
         group=GRP_RISK,
         shell_var="CONFIDENCE_BOOST_GE_095",
@@ -417,7 +417,7 @@ PARAM_REGISTRY: list[ParamDef] = [
     ParamDef(
         key="risk_w_price",
         param_type="float",
-        default=0.50,
+        default=0.15,
         description="风险评分：价格权重",
         group=GRP_RISK,
         shell_var="RISK_W_PRICE",
@@ -426,7 +426,7 @@ PARAM_REGISTRY: list[ParamDef] = [
     ParamDef(
         key="risk_w_direction",
         param_type="float",
-        default=0.15,
+        default=0.35,
         description="风险评分：方向权重",
         group=GRP_RISK,
         shell_var="RISK_W_DIRECTION",
@@ -435,7 +435,7 @@ PARAM_REGISTRY: list[ParamDef] = [
     ParamDef(
         key="risk_w_stability",
         param_type="float",
-        default=0.35,
+        default=0.50,
         description="风险评分：稳定性权重",
         group=GRP_RISK,
         shell_var="RISK_W_STABILITY",
