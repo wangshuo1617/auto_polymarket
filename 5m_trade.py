@@ -1660,7 +1660,7 @@ class FiveMinuteUpDownTrader:
         # 更新 DB (window summary + trade_events)
         self._update_dca_in_db()
         try:
-            btc_now = self._btc_watcher.latest_price if self._btc_watcher else None
+            btc_now = self._get_latest_btc_price_snapshot()
             self.db.write_dca_entry_event(
                 position=self.position,
                 dca_number=self.position.dca_count,
