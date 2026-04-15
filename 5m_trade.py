@@ -175,6 +175,7 @@ class FiveMinuteUpDownTrader:
         dca_deviation_step: float = 20.0,
         dca_end_sec: float = 270.0,
         dca_min_confidence: float = 0.3,
+        dca_max_entry_price: float = 0.95,
         dca_w_deviation: float = 0.25,
         dca_w_atr: float = 0.20,
         dca_w_cross: float = 0.20,
@@ -274,6 +275,7 @@ class FiveMinuteUpDownTrader:
         self.dca_deviation_step = float(dca_deviation_step)
         self.dca_end_sec = float(dca_end_sec)
         self.dca_min_confidence = float(dca_min_confidence)
+        self.dca_max_entry_price = float(dca_max_entry_price)
         self.dca_w_deviation = float(dca_w_deviation)
         self.dca_w_atr = float(dca_w_atr)
         self.dca_w_cross = float(dca_w_cross)
@@ -1587,8 +1589,8 @@ class FiveMinuteUpDownTrader:
         if best_ask is None:
             best_ask = float(entry_levels[0]["price"])
 
-        if best_ask > self.max_entry_price:
-            logger.info("DCA: best_ask=%.4f > max_entry_price=%.4f，跳过", best_ask, self.max_entry_price)
+        if best_ask > self.dca_max_entry_price:
+            logger.info("DCA: best_ask=%.4f > dca_max_entry_price=%.4f，跳过", best_ask, self.dca_max_entry_price)
             return
 
         size = round(add_size_usdc / best_ask, 6)

@@ -21,12 +21,14 @@ GRP_SYSTEM = "系统"
 GRP_BINANCE = "binance止损控制"
 GRP_DEVIATION = "偏离入场"
 GRP_DCA = "DCA加仓"
+GRP_REVERSAL = "方向修正"
 GRP_STREAK = "连败缩仓"
 
 # 分组显示顺序
 GROUP_ORDER: list[str] = [
     GRP_DEVIATION,
     GRP_DCA,
+    GRP_REVERSAL,
     GRP_STREAK,
     GRP_ENTRY,
     GRP_TPSL,
@@ -702,6 +704,15 @@ PARAM_REGISTRY: list[ParamDef] = [
         sig_key="dcamc",
     ),
     ParamDef(
+        key="dca_max_entry_price",
+        param_type="float",
+        default=0.95,
+        description="DCA加仓最高token价格（独立于首次入场限制）",
+        group=GRP_DCA,
+        shell_var="DCA_MAX_ENTRY_PRICE",
+        sig_key="dcamep",
+    ),
+    ParamDef(
         key="dca_w_deviation",
         param_type="float",
         default=0.25,
@@ -754,6 +765,55 @@ PARAM_REGISTRY: list[ParamDef] = [
         group=GRP_DCA,
         shell_var="DCA_W_POSITION",
         sig_key="dcawpos",
+    ),
+
+    # ==================== 方向修正 ====================
+    ParamDef(
+        key="direction_reversal",
+        param_type="bool",
+        default=False,
+        description="启用方向修正（BTC反转时放弃原仓追新方向）",
+        group=GRP_REVERSAL,
+        shell_var="ENABLE_DIRECTION_REVERSAL",
+        sig_key="dr",
+        cli_flag="enable-direction-reversal",
+        constructor_name="enable_direction_reversal",
+    ),
+    ParamDef(
+        key="reversal_threshold",
+        param_type="float",
+        default=50.0,
+        description="BTC反向偏离开盘价$阈值，触发方向修正",
+        group=GRP_REVERSAL,
+        shell_var="REVERSAL_THRESHOLD",
+        sig_key="drt",
+    ),
+    ParamDef(
+        key="reversal_start_sec",
+        param_type="float",
+        default=120.0,
+        description="方向修正最早生效时间（窗口内秒）",
+        group=GRP_REVERSAL,
+        shell_var="REVERSAL_START_SEC",
+        sig_key="drs",
+    ),
+    ParamDef(
+        key="reversal_end_sec",
+        param_type="float",
+        default=240.0,
+        description="方向修正最晚截止时间（窗口内秒）",
+        group=GRP_REVERSAL,
+        shell_var="REVERSAL_END_SEC",
+        sig_key="dre",
+    ),
+    ParamDef(
+        key="reversal_size_multiplier",
+        param_type="float",
+        default=1.2,
+        description="方向修正仓位相对被放弃仓位投入的倍数",
+        group=GRP_REVERSAL,
+        shell_var="REVERSAL_SIZE_MULTIPLIER",
+        sig_key="drsm",
     ),
 
     # ==================== 连败缩仓 ====================
