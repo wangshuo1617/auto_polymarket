@@ -1,204 +1,367 @@
-# 5m Trade 策略融合实现计划
+# 5m Trade 策略融合计划 v3
 
-## 背景
+> 基于 marketing101 (m101) 21天/845窗口/37,674笔交易数据逆向分析，将其盈利模式融入策略框架。
+> 更新日期：2026-04-15
+>
+> ⚠️ v3 修正：v2 错误认为 m101 是 100% taker，实际为 87% maker（限价单）+ 13% taker。
+> 但核心 alpha 来自方向判断+仓位管理，与执行方式无关，用 taker 即可复制。
+> 详见 `docs/marketing101_strategy_analysis.md` §2.0。
 
-将 marketing101 的核心策略思路融合到现有 5m_trade.py 策略中。核心变化：从"固定时间入场、单笔下注、固定仓位"改为"偏离触发入场、DCA加仓、动态缩仓"，同时保留现有所有止损保护机制。
+## 问题诊断
 
-## 现状 vs 目标
+### 当前策略的根本缺陷
 
-| 维度 | 现状 | 目标 |
+deviation entry 策略准确率高 (79.3%) 但 ROI 接近零 (-0.9%)。**根因是入场价过高**：
+
+```
+当前:  入场价 0.80, 胜率 79% → 赢+$0.20, 亏-$0.80 → E[ROI] = -0.9%
+目标:  入场价 0.50, 胜率 65% → 赢+$0.50, 亏-$0.50 → E[ROI] = +30%
+```
+
+准确率不是瓶颈，盈亏比才是。需要 >80% 胜率才能在 0.80 入场价上盈利，这几乎不可能稳定达到。
+
+### m101 数据支持
+
+| 指标 | 我方 dry-run | m101 |
+|------|-------------|------|
+| 入场价 | 0.80 | 0.48 |
+| 胜率 | 79.3% | 61.2% |
+| E[ROI] | -0.9% | +28.8% |
+| 仓位 | $20 | $450-$991 |
+| 止损 | 多种 | 无（100%持有到结算） |
+
+## m101 三种盈利模式
+
+### 模式 A：极速入场 (0-15s)
+- **占比** 16% 窗口，但贡献 **75% 利润** (+$30,019, ROI +43%)
+- token 价格 ≈0.48 (50/50)，市场尚无方向
+- 试探入场（首笔 <30% 总仓），每 10-15s DCA 加仓，平均 8.8 次
+- 方向信号来源不明（与 BTC 短期价格仅 ~55% 相关）
+- 偏好高波动时段（前 5m 波动率 $217 vs 平均 $160）
+
+### 模式 B：观察后顺势入场 (60-300s)
+- **占比** 59% 窗口，PnL +$13,216, ROI +8~19%
+- 观察 BTC 走势后跟随入场，67% 顺势
+- 顺势时 WR=79%（接近我们的 deviation 策略）
+- 首笔价 avg 0.61，仓位 avg $450，DCA 4 次
+- 本质与我们相同，但入场价低 0.20
+
+### 模式 C：Underdog 尾部对冲 (180-300s)
+- **占比** 16% 窗口，PnL +$1,018, ROI +17%
+- 买入极低价 token (<0.30, avg 0.11)，逆市场共识
+- WR 仅 19%，但赔率 9:1，正 EV
+- 相当于花 $40 买一张 "BTC 反转" 的彩票
+
+### 亏损模式 X：犹豫入场 (15-60s)
+- 占比 13%，**唯一亏损群组** (PnL -$3,276, ROI -8.7%)
+- 入场稍晚，价格已偏移但信号不够确定
+- 我们应避免这个区间
+
+## 改动计划
+
+### 改动一：取消所有止损（立即实施）
+
+**依据**：
+- m101 从不卖出，100% 持有到结算
+- 我们的止损累计造成 -$225 亏损（imbalance SL -$122, reversal -$89, bid_drop -$14）
+- 持有到结算的窗口 ROI 显著优于提前退出
+- dry-run 数据：全持有 PnL +$103 vs 实际 +$70
+
+**调整**：
+- 禁用 `sl_binance_trade_imbalance`
+- 禁用 `direction_reversal`
+- 禁用 `sl_last_min_bid_drop`
+- 禁用 `sl_last_min_proximity`
+- 唯一保留：`market_settle_win`（市场提前结算时平仓获利）
+
+**风险**：低。历史数据明确显示止损整体有害。
+
+---
+
+### 改动二：模式 C — Underdog 逆势彩票（暂缓实现）
+
+**目标**：在高波动窗口中，以极低价格买入 BTC 反方向 token，押注趋势反转。
+
+**m101 数据支撑**（详见 `marketing101_strategy_analysis.md` §5.5）：
+
+| 指标 | 数值 |
+|------|------|
+| 窗口数 | 106 纯 underdog + 66 双向彩票侧 |
+| 方向 | 83% 逆 BTC 当前趋势 |
+| 买入价 | avg 0.14（纯 underdog） |
+| 胜率 | 21%，BTC 实际反转率仅 16% |
+| ROI | +37.5%（甜蜜区 < 0.15 时 +44%~214%） |
+| 投入/窗口 | avg $163（仅为正常窗口的 1/8） |
+
+**触发条件**（部分确认）：
+- 高波动（BTC max dev avg=$199），但 80% 的高波动窗口 m101 仍选择跟随而非逆势
+- 入场时 BTC 已偏离 avg=$115（判断趋势过度延伸）
+- **未完全破解**：具体什么特征让 m101 在 20% 的高波动窗口选择 underdog
+
+**⚠️ 暂缓实现原因**：
+
+1. **Maker 优势极关键**：m101 通过 maker 挂单拿到比 market ask 便宜 $0.167 的价格。在 avg 0.14 的 token 上，这几乎是半价。Taker 执行会大幅降低甚至消除正 EV。
+2. **窗口选择信号不明**：m101 只在 ~20% 的高波动窗口做 underdog，选择逻辑未完全还原。
+3. **价格 ≥ 0.20 时负 EV**：只有 < 0.15 的 token 有正 EV，taker 执行几乎无法在这个价位成交。
+
+**若未来实现（需 maker 能力后）**：
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `enable_underdog` | bool | False | 启用 underdog 对冲 |
+| `underdog_start_sec` | float | 60.0 | 开始检查的窗口时间 |
+| `underdog_max_price` | float | 0.15 | 最大买入价格（< 0.15 才有正 EV）|
+| `underdog_stake_usd` | float | 5.0 | 固定下注金额 |
+
+**实现要点**：
+- 需先实现 maker 限价单执行能力
+- underdog 仓位独立记录（可能与主仓位方向相反）
+- DB 中新增 `underdog_pnl` 字段或独立行记录
+
+---
+
+### 改动三：模式 B — 降低 deviation 入场价
+
+**目标**：将现有策略的入场价从 avg 0.80 降至 0.55-0.65。
+
+**方法**：
+1. 降低 `deviation_entry_threshold` — 在更小的 BTC 偏移时触发入场
+2. 硬性限制 `max_entry_price` = 0.65（已有参数）
+3. **新增 `dca_max_avg_price`** — 限制 DCA 后的加权均价上限，防止加仓推高均价
+   - 当前问题：max_entry_price=0.65 限制首笔，但 DCA 把均价推到 0.77
+   - 新逻辑：如果加仓后均价 > `dca_max_avg_price`，跳过本次加仓
+
+**新/调整参数**：
+
+| 参数 | 调整 | 说明 |
 |------|------|------|
-| 入场时机 | 固定第N分钟末尾 | BTC偏离≥阈值时随时触发 |
-| 入场价格 | ~0.96（方向已定，价格已高）| ~0.60-0.75（更早入场）|
-| 买入次数 | 单笔 | DCA多笔，偏离加大时追加 |
-| 仓位控制 | 固定/risk_sizing | 连败缩仓 + DCA信心调节 |
-| 过滤条件 | 硬门槛（跳窗口）| 软调节（调DCA激进度）|
-| 止损 | imbalance/proximity/bid_drop | 全部保留 |
+| `max_entry_price` | 0.98 → 0.65 | 首笔入场价上限 |
+| `deviation_entry_threshold` | 需回测 | 降低以更早触发 |
+| `dca_max_avg_price` | 新参数, 默认 0.65 | DCA 后均价上限 |
 
-## 实现方案
-
-### 第1阶段：偏离触发入场（替换固定时间入场）
-
-**改动核心**：入场判定从 `_handle_entry_minute()` 的"固定时间窗口"模式，改为在 `_clock_tick()` 主循环中持续监控 BTC 偏离。
-
-#### 新参数
-
-| 参数 | 类型 | 默认 | 说明 |
-|------|------|------|------|
-| `enable_deviation_entry` | bool | False | 启用偏离入场模式（False=保持现有固定时间模式） |
-| `deviation_entry_threshold` | float | 40.0 | BTC偏离开盘价$阈值，触发首次入场 |
-| `deviation_entry_start_sec` | float | 60.0 | 偏离入场最早生效时间（窗口内秒） |
-| `deviation_entry_end_sec` | float | 240.0 | 偏离入场最晚截止时间（之后不再首次入场） |
-
-#### 逻辑
-
-1. `_clock_tick()` 中新增分支：若 `enable_deviation_entry=True` 且 `deviation_entry_start_sec <= rel_sec < deviation_entry_end_sec`：
-   - 计算 `abs_diff = abs(btc_price - window_open_price)`
-   - 若 `abs_diff >= deviation_entry_threshold` 且 `window_traded == False`：
-     - 确定方向 → 调用 `_open_position()` 首次建仓
-     - 设置 `window_traded = True`
-2. 原有 `entry_trigger_sec..entry_deadline_sec` 的判定逻辑仅在 `enable_deviation_entry=False` 时生效
-3. 保留 `toxic_utc_hours` 检查（在偏离入场前也检查）
-
-### 第2阶段：DCA 加仓
-
-**改动核心**：首次入场后，在窗口内继续监控 BTC 偏离，满足条件时追加买入。加仓金额由信心评分函数 `compute_dca_add_size()` 动态决定，综合多个市场因子。
-
-#### 新参数
-
-| 参数 | 类型 | 默认 | 说明 |
-|------|------|------|------|
-| `enable_dca` | bool | False | 启用DCA加仓 |
-| `dca_max_adds` | int | 4 | 最大追加次数 |
-| `dca_interval_sec` | float | 15.0 | 两次DCA之间最小间隔（秒） |
-| `dca_deviation_step` | float | 20.0 | 每次追加需要BTC额外偏离的增量（$） |
-| `dca_end_sec` | float | 270.0 | DCA最晚截止时间（留30s给止损逻辑） |
-| `dca_min_confidence` | float | 0.3 | DCA信心分低于此值不加仓 |
-| `dca_w_deviation` | float | 0.25 | 信心权重：BTC偏离强度 |
-| `dca_w_atr` | float | 0.20 | 信心权重：ATR稳定度（ATR越低信心越高） |
-| `dca_w_cross` | float | 0.20 | 信心权重：cross稳定度（cross越少信心越高） |
-| `dca_w_price` | float | 0.15 | 信心权重：token价格（越低盈亏比越好） |
-| `dca_w_time` | float | 0.10 | 信心权重：窗口剩余时间（越早越好） |
-| `dca_w_position` | float | 0.10 | 信心权重：已持仓量（已加仓越少越好） |
-
-#### DCA 信心评分函数 `compute_dca_add_size()`
-
-位置：`services/five_minute_trade/dca_sizing.py`（新文件）
-
-**输入**：
-
-| 因子 | 含义 | 高值 → 信心 |
-|------|------|-------------|
-| BTC 偏离增量 | 相比入场时又偏离了多少 | ↑ 趋势加强 → 加大 |
-| ATR | 窗口内每秒波动均值 | ↑ 方向不确定 → **降低** |
-| Cross count | BTC穿越开盘价次数 | ↑ 反复横跳 → **降低/停止** |
-| Token 当前价格 | 越低盈亏比越好 | ↑ 盈亏比差 → 降低 |
-| 窗口内已用时间 | 离结算越近风险越大 | ↑ 时间不够 → 降低 |
-| 已持仓量 | 已经加了几次 | ↑ 集中度风险 → 降低 |
-
-**输出**：
-
-```python
-@dataclass
-class DCADecision:
-    should_add: bool        # 是否加仓
-    add_size_usdc: float    # 本次加仓金额
-    confidence: float       # 0-1 综合信心分（日志/诊断用）
-    reason: str             # 决策理由
-    # 各分项分数（诊断用）
-    deviation_score: float
-    atr_score: float
-    cross_score: float
-    price_score: float
-    time_score: float
-    position_score: float
+**期望收益**（按 70% WR、0.60 avg 入场价）：
+```
+E[ROI] = 0.70 × 0.40 - 0.30 × 0.60 = +10%
 ```
 
-**计算逻辑**：
+---
 
-```python
-base_add = effective_stake  # 基础加仓额 = 经连败缩仓调整后的stake
+### 改动四：模式 A — 早期 Imbalance 信号入场（需回测验证）
 
-# 各因子独立产出 0.0-1.0 的信心子分数
-deviation_score  = clamp((current_deviation - entry_deviation) / dca_deviation_step, 0, 1)
-atr_score        = clamp(1.0 - atr / atr_ceiling, 0, 1)           # atr_ceiling 取自历史P90
-cross_score      = clamp(1.0 - cross_count / cross_ceiling, 0, 1) # cross_ceiling = dca_max_adds+2
-price_score      = clamp(1.0 - token_price / 0.85, 0, 1)          # token>0.85时score→0
-time_score       = clamp((dca_end_sec - rel_sec) / (dca_end_sec - deviation_entry_start_sec), 0, 1)
-position_score   = clamp(1.0 - dca_count / dca_max_adds, 0, 1)
+**目标**：在窗口 0-15s、token 价格 ≈0.50 时利用 Binance imbalance 信号入场。
 
-confidence = (dca_w_deviation * deviation_score
-            + dca_w_atr * atr_score
-            + dca_w_cross * cross_score
-            + dca_w_price * price_score
-            + dca_w_time * time_score
-            + dca_w_position * position_score)
+**前提**：我们已验证 Binance trade imbalance 信号能提前 1-2s 预测 token 价格方向。
+如果窗口开始后数秒内出现 imbalance，可在 token 还是 ~0.50 时入场。
 
-if confidence < dca_min_confidence:
-    return DCADecision(should_add=False, ...)
+**逻辑**：
+1. 窗口开始后 `early_entry_start_sec` ~ `early_entry_end_sec` 内监听 imbalance
+2. imbalance 超过阈值 → 确定方向 → 立即入场
+3. 首笔试探（30% 总仓），后续每 10-15s 检查是否加仓
+4. 与现有 deviation entry 互补（模式 A 未触发时降级到模式 B）
 
-add_size_usdc = base_add * confidence
-```
-
-#### 触发逻辑
-
-1. 在 `_clock_tick()` 中，若 `enable_dca=True` 且 `position is not None` 且 `rel_sec < dca_end_sec`：
-   - 检查时间间隔：距上次DCA >= `dca_interval_sec`
-   - 检查偏离增量：当前 `abs_diff >= deviation_entry_threshold + dca_add_count * dca_deviation_step`
-   - 方向一致性：DCA方向必须与持仓方向一致
-   - 调用 `compute_dca_add_size()` 获取 DCADecision
-   - `should_add=True` → 追加买入（调用 `_dca_add_position()`）
-2. 新方法 `_dca_add_position(add_size_usdc)`：
-   - 复用 `entry_ops` 的订单簿/下单/流动性检查逻辑
-   - 更新现有 `self.position` 的 size/total_invested_usdc（加权平均入场价）
-   - 更新 DB 中 `trade_window_summary` 的 entry_size/entry_usdc/entry_price
-   - 记录本次 DCA 的诊断信息到 `dca_history`
-3. OpenPosition 新增字段：`dca_count: int = 0`, `dca_history: list = []`
-
-注意：ATR 和 cross count 不再作为硬门槛拦截 DCA，而是通过信心分数**连续调节**加仓金额——ATR 高或 cross 多时信心分低，加仓金额自动缩小甚至归零。
-
-### 第3阶段：连败缩仓
-
-**改动核心**：跟踪连续亏损次数，动态缩减 stake_usd。
-
-#### 新参数
+**新参数**：
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `enable_streak_sizing` | bool | False | 启用连败缩仓 |
-| `streak_loss_threshold` | int | 3 | 连败N次后开始缩仓 |
-| `streak_shrink_factor` | float | 0.5 | 缩仓比例（乘数） |
-| `streak_max_shrinks` | int | 3 | 最大连续缩减次数（防止仓位过小） |
+| `enable_early_entry` | bool | False | 启用早期 imbalance 入场 |
+| `early_entry_end_sec` | float | 15.0 | 早期入场窗口截止时间 |
+| `early_entry_max_price` | float | 0.55 | 早期入场最大 token 价格 |
+| `early_entry_imbalance_threshold` | float | TBD | imbalance 触发阈值 |
+| `early_entry_stake_usd` | float | 30.0 | 早期入场仓位 |
 
-#### 逻辑
+**期望收益**（按 60% WR、0.50 入场价）：
+```
+E[ROI] = 0.60 × 0.50 - 0.40 × 0.50 = +20%
+```
 
-1. 新增实例变量 `_consecutive_losses: int = 0`
-2. 窗口结算时（`settle_window` / `update_window_early_exit`）：
-   - 亏损 → `_consecutive_losses += 1`
-   - 盈利 → `_consecutive_losses = 0`
-3. 入场时的 effective_stake 计算：
-   - 若 `_consecutive_losses >= streak_loss_threshold`：
-     - `shrinks = min(_consecutive_losses - streak_loss_threshold + 1, streak_max_shrinks)`
-     - `effective_stake *= streak_shrink_factor ** shrinks`
-4. 启动时从DB查询最近N个窗口结果，恢复 `_consecutive_losses` 状态
+**前置回测任务**（必须先完成）：
+- [ ] 窗口前 15s 内 imbalance 信号的触发频率
+- [ ] 该场景下 imbalance 信号的方向准确率
+- [ ] 0-15s 内 Polymarket orderbook 流动性（能否成交 $30+）
 
-### 第4阶段：过滤条件降级为DCA调节因子
+---
 
-**逻辑变化（仅 deviation_entry 模式下生效）**：
+### 改动五：渐进式 DCA 模式（模仿 m101）
 
-- `max_btc_cross_count`：不再作为入场拦截 → 通过 DCA 信心函数的 `cross_score` 连续调节加仓量
-- `max_avg_btc_delta` (ATR)：不再作为入场拦截 → 通过 DCA 信心函数的 `atr_score` 连续调节加仓量
-- `min_entry_updown_diff`：**降低至 0.10**（现有0.38是为第4分钟高价差设计的；60-180s时中位价差仅0.33-0.45）。低价差窗口不拦截入场，而是通过 DCA 信心函数的 `price_score` 缩减首单/加仓金额
-  - 数据支持：UP/DOWN diff < 0.10 → 方向正确率仅52%（噪声），0.10-0.20 → 56%，开始有信号
-- `minute_consistency`：在偏离模式下禁用（无固定分钟概念）
-- `min_direction_diff`：被 `deviation_entry_threshold` 替代
-- `cross_borderline_diff_multiplier`：在偏离模式下禁用
-- `risk_diff_boost_*`：在偏离模式下禁用（风险通过连败缩仓+DCA控制）
+**目标**：从"一次性全仓"改为"试探+渐进加仓"。
 
-原有固定时间模式 (`enable_deviation_entry=False`) 下这些参数行为完全不变。
+**m101 DCA 模式数据**：
+- 首笔仅占总仓 <30%（63% 窗口）
+- 每 10-15s 加仓一次，平均 8.8 次（极速入场）/ 4 次（观察入场）
+- 49.5% 追涨（方向确认后加大），23% 抄底，27% 平稳
 
-### 第5阶段：集成测试和参数注册
+**调整现有 DCA 参数**：
 
-按3处更新模式：
+| 参数 | 当前 | 建议 | 说明 |
+|------|------|------|------|
+| `dca_max_adds` | 4 | 6-8 | 增加加仓次数 |
+| `dca_interval_sec` | 15.0 | 12.0 | 缩短加仓间隔 |
+| `dca_end_sec` | 270.0 | 280.0 | 延长加仓窗口 |
+| 首笔仓位 | 100% stake | 30% stake | 试探入场 |
 
-1. **`param_registry.py`**：注册所有新参数的 `ParamDef`
-2. **`5m_trade.py` `__init__`**：新增构造函数参数 + 实例变量
-3. **`restart_5m_trade.sh`**：新增环境变量 + 校验 + echo + CMD
+**新逻辑**：首笔入场金额 = `stake_usd × initial_stake_ratio`（新参数，默认 0.30）
 
-## Todos
+---
 
-- `deviation-entry`: 实现偏离触发入场模式（参数+_clock_tick分支+方向判定）
-- `dca-engine`: 实现DCA加仓引擎（参数+_dca_add_position+OpenPosition扩展+DB更新）
-- `streak-sizing`: 实现连败缩仓（参数+连败追踪+stake计算+启动恢复）
-- `filter-demotion`: 偏离模式下过滤条件降级为DCA调节因子
-- `param-registration`: 所有新参数注册到param_registry+restart_5m_trade.sh
-- `dry-run-validation`: dry-run模式验证全流程不报错
+### 改动六：开启 Risk Sizing 动态仓位（已有框架）
+
+**目标**：根据信号确定性动态调整初始 stake，拉大高/低确定性窗口的仓位差距。
+
+**现状**：
+- 当前 `--disable-risk-sizing`，初始 stake 固定 $5
+- 仅靠 DCA 拉开差距，最大倍数 = 5x（$5 到 $25）
+- m101 的仓位差距高达 65x（$22 到 $1,440），通过"初始仓位不同 + DCA 累积"实现
+- 我们的 DCA 机制已实现"确认后加码"，但初始仓位缺乏区分
+
+**`risk_sizing.py` 已有三维风险模型**：
+1. `entry_price_risk` — token 价格区间风险（walk-forward 标定）
+2. `direction_risk` — BTC 偏离幅度 / 阈值的比率（偏离越大 risk 越低）
+3. `stability_risk` — BTC 穿越开盘价次数（越多越不稳定）
+
+**调整方案**：
+| 参数 | 当前 | 建议 | 效果 |
+|------|------|------|------|
+| `enable_risk_sizing` | False | True | 开启 |
+| `risk_min_stake_ratio` | 0.2 | 0.1 | 最小 $0.5（低信号试探） |
+| `risk_max_stake_ratio` | 1.2 | 5.0 | 最大 $25（高信号重仓） |
+
+- 初始仓位差距从 1x 拉到 **50x**（$0.5 到 $25）
+- 叠加 DCA 4 次后，总仓位差距可达 **$0.5 到 $125 = 250x**
+- `direction_risk` 维度天然对齐 m101 的"BTC 偏离越大→仓位越大"逻辑
+
+**注意**：`compute_entry_price_risk()` 的标定数据基于旧策略（max_entry=0.98），
+现在 max_entry=0.85 且关闭了所有止损，价格区间的 WR 分布可能不同。
+建议新策略跑 1-2 周后用新数据重新 walk-forward 标定。
+
+---
+
+### 改动七：DCA 金额递增（加码加速）
+
+**目标**：DCA 每次加仓金额逐步递增，而非固定，使"方向越确认→加仓越多"更显著。
+
+**现状**：每次 DCA 金额 = risk_adjusted_stake × confidence（大致固定）
+
+**m101 数据参考**：
+- 窗口内后续交易金额通常大于前期
+- taker 单笔 avg $61（确认性补仓）远大于 maker 单笔 avg $19（试探性挂单）
+
+**新参数**：
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `dca_size_multiplier` | float | 1.0 | 每次 DCA 金额递增倍数 |
+
+**逻辑**：第 N 次 DCA 金额 = base_dca_amount × `dca_size_multiplier` ^ (N-1)
+
+示例（multiplier=1.5, base=$5）：
+- DCA#1: $5, DCA#2: $7.5, DCA#3: $11.25, DCA#4: $16.88 → 总 $40.6
+- 对比固定: $5 × 4 = $20 → 差距翻倍
+
+---
+
+### 改动八：入场时间下限优化
+
+**目标**：避免在方向不明朗的窗口早期入场，提高胜率。
+
+**m101 数据**：
+| 入场时间 | 跟随 BTC 比例 | 胜率趋势 |
+|---------|--------------|---------|
+| 0-30s | 68% | 低 |
+| 30-60s | 76% | 中（亏损区间） |
+| 60-120s | 81% | 高 |
+| 180s+ | 87% | 最高 |
+
+**当前**：`deviation_entry_start_sec=0`（BTC 偏离 $40 即可入场，不限时间）
+
+**建议**：`deviation_entry_start_sec=30`（至少等 30s 再入场）
+- 避开 0-30s 的方向不确定期（跟随率仅 68%）
+- 同时不过度延迟（60s+ 后 token 价格已贵）
+- 保守选择，不会错过太多窗口
+
+---
+
+### 改动九：连胜放大（streak 正向调整）
+
+**目标**：连胜后适当放大仓位，与现有的连败缩仓对称。
+
+**m101 数据**：
+- 连续 3 胜后仓位 $372（正常）
+- 连续 3 败后仓位 $194（缩减 ~50%）
+- 差距约 2x
+
+**当前**：只有连败缩仓（`streak_loss_threshold=3, streak_shrink_factor=0.5`），无连胜放大
+
+**新参数**：
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `streak_win_threshold` | int | 3 | 连胜几次后触发放大 |
+| `streak_boost_factor` | float | 1.3 | 仓位放大倍数 |
+| `streak_max_boosts` | int | 2 | 最多放大几次 |
+
+**逻辑**：连续 3 胜 → stake × 1.3，连续 6 胜 → stake × 1.3²
+
+---
+
+### 改动十：方向修正（direction_reversal 尾盘附加项）
+
+**定位**：deviation_entry 的**尾盘纠错机制**，非独立交易模式。
+
+**逻辑**：已有仓位后，如果 BTC 反向突破开盘价 ≥$50（120-240s 内），
+放弃旧仓（让其自然结算为 0），在反方向开新仓。
+
+**m101 数据**：18% 窗口出现方向切换，属于"BTC 反转时及时纠错"。
+
+**当前状态**：代码已实现（`_check_direction_reversal`），但实盘关闭。
+
+**建议**：
+- dry-run 数据显示 direction_reversal 仍是负贡献（67% 正确检测但全损旧仓拖累 PnL）
+- 暂不开启，等 risk_sizing 开启后重新评估
+  （有动态仓位后，旧仓如果是轻仓试探，放弃的成本更低，reversal 可能变为正贡献）
+
+---
+
+## 实施顺序
+
+```
+第零阶段（已完成 ✅）
+  ├─ 1. 取消所有止损
+  ├─ 2. 降低 max_entry_price 至 0.85
+  ├─ 3. 启用 deviation_entry ($40 阈值)
+  └─ 4. 启用 DCA（max 4 次）
+
+第一阶段（低风险，参数调整即可）
+  ├─ 6. 开启 risk_sizing + 拉大仓位差距 ← 框架已有，改参数
+  ├─ 8. 入场时间下限 deviation_entry_start_sec=30 ← 改参数
+  └─ 9. 连胜放大 streak_boost ← 需少量新代码
+
+第二阶段（需新代码 + 回测验证）
+  ├─ 7. DCA 金额递增 dca_size_multiplier ← 新参数+逻辑
+  └─ 10. 方向修正 ← 等 risk_sizing 开启后重新评估
+
+第三阶段（新信号源，需回测）
+  ├─ 3. 降低 deviation 入场价 + dca_max_avg_price
+  ├─ 4. 渐进式首笔 30% DCA
+  └─ 5. 早期 Imbalance 入场
+
+第四阶段（需 Maker 能力后）
+  └─ 2. Underdog 逆势彩票 ← 依赖 maker 执行，暂缓
+```
+
+## 回测任务
+
+| # | 任务 | 目的 | 优先级 |
+|---|------|------|--------|
+| 1 | 不同 `max_entry_price` 下的胜率-ROI 曲线 | 确定改动三最优入场价 | P0 |
+| 2 | `dca_max_avg_price` 对最终均价和 ROI 的影响 | 防止 DCA 推高均价 | P0 |
+| 3 | 全量历史窗口无止损 vs 有止损 PnL 对比 | 确认改动一收益 | P0 |
+| 4 | Underdog (价格<0.15) taker 执行的 EV 估算 | 确认 taker 是否可行（大概率不可行）| P2 |
+| 5 | 窗口前 15s imbalance 信号触发率与准确率 | 验证改动四可行性 | P1 |
+| 6 | 首笔 30% vs 100% 仓位的 ROI 对比 | 确认改动五效果 | P1 |
 
 ## 注意事项
 
 - 所有新功能默认关闭 (`enable_xxx=False`)，不影响现有策略运行
-- 新旧模式通过 `enable_deviation_entry` 开关切换，可随时回退
-- DCA的仓位更新需要原子性（锁保护 + DB事务）
-- `_dca_add_position()` 要复用 entry_ops 的流动性/滑点检查，不能跳过
-- 连败缩仓的DB恢复查询在 `start()` 方法中执行
-- 保留 exit_mode=hold 的默认退出策略
+- 新旧模式可通过参数开关切换，随时回退
+- DCA 的仓位更新需要原子性（锁保护 + DB 事务）
+- Underdog 仓位独立于主仓位，可能方向相反，结算时分别计算 PnL
+- 模式 A（早期入场）与模式 B（deviation 入场）互补：A 未触发则降级到 B
+- 避免 15-60s 犹豫区间入场（m101 数据显示该区间 ROI -8.7%）
