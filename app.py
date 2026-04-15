@@ -591,8 +591,68 @@ def _build_trade_history_rows(rows: list[dict]) -> list[dict]:
             "exit_price": exit_price,
             "exit_usdc": None if unresolved else round(exit_usdc, 4),
             "pnl": pnl,  # unresolved 不计利润
+            "_is_analyze": analyze_buy_count > 0,
         })
     return history_rows
+
+
+def _overlay_tws_entry_data(history_rows: list[dict]) -> None:
+    """用 trade_window_summary 的入场数据修正 trade_events 聚合结果。
+
+    trade_events 按 market_slug 聚合时，可能混入同窗口不同方向的 token 买入
+    （如服务重启导致先买 UP 再买 DOWN），造成 entry_usdc/size/price 失真。
+    trade_window_summary 只跟踪主仓位方向，入场数据更可靠。
+
+    仅修正 entry_* 字段，exit_usdc / exit_price 保持 trade_events + Activity API
+    的原始值不变，pnl 用修正后的 entry_usdc 重算。
+    """
+    if not history_rows:
+        return
+    slugs = [r["window_slug"] for r in history_rows if not r.get("_is_analyze")]
+    if not slugs:
+        return
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                "SELECT market_slug, entry_price, entry_size, entry_usdc "
+                "FROM trade_window_summary WHERE market_slug = ANY(%s)",
+                (slugs,),
+            )
+            tws_map = {r["market_slug"]: r for r in cur.fetchall()}
+    except Exception:
+        return  # 优雅降级
+
+    for row in history_rows:
+        if row.get("_is_analyze"):
+            continue
+        tws = tws_map.get(row.get("window_slug"))
+        if not tws:
+            continue
+        tws_entry_usdc = float(tws["entry_usdc"] or 0)
+        tws_entry_size = float(tws["entry_size"] or 0)
+        tws_entry_price = float(tws["entry_price"] or 0)
+        if tws_entry_usdc <= 0:
+            continue
+
+        row["entry_usdc"] = round(tws_entry_usdc, 4)
+        if tws_entry_size > 0:
+            row["entry_size"] = round(tws_entry_size, 4)
+        if tws_entry_price > 0:
+            row["entry_price"] = round(tws_entry_price, 4)
+
+        # 用修正后的 entry_usdc 重算 pnl（exit_usdc 来源不变）
+        if row.get("pnl") is not None and row.get("exit_usdc") is not None:
+            row["pnl"] = round(float(row["exit_usdc"]) - tws_entry_usdc, 4)
+            if row["pnl"] > 0:
+                row["result"] = "盈利"
+            elif row["pnl"] < 0:
+                row["result"] = "亏损"
+            else:
+                row["result"] = "持平"
+
+    # 清理内部标记，不暴露给 API 响应
+    for row in history_rows:
+        row.pop("_is_analyze", None)
 
 
 def _parse_utc8_datetime(raw: str) -> datetime:
@@ -801,6 +861,7 @@ def api_5m_trade_summary():
             cur.execute(query)
             rows = cur.fetchall()
             history_rows = _build_trade_history_rows(rows)
+            _overlay_tws_entry_data(history_rows)
     except Exception as e:
         return jsonify({"error": f"读取trade_events失败: {e}"}), 500
 
@@ -876,6 +937,7 @@ def api_5m_trade_stats():
             rows = cur.fetchall()
 
             history_rows = _build_trade_history_rows(rows)
+            _overlay_tws_entry_data(history_rows)
             trade_window_count = len(history_rows)
             settled = [r for r in history_rows if r.get("pnl") is not None]
             profit_rows = [r for r in settled if float(r["pnl"]) > 0]
