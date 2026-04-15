@@ -90,6 +90,46 @@ class TradeSQLiteStore:
         except Exception as e:
             logger.warning("write_window_open 失败(不影响交易): %s", e)
 
+    def write_dca_entry_event(
+        self,
+        position: OpenPosition,
+        dca_number: int,
+        dca_size: float,
+        dca_price: float,
+        dca_usdc: float,
+        order_id: Optional[str],
+        dry_run: bool,
+        btc_price_at_trade: Optional[float],
+    ) -> None:
+        """DCA 加仓写入 trade_events（reason='dca_entry'）。"""
+        with self._lock, get_conn() as conn:
+            conn.cursor().execute(
+                """
+                INSERT INTO trade_events (
+                    event_time, side, market_slug, market_id, token_id,
+                    direction, reason, trade_size, trade_price,
+                    related_entry_time, notional_usdc,
+                    btc_price_at_trade, order_id, mode
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    datetime.utcnow().isoformat(),
+                    "buy",
+                    position.market_slug,
+                    position.market_id,
+                    position.token_id,
+                    position.direction,
+                    f"dca_entry_{dca_number}",
+                    dca_size,
+                    dca_price,
+                    self._to_utc_iso(position.entry_time),
+                    dca_usdc,
+                    btc_price_at_trade,
+                    order_id,
+                    "dry-run" if dry_run else "live",
+                ),
+            )
+
     def write_realized_trade(
         self,
         record: TradeRecord,
@@ -539,14 +579,14 @@ _SETTLE_LOOKBACK_SEC = 7200  # 2 小时
 
 
 def settle_open_windows(store: TradeSQLiteStore, profile: str = "trade") -> int:
-    """扫描 open 窗口并通过 Polymarket Activity API 结算。
+    """扫描 live open 窗口并通过 Polymarket Activity API 结算。
 
     返回本次成功结算的窗口数。
     """
     import time
     from data.polymarket import get_5m_updown_activity_history
 
-    # 1) 查出所有 open 窗口（已过了结算年龄）
+    # 1) 查出所有 live open 窗口（已过了结算年龄）
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -554,6 +594,7 @@ def settle_open_windows(store: TradeSQLiteStore, profile: str = "trade") -> int:
             SELECT market_slug, entry_usdc, direction
             FROM trade_window_summary
             WHERE status = 'open'
+              AND mode = 'live'
               AND entry_time < NOW() - INTERVAL '%s seconds'
             ORDER BY entry_time
             """,
@@ -620,6 +661,100 @@ def settle_open_windows(store: TradeSQLiteStore, profile: str = "trade") -> int:
                 slug,
             )
         # result == "unresolved" → 市场未结算，跳过
+
+    return settled
+
+
+def _extract_window_ts_from_slug(slug: str) -> int | None:
+    """从 market_slug 中提取窗口 unix 时间戳。
+
+    slug 格式: btc-updown-5m-{unix_timestamp}
+    """
+    import re
+    m = re.search(r"(\d{10})$", slug)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def settle_open_windows_dry_run(store: TradeSQLiteStore) -> int:
+    """扫描 dry-run open 窗口，根据 btc_poly_1s_ticks 的 winning_direction 结算。
+
+    返回本次成功结算的窗口数。
+    """
+    # 1) 查出所有 dry-run open 窗口（已过了结算年龄）
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT market_slug, entry_usdc, entry_size, direction
+            FROM trade_window_summary
+            WHERE status = 'open'
+              AND mode = 'dry-run'
+              AND entry_time < NOW() - INTERVAL '%s seconds'
+            ORDER BY entry_time
+            """,
+            (_SETTLE_MIN_AGE_SEC,),
+        )
+        open_windows: list[dict] = []
+        for row in cur.fetchall():
+            open_windows.append({
+                "slug": row[0],
+                "entry_usdc": float(row[1] or 0),
+                "entry_size": float(row[2] or 0),
+                "direction": str(row[3] or ""),
+            })
+
+    if not open_windows:
+        return 0
+
+    settled = 0
+    for info in open_windows:
+        slug = info["slug"]
+        win_ts = _extract_window_ts_from_slug(slug)
+        if win_ts is None:
+            logger.warning("settle_dry_run: slug 格式异常，跳过: %s", slug)
+            continue
+
+        # 从 btc_poly_1s_ticks 获取 winning_direction
+        winning_direction: str | None = None
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT DISTINCT winning_direction
+                    FROM btc_poly_1s_ticks
+                    WHERE window_start_ms = %s
+                      AND winning_direction IS NOT NULL
+                    LIMIT 1
+                    """,
+                    (win_ts * 1000,),
+                )
+                row = cur.fetchone()
+                if row:
+                    winning_direction = str(row[0]).strip().lower()
+        except Exception as e:
+            logger.warning("settle_dry_run: 查询 winning_direction 失败 slug=%s error=%s", slug, e)
+            continue
+
+        if not winning_direction:
+            # tick 数据还没有该窗口的结果，稍后重试
+            continue
+
+        our_dir = info["direction"].lower().strip()
+        won = (our_dir == winning_direction)
+        # won: 每个 share 兑回 $1.0; lost: 归零
+        exit_usdc = info["entry_size"] if won else 0.0
+
+        if store.settle_window(slug, exit_usdc, won):
+            settled += 1
+            pnl = exit_usdc - info["entry_usdc"]
+            logger.info(
+                "settle_dry_run: %s → %s (exit_usdc=%.4f, entry_usdc=%.4f, pnl=%.4f)",
+                slug, "won" if won else "lost",
+                exit_usdc, info["entry_usdc"], pnl,
+            )
 
     return settled
 

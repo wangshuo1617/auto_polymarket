@@ -55,7 +55,7 @@ from services.five_minute_trade.position_close_ops import (
 )
 from services.five_minute_trade.auto_redeem import run_auto_redeem
 from services.five_minute_trade.reporting import build_pnl_report_content_and_subject
-from services.five_minute_trade.trade_db import TradeSQLiteStore, settle_open_windows
+from services.five_minute_trade.trade_db import TradeSQLiteStore, settle_open_windows, settle_open_windows_dry_run
 from services.five_minute_trade.param_registry import (
     build_startup_params,
     build_strategy_signature,
@@ -107,7 +107,7 @@ class FiveMinuteUpDownTrader:
     REPEATED_LOG_THROTTLE_SEC = 10.0
     LAST_MIN_PROXIMITY_THRESHOLD = 10.0
     OPEN_PRICE_SETTLE_SEC = 30
-    AUTO_REDEEM_INTERVAL_SEC = 600
+    AUTO_REDEEM_INTERVAL_SEC = 300
     AUTO_REDEEM_JITTER_SEC = 25
     AUTO_REDEEM_ENTRY_GUARD_SEC = 20
 
@@ -181,6 +181,12 @@ class FiveMinuteUpDownTrader:
         dca_w_price: float = 0.15,
         dca_w_time: float = 0.10,
         dca_w_position: float = 0.10,
+        # 方向修正
+        enable_direction_reversal: bool = False,
+        reversal_threshold: float = 50.0,
+        reversal_start_sec: float = 120.0,
+        reversal_end_sec: float = 240.0,
+        reversal_size_multiplier: float = 1.2,
         # 连败缩仓
         enable_streak_sizing: bool = False,
         streak_loss_threshold: int = 3,
@@ -275,6 +281,13 @@ class FiveMinuteUpDownTrader:
         self.dca_w_time = float(dca_w_time)
         self.dca_w_position = float(dca_w_position)
 
+        # 方向修正
+        self.enable_direction_reversal = bool(enable_direction_reversal)
+        self.reversal_threshold = float(reversal_threshold)
+        self.reversal_start_sec = float(reversal_start_sec)
+        self.reversal_end_sec = float(reversal_end_sec)
+        self.reversal_size_multiplier = float(reversal_size_multiplier)
+
         # 连败缩仓
         self.enable_streak_sizing = bool(enable_streak_sizing)
         self.streak_loss_threshold = int(streak_loss_threshold)
@@ -320,6 +333,10 @@ class FiveMinuteUpDownTrader:
         self._dca_add_count: int = 0
         self._dca_last_add_sec: float = 0.0
         self._dca_entry_abs_diff: float = 0.0  # 首次入场时的 abs_btc_diff
+
+        # 方向修正窗口内状态
+        self._direction_reversed: bool = False
+        self._reversed_position_cost: float = 0.0  # 被放弃仓位的投入成本
 
         # 连败缩仓状态
         self._consecutive_losses: int = 0
@@ -901,6 +918,9 @@ class FiveMinuteUpDownTrader:
                 self._dca_add_count = 0
                 self._dca_last_add_sec = 0.0
                 self._dca_entry_abs_diff = 0.0
+                # 方向修正窗口重置
+                self._direction_reversed = False
+                self._reversed_position_cost = 0.0
                 slug_ts = window_start_ms // 1000
                 self.current_market_slug = f"btc-updown-5m-{slug_ts}"
                 try:
@@ -995,6 +1015,17 @@ class FiveMinuteUpDownTrader:
                     and self.window_open_price is not None
                 ):
                     self._check_dca_add(btc_price=btc_price, rel_sec=rel_sec)
+
+                # --- 方向修正检查（偏离模式下，已有持仓且 BTC 反转） ---
+                if (
+                    self.enable_direction_reversal
+                    and not self._direction_reversed
+                    and self.position is not None
+                    and self.window_traded
+                    and self.window_open_price is not None
+                    and self.reversal_start_sec <= rel_sec <= self.reversal_end_sec
+                ):
+                    self._check_direction_reversal(btc_price=btc_price, rel_sec=rel_sec)
 
             else:
                 # --- 原有固定时间入场判定 ---
@@ -1364,6 +1395,93 @@ class FiveMinuteUpDownTrader:
                 logger.warning("偏离入场开仓失败（第 %d 次，将在下一 tick 重试）: %s", self._entry_attempt_count, e)
 
     # ------------------------------------------------------------------
+    # 方向修正
+    # ------------------------------------------------------------------
+    def _check_direction_reversal(self, btc_price: float, rel_sec: float) -> None:
+        """检查 BTC 是否已反向偏离超过阈值，满足则执行方向修正。"""
+        if self.position is None or self.window_open_price is None:
+            return
+
+        open_price = self.window_open_price
+        current_dir = self.position.direction
+        diff = btc_price - open_price
+
+        # 判断 BTC 是否越过开盘价到达对面
+        if current_dir == "up" and diff >= 0:
+            return  # BTC 仍在 UP 侧，无需修正
+        if current_dir == "down" and diff <= 0:
+            return  # BTC 仍在 DOWN 侧，无需修正
+
+        # BTC 已穿越开盘价，检查反向偏离幅度
+        reverse_abs_diff = abs(diff)
+        if reverse_abs_diff < self.reversal_threshold:
+            return
+
+        new_direction = "up" if diff > 0 else "down"
+        logger.info(
+            "方向修正触发: rel_sec=%.0f current_dir=%s new_dir=%s "
+            "reverse_diff=$%.2f (>= $%.2f) btc=%.2f open=%.2f",
+            rel_sec, current_dir, new_direction,
+            reverse_abs_diff, self.reversal_threshold, btc_price, open_price,
+        )
+        self._handle_direction_reversal(new_direction=new_direction, reverse_abs_diff=reverse_abs_diff)
+
+    def _handle_direction_reversal(self, new_direction: str, reverse_abs_diff: float) -> None:
+        """放弃当前仓位（让其自然结算为0），在反方向开新仓。"""
+        old_pos = self.position
+        if old_pos is None:
+            return
+
+        market_slug = self.current_market_slug or old_pos.market_slug
+        old_dir = old_pos.direction
+        old_cost = old_pos.total_invested_usdc or 0.0
+        old_size = old_pos.actual_entry_size or old_pos.size
+
+        # 记录被放弃的仓位信息
+        logger.warning(
+            "方向修正: 放弃 %s 仓 cost=$%.2f size=%.4f (预期结算为0)，"
+            "转向 %s stake=$%.2f (cost*%.1f) | market=%s",
+            old_dir, old_cost, old_size, new_direction,
+            old_cost * self.reversal_size_multiplier, self.reversal_size_multiplier,
+            market_slug,
+        )
+
+        # 记录已实现亏损（旧仓不卖出，exit_price=0 表示全损）
+        self._append_realized_trade(
+            pos=old_pos,
+            reason="direction_reversal",
+            matched_size=old_size,
+            actual_exit_price=0.0,
+            expected_exit_price=0.0,
+            exit_best_bid=None,
+            exit_avg_fill_price=None,
+            exit_full_fill=None,
+            btc_price_at_trade=self._get_latest_btc_price_snapshot(),
+        )
+
+        # 清除旧仓位（不卖出，让链上 token 自然结算）
+        self.position = None
+        self._direction_reversed = True
+        self._reversed_position_cost = old_cost
+
+        # DCA 状态重置（新仓位从零开始）
+        self._dca_add_count = 0
+        self._dca_last_add_sec = 0.0
+        self._dca_entry_abs_diff = 0.0
+
+        # 用旧仓投入 × reversal_size_multiplier 作为新仓大小
+        reversal_stake = old_cost * self.reversal_size_multiplier
+        original_stake = self.stake_usd
+        try:
+            self.stake_usd = reversal_stake
+            self._open_position(market_slug, new_direction, abs_btc_diff=reverse_abs_diff)
+            self._dca_entry_abs_diff = reverse_abs_diff
+        except Exception as e:
+            logger.error("方向修正开新仓失败: %s", e)
+        finally:
+            self.stake_usd = original_stake
+
+    # ------------------------------------------------------------------
     # DCA 加仓
     # ------------------------------------------------------------------
     def _check_dca_add(self, btc_price: float, rel_sec: float) -> None:
@@ -1537,8 +1655,22 @@ class FiveMinuteUpDownTrader:
         self._dca_add_count += 1
         self._dca_last_add_sec = rel_sec
 
-        # 更新 DB
+        # 更新 DB (window summary + trade_events)
         self._update_dca_in_db()
+        try:
+            btc_now = self._btc_watcher.latest_price if self._btc_watcher else None
+            self.db.write_dca_entry_event(
+                position=self.position,
+                dca_number=self.position.dca_count,
+                dca_size=normalized_size,
+                dca_price=entry_price,
+                dca_usdc=add_invested,
+                order_id=order_id,
+                dry_run=self.dry_run,
+                btc_price_at_trade=btc_now,
+            )
+        except Exception as e:
+            logger.warning("DCA trade_events写入失败: %s", e)
 
         if not self.dry_run and order_id:
             self._schedule_position_balance_confirmation(
@@ -2202,7 +2334,10 @@ class FiveMinuteUpDownTrader:
                         logger.error("自动赎回异常: %s", e)
                     # 结算 open 窗口
                     try:
-                        settle_open_windows(self._trade_db)
+                        if self.dry_run:
+                            settle_open_windows_dry_run(self._trade_db)
+                        else:
+                            settle_open_windows(self._trade_db)
                     except Exception as e:
                         logger.error("窗口结算异常: %s", e)
                     # 结算后刷新连败计数
