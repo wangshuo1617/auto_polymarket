@@ -65,6 +65,27 @@ UTC8_TIMEZONE = ZoneInfo("Asia/Shanghai")
 STRATEGY_PARAM_DISPLAY_ORDER = _REGISTRY_DISPLAY_ORDER + ["trade_db_path"]
 
 
+def _normalize_utc_iso(raw: str, default: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return default
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        return parsed.isoformat()
+    except Exception:
+        return default
+
+
+TRADE_METRIC_START_UTC = _normalize_utc_iso(
+    os.getenv("TRADE_METRIC_START_UTC", "2026-03-30T00:00:00+00:00"),
+    "2026-03-30T00:00:00+00:00",
+)
+
+
 def _is_authenticated() -> bool:
     return session.get("dashboard_authed") is True
 
@@ -368,19 +389,19 @@ def _load_activity_exit_by_slug(profile: str) -> tuple[dict[str, float], dict[st
     return exit_usdc_by_slug, exit_count_by_slug
 
 
-def _load_trade_balance_series(cur, limit: int = 2000) -> list[dict]:
+def _load_trade_balance_series(cur, limit: int = 20000) -> list[dict]:
     cur.execute(
         """
         SELECT ts_utc, balance
         FROM usdc_balance_snapshots
         WHERE profile = %s
-        ORDER BY ts_utc DESC
+          AND ts_utc >= %s
+        ORDER BY ts_utc ASC
         LIMIT %s
         """,
-        (TRADE_PM_PROFILE, int(limit)),
+        (TRADE_PM_PROFILE, TRADE_METRIC_START_UTC, int(limit)),
     )
     rows = cur.fetchall()
-    rows = list(reversed(rows))
     result = []
     for row in rows:
         result.append({
@@ -428,14 +449,15 @@ def _load_trade_realized_pnl_series(cur, limit: Optional[int] = None) -> list[di
           AND tws.market_slug LIKE 'btc-updown-5m-%%'
           AND tws.status IN ('won', 'lost', 'early_exit')
           AND tws.pnl IS NOT NULL
+          AND COALESCE(tws.exit_time, tws.settled_at, tws.entry_time) >= %s
           AND twf.analyze_buy_count = 0
           AND twf.trade_buy_count > 0
         ORDER BY COALESCE(tws.exit_time, tws.settled_at, tws.entry_time) ASC, tws.id ASC
     """
     if limit is not None:
-        cur.execute(sql + "\nLIMIT %s", (int(limit),))
+        cur.execute(sql + "\nLIMIT %s", (TRADE_METRIC_START_UTC, int(limit)))
     else:
-        cur.execute(sql)
+        cur.execute(sql, (TRADE_METRIC_START_UTC,))
     rows = cur.fetchall()
     result = []
     for row in rows:
@@ -961,6 +983,7 @@ def api_5m_trade_summary():
         "balance_series": log_series,
         "history": history_rows,
         "pnl_series": pnl_series,
+        "metric_start_utc": TRADE_METRIC_START_UTC,
         "skipped_windows": skipped_windows,
         "strategy_params": strategy_params,
     })
