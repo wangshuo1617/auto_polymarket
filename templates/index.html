@@ -448,7 +448,7 @@
         let tradeResultFilter = 'all';
         let skipPredFilter = 'all';
         let tradeCurrentBalance = '—';
-        let tradeBalanceSeriesData = [];
+        let tradePnlSeriesData = [];
         let tradeChartStart = '';
         let tradeChartEnd = '';
         let tradeHistoryStatStart = '';
@@ -516,12 +516,6 @@
             return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
         }
 
-        function _parseCashBalanceText(balanceText) {
-            const raw = String(balanceText || '').replace(/\$/g, '').replace(/,/g, '').trim();
-            const n = Number(raw);
-            return Number.isFinite(n) ? n : NaN;
-        }
-
         function _pad2(n) {
             return String(n).padStart(2, '0');
         }
@@ -559,36 +553,36 @@
             btn.disabled = !(Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs);
         }
 
-        function _getFilteredTradeBalanceSeries() {
-            const rows = Array.isArray(tradeBalanceSeriesData) ? tradeBalanceSeriesData : [];
+        function _buildTradePnlSeries(historyRows) {
+            const rows = Array.isArray(historyRows) ? historyRows : [];
+            const realized = rows
+                .map(r => ({
+                    ts: String((r && typeof r === 'object' ? (r.pnl_ts ?? r.ts) : '') || '').trim(),
+                    pnl: Number(r && typeof r === 'object' ? (r.delta_pnl ?? r.pnl) : NaN),
+                    window_slug: (r && typeof r === 'object' ? (r.window_slug || '--') : '--'),
+                }))
+                .filter(r => r.ts && Number.isFinite(Date.parse(r.ts)) && Number.isFinite(r.pnl));
+            realized.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+            let cumulative = 0;
+            return realized.map((r) => {
+                cumulative += r.pnl;
+                return {
+                    ts: r.ts,
+                    pnl: Number(cumulative.toFixed(4)),
+                    delta_pnl: Number(r.pnl.toFixed(4)),
+                    window_slug: r.window_slug,
+                };
+            });
+        }
+
+        function _getFilteredTradePnlSeries() {
+            const rows = Array.isArray(tradePnlSeriesData) ? tradePnlSeriesData : [];
             const { startMs, endMs } = _getChartRangeMs();
             if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return rows;
             return rows.filter((p) => {
                 const tsMs = Date.parse(String(p.ts || ''));
                 return Number.isFinite(tsMs) && tsMs >= startMs && tsMs <= endMs;
             });
-        }
-
-        function _appendLiveBalancePointIfNeeded(series, currentBalanceText) {
-            const rows = Array.isArray(series) ? [...series] : [];
-            const liveBalance = _parseCashBalanceText(currentBalanceText);
-            if (!Number.isFinite(liveBalance)) return rows;
-
-            const nowMs = Date.now();
-            const { startMs, endMs } = _getChartRangeMs();
-            if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
-                if (nowMs < startMs || nowMs > endMs) return rows;
-            }
-
-            const nowIso = new Date(nowMs).toISOString();
-            const last = rows.length ? rows[rows.length - 1] : null;
-            const lastTsMs = last ? Date.parse(String(last.ts || '')) : NaN;
-            const lastBal = last ? Number(last.balance) : NaN;
-            if (Number.isFinite(lastTsMs) && Math.abs(nowMs - lastTsMs) < 5000 && Number.isFinite(lastBal) && Math.abs(lastBal - liveBalance) < 1e-9) {
-                return rows;
-            }
-            rows.push({ ts: nowIso, balance: liveBalance });
-            return rows;
         }
 
         function applyTradeChartRange() {
@@ -978,18 +972,18 @@
             `;
         }
 
-        function _drawBalanceChart(series) {
+        function _drawPnlChart(series) {
             if (!Array.isArray(series) || series.length === 0) {
-                return '<div class="text-muted p-3">暂无余额曲线数据</div>';
+                return '<div class="text-muted p-3">暂无已实现盈亏曲线数据</div>';
             }
             let points = [...series];
             if (points.length > 800) {
                 const step = Math.ceil(points.length / 800);
                 points = points.filter((_, idx) => idx % step === 0 || idx === points.length - 1);
             }
-            const values = points.map(p => Number(p.balance)).filter(v => !isNaN(v));
+            const values = points.map(p => Number(p.pnl)).filter(v => !isNaN(v));
             if (values.length === 0) {
-                return '<div class="text-muted p-3">暂无有效余额数据</div>';
+                return '<div class="text-muted p-3">暂无有效盈亏数据</div>';
             }
             const minV = Math.min(...values);
             const maxV = Math.max(...values);
@@ -1005,27 +999,35 @@
 
             const chartPoints = points.map((p, i) => {
                 const x = padL + (i * plotW / Math.max(1, points.length - 1));
-                const y = padT + (maxV - Number(p.balance)) * plotH / span;
+                const y = padT + (maxV - Number(p.pnl)) * plotH / span;
                 return {
                     x: x.toFixed(2),
                     y: y.toFixed(2),
-                    balance: Number(p.balance),
+                    pnl: Number(p.pnl),
+                    delta_pnl: Number(p.delta_pnl),
+                    slug: p.window_slug || '--',
                     ts: p.ts,
                 };
             });
             const xy = chartPoints.map(p => `${p.x},${p.y}`).join(' ');
             const dots = chartPoints.map(p => {
                 const tipTime = _fmtUtc8DateTime(p.ts);
-                const tipVal = _fmt2(p.balance);
+                const tipVal = _fmt2(p.pnl);
+                const tipDelta = _fmt2(p.delta_pnl);
+                const tipDeltaSigned = (Number(p.delta_pnl) >= 0 ? '+' : '') + tipDelta;
+                const tipCumSigned = (Number(p.pnl) >= 0 ? '+' : '') + tipVal;
                 return `
                     <circle class="trade-chart-dot" cx="${p.x}" cy="${p.y}" r="3.2">
                         <title>时间(UTC+8): ${tipTime}
-余额: $${tipVal}</title>
+窗口: ${p.slug}
+累计盈亏: ${tipCumSigned} USDC
+单笔盈亏: ${tipDeltaSigned} USDC</title>
                     </circle>
                 `;
             }).join('');
 
-            const lastVal = Number(points[points.length - 1].balance);
+            const lastVal = Number(points[points.length - 1].pnl);
+            const lastText = (lastVal >= 0 ? '+' : '') + _fmt2(lastVal);
             const yMin = (padT + plotH).toFixed(2);
             const yMax = padT.toFixed(2);
             return `
@@ -1037,7 +1039,7 @@
                     ${dots}
                     <text x="10" y="${yMax}" font-size="12" fill="#6c757d">${_fmt2(maxV)}</text>
                     <text x="10" y="${yMin}" font-size="12" fill="#6c757d">${_fmt2(minV)}</text>
-                    <text x="${W - 150}" y="18" font-size="12" fill="#0d6efd">最新: $${_fmt2(lastVal)}</text>
+                    <text x="${W - 200}" y="18" font-size="12" fill="#0d6efd">最新累计: ${lastText} USDC</text>
                 </svg>
             `;
         }
@@ -1271,8 +1273,13 @@
                 : tradeHistoryRowsData.filter(r => String(r.result || '').trim() === tradeResultFilter);
             const hPage = _pageSlice(historyFilteredRows, tradeHistoryPage, TRADE_TABLE_PAGE_SIZE);
             tradeHistoryPage = hPage.current;
-            const filteredSeries = _appendLiveBalancePointIfNeeded(_getFilteredTradeBalanceSeries(), currentBalance);
-            const chartHtml = _drawBalanceChart(filteredSeries);
+            const filteredSeries = _getFilteredTradePnlSeries();
+            const chartHtml = _drawPnlChart(filteredSeries);
+            const latestTotalPnl = (
+                Array.isArray(tradePnlSeriesData) && tradePnlSeriesData.length > 0
+            ) ? Number(tradePnlSeriesData[tradePnlSeriesData.length - 1].pnl) : 0;
+            const totalPnlClass = latestTotalPnl >= 0 ? 'text-success' : 'text-danger';
+            const totalPnlLabel = (latestTotalPnl >= 0 ? '+' : '') + _fmt2(latestTotalPnl);
             let tableRows = '';
             hPage.items.forEach(r => {
                 const pnlClass = r.pnl == null ? '' : (Number(r.pnl) >= 0 ? 'text-success' : 'text-danger');
@@ -1331,7 +1338,10 @@
 
             let html = '';
             html += '<div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">';
-            html += '<h2 class="h4 mb-0">Current Balance：' + (currentBalance || '—') + '</h2>';
+            html += '<div>';
+            html += '<h2 class="h4 mb-1">累计已实现盈亏：<span class="' + totalPnlClass + '">' + totalPnlLabel + ' USDC</span></h2>';
+            html += '<div class="small text-muted">当前账户余额：' + (currentBalance || '—') + '</div>';
+            html += '</div>';
             html += '<div style="max-width: 300px; width: 100%;">' + _renderStrategyParamsPanel(tradeStrategyParams) + '</div>';
             html += '</div>';
             html += '<div class="d-flex align-items-center gap-2 mb-2">';
@@ -1402,8 +1412,11 @@
                     }
                     tradeHistoryRowsData = Array.isArray(data.history) ? data.history : [];
                     tradeSkipRowsData = Array.isArray(data.skipped_windows) ? data.skipped_windows : [];
-                    tradeBalanceSeriesData = Array.isArray(data.balance_series) ? data.balance_series : [];
-                    const seriesTs = tradeBalanceSeriesData
+                    const pnlSourceRows = (Array.isArray(data.pnl_series) && data.pnl_series.length > 0)
+                        ? data.pnl_series
+                        : tradeHistoryRowsData;
+                    tradePnlSeriesData = _buildTradePnlSeries(pnlSourceRows);
+                    const seriesTs = tradePnlSeriesData
                         .map(p => Date.parse(String(p.ts || '')))
                         .filter(v => Number.isFinite(v));
                     if (seriesTs.length > 0) {

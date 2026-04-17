@@ -654,38 +654,67 @@ def sell_order(
         )
         return clob_client.post_order(signed_order, orderType=order_type)
 
-    submit_t0 = time.perf_counter()
-    try:
-        response = _submit_once(normalized_size)
-        order_id = response.get("orderID") if isinstance(response, dict) else None
-        submit_ms = (time.perf_counter() - submit_t0) * 1000
-        logger.info("sell_order success: order_id=%s submit_latency=%.2fms", order_id, submit_ms)
-        return order_id
-    except Exception as e:
-        err_msg = str(e).lower()
-        if "not enough balance / allowance" not in err_msg:
-            logger.exception("sell_order failed: %s", e)
-            return None
-
-        # --- 救回那段死代码：自动降量重试机制 ---
-        logger.warning("sell_order 触发余额不足，尝试去链上核实真实余额并重试...")
-        available_balance = get_conditional_token_balance(token_id, profile=profile)
-        retry_size = normalize_order_size(
-            size=min(normalized_size, available_balance),
-            tick_size=meta["minimum_tick_size"],
+    def _is_retryable_server_error(err_msg: str) -> bool:
+        text = str(err_msg or "").lower()
+        return (
+            "status_code=500" in text
+            or "status_code=502" in text
+            or "status_code=503" in text
+            or "status_code=504" in text
+            or "could not run the execution" in text
+            or "internal server error" in text
+            or "bad gateway" in text
+            or "service unavailable" in text
+            or "gateway timeout" in text
         )
-        
-        if retry_size <= 0 or retry_size + 1e-12 >= normalized_size:
-            logger.warning("sell_order 真实余额验证失败: 目标=%.6f, 实际=%.6f", normalized_size, available_balance)
-            return None
 
+    submit_t0 = time.perf_counter()
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
         try:
-            logger.info("sell_order 使用真实余额重试: size=%.6f", retry_size)
-            retry_resp = _submit_once(retry_size)
-            return retry_resp.get("orderID") if isinstance(retry_resp, dict) else None
-        except Exception as retry_err:
-            logger.exception("sell_order 降量重试依然失败: %s", retry_err)
-            return None
+            response = _submit_once(normalized_size)
+            order_id = response.get("orderID") if isinstance(response, dict) else None
+            submit_ms = (time.perf_counter() - submit_t0) * 1000
+            logger.info("sell_order success: order_id=%s submit_latency=%.2fms", order_id, submit_ms)
+            return order_id
+        except Exception as e:
+            err_msg = str(e).lower()
+            is_balance_err = "not enough balance / allowance" in err_msg
+            if _is_retryable_server_error(err_msg) and attempt < max_attempts:
+                backoff_sec = 0.15 * attempt
+                logger.warning(
+                    "sell_order 交易所临时错误，准备重试: attempt=%d/%d wait=%.2fs error=%s",
+                    attempt,
+                    max_attempts,
+                    backoff_sec,
+                    e,
+                )
+                time.sleep(backoff_sec)
+                continue
+            if not is_balance_err:
+                logger.exception("sell_order failed: %s", e)
+                return None
+
+            # --- 救回那段死代码：自动降量重试机制 ---
+            logger.warning("sell_order 触发余额不足，尝试去链上核实真实余额并重试...")
+            available_balance = get_conditional_token_balance(token_id, profile=profile)
+            retry_size = normalize_order_size(
+                size=min(normalized_size, available_balance),
+                tick_size=meta["minimum_tick_size"],
+            )
+            
+            if retry_size <= 0 or retry_size + 1e-12 >= normalized_size:
+                logger.warning("sell_order 真实余额验证失败: 目标=%.6f, 实际=%.6f", normalized_size, available_balance)
+                return None
+
+            try:
+                logger.info("sell_order 使用真实余额重试: size=%.6f", retry_size)
+                retry_resp = _submit_once(retry_size)
+                return retry_resp.get("orderID") if isinstance(retry_resp, dict) else None
+            except Exception as retry_err:
+                logger.exception("sell_order 降量重试依然失败: %s", retry_err)
+                return None
+    return None
 
 def cancel_order(order_id: str, profile: Optional[str] = None):
     clob_client = get_client(profile)

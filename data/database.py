@@ -213,7 +213,7 @@ CREATE INDEX IF NOT EXISTS idx_usdc_balance_profile_ts ON usdc_balance_snapshots
 _DDL_TRADE_WINDOW_SUMMARY = """
 CREATE TABLE IF NOT EXISTS trade_window_summary (
     id SERIAL PRIMARY KEY,
-    market_slug TEXT NOT NULL UNIQUE,
+    market_slug TEXT NOT NULL,
     direction TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'open',
     entry_time TIMESTAMPTZ NOT NULL,
@@ -236,6 +236,7 @@ _DDL_TRADE_WINDOW_SUMMARY_INDICES = """
 CREATE INDEX IF NOT EXISTS idx_tws_status ON trade_window_summary(status);
 CREATE INDEX IF NOT EXISTS idx_tws_entry_time ON trade_window_summary(entry_time);
 CREATE INDEX IF NOT EXISTS idx_tws_mode ON trade_window_summary(mode);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tws_slug_mode_unique ON trade_window_summary(market_slug, mode);
 """
 
 
@@ -255,6 +256,8 @@ def init_db() -> None:
         cur.execute(_DDL_USDC_BALANCE_SNAPSHOTS)
         cur.execute(_DDL_USDC_BALANCE_SNAPSHOTS_INDICES)
         cur.execute(_DDL_TRADE_WINDOW_SUMMARY)
+        # 兼容旧版：旧表是 market_slug 单列唯一，需迁移为 (market_slug, mode) 复合唯一。
+        cur.execute("ALTER TABLE trade_window_summary DROP CONSTRAINT IF EXISTS trade_window_summary_market_slug_key;")
         cur.execute(_DDL_TRADE_WINDOW_SUMMARY_INDICES)
 
         # 创建 btc_poly_1s_ticks（需要先建表再转 hypertable）

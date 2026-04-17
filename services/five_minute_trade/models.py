@@ -77,6 +77,10 @@ class OpenPosition:
     direction_risk: Optional[float] = None
     stability_risk: Optional[float] = None
     window_open_btc_price: Optional[float] = None
+    entry_mode: Optional[str] = None
+    entry_stake_ratio: Optional[float] = None
+    entry_trigger_threshold: Optional[float] = None
+    entry_rel_sec: Optional[float] = None
     # DCA 追踪
     dca_count: int = 0
     dca_history: list = field(default_factory=list)

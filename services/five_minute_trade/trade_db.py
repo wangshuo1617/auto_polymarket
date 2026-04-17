@@ -188,7 +188,7 @@ class TradeSQLiteStore:
             )
         # 同步更新窗口汇总
         try:
-            self.update_window_early_exit(record)
+            self.update_window_early_exit(record, dry_run)
         except Exception as e:
             logger.warning("update_window_early_exit 失败(不影响交易): %s", e)
 
@@ -344,7 +344,7 @@ class TradeSQLiteStore:
             deleted = int(cur.rowcount or 0)
             # 同步删除窗口汇总
             try:
-                self.delete_window_summary(market_slug)
+                self.delete_window_summary(market_slug, dry_run)
             except Exception as e:
                 logger.warning("delete_window_summary 失败: %s", e)
             return deleted
@@ -396,7 +396,7 @@ class TradeSQLiteStore:
             updated = int(cur.rowcount or 0)
             # 入场失败，删除窗口汇总
             try:
-                self.delete_window_summary(market_slug)
+                self.delete_window_summary(market_slug, dry_run)
             except Exception as e:
                 logger.warning("delete_window_summary 失败: %s", e)
             return updated
@@ -456,6 +456,14 @@ class TradeSQLiteStore:
             diag["take_profit_price"] = round(position.take_profit_price, 4)
         if position.window_open_btc_price is not None:
             diag["window_open_btc_price"] = round(position.window_open_btc_price, 2)
+        if position.entry_mode:
+            diag["entry_mode"] = position.entry_mode
+        if position.entry_stake_ratio is not None:
+            diag["entry_stake_ratio"] = round(float(position.entry_stake_ratio), 4)
+        if position.entry_trigger_threshold is not None:
+            diag["entry_trigger_threshold"] = round(float(position.entry_trigger_threshold), 4)
+        if position.entry_rel_sec is not None:
+            diag["entry_rel_sec"] = round(float(position.entry_rel_sec), 1)
         entry_diagnostics_json = json.dumps(diag, ensure_ascii=False) if diag else None
 
         with self._lock, get_conn() as conn:
@@ -466,7 +474,7 @@ class TradeSQLiteStore:
                     entry_time, entry_price, entry_size, entry_usdc,
                     btc_entry_price, mode, entry_diagnostics
                 ) VALUES (%s, %s, 'open', %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (market_slug) DO NOTHING
+                ON CONFLICT (market_slug, mode) DO NOTHING
                 """,
                 (
                     position.market_slug,
@@ -484,6 +492,7 @@ class TradeSQLiteStore:
     def update_window_early_exit(
         self,
         record: TradeRecord,
+        dry_run: bool,
     ) -> None:
         """早期退出（tpsl 止盈/止损/方向反转等）时更新窗口汇总。"""
         exit_usdc = (
@@ -491,6 +500,7 @@ class TradeSQLiteStore:
             if record.exit_recovered_usdc is not None
             else 0.0
         )
+        mode = "dry-run" if dry_run else "live"
         with self._lock, get_conn() as conn:
             conn.cursor().execute(
                 """
@@ -501,7 +511,7 @@ class TradeSQLiteStore:
                     exit_reason = %s,
                     pnl = %s,
                     settled_at = NOW()
-                WHERE market_slug = %s AND status = 'open'
+                WHERE market_slug = %s AND mode = %s AND status = 'open'
                 """,
                 (
                     self._to_utc_iso(record.exit_time),
@@ -509,6 +519,7 @@ class TradeSQLiteStore:
                     record.reason,
                     float(record.pnl),
                     record.market_slug,
+                    mode,
                 ),
             )
 
@@ -517,15 +528,17 @@ class TradeSQLiteStore:
         market_slug: str,
         exit_usdc: float,
         won: bool,
+        dry_run: bool = False,
     ) -> bool:
         """市场结算后更新窗口汇总，返回是否成功更新。"""
         status = "won" if won else "lost"
+        mode = "dry-run" if dry_run else "live"
         with self._lock, get_conn() as conn:
             cur = conn.cursor()
             # 先取 entry_usdc 用于计算 pnl
             cur.execute(
-                "SELECT entry_usdc FROM trade_window_summary WHERE market_slug = %s AND status = 'open'",
-                (market_slug,),
+                "SELECT entry_usdc FROM trade_window_summary WHERE market_slug = %s AND mode = %s AND status = 'open'",
+                (market_slug, mode),
             )
             row = cur.fetchone()
             if row is None:
@@ -541,7 +554,7 @@ class TradeSQLiteStore:
                     exit_reason = %s,
                     pnl = %s,
                     settled_at = NOW()
-                WHERE market_slug = %s AND status = 'open'
+                WHERE market_slug = %s AND mode = %s AND status = 'open'
                 """,
                 (
                     status,
@@ -549,6 +562,7 @@ class TradeSQLiteStore:
                     "market_settle_win" if won else "market_settle_loss",
                     round(pnl, 6),
                     market_slug,
+                    mode,
                 ),
             )
             return int(cur.rowcount or 0) > 0
@@ -556,13 +570,15 @@ class TradeSQLiteStore:
     def delete_window_summary(
         self,
         market_slug: str,
+        dry_run: bool,
     ) -> int:
         """删除误记的窗口汇总（配合 delete_entry_event 使用）。"""
+        mode = "dry-run" if dry_run else "live"
         with self._lock, get_conn() as conn:
             cur = conn.cursor()
             cur.execute(
-                "DELETE FROM trade_window_summary WHERE market_slug = %s AND status = 'open'",
-                (market_slug,),
+                "DELETE FROM trade_window_summary WHERE market_slug = %s AND mode = %s AND status = 'open'",
+                (market_slug, mode),
             )
             return int(cur.rowcount or 0)
 
@@ -638,7 +654,7 @@ def settle_open_windows(store: TradeSQLiteStore, profile: str = "trade") -> int:
         exit_usdc = exit_by_slug.get(slug)
         if exit_usdc is not None:
             won = exit_usdc > 0
-            if store.settle_window(slug, exit_usdc, won):
+            if store.settle_window(slug, exit_usdc, won, dry_run=False):
                 settled += 1
                 logger.info(
                     "settle_open_windows: %s → %s (exit_usdc=%.4f, entry_usdc=%.4f)",
@@ -649,7 +665,7 @@ def settle_open_windows(store: TradeSQLiteStore, profile: str = "trade") -> int:
         # Activity 中无记录 — 通过 CLOB API 检查市场结算方向
         result = _check_market_resolution(slug, info["direction"], profile)
         if result == "lost":
-            if store.settle_window(slug, 0.0, won=False):
+            if store.settle_window(slug, 0.0, won=False, dry_run=False):
                 settled += 1
                 logger.info(
                     "settle_open_windows: %s → lost (on-chain confirmed, entry_usdc=%.4f)",
@@ -747,7 +763,7 @@ def settle_open_windows_dry_run(store: TradeSQLiteStore) -> int:
         # won: 每个 share 兑回 $1.0; lost: 归零
         exit_usdc = info["entry_size"] if won else 0.0
 
-        if store.settle_window(slug, exit_usdc, won):
+        if store.settle_window(slug, exit_usdc, won, dry_run=True):
             settled += 1
             pnl = exit_usdc - info["entry_usdc"]
             logger.info(

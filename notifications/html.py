@@ -23,9 +23,12 @@ def generate_btc_prediction_section(data: dict) -> str:
     confidence = data.get("置信度", "")
     current_price = data.get("当前价格", "")
     target_range = data.get("24h目标区间", "")
+    month_direction = data.get("月底方向判断", "")
+    month_target_range = data.get("月底目标区间", "")
     support = data.get("关键支撑位", "")
     resistance = data.get("关键阻力位", "")
     paths = data.get("路径概率", [])
+    news_drivers = data.get("新闻驱动因子", [])
     logic = data.get("核心逻辑", "")
     risk = data.get("风险提示", "")
 
@@ -51,8 +54,41 @@ def generate_btc_prediction_section(data: dict) -> str:
                 <span style="color: {color}; font-weight: 600; white-space: nowrap;">{p.get('概率', '')}</span>
             </div>"""
 
+    news_rows = ""
+    bias_colors = {"偏多": "#10b981", "偏空": "#ef4444", "偏震荡": "#f59e0b"}
+    for item in news_drivers:
+        if isinstance(item, dict):
+            event = item.get("事件", "")
+            bias = item.get("方向偏置", "")
+            impact = item.get("影响说明", "")
+            publish_time = item.get("发布时间", "")
+            source = item.get("来源", "")
+        else:
+            event = str(item)
+            bias = ""
+            impact = ""
+            publish_time = ""
+            source = ""
+        bias_color = bias_colors.get(bias, "#94a3b8")
+        source_html = (
+            f"<a href=\"{source}\" target=\"_blank\" rel=\"noopener\" style=\"color:#60a5fa; text-decoration:none;\">来源</a>"
+            if source else
+            "<span style=\"color:#64748b;\">来源缺失</span>"
+        )
+        news_rows += f"""
+            <div style="padding: 6px 0; border-bottom: 1px solid #1e293b;">
+                <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+                    <span style="color: #e2e8f0;">{event}</span>
+                    <span class="status-badge" style="background: #334155; color: {bias_color}; padding: 2px 8px; font-size: 11px;">{bias or '未标注偏置'}</span>
+                </div>
+                <div style="color: #64748b; font-size: 12px; margin-bottom: 4px;">发布时间：{publish_time or '未提供'} · {source_html}</div>
+                <div style="color: #94a3b8; font-size: 13px;">{impact}</div>
+            </div>"""
+
+    month_color = dir_colors.get(month_direction, ("#64748b", "#64748b20", "❓"))[0]
+
     return f"""
-        <h2 style="color: {color};">{icon} BTC 短期预测</h2>
+        <h2 style="color: {color};">{icon} BTC 短期与月底预测</h2>
         <div class="card" style="border-left: 4px solid {color};">
             <div class="card-body">
                 <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
@@ -64,6 +100,14 @@ def generate_btc_prediction_section(data: dict) -> str:
                     <div style="flex: 1; min-width: 140px; background: #1e293b; border-radius: 6px; padding: 10px;">
                         <div style="color: #64748b; font-size: 12px;">24h 目标区间</div>
                         <div style="color: #e2e8f0; font-weight: 600;">{target_range}</div>
+                    </div>
+                    <div style="flex: 1; min-width: 140px; background: #1e293b; border-radius: 6px; padding: 10px;">
+                        <div style="color: #64748b; font-size: 12px;">到月底目标区间</div>
+                        <div style="color: #e2e8f0; font-weight: 600;">{month_target_range}</div>
+                    </div>
+                    <div style="flex: 1; min-width: 140px; background: #1e293b; border-radius: 6px; padding: 10px;">
+                        <div style="color: #64748b; font-size: 12px;">月底方向</div>
+                        <div style="color: {month_color}; font-weight: 600;">{month_direction}</div>
                     </div>
                     <div style="flex: 1; min-width: 140px; background: #1e293b; border-radius: 6px; padding: 10px;">
                         <div style="color: #64748b; font-size: 12px;">关键支撑</div>
@@ -78,6 +122,7 @@ def generate_btc_prediction_section(data: dict) -> str:
                     <div style="color: #94a3b8; font-size: 13px; margin-bottom: 6px;">📊 路径概率</div>
                     {path_rows}
                 </div>
+                {'<div style="margin-bottom: 12px;"><div style="color: #94a3b8; font-size: 13px; margin-bottom: 6px;">📰 新闻驱动因子（概率校准）</div>' + news_rows + '</div>' if news_rows else ''}
                 <div class="logic-text" style="margin-bottom: 8px;">📌 核心逻辑：{logic}</div>
                 {'<div class="logic-text" style="color: #f59e0b;">⚠️ 风险提示：' + risk + '</div>' if risk else ''}
             </div>

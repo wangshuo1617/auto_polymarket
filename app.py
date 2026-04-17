@@ -390,6 +390,70 @@ def _load_trade_balance_series(cur, limit: int = 2000) -> list[dict]:
     return result
 
 
+def _load_trade_realized_pnl_series(cur, limit: Optional[int] = None) -> list[dict]:
+    sql = """
+        WITH trade_window_flags AS (
+            SELECT
+                market_slug,
+                SUM(
+                    CASE
+                        WHEN side='buy'
+                             AND reason='analyze_backfill'
+                             AND COALESCE(reason,'')!='entry_try_fail'
+                        THEN 1 ELSE 0
+                    END
+                ) AS analyze_buy_count,
+                SUM(
+                    CASE
+                        WHEN side='buy'
+                             AND COALESCE(reason,'')!='entry_try_fail'
+                             AND (reason IS NULL OR reason!='analyze_backfill')
+                        THEN 1 ELSE 0
+                    END
+                ) AS trade_buy_count
+            FROM trade_events
+            WHERE mode='live'
+              AND market_slug LIKE 'btc-updown-5m-%%'
+              AND side IN ('buy', 'sell', 'redeem')
+            GROUP BY market_slug
+        )
+        SELECT
+            tws.market_slug,
+            tws.pnl,
+            COALESCE(tws.exit_time, tws.settled_at, tws.entry_time) AS pnl_time,
+            tws.id
+        FROM trade_window_summary tws
+        JOIN trade_window_flags twf ON twf.market_slug = tws.market_slug
+        WHERE tws.mode='live'
+          AND tws.market_slug LIKE 'btc-updown-5m-%%'
+          AND tws.status IN ('won', 'lost', 'early_exit')
+          AND tws.pnl IS NOT NULL
+          AND twf.analyze_buy_count = 0
+          AND twf.trade_buy_count > 0
+        ORDER BY COALESCE(tws.exit_time, tws.settled_at, tws.entry_time) ASC, tws.id ASC
+    """
+    if limit is not None:
+        cur.execute(sql + "\nLIMIT %s", (int(limit),))
+    else:
+        cur.execute(sql)
+    rows = cur.fetchall()
+    result = []
+    for row in rows:
+        ts = str(row.get("pnl_time") or "").strip()
+        if not ts:
+            continue
+        try:
+            pnl = round(float(row["pnl"]), 4)
+        except Exception:
+            continue
+        result.append({
+            "window_slug": row["market_slug"],
+            "ts": ts,
+            "pnl": pnl,
+        })
+    return result
+
+
 def _load_latest_trade_strategy_params(cur) -> dict:
     try:
         cur.execute(
@@ -529,6 +593,7 @@ def _build_trade_history_rows(rows: list[dict]) -> list[dict]:
     history_rows: list[dict] = []
     for row in rows:
         slug = str(row["market_slug"] or "").strip().lower()
+        last_exit_event_time = str(row.get("last_exit_event_time") or "")
         analyze_entry_usdc = float(row["analyze_entry_usdc"] or 0.0)
         db_analyze_exit_usdc = float(row["analyze_exit_usdc"] or 0.0)
         analyze_entry_size = float(row["analyze_entry_size"] or 0.0)
@@ -548,10 +613,19 @@ def _build_trade_history_rows(rows: list[dict]) -> list[dict]:
         api_analyze_exit_usdc = float(analyze_exit_by_slug.get(slug, 0.0))
         api_analyze_exit_count = int(analyze_exit_count_by_slug.get(slug, 0))
 
-        resolved_trade_exit_usdc = max(db_trade_exit_usdc, api_trade_exit_usdc)
-        resolved_trade_exit_count = max(db_trade_exit_count, api_trade_exit_count)
-        resolved_analyze_exit_usdc = max(db_analyze_exit_usdc, api_analyze_exit_usdc)
-        resolved_analyze_exit_count = max(db_analyze_exit_count, api_analyze_exit_count)
+        # 优先使用 Activity API 的真实回款；若 Activity 缺失再回退 DB 估值。
+        if api_trade_exit_count > 0:
+            resolved_trade_exit_usdc = api_trade_exit_usdc
+            resolved_trade_exit_count = api_trade_exit_count
+        else:
+            resolved_trade_exit_usdc = db_trade_exit_usdc
+            resolved_trade_exit_count = db_trade_exit_count
+        if api_analyze_exit_count > 0:
+            resolved_analyze_exit_usdc = api_analyze_exit_usdc
+            resolved_analyze_exit_count = api_analyze_exit_count
+        else:
+            resolved_analyze_exit_usdc = db_analyze_exit_usdc
+            resolved_analyze_exit_count = db_analyze_exit_count
 
         # 规则：
         # - 分离前窗口（有 analyze_backfill 入场）只按 analyze 账号结算。
@@ -584,6 +658,12 @@ def _build_trade_history_rows(rows: list[dict]) -> list[dict]:
         history_rows.append({
             "window_slug": row["market_slug"],
             "utc_time": _format_utc_time(str(row["first_event_time"] or "")),
+            "pnl_ts": (last_exit_event_time if (not unresolved and last_exit_event_time) else None),
+            "pnl_utc_time": (
+                _format_utc_time(last_exit_event_time)
+                if (not unresolved and last_exit_event_time)
+                else None
+            ),
             "result": result,
             "entry_price": entry_price,
             "entry_size": round(entry_size, 4),
@@ -614,8 +694,8 @@ def _overlay_tws_entry_data(history_rows: list[dict]) -> None:
     try:
         with get_cursor() as cur:
             cur.execute(
-                "SELECT market_slug, entry_price, entry_size, entry_usdc "
-                "FROM trade_window_summary WHERE market_slug = ANY(%s)",
+                "SELECT market_slug, entry_price, entry_size, entry_usdc, exit_time, settled_at "
+                "FROM trade_window_summary WHERE mode='live' AND market_slug = ANY(%s)",
                 (slugs,),
             )
             tws_map = {r["market_slug"]: r for r in cur.fetchall()}
@@ -639,6 +719,14 @@ def _overlay_tws_entry_data(history_rows: list[dict]) -> None:
             row["entry_size"] = round(tws_entry_size, 4)
         if tws_entry_price > 0:
             row["entry_price"] = round(tws_entry_price, 4)
+
+        if row.get("pnl") is not None and not row.get("pnl_ts"):
+            exit_time = tws.get("exit_time")
+            settled_at = tws.get("settled_at")
+            resolved_ts = str(exit_time or settled_at or "")
+            if resolved_ts:
+                row["pnl_ts"] = resolved_ts
+                row["pnl_utc_time"] = _format_utc_time(resolved_ts)
 
         # 用修正后的 entry_usdc 重算 pnl（exit_usdc 来源不变）
         if row.get("pnl") is not None and row.get("exit_usdc") is not None:
@@ -816,11 +904,13 @@ def api_5m_trade_summary():
 
     log_series = []
     history_rows = []
+    pnl_series = []
     skipped_windows = []
     strategy_params = {}
     try:
         with get_cursor() as cur:
             log_series = _load_trade_balance_series(cur=cur)
+            pnl_series = _load_trade_realized_pnl_series(cur=cur)
             skipped_windows = _load_skipped_windows(cur=cur, limit=80)
             strategy_params = _load_latest_trade_strategy_params(cur=cur)
             query = """
@@ -837,6 +927,7 @@ def api_5m_trade_summary():
                     SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(notional_usdc, 0) ELSE 0 END) /
                         NULLIF(SUM(CASE WHEN side IN ('sell','redeem') THEN COALESCE(trade_size, 0) ELSE 0 END), 0) AS exit_price,
                     SUM(CASE WHEN side IN ('sell','redeem') THEN 1 ELSE 0 END) AS exit_event_count,
+                    MAX(CASE WHEN side IN ('sell','redeem') THEN event_time END) AS last_exit_event_time,
                     SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN 1 ELSE 0 END) AS analyze_buy_count,
                     SUM(CASE WHEN side IN ('sell','redeem') AND (reason='analyze_backfill' OR reason IN ('analyze_forced_loss_no_exit', 'analyze_activity_backfill_settlement')) THEN 1 ELSE 0 END) AS analyze_exit_count,
                     SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_entry_usdc,
@@ -869,6 +960,7 @@ def api_5m_trade_summary():
         "current_balance": balance_str,
         "balance_series": log_series,
         "history": history_rows,
+        "pnl_series": pnl_series,
         "skipped_windows": skipped_windows,
         "strategy_params": strategy_params,
     })
@@ -910,6 +1002,7 @@ def api_5m_trade_stats():
                     SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS entry_usdc,
                     SUM(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(trade_size, 0) ELSE 0 END) AS entry_size,
                     SUM(CASE WHEN side IN ('sell','redeem') THEN 1 ELSE 0 END) AS exit_event_count,
+                    MAX(CASE WHEN side IN ('sell','redeem') THEN event_time END) AS last_exit_event_time,
                     SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN 1 ELSE 0 END) AS analyze_buy_count,
                     SUM(CASE WHEN side IN ('sell','redeem') AND (reason='analyze_backfill' OR reason IN ('analyze_forced_loss_no_exit', 'analyze_activity_backfill_settlement')) THEN 1 ELSE 0 END) AS analyze_exit_count,
                     SUM(CASE WHEN side='buy' AND reason='analyze_backfill' AND COALESCE(reason,'')!='entry_try_fail' THEN COALESCE(notional_usdc, 0) ELSE 0 END) AS analyze_entry_usdc,
@@ -1172,6 +1265,62 @@ _PARAM_SHELL_MAP: dict[str, str] = {
 
 # 合法 shell 变量值的正则（防注入）
 _SAFE_VALUE_RE = re.compile(r'^[A-Za-z0-9_.,:/ -]*$')
+_WINDOW_ENTER_RE = re.compile(
+    r"进入新 5m 窗口: start_ms=(\d+).*open_price=([0-9]+(?:\.[0-9]+)?)"
+)
+_WINDOW_OPEN_SETTLED_RE = re.compile(
+    r"开盘价沉淀完成:\s*[0-9]+(?:\.[0-9]+)?\s*→\s*([0-9]+(?:\.[0-9]+)?)"
+)
+_WINDOW_OPEN_TIMEOUT_RE = re.compile(
+    r"开盘价沉淀超时锁定:\s*([0-9]+(?:\.[0-9]+)?)"
+)
+
+
+def _read_window_settled_open_from_logs(window_start_ms: int) -> tuple[bool, Optional[float]]:
+    """从 5m_trade 日志提取某窗口的“开盘沉淀价”。
+
+    返回 (found_window, settled_price)：
+    - found_window=True  且 settled_price 有值：已找到该窗口且已沉淀
+    - found_window=True  且 settled_price=None：已找到该窗口但尚未沉淀
+    - found_window=False：日志中未找到该窗口（可能已轮转或服务未记录）
+    """
+    logs_dir = Path("logs")
+    if not logs_dir.exists():
+        return False, None
+
+    candidates = [p for p in logs_dir.glob("5m_trade.log*") if p.is_file()]
+    if not candidates:
+        return False, None
+    candidates.sort(key=lambda p: p.stat().st_mtime)
+
+    found_window = False
+    for path in candidates:
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    enter_match = _WINDOW_ENTER_RE.search(line)
+                    if enter_match:
+                        start_ms = int(enter_match.group(1))
+                        if found_window and start_ms != window_start_ms:
+                            return True, None
+                        if start_ms == window_start_ms:
+                            found_window = True
+                        continue
+
+                    if not found_window:
+                        continue
+
+                    settled_match = _WINDOW_OPEN_SETTLED_RE.search(line)
+                    if settled_match:
+                        return True, float(settled_match.group(1))
+
+                    timeout_match = _WINDOW_OPEN_TIMEOUT_RE.search(line)
+                    if timeout_match:
+                        return True, float(timeout_match.group(1))
+        except Exception:
+            continue
+
+    return found_window, None
 
 
 @app.route('/api/5m_trade_window_detail')
@@ -1190,6 +1339,7 @@ def api_5m_trade_window_detail():
                        btc_entry_price, pnl, entry_diagnostics
                 FROM trade_window_summary
                 WHERE market_slug = %s
+                  AND mode = 'live'
                 """,
                 (market_slug,),
             )
@@ -1202,18 +1352,17 @@ def api_5m_trade_window_detail():
                 winning_map = _batch_winning_directions(cur, [wms])
                 winning_direction = winning_map.get(wms)
 
-            # 获取BTC秒级价格走势
+            # 获取本窗口 BTC 秒级价格走势
             window_start_sec = int(market_slug.split("-")[-1])
-            # 包含 rel=300（收盘价）：该秒的 market_slug 已属于下一窗口，需按 ts_sec 补取
             cur.execute(
                 """
                 SELECT ts_sec, btc_price
                 FROM btc_poly_1s_ticks
-                WHERE (market_slug = %s OR ts_sec = %s)
+                WHERE market_slug = %s
                   AND btc_price IS NOT NULL
                 ORDER BY ts_sec ASC
                 """,
-                (market_slug, window_start_sec + 300),
+                (market_slug,),
             )
             price_rows = cur.fetchall()
             prices = []
@@ -1222,18 +1371,61 @@ def api_5m_trade_window_detail():
                     "rel_sec": int(pr["ts_sec"]) - window_start_sec,
                     "btc_price": float(pr["btc_price"]),
                 })
+            open_btc_price = prices[0]["btc_price"] if prices else None
 
+            # 收盘价口径：使用“下一窗口沉淀开盘价”。
+            # 优先读取 5m_trade 日志中的沉淀结果；日志缺失时回退到监控表估算。
             close_btc_price = None
-            for p in reversed(prices):
-                if p["rel_sec"] == 300:
-                    close_btc_price = p["btc_price"]
-                    break
+            next_window_start_sec = window_start_sec + 300
+            next_window_start_ms = next_window_start_sec * 1000
+            next_market_slug = f"btc-updown-5m-{next_window_start_sec}"
+            found_in_logs, settled_from_logs = _read_window_settled_open_from_logs(next_window_start_ms)
+            if found_in_logs:
+                close_btc_price = settled_from_logs
+            else:
+                # 日志不可用时回退到监控表口径（兼容历史数据）
+                open_settle_sec = 30
+                cur.execute(
+                    """
+                    SELECT ts_sec, btc_price, btc_event_ms
+                    FROM btc_poly_1s_ticks
+                    WHERE market_slug = %s
+                      AND ts_sec >= %s
+                      AND ts_sec <= %s
+                      AND btc_price IS NOT NULL
+                    ORDER BY ts_sec ASC
+                    """,
+                    (next_market_slug, next_window_start_sec, next_window_start_sec + 120),
+                )
+                next_rows = cur.fetchall()
+                if next_rows:
+                    first_next_price = float(next_rows[0]["btc_price"])
+                    for row in next_rows:
+                        event_ms = row.get("btc_event_ms")
+                        if event_ms is None:
+                            continue
+                        if int(event_ms) >= next_window_start_ms:
+                            close_btc_price = float(row["btc_price"])
+                            break
+                    if close_btc_price is None:
+                        latest_rel = int(next_rows[-1]["ts_sec"]) - next_window_start_sec
+                        if latest_rel >= open_settle_sec:
+                            close_btc_price = first_next_price
+
+            if close_btc_price is not None:
+                has_rel_300 = any(int(p["rel_sec"]) == 300 for p in prices)
+                if not has_rel_300:
+                    prices.append({"rel_sec": 300, "btc_price": close_btc_price})
+                else:
+                    for p in prices:
+                        if int(p["rel_sec"]) == 300:
+                            p["btc_price"] = close_btc_price
 
             result = {
                 "market_slug": market_slug,
                 "winning_direction": winning_direction,
                 "prices": prices,
-                "open_btc_price": prices[0]["btc_price"] if prices else None,
+                "open_btc_price": open_btc_price,
                 "close_btc_price": close_btc_price,
             }
 
@@ -1268,6 +1460,7 @@ def api_5m_trade_window_detail():
                 """
                 SELECT event_time FROM trade_events
                 WHERE market_slug = %s AND side = 'buy'
+                  AND mode = 'live'
                   AND COALESCE(reason, '') != 'entry_try_fail'
                 ORDER BY event_time ASC LIMIT 1
                 """,
@@ -1317,6 +1510,7 @@ def api_5m_trade_window_summary():
                        pnl, mode, settled_at
                 FROM trade_window_summary
                 WHERE entry_time >= NOW() - INTERVAL '%s days'
+                  AND mode = 'live'
                 ORDER BY entry_time DESC
                 """,
                 (days,),
@@ -1337,6 +1531,7 @@ def api_5m_trade_window_summary():
                     COALESCE(SUM(CASE WHEN status != 'open' THEN pnl ELSE 0 END), 0) AS total_pnl
                 FROM trade_window_summary
                 WHERE entry_time >= NOW() - INTERVAL '%s days'
+                  AND mode = 'live'
                 """,
                 (days,),
             )
@@ -1434,6 +1629,7 @@ def _backfill_window_summary() -> int:
                 SUM(CASE WHEN side IN ('sell','redeem') AND (reason IS NULL OR reason!='analyze_backfill') THEN COALESCE(trade_size, 0) ELSE 0 END) AS trade_exit_size,
                 MAX(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN direction END) AS direction,
                 MAX(CASE WHEN side='buy' AND COALESCE(reason,'')!='entry_try_fail' THEN btc_price_at_trade END) AS btc_entry_price,
+                MAX(CASE WHEN side IN ('sell','redeem') THEN event_time END) AS last_exit_event_time,
                 MAX(mode) AS mode,
                 MAX(CASE WHEN side IN ('sell') AND pnl IS NOT NULL THEN reason END) AS sell_with_pnl_reason
             FROM trade_events
@@ -1457,6 +1653,8 @@ def _backfill_window_summary() -> int:
             "btc_entry_price": r["btc_entry_price"],
             "mode": r["mode"] or "live",
             "sell_with_pnl_reason": r["sell_with_pnl_reason"],
+            "first_event_time": r["first_event_time"],
+            "last_exit_event_time": r["last_exit_event_time"],
         }
 
     inserted = 0
@@ -1500,12 +1698,18 @@ def _backfill_window_summary() -> int:
                         pnl, mode, settled_at
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                               CASE WHEN %s != 'open' THEN NOW() ELSE NULL END)
-                    ON CONFLICT (market_slug) DO NOTHING
+                    ON CONFLICT (market_slug, mode) DO NOTHING
                     """,
                     (
                         slug, extra.get("direction", "na"), status,
-                        h["utc_time"], entry_price, entry_size, entry_usdc,
-                        extra.get("btc_entry_price"), h["utc_time"] if status != "open" else None,
+                        extra.get("first_event_time"), entry_price, entry_size, entry_usdc,
+                        extra.get("btc_entry_price"),
+                        (
+                            extra.get("last_exit_event_time")
+                            or extra.get("first_event_time")
+                            if status != "open"
+                            else None
+                        ),
                         exit_usdc, exit_reason, pnl,
                         extra.get("mode", "live"), status,
                     ),

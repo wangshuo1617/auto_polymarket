@@ -85,6 +85,12 @@ ENABLE_DEVIATION_ENTRY="${ENABLE_DEVIATION_ENTRY:-false}"                     # 
 DEVIATION_ENTRY_THRESHOLD="${DEVIATION_ENTRY_THRESHOLD:-40.0}"                # BTC偏离开盘价$阈值
 DEVIATION_ENTRY_START_SEC="${DEVIATION_ENTRY_START_SEC:-60.0}"                # 偏离入场最早生效时间(窗口内秒)
 DEVIATION_ENTRY_END_SEC="${DEVIATION_ENTRY_END_SEC:-240.0}"                   # 偏离入场最晚截止时间
+ENABLE_EARLY_PROBE="${ENABLE_EARLY_PROBE:-false}"                             # 启用早期试探入场（弱信号小仓）
+EARLY_PROBE_START_SEC="${EARLY_PROBE_START_SEC:-0.0}"                         # 早期试探最早生效时间(窗口内秒)
+EARLY_PROBE_END_SEC="${EARLY_PROBE_END_SEC:-60.0}"                            # 早期试探最晚截止时间
+EARLY_PROBE_MIN_ABS_DIFF="${EARLY_PROBE_MIN_ABS_DIFF:-10.0}"                  # 早期试探触发最小BTC偏离($)
+EARLY_PROBE_STAKE_RATIO="${EARLY_PROBE_STAKE_RATIO:-0.20}"                    # 早期试探仓位比例(相对stake_usd)
+EARLY_PROBE_MAX_ENTRY_PRICE="${EARLY_PROBE_MAX_ENTRY_PRICE:-0.60}"            # 早期试探最高入场价
 
 # DCA 加仓
 ENABLE_DCA="${ENABLE_DCA:-false}"                                            # 启用DCA加仓
@@ -100,6 +106,9 @@ DCA_W_CROSS="${DCA_W_CROSS:-0.20}"                                           # �
 DCA_W_PRICE="${DCA_W_PRICE:-0.15}"                                           # 信心权重：token价格
 DCA_W_TIME="${DCA_W_TIME:-0.10}"                                             # 信心权重：剩余时间
 DCA_W_POSITION="${DCA_W_POSITION:-0.10}"                                     # 信心权重：已持仓量
+DCA_ALLOW_PULLBACK_ADD="${DCA_ALLOW_PULLBACK_ADD:-false}"                    # 启用方向不变时回落补仓
+DCA_PULLBACK_RATIO_MIN="${DCA_PULLBACK_RATIO_MIN:-0.03}"                     # 回落补仓触发跌幅比例
+DCA_MAX_AVG_PRICE="${DCA_MAX_AVG_PRICE:-0.0}"                                # DCA后均价上限(<=0表示禁用)
 
 # 方向修正
 ENABLE_DIRECTION_REVERSAL="${ENABLE_DIRECTION_REVERSAL:-false}"              # 启用方向修正
@@ -107,6 +116,7 @@ REVERSAL_THRESHOLD="${REVERSAL_THRESHOLD:-50.0}"                             # B
 REVERSAL_START_SEC="${REVERSAL_START_SEC:-120.0}"                            # 方向修正最早生效时间
 REVERSAL_END_SEC="${REVERSAL_END_SEC:-240.0}"                                # 方向修正最晚截止时间
 REVERSAL_SIZE_MULTIPLIER="${REVERSAL_SIZE_MULTIPLIER:-1.2}"                  # 修正仓位倍数
+REVERSAL_MIN_POSITION_USDC="${REVERSAL_MIN_POSITION_USDC:-0.0}"              # 触发方向修正所需最小原仓位投入
 
 # 连败缩仓
 ENABLE_STREAK_SIZING="${ENABLE_STREAK_SIZING:-false}"                        # 启用连败缩仓
@@ -332,6 +342,64 @@ if [ "$ENABLE_DB_TICK_VALIDATION" != "true" ] && [ "$ENABLE_DB_TICK_VALIDATION" 
   exit 1
 fi
 
+if [ "$ENABLE_EARLY_PROBE" != "true" ] && [ "$ENABLE_EARLY_PROBE" != "false" ]; then
+  echo "❌ enable_early_probe 必须是 true 或 false"
+  print_usage
+  exit 1
+fi
+if ! [[ "$EARLY_PROBE_START_SEC" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ early_probe_start_sec 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+if ! [[ "$EARLY_PROBE_END_SEC" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ early_probe_end_sec 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+if ! awk "BEGIN{exit !($EARLY_PROBE_END_SEC > $EARLY_PROBE_START_SEC)}"; then
+  echo "❌ early_probe_end_sec 必须大于 early_probe_start_sec"
+  print_usage
+  exit 1
+fi
+if ! [[ "$EARLY_PROBE_MIN_ABS_DIFF" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($EARLY_PROBE_MIN_ABS_DIFF > 0)}"; then
+  echo "❌ early_probe_min_abs_diff 必须是大于 0 的数字"
+  print_usage
+  exit 1
+fi
+if ! [[ "$EARLY_PROBE_STAKE_RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($EARLY_PROBE_STAKE_RATIO > 0 && $EARLY_PROBE_STAKE_RATIO <= 1)}"; then
+  echo "❌ early_probe_stake_ratio 必须在 (0, 1] 之间"
+  print_usage
+  exit 1
+fi
+if ! [[ "$EARLY_PROBE_MAX_ENTRY_PRICE" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk "BEGIN{exit !($EARLY_PROBE_MAX_ENTRY_PRICE > 0)}"; then
+  echo "❌ early_probe_max_entry_price 必须是大于 0 的数字"
+  print_usage
+  exit 1
+fi
+
+if [ "$DCA_ALLOW_PULLBACK_ADD" != "true" ] && [ "$DCA_ALLOW_PULLBACK_ADD" != "false" ]; then
+  echo "❌ dca_allow_pullback_add 必须是 true 或 false"
+  print_usage
+  exit 1
+fi
+if ! [[ "$DCA_PULLBACK_RATIO_MIN" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ dca_pullback_ratio_min 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+if ! [[ "$DCA_MAX_AVG_PRICE" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ dca_max_avg_price 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+
+if ! [[ "$REVERSAL_MIN_POSITION_USDC" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "❌ reversal_min_position_usdc 必须是大于等于 0 的数字"
+  print_usage
+  exit 1
+fi
+
 if [ -n "$TOXIC_UTC_HOURS" ]; then
   IFS=',' read -r -a TOXIC_HOUR_PARTS <<< "$TOXIC_UTC_HOURS"
   for hour_part in "${TOXIC_HOUR_PARTS[@]}"; do
@@ -405,9 +473,10 @@ echo "Binance前哨止损: enable=$ENABLE_BINANCE_EARLY_SL proximity=\$${BINANCE
 echo "Binance成交流止损: enable=$ENABLE_BINANCE_TRADE_IMBALANCE_SL ratio=$BINANCE_SL_IMBALANCE_RATIO window=${BINANCE_SL_IMBALANCE_WINDOW_SEC}s start=${BINANCE_SL_IMBALANCE_START_SEC}s min_proximity=\$${BINANCE_SL_IMBALANCE_MIN_PROXIMITY}"
 echo "DB tick交叉验证: enable=$ENABLE_DB_TICK_VALIDATION"
 echo "偏离入场: enable=$ENABLE_DEVIATION_ENTRY threshold=\$${DEVIATION_ENTRY_THRESHOLD} start=${DEVIATION_ENTRY_START_SEC}s end=${DEVIATION_ENTRY_END_SEC}s"
-echo "DCA加仓: enable=$ENABLE_DCA max_adds=$DCA_MAX_ADDS interval=${DCA_INTERVAL_SEC}s step=\$${DCA_DEVIATION_STEP} end=${DCA_END_SEC}s min_conf=$DCA_MIN_CONFIDENCE max_price=$DCA_MAX_ENTRY_PRICE"
+echo "早期试探: enable=$ENABLE_EARLY_PROBE start=${EARLY_PROBE_START_SEC}s end=${EARLY_PROBE_END_SEC}s min_abs_diff=\$${EARLY_PROBE_MIN_ABS_DIFF} ratio=$EARLY_PROBE_STAKE_RATIO max_price=$EARLY_PROBE_MAX_ENTRY_PRICE"
+echo "DCA加仓: enable=$ENABLE_DCA max_adds=$DCA_MAX_ADDS interval=${DCA_INTERVAL_SEC}s step=\$${DCA_DEVIATION_STEP} end=${DCA_END_SEC}s min_conf=$DCA_MIN_CONFIDENCE max_price=$DCA_MAX_ENTRY_PRICE max_avg_price=$DCA_MAX_AVG_PRICE pullback=$DCA_ALLOW_PULLBACK_ADD pullback_ratio=$DCA_PULLBACK_RATIO_MIN"
 echo "DCA权重: deviation=$DCA_W_DEVIATION atr=$DCA_W_ATR cross=$DCA_W_CROSS price=$DCA_W_PRICE time=$DCA_W_TIME position=$DCA_W_POSITION"
-echo "方向修正: enable=$ENABLE_DIRECTION_REVERSAL threshold=\$${REVERSAL_THRESHOLD} start=${REVERSAL_START_SEC}s end=${REVERSAL_END_SEC}s size_mult=$REVERSAL_SIZE_MULTIPLIER"
+echo "方向修正: enable=$ENABLE_DIRECTION_REVERSAL threshold=\$${REVERSAL_THRESHOLD} start=${REVERSAL_START_SEC}s end=${REVERSAL_END_SEC}s size_mult=$REVERSAL_SIZE_MULTIPLIER min_position_usdc=$REVERSAL_MIN_POSITION_USDC"
 echo "连败缩仓: enable=$ENABLE_STREAK_SIZING threshold=$STREAK_LOSS_THRESHOLD factor=$STREAK_SHRINK_FACTOR max_shrinks=$STREAK_MAX_SHRINKS"
 echo "数据库: PG_DSN 环境变量"
 echo "=========================================="
@@ -457,16 +526,24 @@ _build_cmd() {
     --deviation-entry-threshold "$DEVIATION_ENTRY_THRESHOLD"
     --deviation-entry-start-sec "$DEVIATION_ENTRY_START_SEC"
     --deviation-entry-end-sec "$DEVIATION_ENTRY_END_SEC"
+    --early-probe-start-sec "$EARLY_PROBE_START_SEC"
+    --early-probe-end-sec "$EARLY_PROBE_END_SEC"
+    --early-probe-min-abs-diff "$EARLY_PROBE_MIN_ABS_DIFF"
+    --early-probe-stake-ratio "$EARLY_PROBE_STAKE_RATIO"
+    --early-probe-max-entry-price "$EARLY_PROBE_MAX_ENTRY_PRICE"
     --reversal-threshold "$REVERSAL_THRESHOLD"
     --reversal-start-sec "$REVERSAL_START_SEC"
     --reversal-end-sec "$REVERSAL_END_SEC"
     --reversal-size-multiplier "$REVERSAL_SIZE_MULTIPLIER"
+    --reversal-min-position-usdc "$REVERSAL_MIN_POSITION_USDC"
     --dca-max-adds "$DCA_MAX_ADDS"
     --dca-interval-sec "$DCA_INTERVAL_SEC"
     --dca-deviation-step "$DCA_DEVIATION_STEP"
     --dca-end-sec "$DCA_END_SEC"
     --dca-min-confidence "$DCA_MIN_CONFIDENCE"
     --dca-max-entry-price "$DCA_MAX_ENTRY_PRICE"
+    --dca-pullback-ratio-min "$DCA_PULLBACK_RATIO_MIN"
+    --dca-max-avg-price "$DCA_MAX_AVG_PRICE"
     --dca-w-deviation "$DCA_W_DEVIATION"
     --dca-w-atr "$DCA_W_ATR"
     --dca-w-cross "$DCA_W_CROSS"
@@ -512,12 +589,20 @@ _build_cmd() {
     CMD+=(--enable-deviation-entry)
   fi
 
+  if [ "$ENABLE_EARLY_PROBE" = "true" ]; then
+    CMD+=(--enable-early-probe)
+  fi
+
   if [ "$ENABLE_DIRECTION_REVERSAL" = "true" ]; then
     CMD+=(--enable-direction-reversal)
   fi
 
   if [ "$ENABLE_DCA" = "true" ]; then
     CMD+=(--enable-dca)
+  fi
+
+  if [ "$DCA_ALLOW_PULLBACK_ADD" = "true" ]; then
+    CMD+=(--enable-dca-pullback-add)
   fi
 
   if [ "$ENABLE_STREAK_SIZING" = "true" ]; then

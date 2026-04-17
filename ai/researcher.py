@@ -25,6 +25,61 @@ from ai.prompts import (
 ET_TIMEZONE = ZoneInfo("America/New_York")
 
 
+def _dedupe_grounding_sources(sources: list[dict]) -> list[dict]:
+    """按 URL 去重，保留前序来源。"""
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for src in sources:
+        url = str(src.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        deduped.append(src)
+    return deduped
+
+
+def _ensure_news_factors_from_grounding(result: Dict[str, Any], sources: list[dict]) -> None:
+    """
+    保证 BTC短期预测.新闻驱动因子 引用外部检索来源。
+    若模型未给出来源URL，则基于 grounding sources 进行兜底填充。
+    """
+    btc_prediction = result.get("BTC短期预测")
+    if not isinstance(btc_prediction, dict):
+        return
+
+    news_factors = btc_prediction.get("新闻驱动因子")
+    if not isinstance(news_factors, list):
+        news_factors = []
+
+    deduped_sources = _dedupe_grounding_sources(sources)
+    if not deduped_sources:
+        return
+    grounded_urls = {str(src.get("url") or "").strip() for src in deduped_sources}
+    news_urls = {
+        str(item.get("来源") or "").strip()
+        for item in news_factors
+        if isinstance(item, dict)
+    }
+    if grounded_urls.intersection(news_urls):
+        return
+
+    fallback_items = []
+    for src in deduped_sources[:3]:
+        title = str(src.get("title") or "").strip() or "外部检索新闻"
+        url = str(src.get("url") or "").strip()
+        fallback_items.append(
+            {
+                "事件": title,
+                "方向偏置": "偏震荡",
+                "影响说明": "该条目来自外部检索来源，请结合K线与成交量确认其方向强度。",
+                "发布时间": "未知",
+                "来源": url,
+            }
+        )
+    if fallback_items:
+        btc_prediction["新闻驱动因子"] = fallback_items
+
+
 # Initialize the Gemini client
 def _get_client():
     """Initialize and return the Gemini client."""
@@ -140,6 +195,7 @@ def analyze_market_with_grounding(
             
             result = json.loads(response_text)
         
+        _ensure_news_factors_from_grounding(result, sources)
         return result
         
     except Exception as e:

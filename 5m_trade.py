@@ -168,6 +168,12 @@ class FiveMinuteUpDownTrader:
         deviation_entry_threshold: float = 40.0,
         deviation_entry_start_sec: float = 60.0,
         deviation_entry_end_sec: float = 240.0,
+        enable_early_probe: bool = False,
+        early_probe_start_sec: float = 0.0,
+        early_probe_end_sec: float = 60.0,
+        early_probe_min_abs_diff: float = 10.0,
+        early_probe_stake_ratio: float = 0.2,
+        early_probe_max_entry_price: float = 0.60,
         # DCA 加仓
         enable_dca: bool = False,
         dca_max_adds: int = 4,
@@ -182,12 +188,16 @@ class FiveMinuteUpDownTrader:
         dca_w_price: float = 0.15,
         dca_w_time: float = 0.10,
         dca_w_position: float = 0.10,
+        dca_allow_pullback_add: bool = False,
+        dca_pullback_ratio_min: float = 0.03,
+        dca_max_avg_price: float = 0.0,
         # 方向修正
         enable_direction_reversal: bool = False,
         reversal_threshold: float = 50.0,
         reversal_start_sec: float = 120.0,
         reversal_end_sec: float = 240.0,
         reversal_size_multiplier: float = 1.2,
+        reversal_min_position_usdc: float = 0.0,
         # 连败缩仓
         enable_streak_sizing: bool = False,
         streak_loss_threshold: int = 3,
@@ -267,6 +277,22 @@ class FiveMinuteUpDownTrader:
         self.deviation_entry_threshold = float(deviation_entry_threshold)
         self.deviation_entry_start_sec = float(deviation_entry_start_sec)
         self.deviation_entry_end_sec = float(deviation_entry_end_sec)
+        self.enable_early_probe = bool(enable_early_probe)
+        self.early_probe_start_sec = float(early_probe_start_sec)
+        self.early_probe_end_sec = float(early_probe_end_sec)
+        self.early_probe_min_abs_diff = float(early_probe_min_abs_diff)
+        self.early_probe_stake_ratio = float(early_probe_stake_ratio)
+        self.early_probe_max_entry_price = float(early_probe_max_entry_price)
+        if self.early_probe_start_sec < 0:
+            raise ValueError("early_probe_start_sec 必须大于等于 0")
+        if self.early_probe_end_sec <= self.early_probe_start_sec:
+            raise ValueError("early_probe_end_sec 必须大于 early_probe_start_sec")
+        if self.early_probe_min_abs_diff <= 0:
+            raise ValueError("early_probe_min_abs_diff 必须大于 0")
+        if self.early_probe_stake_ratio <= 0 or self.early_probe_stake_ratio > 1:
+            raise ValueError("early_probe_stake_ratio 必须在 (0, 1] 之间")
+        if self.early_probe_max_entry_price <= 0:
+            raise ValueError("early_probe_max_entry_price 必须大于 0")
 
         # DCA 加仓
         self.enable_dca = bool(enable_dca)
@@ -282,6 +308,13 @@ class FiveMinuteUpDownTrader:
         self.dca_w_price = float(dca_w_price)
         self.dca_w_time = float(dca_w_time)
         self.dca_w_position = float(dca_w_position)
+        self.dca_allow_pullback_add = bool(dca_allow_pullback_add)
+        self.dca_pullback_ratio_min = float(dca_pullback_ratio_min)
+        self.dca_max_avg_price = float(dca_max_avg_price)
+        if self.dca_pullback_ratio_min < 0:
+            raise ValueError("dca_pullback_ratio_min 必须大于等于 0")
+        if self.dca_max_avg_price < 0:
+            raise ValueError("dca_max_avg_price 必须大于等于 0")
 
         # 方向修正
         self.enable_direction_reversal = bool(enable_direction_reversal)
@@ -289,6 +322,9 @@ class FiveMinuteUpDownTrader:
         self.reversal_start_sec = float(reversal_start_sec)
         self.reversal_end_sec = float(reversal_end_sec)
         self.reversal_size_multiplier = float(reversal_size_multiplier)
+        self.reversal_min_position_usdc = float(reversal_min_position_usdc)
+        if self.reversal_min_position_usdc < 0:
+            raise ValueError("reversal_min_position_usdc 必须大于等于 0")
 
         # 连败缩仓
         self.enable_streak_sizing = bool(enable_streak_sizing)
@@ -339,6 +375,12 @@ class FiveMinuteUpDownTrader:
         # 方向修正窗口内状态
         self._direction_reversed: bool = False
         self._reversed_position_cost: float = 0.0  # 被放弃仓位的投入成本
+
+        # 本次入场上下文（由 _open_position 读取并写入 position.entry_diagnostics）
+        self._pending_entry_mode: str = "fixed"
+        self._pending_entry_stake_ratio: float = 1.0
+        self._pending_entry_trigger_threshold: float = self.min_direction_diff
+        self._pending_entry_rel_sec: float = 0.0
 
         # 连败缩仓状态
         self._consecutive_losses: int = 0
@@ -891,6 +933,7 @@ class FiveMinuteUpDownTrader:
 
             # --- 检测新 5m 窗口，用当前最新价格锁定开盘价（对齐回测 open_row） ---
             if self.current_window_start_ms != window_start_ms:
+                missed_window_open = rel_sec >= self.OPEN_PRICE_SETTLE_SEC
                 logger.info(
                     "进入新 5m 窗口: start_ms=%s (clock-driven, open_price=%.2f, btc_age=%dms)",
                     window_start_ms,
@@ -899,9 +942,9 @@ class FiveMinuteUpDownTrader:
                 )
                 self.current_window_start_ms = window_start_ms
                 self.window_open_price = btc_price
-                self._open_price_locked = False
+                self._open_price_locked = missed_window_open
                 self._open_price_event_ms = self.latest_btc_price_event_ms or 0
-                self.window_traded = False
+                self.window_traded = missed_window_open
                 self.preclose_entry_triggered = False
                 self._entry_attempt_count = 0
                 self._btc_cross_count = 0
@@ -923,8 +966,21 @@ class FiveMinuteUpDownTrader:
                 # 方向修正窗口重置
                 self._direction_reversed = False
                 self._reversed_position_cost = 0.0
+                self._pending_entry_mode = "fixed"
+                self._pending_entry_stake_ratio = 1.0
+                self._pending_entry_trigger_threshold = self.min_direction_diff
+                self._pending_entry_rel_sec = 0.0
                 slug_ts = window_start_ms // 1000
                 self.current_market_slug = f"btc-updown-5m-{slug_ts}"
+                if missed_window_open:
+                    reason = "Skip entry: missed window open (rel_sec=%.1fs), avoid unreliable open price" % rel_sec
+                    logger.warning(
+                        "窗口开盘已错过，跳过本窗口交易: start_ms=%s rel_sec=%.1f open_price=%.2f",
+                        window_start_ms,
+                        rel_sec,
+                        btc_price,
+                    )
+                    self._record_skip_window(reason=reason, market_slug=self.current_market_slug)
                 try:
                     prewarm_t0 = time.perf_counter()
                     self._select_market_and_tokens(self.current_market_slug)
@@ -988,7 +1044,11 @@ class FiveMinuteUpDownTrader:
                     not self.window_traded
                     and self._open_price_locked
                     and self.window_open_price is not None
-                    and self.deviation_entry_start_sec <= rel_sec < self.deviation_entry_end_sec
+                    and (
+                        self.enable_early_probe
+                        and self.early_probe_start_sec <= rel_sec < self.early_probe_end_sec
+                        or self.deviation_entry_start_sec <= rel_sec < self.deviation_entry_end_sec
+                    )
                 ):
                     if btc_age_ms > self.MAX_BTC_AGE_MS:
                         if rel_sec >= self.deviation_entry_end_sec - 1.5:
@@ -1000,11 +1060,28 @@ class FiveMinuteUpDownTrader:
                         self._consecutive_stale_windows = 0
                         self._stale_alert_sent = False
                         abs_diff = abs(btc_price - self.window_open_price)
-                        if abs_diff >= self.deviation_entry_threshold:
+                        can_probe = (
+                            self.enable_early_probe
+                            and self.early_probe_start_sec <= rel_sec < self.early_probe_end_sec
+                            and self.early_probe_min_abs_diff <= abs_diff < self.deviation_entry_threshold
+                        )
+                        if can_probe:
                             self._handle_deviation_entry(
                                 btc_price=btc_price,
                                 abs_diff=abs_diff,
                                 rel_sec=rel_sec,
+                                entry_mode="early_probe",
+                                trigger_threshold=self.early_probe_min_abs_diff,
+                                stake_ratio=self.early_probe_stake_ratio,
+                                max_entry_price_override=self.early_probe_max_entry_price,
+                            )
+                        elif abs_diff >= self.deviation_entry_threshold:
+                            self._handle_deviation_entry(
+                                btc_price=btc_price,
+                                abs_diff=abs_diff,
+                                rel_sec=rel_sec,
+                                entry_mode="deviation_entry",
+                                trigger_threshold=self.deviation_entry_threshold,
                             )
 
                 # --- DCA 加仓检查（偏离模式下，已有持仓时） ---
@@ -1332,6 +1409,10 @@ class FiveMinuteUpDownTrader:
             market_slug,
         )
 
+        self._pending_entry_mode = "fixed"
+        self._pending_entry_stake_ratio = 1.0
+        self._pending_entry_trigger_threshold = self.min_direction_diff
+        self._pending_entry_rel_sec = self.entry_decision_minute * 60 - ms_to_close / 1000
         try:
             self._open_position(market_slug, direction, abs_btc_diff=abs_diff)
             self.window_traded = True
@@ -1346,16 +1427,32 @@ class FiveMinuteUpDownTrader:
     # ------------------------------------------------------------------
     # 偏离入场
     # ------------------------------------------------------------------
-    def _handle_deviation_entry(self, btc_price: float, abs_diff: float, rel_sec: float) -> None:
-        """偏离入场模式：BTC 偏离 ≥ threshold 时触发首次建仓。"""
+    def _handle_deviation_entry(
+        self,
+        btc_price: float,
+        abs_diff: float,
+        rel_sec: float,
+        entry_mode: str = "deviation_entry",
+        trigger_threshold: Optional[float] = None,
+        stake_ratio: float = 1.0,
+        max_entry_price_override: Optional[float] = None,
+    ) -> None:
+        """偏离入场模式：BTC 偏离触发首次建仓。"""
         if self.current_window_start_ms is None or self.window_open_price is None:
             return
+
+        trigger = trigger_threshold if trigger_threshold is not None else self.deviation_entry_threshold
+        effective_max_entry_price = (
+            min(self.max_entry_price, max_entry_price_override)
+            if max_entry_price_override is not None
+            else self.max_entry_price
+        )
 
         # toxic time 检查
         if self._is_toxic_time_regime():
             current_utc_hour = datetime.now(timezone.utc).hour
             direction = "up" if btc_price > self.window_open_price else "down"
-            reason = "Skip deviation entry: Toxic Time Regime (UTC hour=%s)" % current_utc_hour
+            reason = "Skip %s: Toxic Time Regime (UTC hour=%s)" % (entry_mode, current_utc_hour)
             logger.info("%s", reason)
             self._record_skip_window(reason=reason, direction=direction)
             self.window_traded = True
@@ -1380,12 +1477,33 @@ class FiveMinuteUpDownTrader:
 
         market_slug = self.current_market_slug or f"btc-updown-5m-{self.current_window_start_ms // 1000}"
         logger.info(
-            "偏离入场触发: rel_sec=%.0f abs_diff=%.2f (>= %.2f) direction=%s market=%s",
-            rel_sec, abs_diff, self.deviation_entry_threshold, direction, market_slug,
+            "偏离入场触发: mode=%s rel_sec=%.0f abs_diff=%.2f (>= %.2f) direction=%s market=%s "
+            "stake_ratio=%.2f entry_price_cap=%.4f",
+            entry_mode,
+            rel_sec,
+            abs_diff,
+            trigger,
+            direction,
+            market_slug,
+            stake_ratio,
+            effective_max_entry_price,
         )
 
+        original_stake = self.stake_usd
+        original_max_entry_price = self.max_entry_price
+        self._pending_entry_mode = entry_mode
+        self._pending_entry_stake_ratio = stake_ratio
+        self._pending_entry_trigger_threshold = trigger
+        self._pending_entry_rel_sec = rel_sec
         try:
+            self.stake_usd = original_stake * stake_ratio
+            self.max_entry_price = effective_max_entry_price
             self._open_position(market_slug, direction, abs_btc_diff=abs_diff)
+            if self.position is None:
+                if entry_mode == "early_probe":
+                    return
+                self.window_traded = True
+                return
             self.window_traded = True
             self._dca_entry_abs_diff = abs_diff
         except Exception as e:
@@ -1395,6 +1513,9 @@ class FiveMinuteUpDownTrader:
                 self.window_traded = True
             else:
                 logger.warning("偏离入场开仓失败（第 %d 次，将在下一 tick 重试）: %s", self._entry_attempt_count, e)
+        finally:
+            self.stake_usd = original_stake
+            self.max_entry_price = original_max_entry_price
 
     # ------------------------------------------------------------------
     # 方向修正
@@ -1426,9 +1547,13 @@ class FiveMinuteUpDownTrader:
             rel_sec, current_dir, new_direction,
             reverse_abs_diff, self.reversal_threshold, btc_price, open_price,
         )
-        self._handle_direction_reversal(new_direction=new_direction, reverse_abs_diff=reverse_abs_diff)
+        self._handle_direction_reversal(
+            new_direction=new_direction,
+            reverse_abs_diff=reverse_abs_diff,
+            rel_sec=rel_sec,
+        )
 
-    def _handle_direction_reversal(self, new_direction: str, reverse_abs_diff: float) -> None:
+    def _handle_direction_reversal(self, new_direction: str, reverse_abs_diff: float, rel_sec: float) -> None:
         """放弃当前仓位（让其自然结算为0），在反方向开新仓。"""
         old_pos = self.position
         if old_pos is None:
@@ -1437,6 +1562,13 @@ class FiveMinuteUpDownTrader:
         market_slug = self.current_market_slug or old_pos.market_slug
         old_dir = old_pos.direction
         old_cost = old_pos.total_invested_usdc or 0.0
+        if old_cost < self.reversal_min_position_usdc:
+            logger.info(
+                "方向修正跳过: old_cost=%.2f < reversal_min_position_usdc=%.2f",
+                old_cost,
+                self.reversal_min_position_usdc,
+            )
+            return
         old_size = old_pos.actual_entry_size or old_pos.size
 
         # 记录被放弃的仓位信息
@@ -1476,6 +1608,10 @@ class FiveMinuteUpDownTrader:
         original_stake = self.stake_usd
         try:
             self.stake_usd = reversal_stake
+            self._pending_entry_mode = "direction_reversal"
+            self._pending_entry_stake_ratio = self.reversal_size_multiplier
+            self._pending_entry_trigger_threshold = self.reversal_threshold
+            self._pending_entry_rel_sec = rel_sec
             self._open_position(market_slug, new_direction, abs_btc_diff=reverse_abs_diff)
             self._dca_entry_abs_diff = reverse_abs_diff
         except Exception as e:
@@ -1495,16 +1631,13 @@ class FiveMinuteUpDownTrader:
         if rel_sec - self._dca_last_add_sec < self.dca_interval_sec:
             return
 
-        # 偏离增量检查
-        abs_diff = abs(btc_price - self.window_open_price)
-        required_diff = self.deviation_entry_threshold + (self._dca_add_count + 1) * self.dca_deviation_step
-        if abs_diff < required_diff:
-            return
-
         # 方向一致性检查
         current_direction = "up" if btc_price > self.window_open_price else "down"
         if current_direction != self.position.direction:
             return
+
+        abs_diff = abs(btc_price - self.window_open_price)
+        required_diff = self.deviation_entry_threshold + (self._dca_add_count + 1) * self.dca_deviation_step
 
         # 计算窗口 ATR
         atr = 0.0
@@ -1521,6 +1654,22 @@ class FiveMinuteUpDownTrader:
                 _ask = self._to_positive_float(ws_snap.get("best_ask"))
                 if _ask is not None:
                     token_price = _ask
+
+        deviation_triggered = abs_diff >= required_diff
+        pullback_triggered = False
+        if (
+            self.dca_allow_pullback_add
+            and self.position.actual_entry_price is not None
+            and self.position.actual_entry_price > 0
+        ):
+            pullback_price = self.position.actual_entry_price * (1 - self.dca_pullback_ratio_min)
+            pullback_triggered = (
+                abs_diff >= self.deviation_entry_threshold
+                and token_price <= pullback_price
+            )
+
+        if not deviation_triggered and not pullback_triggered:
+            return
 
         # 计算连败缩仓后的 effective_stake
         effective_stake = self._compute_effective_stake()
@@ -1552,7 +1701,8 @@ class FiveMinuteUpDownTrader:
             logger.debug("DCA skip: %s", decision.reason)
             return
 
-        logger.info("DCA 加仓决策: %s", decision.reason)
+        trigger_reason = "deviation_step" if deviation_triggered else "pullback"
+        logger.info("DCA 加仓决策[%s]: %s", trigger_reason, decision.reason)
         self._dca_add_position(
             add_size_usdc=decision.add_size_usdc,
             abs_diff=abs_diff,
@@ -1617,6 +1767,20 @@ class FiveMinuteUpDownTrader:
             entry_price, normalized_size, add_size_usdc, confidence,
         )
 
+        old_invested = self.position.total_invested_usdc or 0.0
+        old_size = self.position.actual_entry_size or self.position.size
+        add_invested = float(plan["vwap_price"]) * normalized_size
+        projected_invested = old_invested + add_invested
+        projected_size = old_size + normalized_size
+        projected_avg_price = projected_invested / projected_size if projected_size > 0 else entry_price
+        if self.dca_max_avg_price > 0 and projected_avg_price > self.dca_max_avg_price:
+            logger.info(
+                "DCA: 跳过，预计加仓后均价=%.4f > dca_max_avg_price=%.4f",
+                projected_avg_price,
+                self.dca_max_avg_price,
+            )
+            return
+
         if self.dry_run:
             order_id = None
         else:
@@ -1631,11 +1795,8 @@ class FiveMinuteUpDownTrader:
             logger.info("DCA 买单已提交: order_id=%s", order_id)
 
         # 更新持仓
-        old_invested = self.position.total_invested_usdc or 0.0
-        old_size = self.position.actual_entry_size or self.position.size
-        add_invested = float(plan["vwap_price"]) * normalized_size
-        new_invested = old_invested + add_invested
-        new_size = old_size + normalized_size
+        new_invested = projected_invested
+        new_size = projected_size
         new_avg_price = new_invested / new_size if new_size > 0 else entry_price
 
         self.position.actual_entry_size = new_size
@@ -1659,20 +1820,21 @@ class FiveMinuteUpDownTrader:
 
         # 更新 DB (window summary + trade_events)
         self._update_dca_in_db()
-        try:
-            btc_now = self._get_latest_btc_price_snapshot()
-            self.db.write_dca_entry_event(
-                position=self.position,
-                dca_number=self.position.dca_count,
-                dca_size=normalized_size,
-                dca_price=entry_price,
-                dca_usdc=add_invested,
-                order_id=order_id,
-                dry_run=self.dry_run,
-                btc_price_at_trade=btc_now,
-            )
-        except Exception as e:
-            logger.warning("DCA trade_events写入失败: %s", e)
+        if self._trade_db is not None:
+            try:
+                btc_now = self._get_latest_btc_price_snapshot()
+                self._trade_db.write_dca_entry_event(
+                    position=self.position,
+                    dca_number=self.position.dca_count,
+                    dca_size=normalized_size,
+                    dca_price=entry_price,
+                    dca_usdc=add_invested,
+                    order_id=order_id,
+                    dry_run=self.dry_run,
+                    btc_price_at_trade=btc_now,
+                )
+            except Exception as e:
+                logger.warning("DCA trade_events写入失败: %s", e)
 
         if not self.dry_run and order_id:
             self._schedule_position_balance_confirmation(
@@ -1703,9 +1865,16 @@ class FiveMinuteUpDownTrader:
                     UPDATE trade_window_summary
                     SET entry_size = %s, entry_usdc = %s, entry_price = %s,
                         entry_diagnostics = COALESCE(entry_diagnostics, '{}'::jsonb) || %s::jsonb
-                    WHERE market_slug = %s AND status = 'open'
+                    WHERE market_slug = %s AND mode = %s AND status = 'open'
                     """,
-                    (entry_size, entry_usdc, entry_price, diag_patch, self.position.market_slug),
+                    (
+                        entry_size,
+                        entry_usdc,
+                        entry_price,
+                        diag_patch,
+                        self.position.market_slug,
+                        "dry-run" if self.dry_run else "live",
+                    ),
                 )
         except Exception as e:
             logger.warning("DCA DB更新失败: %s", e)
