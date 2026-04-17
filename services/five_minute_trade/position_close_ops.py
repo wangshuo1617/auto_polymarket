@@ -118,22 +118,28 @@ def schedule_position_balance_confirmation(
             old_size = float(pos.size)
             pos.size = confirmed_size
             pos.balance_confirmed = True
-            if matched_size > 0:
-                pos.actual_entry_size = matched_size
-            elif pos.actual_entry_size is None and confirmed_size > 0:
-                pos.actual_entry_size = confirmed_size
 
-            if matched_price is not None:
-                pos.actual_entry_price = matched_price
-            elif pos.actual_entry_price is None and pos.entry_avg_fill_price is not None:
-                pos.actual_entry_price = pos.entry_avg_fill_price
+            # DCA 加仓后，累计的 actual_entry_size/price/total_invested_usdc
+            # 已由 _try_dca_add 正确维护，不能用单笔确认值覆盖
+            is_dca_confirm = getattr(pos, 'dca_count', 0) > 0 and pos.total_invested_usdc is not None
 
-            if (
-                pos.actual_entry_price is not None
-                and pos.actual_entry_size is not None
-                and pos.actual_entry_size > 0
-            ):
-                pos.total_invested_usdc = pos.actual_entry_price * pos.actual_entry_size
+            if not is_dca_confirm:
+                if matched_size > 0:
+                    pos.actual_entry_size = matched_size
+                elif pos.actual_entry_size is None and confirmed_size > 0:
+                    pos.actual_entry_size = confirmed_size
+
+                if matched_price is not None:
+                    pos.actual_entry_price = matched_price
+                elif pos.actual_entry_price is None and pos.entry_avg_fill_price is not None:
+                    pos.actual_entry_price = pos.entry_avg_fill_price
+
+                if (
+                    pos.actual_entry_price is not None
+                    and pos.actual_entry_size is not None
+                    and pos.actual_entry_size > 0
+                ):
+                    pos.total_invested_usdc = pos.actual_entry_price * pos.actual_entry_size
             logger.info(
                 "建仓后余额确认: market=%s token=%s old_size=%.6f confirmed_size=%.6f raw_balance=%.6f entry_size=%.6f entry_price=%s invested=%s delay=%ss",
                 market_slug,
