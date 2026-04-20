@@ -17,9 +17,13 @@ _BASELINE_FILE = Path("data/monthly_baseline.json")
 logger = logging.getLogger(__name__)
 
 # 肥尾修正乘数: GBM 假设正态分布，BTC 实际收益分布肥尾显著。
-# 回测 Nov'25-Mar'26 共 84 个月度市场的校准分析，σ×1.35 取得最优
-# Brier score (0.1165) 和中远距离行权价校准误差 (8-15%: +3pp, 15-30%: +1pp)。
-_FAT_TAIL_SIGMA_MULT = 1.35
+# 回测 Nov'25-Mar'26 共 84 个月度市场的校准分析:
+#   - 使用历史已实现波动率时，σ×1.35 最优 (Brier 0.1161, 中远距离校准误差 <5pp)
+#   - 使用 Deribit IV 时，IV 已含 vol risk premium (≈ realized × 1.12)，
+#     等效目标 σ 不变 → IV 模式乘数 ≈ 1.35/1.12 ≈ 1.20
+_FAT_TAIL_MULT_REALIZED = 1.35
+_FAT_TAIL_MULT_IV = 1.20
+
 
 
 def _load_monthly_baseline() -> dict:
@@ -164,6 +168,8 @@ def _barrier_touch_prob(
     mu_daily: float,
     sigma_daily: float,
     days_left: float,
+    *,
+    sigma_is_iv: bool = False,
 ) -> float:
     """
     首次触及概率（反射原理 / reflection principle）。
@@ -183,9 +189,12 @@ def _barrier_touch_prob(
       回测 4 个月 84 个市场的校准分析显示:
         - 行权距离 8-15%: 原始模型预测 37%，实际 54%（低估 +17pp）
         - 行权距离 15-30%: 原始模型预测 11%，实际 21%（低估 +10pp）
-      将 σ 乘以 _FAT_TAIL_SIGMA_MULT=1.35 后:
-        - 8-15% 校准误差降至 +3pp，15-30% 降至 +1pp
-        - Brier score 从 0.1194 改善至 0.1165
+
+      σ 来源不同，乘数不同:
+        - 已实现波动率: ×1.35 (Brier 0.1194→0.1161, 8-15% 误差 +18pp→+5pp)
+        - Deribit IV: ×1.20 (IV 已含 vol risk premium ≈ realized×1.12)
+
+    sigma_is_iv: True 表示 sigma_daily 来自 Deribit IV，使用较小乘数。
     """
     if days_left <= 0 or sigma_daily <= 1e-9:
         if direction == "above":
@@ -193,7 +202,8 @@ def _barrier_touch_prob(
         else:
             return 1.0 if current_price <= strike else 0.0
 
-    sigma_adj = sigma_daily * _FAT_TAIL_SIGMA_MULT
+    fat_tail_mult = _FAT_TAIL_MULT_IV if sigma_is_iv else _FAT_TAIL_MULT_REALIZED
+    sigma_adj = sigma_daily * fat_tail_mult
 
     # log-drift: μ_log = μ_simple - σ²/2 (Itō 修正)
     mu_log = mu_daily - 0.5 * sigma_adj ** 2
@@ -356,6 +366,8 @@ def _build_position_safety_assessment(
     asset: str = "btc",
     drift_daily: float = 0.0,
     sigma_daily: float = 0.018,
+    *,
+    sigma_is_iv: bool = False,
 ) -> list:
     """对每个持仓评估安全度: safe_to_hold / monitor / at_risk，并用 barrier 模型计算胜率。"""
     current_price = _get_current_price(future_possibility_context, asset)
@@ -422,6 +434,7 @@ def _build_position_safety_assessment(
         if direction in ("above", "below") and days_left > 0:
             p_yes = _barrier_touch_prob(
                 current_price, strike, direction, drift_daily, sigma_daily, days_left,
+                sigma_is_iv=sigma_is_iv,
             )
             model_win_prob = round(1.0 - p_yes if is_no else p_yes, 4)
 
@@ -569,6 +582,8 @@ def _build_swing_opportunities(
     days_left: float,
     held_questions: set | None = None,
     asset: str = "btc",
+    *,
+    sigma_is_iv: bool = False,
 ) -> list:
     """
     波段交易机会分析：计算每个市场 token 对 BTC 短期波动的价格敏感度 (Delta)。
@@ -598,6 +613,7 @@ def _build_swing_opportunities(
         # 基准 barrier 概率
         p_yes_base = _barrier_touch_prob(
             current_asset_price, strike, direction, drift_daily, sigma_daily, days_left,
+            sigma_is_iv=sigma_is_iv,
         )
 
         # BTC ±1% / ±3% 时的 token 理论价变化
@@ -606,6 +622,7 @@ def _build_swing_opportunities(
             scenario_price = current_asset_price * (1.0 + move_pct / 100.0)
             p_yes_scenario = _barrier_touch_prob(
                 scenario_price, strike, direction, drift_daily, sigma_daily, days_left,
+                sigma_is_iv=sigma_is_iv,
             )
             # Yes token 价格变化
             yes_change = p_yes_scenario - p_yes_base
@@ -726,6 +743,8 @@ def _build_portfolio_analysis(
     drift_daily: float = 0.0,
     sigma_daily: float = 0.018,
     days_left: float = 15,
+    *,
+    sigma_is_iv: bool = False,
 ) -> dict:
     """组合级关联风险分析：用 barrier 模型做情景矩阵、对冲结构识别。"""
     if current_asset_price <= 0:
@@ -757,6 +776,7 @@ def _build_portfolio_analysis(
             # 用 barrier 模型从 scenario 价格重新算 touch 概率
             p_yes = _barrier_touch_prob(
                 scenario_asset, strike, direction, drift_daily, sigma_daily, days_left,
+                sigma_is_iv=sigma_is_iv,
             )
             # 合约价格 ≈ 胜率
             new_yes_price = max(0.01, min(0.99, p_yes))
@@ -899,11 +919,13 @@ def build_profit_optimization_context(
     iv_daily = _to_float(daily_volatility_profile.get("iv_daily"), 0.0)
     if iv_daily > 0:
         sigma_daily = iv_daily
+        sigma_is_iv = True
     else:
         sigma_daily = _to_float(daily_volatility_profile.get("realized_vol_daily_pct"), 0.0) / 100.0
         if sigma_daily <= 0:
             # fallback: ATR → σ 转换; 正态分布下 E[|X|] ≈ 0.8σ
             sigma_daily = max(0.008, _to_float(daily_volatility_profile.get("atr_pct"), 1.8) / 100.0 * 0.8)
+        sigma_is_iv = False
 
     days_left = max(0.0, _to_float(future_possibility_context.get("days_left_in_month"), 0))
     current_price = _get_current_price(future_possibility_context, asset)
@@ -924,6 +946,7 @@ def build_profit_optimization_context(
     position_assessments = _build_position_safety_assessment(
         positions, future_possibility_context, daily_volatility_profile,
         asset=asset, drift_daily=drift_daily, sigma_daily=sigma_daily,
+        sigma_is_iv=sigma_is_iv,
     )
 
     # --- Theta daily income ---
@@ -945,6 +968,7 @@ def build_profit_optimization_context(
         # 首次触及概率（barrier model）替代旧的到期分布
         p_yes = _barrier_touch_prob(
             current_price, strike, direction, drift_daily, sigma_daily, days_left,
+            sigma_is_iv=sigma_is_iv,
         )
         p_no = 1.0 - p_yes
 
@@ -1005,12 +1029,14 @@ def build_profit_optimization_context(
     swing_opportunities = _build_swing_opportunities(
         markets, current_price, drift_daily, sigma_daily, days_left,
         held_questions=held_questions, asset=asset,
+        sigma_is_iv=sigma_is_iv,
     )
 
     # --- Portfolio-level analysis ---
     portfolio_analysis = _build_portfolio_analysis(
         position_assessments, current_price, balance,
         asset=asset, drift_daily=drift_daily, sigma_daily=sigma_daily, days_left=days_left,
+        sigma_is_iv=sigma_is_iv,
     )
 
     # --- Prediction review ---
@@ -1032,14 +1058,14 @@ def build_profit_optimization_context(
         "scenario_probabilities": scenario_probs,
         "distribution_assumption": {
             "model_type": "barrier_touch_GBM_reflection_fat_tail",
-            "note": "使用首次触及概率（反射原理）+ 肥尾修正σ×1.35",
+            "note": f"使用首次触及概率（反射原理）+ 肥尾修正σ×{_FAT_TAIL_MULT_IV if sigma_is_iv else _FAT_TAIL_MULT_REALIZED}",
             "asset": asset,
             "days_left": days_left,
             "drift_daily": round(drift_daily, 6),
             "sigma_daily_raw": round(sigma_daily, 6),
-            "sigma_daily_adjusted": round(sigma_daily * _FAT_TAIL_SIGMA_MULT, 6),
-            "fat_tail_multiplier": _FAT_TAIL_SIGMA_MULT,
-            "sigma_source": "deribit_iv" if iv_daily > 0 else "realized_vol" if _to_float(daily_volatility_profile.get("realized_vol_daily_pct"), 0.0) > 0 else "atr_fallback",
+            "sigma_daily_adjusted": round(sigma_daily * (_FAT_TAIL_MULT_IV if sigma_is_iv else _FAT_TAIL_MULT_REALIZED), 6),
+            "fat_tail_multiplier": _FAT_TAIL_MULT_IV if sigma_is_iv else _FAT_TAIL_MULT_REALIZED,
+            "sigma_source": "deribit_iv" if sigma_is_iv else "realized_vol" if _to_float(daily_volatility_profile.get("realized_vol_daily_pct"), 0.0) > 0 else "atr_fallback",
             "current_price": round(current_price, 2),
         },
         "position_safety_assessment": position_assessments,
