@@ -320,8 +320,9 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
    - `rotation_opportunities`：从低收益仓位轮动到高收益未建仓标的的机会列表
    - `prediction_review`：上期预测回顾与准确度评估
    - `scenario_probabilities`：动态情景概率（已考虑剩余天数和波动率压缩）
-   - `top_edge_opportunities`：edge 最高的未建仓机会
+   - `top_edge_opportunities`：edge 最高的未建仓机会（含 `model_prob_yes` 和 `best_side_edge`）
    - `swing_opportunities`：每个市场的波段交易参数——含 Delta 杠杆(BTC ±1%时 token 变动幅度)、波段评分、方向性建议(BTC涨/跌时应买哪侧)、Delta矩阵(±1%/±3%情景下 token 价格变化)。杠杆≥10x 的标的适合方向性波段。
+   - `distribution_assumption`：barrier touch 概率模型参数（含 σ 来源、肥尾修正乘数、模型类型）。**关于此模型的已知偏差，请参阅下方"模型校准偏差"章节。**
 10. **上一时间段报告**（若有）：上一轮输出的完整报告。
 
 # Analysis Framework (COT - Chain of Thought)
@@ -348,6 +349,23 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
   - **禁止无信息均分**：禁止输出“30%/30%/30%”或近似均分概率。若出现“最高概率<45%”或“最高与最低差值<15%”的模糊状态，必须使用检索工具补充近48小时外部新闻（宏观、监管、ETF资金、地缘事件），用新闻因子重新校准后再给出概率分布，并明确更可能的主方向（最高概率需明显高于次高概率）。
 * **定价偏差检查**：计算当前合约价格隐含的概率与 K 线技术面判断的概率是否存在显著偏差？
 * **EV 优先级**：必须参考 `top_edge_opportunities`，优先推荐 edge 为正的标的。
+
+### 模型校准偏差（Model Calibration Bias — 必须参考）
+`top_edge_opportunities` 中的 `model_prob_yes` 基于 GBM barrier touch 概率模型 + 肥尾修正。
+该模型在 85 个已结算月度市场上的回测显示以下**系统性偏差**，你必须在评估 edge 时手动校正：
+
+| 行权距离 | 样本数 | 模型偏差 | 校正指引 |
+|---------|-------|---------|---------|
+| 0-3% (近距离) | 6 | **高估 +9pp** | 模型给 92%，实际仅 83%。对近距离 Yes 的 edge 打折 ~10pp |
+| 3-8% (中近距离) | 7 | **高估 +23pp** | 模型给 80%，实际仅 57%。**此区间 edge 极不可靠**，应大幅下调置信度或直接跳过 |
+| 8-15% (中距离) | 13 | 低估 -6pp | 模型偏保守，可信赖的 edge；若模型已显示正 edge，实际 edge 可能更大 |
+| 15-30% (中远距离) | 19 | **几乎完美 (+0.3pp)** | ✅ 最可信赖区间，模型概率可直接采信 |
+| 30%+ (远距离) | 40 | 高估 +5pp | 模型给 5%，实际为 0%。远距离 Yes 的 edge 往往是虚假的 |
+
+**关键风险：波动率政体变化 (Vol Regime Shift)**
+* 模型使用过去 30 天已实现波动率（或 Deribit IV），但未来波动率可能剧烈变化。
+* 历史案例：2026年2月 BTC 从 $78k 暴跌至 $60k，实际 σ 从 2.3%/天翻倍至 4.4%/天，模型未能预见。
+* **校正规则**：当你在 Step 1 中判断市场正在或即将进入新的波动率政体时（例如重大监管事件、宏观冲击），应对模型概率施加额外折扣/溢价——上行波动率增大时上方 Yes 概率上调、下方 dip 概率也上调；波动率收缩时则相反。
 
 ## Step 2: 持仓安全度分类与利润最大化 (Position Diagnosis)
 * **首先按安全度分类**：参考 `position_safety_assessment` 将每个持仓标记为 safe_to_hold / monitor / at_risk。
@@ -738,6 +756,7 @@ GOLD_SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 * **波动率测算**：基于 K 线高低点估算未来波动范围。参考 `scenario_probabilities.time_compression_note`。
 * **定价偏差**：计算当前合约隐含概率与技术面判断概率的偏差。
 * **EV 优先级**：参考 `top_edge_opportunities`，推荐 edge 为正的标的。
+* **模型校准提醒**：`model_prob_yes` 基于 GBM barrier touch 模型 + 肥尾修正。该模型在 BTC 月度市场中的回测显示近距离(0-8%)有高估倾向、中远距离(15-30%)校准最佳。黄金市场的校准数据不足，对模型概率的采信度应更保守，优先依赖你自身的基本面和技术面判断。
 
 ## Step 2: 持仓安全度分类与利润最大化
 * 参考 `position_safety_assessment` 按安全度分类。
