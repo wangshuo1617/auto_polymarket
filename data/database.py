@@ -197,6 +197,24 @@ CREATE INDEX IF NOT EXISTS idx_btc_poly_1s_ticks_market ON btc_poly_1s_ticks(mar
 CREATE INDEX IF NOT EXISTS idx_btc_poly_1s_ticks_wms_wd ON btc_poly_1s_ticks(window_start_ms, winning_direction);
 """
 
+_DDL_BTC_AGGTRADES = """
+CREATE TABLE IF NOT EXISTS btc_aggtrades (
+    ts TIMESTAMPTZ NOT NULL,
+    price DOUBLE PRECISION NOT NULL,
+    qty DOUBLE PRECISION NOT NULL,
+    is_sell BOOLEAN NOT NULL,
+    quote_qty DOUBLE PRECISION NOT NULL,
+    agg_id BIGINT NOT NULL,
+    event_time_ms BIGINT,
+    received_at TIMESTAMPTZ DEFAULT NOW()
+);
+"""
+
+_DDL_BTC_AGGTRADES_INDICES = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_btc_aggtrades_ts_agg_id
+    ON btc_aggtrades(ts, agg_id);
+"""
+
 _DDL_USDC_BALANCE_SNAPSHOTS = """
 CREATE TABLE IF NOT EXISTS usdc_balance_snapshots (
     id SERIAL PRIMARY KEY,
@@ -293,4 +311,35 @@ def init_db() -> None:
             """)
             logger.info("btc_poly_1s_ticks 压缩策略已启用（7天后自动压缩）")
 
-        logger.info("PostgreSQL DDL 初始化完成（5 张表）")
+        # 创建 btc_aggtrades（需要先建表再转 hypertable）
+        cur.execute(_DDL_BTC_AGGTRADES)
+        cur.execute(_DDL_BTC_AGGTRADES_INDICES)
+
+        cur.execute("""
+            SELECT COUNT(*) FROM timescaledb_information.hypertables
+            WHERE hypertable_name = 'btc_aggtrades'
+        """)
+        is_aggtrade_hyper = cur.fetchone()[0] > 0
+        if not is_aggtrade_hyper:
+            cur.execute("""
+                SELECT create_hypertable(
+                    'btc_aggtrades',
+                    'ts',
+                    chunk_time_interval => INTERVAL '1 day',
+                    migrate_data => true
+                )
+            """)
+            logger.info("btc_aggtrades 已转为 TimescaleDB hypertable")
+
+            cur.execute("""
+                ALTER TABLE btc_aggtrades SET (
+                    timescaledb.compress,
+                    timescaledb.compress_orderby = 'ts'
+                )
+            """)
+            cur.execute("""
+                SELECT add_compression_policy('btc_aggtrades', INTERVAL '7 days')
+            """)
+            logger.info("btc_aggtrades 压缩策略已启用（7天后自动压缩）")
+
+        logger.info("PostgreSQL DDL 初始化完成（6 张表）")

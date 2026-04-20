@@ -30,6 +30,7 @@ from data.polymarket import (
 	prefetch_order_metadata_for_tokens,
 )
 from services.five_minute_trade.watchers import (
+	BinanceBTCRealtimeWatcher,
 	ChainlinkBTCPriceWatcher,
 	PolymarketAssetPriceWatcher,
 )
@@ -199,6 +200,137 @@ class SQLiteBatchWriter:
 				logger.exception("退出前最终 flush 失败，丢弃 %d 条记录", len(buffer))
 
 
+class AggTradeBatchWriter:
+	"""Binance aggTrade 批量写入 PG（btc_aggtrades 表）。
+
+	与 SQLiteBatchWriter 的区别：
+	- ON CONFLICT DO NOTHING 去重（WebSocket 重连重播）
+	- 失败时保留 buffer 重试而非丢弃
+	"""
+
+	_INSERT_SQL = """
+		INSERT INTO btc_aggtrades (ts, price, qty, is_sell, quote_qty, agg_id, event_time_ms)
+		VALUES %s
+		ON CONFLICT (ts, agg_id) DO NOTHING
+	"""
+	_TEMPLATE = "(%s, %s, %s, %s, %s, %s, %s)"
+
+	def __init__(
+		self,
+		flush_rows: int = 500,
+		flush_interval_sec: float = 1.0,
+		max_retries: int = 3,
+	) -> None:
+		self.flush_rows = max(1, int(flush_rows))
+		self.flush_interval_sec = max(0.1, float(flush_interval_sec))
+		self._max_retries = max_retries
+		self._queue: "queue.Queue[Optional[Tuple[Any, ...]]]" = queue.Queue(maxsize=200_000)
+		self._running = False
+		self._thread: Optional[threading.Thread] = None
+
+	def start(self) -> None:
+		if self._running:
+			return
+		self._running = True
+		self._thread = threading.Thread(target=self._run, daemon=True)
+		self._thread.start()
+		logger.info("AggTradeBatchWriter 已启动")
+
+	def stop(self) -> None:
+		if not self._running:
+			return
+		self._running = False
+		self._queue.put(None)
+		if self._thread is not None:
+			self._thread.join(timeout=15)
+
+	def put(self, row: Tuple[Any, ...]) -> None:
+		if not self._running:
+			return
+		try:
+			self._queue.put_nowait(row)
+		except queue.Full:
+			logger.warning("aggTrade 写入队列已满，丢弃 1 条记录")
+
+	def _flush_rows(self, rows: List[Tuple[Any, ...]]) -> None:
+		if not rows:
+			return
+		with get_conn() as conn:
+			psycopg2.extras.execute_values(
+				conn.cursor(),
+				self._INSERT_SQL,
+				rows,
+				template=self._TEMPLATE,
+			)
+
+	def _run(self) -> None:
+		buffer: List[Tuple[Any, ...]] = []
+		last_flush = time.time()
+		retry_count = 0
+
+		while self._running:
+			try:
+				item = self._queue.get(timeout=0.2)
+			except queue.Empty:
+				item = "__EMPTY__"
+
+			now = time.time()
+
+			if item is None:
+				break
+
+			if item != "__EMPTY__":
+				buffer.append(item)
+
+			should_flush = (
+				len(buffer) >= self.flush_rows
+				or (buffer and (now - last_flush) >= self.flush_interval_sec)
+			)
+			if should_flush:
+				try:
+					self._flush_rows(buffer)
+					buffer.clear()
+					last_flush = now
+					retry_count = 0
+				except Exception:
+					retry_count += 1
+					if retry_count >= self._max_retries:
+						logger.exception(
+							"aggTrade PG 写入连续失败 %d 次，丢弃 %d 条",
+							retry_count, len(buffer),
+						)
+						buffer.clear()
+						retry_count = 0
+						time.sleep(5.0)
+					else:
+						logger.warning(
+							"aggTrade PG 写入失败 (%d/%d)，保留 %d 条待重试",
+							retry_count, self._max_retries, len(buffer),
+						)
+						time.sleep(1.0)
+					last_flush = now
+
+		# 退出前 drain
+		while not self._queue.empty():
+			try:
+				item = self._queue.get_nowait()
+				if item is not None:
+					buffer.append(item)
+			except queue.Empty:
+				break
+		if buffer:
+			for attempt in range(self._max_retries):
+				try:
+					self._flush_rows(buffer)
+					logger.info("AggTradeBatchWriter 退出前 flush 成功，写入 %d 条", len(buffer))
+					break
+				except Exception:
+					if attempt == self._max_retries - 1:
+						logger.exception("AggTradeBatchWriter 退出 flush 最终失败，丢弃 %d 条", len(buffer))
+					else:
+						time.sleep(0.5)
+
+
 class BTC1sMarketMonitor:
 	WINDOW_MS = 5 * 60 * 1000
 	HTTP_BOOK_MAX_AGE_MS = 2000
@@ -214,9 +346,14 @@ class BTC1sMarketMonitor:
 		self._sampler_thread: Optional[threading.Thread] = None
 
 		self._writer = SQLiteBatchWriter()
+		self._aggtrade_writer = AggTradeBatchWriter()
 		self._btc_watcher = ChainlinkBTCPriceWatcher(
 			symbol=self.symbol,
 			callback=self._on_btc_price,
+		)
+		self._binance_watcher = BinanceBTCRealtimeWatcher(
+			symbol=self.symbol,
+			trade_callback=self._on_aggtrade,
 		)
 		self._poly_watcher: Optional[PolymarketAssetPriceWatcher] = None
 
@@ -239,12 +376,14 @@ class BTC1sMarketMonitor:
 
 		self._running = True
 		self._writer.start()
+		self._aggtrade_writer.start()
 
 		threading.Thread(target=self._btc_watcher.start, daemon=True).start()
+		threading.Thread(target=self._binance_watcher.start, daemon=True).start()
 		self._sampler_thread = threading.Thread(target=self._sampling_loop, daemon=True)
 		self._sampler_thread.start()
 
-		logger.info("BTC1sMarketMonitor 启动完成，数据库: PG_DSN")
+		logger.info("BTC1sMarketMonitor 启动完成（含 aggTrade 采集），数据库: PG_DSN")
 
 	def stop(self) -> None:
 		self._running = False
@@ -252,8 +391,13 @@ class BTC1sMarketMonitor:
 			self._btc_watcher.stop()
 		except Exception:
 			pass
+		try:
+			self._binance_watcher.stop()
+		except Exception:
+			pass
 
 		self._stop_polymarket_watcher()
+		self._aggtrade_writer.stop()
 		self._writer.stop()
 		logger.info("BTC1sMarketMonitor 已停止")
 
@@ -282,6 +426,23 @@ class BTC1sMarketMonitor:
 		with self._lock:
 			self._latest_btc_price = parsed_price
 			self._latest_btc_event_ms = event_ms
+
+	def _on_aggtrade(self, payload: Dict[str, Any]) -> None:
+		"""将 Binance aggTrade 转为 PG 行并放入写入队列。"""
+		try:
+			trade_time_ms = payload.get("trade_time_ms") or payload.get("event_time_ms", 0)
+			ts = datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc)
+			price = float(payload["price"])
+			qty = float(payload["qty"])
+			is_sell = bool(payload.get("is_sell", False))
+			quote_qty = price * qty
+			agg_id = int(payload.get("agg_id", 0))
+			event_time_ms = int(payload.get("event_time_ms", 0))
+
+			row = (ts, price, qty, is_sell, quote_qty, agg_id, event_time_ms)
+			self._aggtrade_writer.put(row)
+		except Exception:
+			logger.debug("aggTrade 回调处理异常", exc_info=True)
 
 	def _on_polymarket_book(self, payload: Dict[str, Any]) -> None:
 		token_id = str(payload.get("asset_id") or "")

@@ -493,6 +493,8 @@ class BinanceBTCRealtimeWatcher:
             qty = float(data.get("q", 0))
             is_seller = bool(data.get("m", False))  # m=True → buyer is maker → seller initiated
             event_time = int(data.get("E", 0))
+            trade_time = int(data.get("T", 0)) or event_time  # T=实际成交时间
+            agg_id = int(data.get("a", 0))  # Binance aggregate trade ID
 
             if self.trade_callback:
                 self.trade_callback({
@@ -500,6 +502,8 @@ class BinanceBTCRealtimeWatcher:
                     "qty": qty,
                     "is_sell": is_seller,
                     "event_time_ms": event_time,
+                    "trade_time_ms": trade_time,
+                    "agg_id": agg_id,
                     "timestamp": time.time(),
                 })
         except Exception as e:
@@ -519,7 +523,14 @@ class BinanceBTCRealtimeWatcher:
         logger.info("Binance 实时 WS 已连接 (bookTicker + aggTrade)")
 
     def _start_ws(self) -> None:
-        streams = f"{self.symbol}@bookTicker/{self.symbol}@aggTrade"
+        parts = []
+        if self.price_callback:
+            parts.append(f"{self.symbol}@bookTicker")
+        if self.trade_callback:
+            parts.append(f"{self.symbol}@aggTrade")
+        if not parts:
+            parts = [f"{self.symbol}@bookTicker", f"{self.symbol}@aggTrade"]
+        streams = "/".join(parts)
         url = f"{self.BASE_URL}/stream?streams={streams}"
         logger.info("连接 Binance 实时 WS: %s", url)
         self.ws = WebSocketApp(
