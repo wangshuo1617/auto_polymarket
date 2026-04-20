@@ -763,14 +763,21 @@ def _build_swing_opportunities(
 
         is_held = (strike, direction) in held_questions
 
+        dist_pct = abs(strike - current_asset_price) / current_asset_price * 100.0
+        cal_conf = _calibration_confidence(dist_pct)
+        p_yes_cal = _calibrate_p_yes(p_yes_base, dist_pct)
+
         opportunities.append({
             "question": question,
             "strike": round(strike, 2),
             "direction": direction,
+            "distance_pct": round(dist_pct, 1),
+            "calibration_confidence": cal_conf,
             "is_held": is_held,
             "current_yes_price": round(yes_price, 4),
             "current_no_price": round(no_price, 4),
             "model_yes_prob": round(p_yes_base, 4),
+            "prob_yes_calibrated": round(p_yes_cal, 4),
             "delta_matrix": deltas,
             "yes_leverage_per_1pct": round(yes_leverage, 1),
             "no_leverage_per_1pct": round(no_leverage, 1),
