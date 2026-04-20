@@ -24,6 +24,80 @@ logger = logging.getLogger(__name__)
 _FAT_TAIL_MULT_REALIZED = 1.35
 _FAT_TAIL_MULT_IV = 1.20
 
+# ── 校准偏差修正 (Calibration Bias Correction) ──────────────────────
+# 回测 85 个已结算月度 BTC 市场 (Nov'25-Apr'26) 的校准分析。
+# 模型在不同行权距离上存在系统性偏差，使用分段线性插值 + 小样本收缩修正。
+# 控制点: (distance_pct, raw_bias_pp, sample_n)
+#   bias > 0 表示模型高估 p_yes，bias < 0 表示低估。
+_CALIBRATION_CONTROL_POINTS: list[tuple[float, float, int]] = [
+    (0.0,    0.0,   0),   # at-the-money: 无修正
+    (1.5,    9.0,   6),   # 0-3% 桶中点
+    (5.5,   23.0,   7),   # 3-8% 桶中点
+    (11.5,  -6.0,  13),   # 8-15% 桶中点
+    (22.5,   0.3,  19),   # 15-30% 桶中点
+    (50.0,   5.0,  40),   # 30%+ 桶中点
+    (80.0,   0.0,   0),   # 极远距离: 衰减至零
+]
+_CALIBRATION_BIAS_CAP_PP = 15.0  # 最大校正幅度上限
+
+
+def _shrinkage_weight(n: int) -> float:
+    """小样本收缩: 样本量越小，校正越保守。"""
+    if n >= 15:
+        return 1.0
+    if n >= 10:
+        return 0.85
+    if n >= 5:
+        return 0.6
+    return 0.0
+
+
+def _calibration_bias_pp(distance_pct: float) -> float:
+    """
+    返回模型在给定行权距离上的校准偏差 (pp)。
+
+    正值 = 模型高估 p_yes，应下调；负值 = 模型低估，应上调。
+    使用分段线性插值 + 小样本收缩，避免桶边界处的突变。
+    """
+    pts = _CALIBRATION_CONTROL_POINTS
+    d = max(0.0, distance_pct)
+
+    if d <= pts[0][0]:
+        return 0.0
+    if d >= pts[-1][0]:
+        return 0.0
+
+    for i in range(len(pts) - 1):
+        d0, b0, n0 = pts[i]
+        d1, b1, n1 = pts[i + 1]
+        if d0 <= d <= d1:
+            t = (d - d0) / (d1 - d0) if d1 > d0 else 0.0
+            bias0 = b0 * _shrinkage_weight(n0)
+            bias1 = b1 * _shrinkage_weight(n1)
+            raw = bias0 + t * (bias1 - bias0)
+            return max(-_CALIBRATION_BIAS_CAP_PP, min(_CALIBRATION_BIAS_CAP_PP, raw))
+
+    return 0.0
+
+
+def _calibration_confidence(distance_pct: float) -> str:
+    """根据行权距离返回校准置信度标签。"""
+    if distance_pct < 3:
+        return "low"
+    if distance_pct < 8:
+        return "low"
+    if distance_pct < 15:
+        return "medium"
+    if distance_pct < 30:
+        return "high"
+    return "medium"
+
+
+def _calibrate_p_yes(p_yes_raw: float, distance_pct: float) -> float:
+    """对 p_yes 施加校准偏差修正，返回校准后概率。"""
+    bias = _calibration_bias_pp(distance_pct) / 100.0
+    return max(0.001, min(0.999, p_yes_raw - bias))
+
 
 
 def _load_monthly_baseline() -> dict:
@@ -431,12 +505,15 @@ def _build_position_safety_assessment(
 
         # 用 barrier 模型计算持仓胜率
         model_win_prob = None
+        dist_pct = safety_margin_pct  # already computed above
+        cal_conf = _calibration_confidence(dist_pct)
         if direction in ("above", "below") and days_left > 0:
             p_yes = _barrier_touch_prob(
                 current_price, strike, direction, drift_daily, sigma_daily, days_left,
                 sigma_is_iv=sigma_is_iv,
             )
-            model_win_prob = round(1.0 - p_yes if is_no else p_yes, 4)
+            p_yes_cal = _calibrate_p_yes(p_yes, dist_pct)
+            model_win_prob = round(1.0 - p_yes_cal if is_no else p_yes_cal, 4)
 
         assessments.append({
             "title": title,
@@ -445,6 +522,8 @@ def _build_position_safety_assessment(
             "cur_price": cur_price_contract,
             "strike": strike,
             "direction": direction,
+            "distance_pct": round(dist_pct, 1),
+            "calibration_confidence": cal_conf,
             "safety_margin_pct": round(safety_margin_pct, 2),
             "atr_distance": round(atr_distance, 2),
             "within_one_atr_warning": near_atr_warning,
@@ -952,7 +1031,7 @@ def build_profit_optimization_context(
     # --- Theta daily income ---
     theta_income = _build_theta_income(position_assessments, days_left)
 
-    # --- Edge calculation (barrier touch probability) ---
+    # --- Edge calculation (barrier touch probability + calibration) ---
     edges = []
     markets = polymarket_event_situation.get("markets", []) if isinstance(polymarket_event_situation, dict) else []
     for market in markets:
@@ -965,31 +1044,44 @@ def build_profit_optimization_context(
         if current_price <= 0 or strike is None or direction == "unknown" or yes_price is None or no_price is None:
             continue
 
-        # 首次触及概率（barrier model）替代旧的到期分布
+        distance_pct = abs(strike - current_price) / current_price * 100.0
+        cal_conf = _calibration_confidence(distance_pct)
+
+        # 首次触及概率（barrier model）
         p_yes = _barrier_touch_prob(
             current_price, strike, direction, drift_daily, sigma_daily, days_left,
             sigma_is_iv=sigma_is_iv,
         )
         p_no = 1.0 - p_yes
 
-        ev_yes = p_yes - yes_price
-        ev_no = p_no - no_price
+        # 校准后概率 (用于决策和 Kelly sizing)
+        p_yes_cal = _calibrate_p_yes(p_yes, distance_pct)
+        p_no_cal = 1.0 - p_yes_cal
 
-        if ev_yes >= ev_no:
+        # 原始 edge (供参考)
+        ev_yes_raw = p_yes - yes_price
+        ev_no_raw = p_no - no_price
+
+        # 校准后 edge (用于决策)
+        ev_yes_cal = p_yes_cal - yes_price
+        ev_no_cal = p_no_cal - no_price
+
+        if ev_yes_cal >= ev_no_cal:
             chosen_side = "Yes"
             chosen_price = yes_price
-            chosen_prob = p_yes
-            edge = ev_yes
+            chosen_prob_cal = p_yes_cal
+            edge_cal = ev_yes_cal
         else:
             chosen_side = "No"
             chosen_price = no_price
-            chosen_prob = p_no
-            edge = ev_no
+            chosen_prob_cal = p_no_cal
+            edge_cal = ev_no_cal
 
+        # Kelly sizing 使用校准后概率
         if chosen_price >= 0.999:
             kelly = 0.0
         else:
-            kelly = max(0.0, (chosen_prob - chosen_price) / max(1e-6, 1.0 - chosen_price))
+            kelly = max(0.0, (chosen_prob_cal - chosen_price) / max(1e-6, 1.0 - chosen_price))
 
         fractional_kelly = 0.25 * kelly
         suggested_alloc = min(
@@ -998,17 +1090,28 @@ def build_profit_optimization_context(
             total_net_value * fractional_kelly,
         )
 
+        # 相关性分组: 同方向标的高度相关（同月 above/below BTC 共享驱动因素）
+        corr_group = f"{asset}_{direction}"
+
         edges.append({
             "question": question,
             "direction_in_question": direction,
             "strike": round(strike, 2),
+            "distance_pct": round(distance_pct, 1),
+            "calibration_confidence": cal_conf,
+            "correlation_group": corr_group,
+            # 原始模型输出 (透明度)
             "model_prob_yes": round(p_yes, 4),
             "implied_prob_yes": round(yes_price, 4),
-            "edge_yes": round(ev_yes, 4),
-            "edge_no": round(ev_no, 4),
+            "edge_yes_raw": round(ev_yes_raw, 4),
+            "edge_no_raw": round(ev_no_raw, 4),
+            # 校准后输出 (用于决策)
+            "prob_yes_calibrated": round(p_yes_cal, 4),
+            "edge_yes_calibrated": round(ev_yes_cal, 4),
+            "edge_no_calibrated": round(ev_no_cal, 4),
             "best_side": chosen_side,
             "best_side_price": round(chosen_price, 4),
-            "best_side_edge": round(edge, 4),
+            "best_side_edge": round(edge_cal, 4),
             "fractional_kelly": round(fractional_kelly, 4),
             "suggested_max_alloc_usdc": round(max(0.0, suggested_alloc), 2),
         })

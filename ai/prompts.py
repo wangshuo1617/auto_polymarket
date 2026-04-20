@@ -350,17 +350,31 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 * **定价偏差检查**：计算当前合约价格隐含的概率与 K 线技术面判断的概率是否存在显著偏差？
 * **EV 优先级**：必须参考 `top_edge_opportunities`，优先推荐 edge 为正的标的。
 
-### 模型校准偏差（Model Calibration Bias — 必须参考）
-`top_edge_opportunities` 中的 `model_prob_yes` 基于 GBM barrier touch 概率模型 + 肥尾修正。
-该模型在 85 个已结算月度市场上的回测显示以下**系统性偏差**，你必须在评估 edge 时手动校正：
+### 模型校准偏差（Model Calibration Bias — 已自动校正）
+`top_edge_opportunities` 中包含两套概率/edge：
+* **原始值** (`model_prob_yes`, `edge_yes_raw`, `edge_no_raw`)：GBM barrier touch 模型的直接输出。
+* **校准值** (`prob_yes_calibrated`, `edge_yes_calibrated`, `edge_no_calibrated`, `best_side_edge`)：已根据下表自动施加分段线性校正。
 
-| 行权距离 | 样本数 | 模型偏差 | 校正指引 |
+校准基于 85 个已结算月度市场的回测偏差：
+
+| 行权距离 | 样本数 | 模型偏差 | 校正效果 |
 |---------|-------|---------|---------|
-| 0-3% (近距离) | 6 | **高估 +9pp** | 模型给 92%，实际仅 83%。对近距离 Yes 的 edge 打折 ~10pp |
-| 3-8% (中近距离) | 7 | **高估 +23pp** | 模型给 80%，实际仅 57%。**此区间 edge 极不可靠**，应大幅下调置信度或直接跳过 |
-| 8-15% (中距离) | 13 | 低估 -6pp | 模型偏保守，可信赖的 edge；若模型已显示正 edge，实际 edge 可能更大 |
-| 15-30% (中远距离) | 19 | **几乎完美 (+0.3pp)** | ✅ 最可信赖区间，模型概率可直接采信 |
-| 30%+ (远距离) | 40 | 高估 +5pp | 模型给 5%，实际为 0%。远距离 Yes 的 edge 往往是虚假的 |
+| 0-3% (近距离) | 6 | **高估 +9pp** | 已自动下调（小样本收缩后约 -5pp） |
+| 3-8% (中近距离) | 7 | **高估 +23pp** | 已自动下调（收缩后约 -14pp），但 `calibration_confidence=low`，**仍需额外谨慎** |
+| 8-15% (中距离) | 13 | 低估 -6pp | 已自动上调约 +5pp，`calibration_confidence=medium` |
+| 15-30% (中远距离) | 19 | **几乎完美** | ✅ 无显著校正，`calibration_confidence=high`，最可信赖 |
+| 30%+ (远距离) | 40 | 高估 +5pp | 已自动下调，`calibration_confidence=medium` |
+
+**使用指引**：
+1. 优先使用 `best_side_edge`（校准后）和 `prob_yes_calibrated` 做决策，而非原始值。
+2. `calibration_confidence=low` 的标的，即使校准后 edge 仍为正，也应降低仓位或跳过。
+3. `distance_pct` 字段可直接获知行权距离，无需手动计算。
+
+### 同方向相关性警告（Correlation Risk）
+`correlation_group` 字段标识同方向市场组（如 `btc_above`、`btc_below`）。
+**同方向标的高度相关**：如果 BTC 涨到 $110k，则 $100k/$105k/$108k above 全部获胜。
+* 同一 `correlation_group` 内的标的不要合计超过单市场上限的 2 倍（即总仓位 ≤ 40% risk_budget）。
+* 跨方向（above + below）组合可以分散风险。
 
 **关键风险：波动率政体变化 (Vol Regime Shift)**
 * 模型使用过去 30 天已实现波动率（或 Deribit IV），但未来波动率可能剧烈变化。
