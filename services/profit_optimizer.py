@@ -16,6 +16,11 @@ ET_TIMEZONE = ZoneInfo("America/New_York")
 _BASELINE_FILE = Path("data/monthly_baseline.json")
 logger = logging.getLogger(__name__)
 
+# 肥尾修正乘数: GBM 假设正态分布，BTC 实际收益分布肥尾显著。
+# 回测 Nov'25-Mar'26 共 84 个月度市场的校准分析，σ×1.35 取得最优
+# Brier score (0.1165) 和中远距离行权价校准误差 (8-15%: +3pp, 15-30%: +1pp)。
+_FAT_TAIL_SIGMA_MULT = 1.35
+
 
 def _load_monthly_baseline() -> dict:
     """加载月度基准净值记录文件。"""
@@ -172,6 +177,15 @@ def _barrier_touch_prob(
     基于 GBM 反射原理:
       X_t = ln(S_t/S_0) = μ_log·t + σ·W_t
       P(max X_t >= a) = Φ((μT-a)/(σ√T)) + exp(2μa/σ²)·Φ((-μT-a)/(σ√T))
+
+    肥尾修正 (fat-tail correction):
+      GBM 假设对数收益服从正态分布，但 BTC 实际分布具有显著肥尾（kurtosis >> 3）。
+      回测 4 个月 84 个市场的校准分析显示:
+        - 行权距离 8-15%: 原始模型预测 37%，实际 54%（低估 +17pp）
+        - 行权距离 15-30%: 原始模型预测 11%，实际 21%（低估 +10pp）
+      将 σ 乘以 _FAT_TAIL_SIGMA_MULT=1.35 后:
+        - 8-15% 校准误差降至 +3pp，15-30% 降至 +1pp
+        - Brier score 从 0.1194 改善至 0.1165
     """
     if days_left <= 0 or sigma_daily <= 1e-9:
         if direction == "above":
@@ -179,11 +193,13 @@ def _barrier_touch_prob(
         else:
             return 1.0 if current_price <= strike else 0.0
 
+    sigma_adj = sigma_daily * _FAT_TAIL_SIGMA_MULT
+
     # log-drift: μ_log = μ_simple - σ²/2 (Itō 修正)
-    mu_log = mu_daily - 0.5 * sigma_daily ** 2
+    mu_log = mu_daily - 0.5 * sigma_adj ** 2
     T = float(days_left)
     mu_T = mu_log * T
-    sigma_T = sigma_daily * sqrt(T)
+    sigma_T = sigma_adj * sqrt(T)
 
     if direction == "above":
         if current_price >= strike:
@@ -206,7 +222,7 @@ def _barrier_touch_prob(
         # 零漂移: P = 2·Φ(-a / σ√T)
         p = 2.0 * _norm_cdf(-a / sigma_T)
     else:
-        exp_arg = 2.0 * mu_log * a / (sigma_daily ** 2)
+        exp_arg = 2.0 * mu_log * a / (sigma_adj ** 2)
         if exp_arg > 500:
             p = 1.0
         elif exp_arg < -500:
@@ -1015,12 +1031,14 @@ def build_profit_optimization_context(
         },
         "scenario_probabilities": scenario_probs,
         "distribution_assumption": {
-            "model_type": "barrier_touch_GBM_reflection",
-            "note": "使用首次触及概率（反射原理），非到期分布",
+            "model_type": "barrier_touch_GBM_reflection_fat_tail",
+            "note": "使用首次触及概率（反射原理）+ 肥尾修正σ×1.35",
             "asset": asset,
             "days_left": days_left,
             "drift_daily": round(drift_daily, 6),
-            "sigma_daily": round(sigma_daily, 6),
+            "sigma_daily_raw": round(sigma_daily, 6),
+            "sigma_daily_adjusted": round(sigma_daily * _FAT_TAIL_SIGMA_MULT, 6),
+            "fat_tail_multiplier": _FAT_TAIL_SIGMA_MULT,
             "sigma_source": "deribit_iv" if iv_daily > 0 else "realized_vol" if _to_float(daily_volatility_profile.get("realized_vol_daily_pct"), 0.0) > 0 else "atr_fallback",
             "current_price": round(current_price, 2),
         },
