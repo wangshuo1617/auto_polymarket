@@ -5,25 +5,29 @@ Polymarket 持仓分析主入口
 import json
 import os
 import calendar
+import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from config import TO_EMAIL
+from config import TO_EMAIL, GEMINI_MODEL_ID
 from data.polymarket import get_positions, get_open_orders, get_event_situation, get_balance_allowance
 from data.binance import get_btc_price, get_4h_klines_data, get_1d_klines_data
 from data.deribit import get_btc_dvol
+from ai.prompts import RESPONSE_SCHEMA, get_system_instruction
 from ai.researcher import analyze_market_with_grounding
 from notifications.email import EmailSender
 from notifications.html import generate_html_template
 from services.position import match_orders_with_positions, format_matched_data
 from services.market_sentiment import get_market_sentiment_and_funding
 from services.profit_optimizer import build_profit_optimization_context
+from services.recommendation_db import RecommendationDB, build_recommendation_items
 from services.volatility import build_daily_volatility_profile
 
 LAST_REPORT_PATH = Path(__file__).resolve().parent / "last_report.json"
 ET_TIMEZONE = ZoneInfo("America/New_York")
 ANALYZE_PROFILE = "analyze"
+PROMPT_FAMILY = "btc-monthly-position-analyze"
 
 
 def _build_intraday_volatility_hint() -> dict:
@@ -147,6 +151,43 @@ def _save_report(data: dict) -> None:
         pass
 
 
+def _classify_run_status(analyze_result: dict | None, items: list) -> str:
+    """第四轮加固 #5：把 run.status 区分为
+        - completed         : 模型给出完整结构化输出 + 至少一条 recommendation
+        - completed_no_action: 模型给出完整结构化输出但明确无操作 / 0 条 item（合理 no-op）
+        - partial           : analyze_result 缺失关键字段或 normalize 失败
+    Dashboard 只在 partial/failed 上做高亮告警，避免把"合理无操作"误判成模型抽取失败。
+    """
+    has_items = bool(items)
+    if not isinstance(analyze_result, dict) or not analyze_result:
+        return "partial"
+    overall = analyze_result.get("整体分析")
+    has_overall = isinstance(overall, str) and overall.strip()
+    has_position_section = isinstance(
+        analyze_result.get("当前持仓与挂单分析与建议"), (dict, list)
+    )
+    if not (has_overall and has_position_section):
+        return "partial"
+    if has_items:
+        return "completed"
+    return "completed_no_action"
+
+
+def _build_prompt_metadata() -> dict[str, str]:
+    """构建稳定的 prompt/version 元信息，供 recommendation_runs 审计。"""
+    system_prompt = get_system_instruction("1970-01-01")
+    system_prompt_hash = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+    schema_hash = hashlib.sha256(
+        json.dumps(RESPONSE_SCHEMA, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return {
+        "prompt_family": PROMPT_FAMILY,
+        "prompt_version": f"{system_prompt_hash[:8]}-{schema_hash[:8]}",
+        "system_prompt_hash": system_prompt_hash,
+        "schema_hash": schema_hash,
+    }
+
+
 def _build_future_possibility_context(
     btc_1d_k_data: list,
     current_btc_price: float,
@@ -227,6 +268,8 @@ def _build_future_possibility_context(
 
 if __name__ == "__main__":
     email_sender = EmailSender()
+    recommendation_db = RecommendationDB()
+    recommendation_db.init_tables()
     time_now = datetime.now(ET_TIMEZONE).strftime("%m-%d %H:%M")
 
     positions = get_positions(profile=ANALYZE_PROFILE)
@@ -282,6 +325,16 @@ if __name__ == "__main__":
     if previous_report:
         print(f"{time_now} 已加载上一时间段报告作为参考")
 
+    recommendation_memory_context = recommendation_db.build_memory_context(asset="btc")
+    feedback_count = (
+        recommendation_memory_context.get("recent_feedback_summary", {}).get("total_feedback_count") or 0
+    )
+    pending_count = len(recommendation_memory_context.get("pending_or_deferred_items", []) or [])
+    print(
+        f"{time_now} 建议历史记忆摘要已加载: recent_feedback={feedback_count} "
+        f"pending_or_deferred={pending_count}"
+    )
+
     event_situation = get_event_situation()
     raw_market_count = len(event_situation.get("markets", [])) if isinstance(event_situation, dict) else 0
     event_situation = _filter_unsettled_event_situation(event_situation)
@@ -316,8 +369,56 @@ if __name__ == "__main__":
         market_sentiment_and_funding,
         event_situation,
         usdc_balance,
+        recommendation_memory_context=recommendation_memory_context,
         previous_report=previous_report,
         operator_intent=os.environ.get("OPERATOR_INTENT") or None,
+    )
+    recommendation_items = build_recommendation_items(
+        analyze_result,
+        profit_optimization_context=profit_optimization_context,
+    )
+    prompt_metadata = _build_prompt_metadata()
+    run_id = recommendation_db.persist_analysis_run(
+        asset="btc",
+        analysis_kind="position_analyze",
+        profile=ANALYZE_PROFILE,
+        trigger_type=(os.environ.get("ANALYZE_TRIGGER_TYPE") or "scheduled").strip() or "scheduled",
+        trigger_reason=(os.environ.get("ANALYZE_TRIGGER_REASON") or "").strip() or None,
+        operator_intent=(os.environ.get("OPERATOR_INTENT") or "").strip() or None,
+        model_id=GEMINI_MODEL_ID,
+        prompt_family=prompt_metadata["prompt_family"],
+        prompt_version=prompt_metadata["prompt_version"],
+        system_prompt_hash=prompt_metadata["system_prompt_hash"],
+        schema_hash=prompt_metadata["schema_hash"],
+        btc_price=float(current_btc_price),
+        days_left_in_month=float(future_possibility_context.get("days_left_in_month") or 0.0),
+        input_snapshot={
+            "positions": positions,
+            "formatted_positions": formatted,
+            "daily_volatility_profile": daily_volatility_profile,
+            "intraday_volatility_hint": intraday_volatility_hint,
+            "future_possibility_context": future_possibility_context,
+            "profit_optimization_context": profit_optimization_context,
+            "recommendation_memory_context": recommendation_memory_context,
+            "market_sentiment_and_funding": market_sentiment_and_funding,
+            "polymarket_event_situation": event_situation,
+            "usdc_balance": usdc_balance,
+            "operator_intent": os.environ.get("OPERATOR_INTENT") or None,
+            "previous_report_summary": (
+                previous_report.get("整体分析") if isinstance(previous_report, dict) else None
+            ),
+        },
+        analysis_output=analyze_result,
+        items=recommendation_items,
+        # 第四轮加固 #5（低）：区分"模型有判断且明确无操作"与"normalize 真的失败"。
+        # 启发式：analyze_result 形如 {"整体分析": "...", "当前持仓与挂单分析与建议": {...}, "预警信号": [...]}，
+        # 只要顶层结构化字段齐全（至少有 "整体分析" 非空），就认为模型给出了完整判断；
+        # 此时 items=0 应记为 completed_no_action；其它情况才落 partial。
+        status=_classify_run_status(analyze_result, recommendation_items),
+    )
+    print(
+        f"{time_now} 建议持久化完成: run_id={run_id} items={len(recommendation_items)} "
+        f"trigger={(os.environ.get('ANALYZE_TRIGGER_TYPE') or 'scheduled')}"
     )
     warn_prices = analyze_result["预警信号"]
     for warn_price in warn_prices:

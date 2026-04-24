@@ -101,6 +101,7 @@ def analyze_market_with_grounding(
     market_sentiment_and_funding: dict,
     polymarket_event_situation: dict,
     usdc_balance: str,
+    recommendation_memory_context: dict | None = None,
     previous_report: dict | None = None,
     operator_intent: str | None = None,
     monthly_target: str = "月度净值翻倍（+100%）",
@@ -144,6 +145,7 @@ def analyze_market_with_grounding(
         market_sentiment_and_funding,
         polymarket_event_situation,
         usdc_balance,
+        recommendation_memory_context=recommendation_memory_context,
         previous_report=previous_report,
         operator_intent=operator_intent,
     )

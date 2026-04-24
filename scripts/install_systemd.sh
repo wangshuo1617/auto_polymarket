@@ -13,6 +13,7 @@ SERVICES=(
   auto-poly-5m-trade
   auto-poly-app
   auto-poly-usdc-monitor
+  auto-poly-recommendation-executor
 )
 
 EXTRA_UNITS=(

@@ -105,6 +105,9 @@
                 <button class="nav-link" id="orders-tab" data-bs-toggle="tab" data-bs-target="#orders" type="button" role="tab" aria-controls="orders" aria-selected="false">Open Orders</button>
             </li>
             <li class="nav-item" role="presentation">
+                <button class="nav-link" id="recommendations-tab" data-bs-toggle="tab" data-bs-target="#recommendations" type="button" role="tab" aria-controls="recommendations" aria-selected="false">Recommendations</button>
+            </li>
+            <li class="nav-item" role="presentation">
                 <button class="nav-link" id="trade5m-tab" data-bs-toggle="tab" data-bs-target="#trade5m" type="button" role="tab" aria-controls="trade5m" aria-selected="false">5m Trade</button>
             </li>
         </ul>
@@ -117,6 +120,9 @@
             </div>
             <div class="tab-pane fade" id="orders" role="tabpanel" aria-labelledby="orders-tab">
                 <div id="orders-content">Loading...</div>
+            </div>
+            <div class="tab-pane fade" id="recommendations" role="tabpanel" aria-labelledby="recommendations-tab">
+                <div id="recommendations-content">Loading...</div>
             </div>
             <div class="tab-pane fade" id="trade5m" role="tabpanel" aria-labelledby="trade5m-tab">
                 <div id="trade5m-content">Loading...</div>
@@ -215,10 +221,64 @@
         </div>
     </div>
 
+    <div class="modal fade" id="recommendationFeedbackModal" tabindex="-1" aria-labelledby="recommendationFeedbackModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="recommendationFeedbackModalLabel">建议反馈</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="recFeedbackItemId">
+                    <input type="hidden" id="recFeedbackDecision">
+                    <div class="mb-2 small text-muted" id="recFeedbackActionHint"></div>
+                    <div class="mb-3">
+                        <label class="form-label">标的</label>
+                        <div class="form-control bg-light" id="recFeedbackTitle"></div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">原因标签（可多选）</label>
+                        <div class="row g-2" id="recFeedbackReasonTags">
+                            <div class="col-md-4 rec-reason-group" data-decision-group="execute"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="同意方向" id="recTagAgreeDir"><label class="form-check-label" for="recTagAgreeDir">同意方向</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="execute"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="价格合适" id="recTagPriceOk"><label class="form-check-label" for="recTagPriceOk">价格合适</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="execute"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="时机正确" id="recTagTimingOk"><label class="form-check-label" for="recTagTimingOk">时机正确</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="execute"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="风险可控" id="recTagRiskOk"><label class="form-check-label" for="recTagRiskOk">风险可控</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="execute"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="仓位互补" id="recTagComplement"><label class="form-check-label" for="recTagComplement">仓位互补</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="execute"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="流动性充足" id="recTagLiqOk"><label class="form-check-label" for="recTagLiqOk">流动性充足</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="reject"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="价格不合适" id="recTagPrice"><label class="form-check-label" for="recTagPrice">价格不合适</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="reject"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="不同意方向" id="recTagDirection"><label class="form-check-label" for="recTagDirection">不同意方向</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="reject"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="仓位重复" id="recTagDup"><label class="form-check-label" for="recTagDup">仓位重复</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="reject"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="相关性过高" id="recTagCorr"><label class="form-check-label" for="recTagCorr">相关性过高</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="reject"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="风险过高" id="recTagRisk"><label class="form-check-label" for="recTagRisk">风险过高</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="reject"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="流动性不足" id="recTagLiquidity"><label class="form-check-label" for="recTagLiquidity">流动性不足</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="reject"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="时机不对" id="recTagTiming"><label class="form-check-label" for="recTagTiming">时机不对</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="defer"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="仅观察" id="recTagObserve"><label class="form-check-label" for="recTagObserve">仅观察</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="defer"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="稍后处理" id="recTagLater"><label class="form-check-label" for="recTagLater">稍后处理</label></div></div>
+                            <div class="col-md-4 rec-reason-group" data-decision-group="defer"><div class="form-check"><input class="form-check-input rec-reason-tag" type="checkbox" value="人工已有计划" id="recTagManual"><label class="form-check-label" for="recTagManual">人工已有计划</label></div></div>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="recFeedbackText" class="form-label">补充说明</label>
+                        <textarea class="form-control" id="recFeedbackText" rows="4" placeholder="例如：我不同意方向；已有相似仓位；想等更好价格；先观察 BTC 是否突破关键位。"></textarea>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="recAllowLearning" checked>
+                        <label class="form-check-label" for="recAllowLearning">允许模型在后续建议中参考这条反馈</label>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                    <button type="button" id="recFeedbackSubmitBtn" class="btn btn-primary" onclick="submitRecommendationFeedback()">保存反馈</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let currentAction = null;
         let currentData = null;
+        let recommendationFeedbackModal = null;
 
         function formatMoneyNum(num) {
             if (num == null || isNaN(num)) return '—';
@@ -233,7 +293,11 @@
                         return;
                     }
                     const profileStr = formatMoneyNum(data.profile_value);
-                    document.getElementById('balance').innerHTML = 'Cash: <strong>' + (data.cash_balance || '—') + '</strong> &nbsp;|&nbsp; Profile: <strong>' + profileStr + '</strong>';
+                    let availStr = '';
+                    if (data.available_balance != null) {
+                        availStr = ' &nbsp;|&nbsp; 可用: <strong>' + formatMoneyNum(data.available_balance) + '</strong>';
+                    }
+                    document.getElementById('balance').innerHTML = 'Cash: <strong>' + (data.cash_balance || '—') + '</strong>' + availStr + ' &nbsp;|&nbsp; Profile: <strong>' + profileStr + '</strong>';
                 })
                 .catch(error => {
                     document.getElementById('balance').innerText = 'Error loading balance';
@@ -310,12 +374,22 @@
                         content += '<div class="card event-card shadow-sm mb-3"><div class="card-body p-2 p-md-3">';
                         content += '<h3 class="text-wrap-mobile">' + market.question + '</h3>';
                         content += '<div class="table-responsive">';
-                        content += '<table class="table table-sm align-middle mb-0"><thead><tr><th>Outcome</th><th>Price</th><th>Actions</th></tr></thead><tbody>';
+                        content += '<table class="table table-sm align-middle mb-0"><thead><tr><th>Outcome</th><th>Mid</th><th>Best Bid</th><th>Best Ask</th><th>Actions</th></tr></thead><tbody>';
                         market.outcomes.forEach((outcome, index) => {
                             const price = market.outcomePrices[index];
-                            content += '<tr><td class="text-wrap-mobile">' + outcome + '</td><td>' + price + '</td><td><div class="d-flex flex-wrap gap-1">';
-                            content += '<button class="btn btn-success btn-sm" onclick="openBuyModal(\'' + market.market_id + '\', \'' + market.token_id[index] + '\', ' + price + ')">Buy</button>';
-                            content += '<button class="btn btn-danger btn-sm" onclick="openSellModal(\'' + market.market_id + '\', \'' + market.token_id[index] + '\', ' + price + ')">Sell</button>';
+                            const bestBid = (market.bestBids || [])[index];
+                            const bestAsk = (market.bestAsks || [])[index];
+                            const fmtPx = v => (v == null || isNaN(Number(v))) ? '—' : Number(v).toFixed(3);
+                            // 快速下单：买单按 best ask（吃单）/ 卖单按 best bid，避免无脑用 mid
+                            const buyPx = (bestAsk != null && !isNaN(Number(bestAsk))) ? Number(bestAsk) : Number(price);
+                            const sellPx = (bestBid != null && !isNaN(Number(bestBid))) ? Number(bestBid) : Number(price);
+                            content += '<tr><td class="text-wrap-mobile">' + outcome + '</td>';
+                            content += '<td>' + price + '</td>';
+                            content += '<td class="text-success">' + fmtPx(bestBid) + '</td>';
+                            content += '<td class="text-danger">' + fmtPx(bestAsk) + '</td>';
+                            content += '<td><div class="d-flex flex-wrap gap-1">';
+                            content += '<button class="btn btn-success btn-sm" onclick="openBuyModal(\'' + market.market_id + '\', \'' + market.token_id[index] + '\', ' + buyPx + ')">Buy</button>';
+                            content += '<button class="btn btn-danger btn-sm" onclick="openSellModal(\'' + market.market_id + '\', \'' + market.token_id[index] + '\', ' + sellPx + ')">Sell</button>';
                             content += '</div></td></tr>';
                         });
                         content += '</tbody></table></div></div></div>';
@@ -438,6 +512,765 @@
                     document.getElementById('orders-content').innerHTML = content;
                 })
                 .catch(error => console.error('Error loading orders:', error));
+        }
+
+        function setRecItemFilter(key) {
+            window.__recItemFilter = String(key || 'all');
+            loadRecommendationsTab();
+        }
+
+        function loadRecommendationsTab() {
+            Promise.all([
+                fetchJsonSafe('/api/recommendations/latest'),
+                fetchJsonSafe('/api/model_change_proposals'),
+                fetchJsonSafe('/api/recommendations/stale_executing?timeout_minutes=15'),
+            ])
+                .then(([data, proposalData, staleData]) => {
+                    const root = document.getElementById('recommendations-content');
+                    if (data.error) {
+                        root.innerHTML = '<div class="alert alert-warning">' + _escapeHtml(data.error) + '</div>';
+                        return;
+                    }
+                    if (!data.run) {
+                        root.innerHTML = '<div class="card shadow-sm"><div class="card-body text-muted">暂无 recommendation run。</div></div>';
+                        return;
+                    }
+
+                    const run = data.run || {};
+                    const items = Array.isArray(data.items) ? data.items : [];
+                    const summary = data.summary || {};
+                    const proposals = Array.isArray(proposalData.items) ? proposalData.items : [];
+                    const staleItems = Array.isArray(staleData && staleData.items) ? staleData.items : [];
+                    let html = '';
+                    if (staleItems.length > 0) {
+                        html += '<div class="alert alert-danger d-flex flex-column gap-2">';
+                        html += '<div><strong>⚠ 有 ' + staleItems.length + ' 条 item 卡在 executing 超过 ' +
+                                _escapeHtml(staleData.timeout_minutes || 15) + ' 分钟</strong>';
+                        html += '<div class="small text-muted">通常意味着 record_action 失败而订单状态未知。请人工确认订单后释放。</div></div>';
+                        html += '<ul class="small mb-0">';
+                        staleItems.forEach((it) => {
+                            const minutes = (Number(it.stale_seconds || 0) / 60).toFixed(1);
+                            html += '<li>#' + _escapeHtml(it.id) + ' [' + _escapeHtml(it.action_type || '') + '] '
+                                  + _escapeHtml(it.title || '') + ' — 已 ' + minutes + ' min '
+                                  + '<button class="btn btn-sm btn-outline-light ms-2" onclick="releaseStaleExecuting('
+                                  + Number(it.id) + ')">解除</button></li>';
+                        });
+                        html += '</ul></div>';
+                    }
+                    html += '<div class="card shadow-sm mb-3"><div class="card-body p-3">';
+                    html += '<div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-2">';
+                    html += '<div><h2 class="h4 mb-1">Recommendation Inbox</h2>';
+                    html += '<div class="small text-muted">最近一次运行：' + _escapeHtml(run.created_at_utc8 || '--') + '（UTC+8）</div></div>';
+                    html += '<div class="text-end">';
+                    if (run.status && run.status !== 'completed' && run.status !== 'completed_no_action') {
+                        const _statusBadgeClass = run.status === 'partial' ? 'bg-warning text-dark'
+                            : (run.status === 'failed' ? 'bg-danger' : 'bg-secondary');
+                        html += '<div class="mb-1"><span class="badge ' + _statusBadgeClass + '">run.status: '
+                                + _escapeHtml(run.status) + '</span></div>';
+                    } else if (run.status === 'completed_no_action') {
+                        html += '<div class="mb-1"><span class="badge bg-secondary">本次模型判断：无操作</span></div>';
+                    }
+                    html += '<div class="small"><strong>trigger:</strong> ' + _escapeHtml(run.trigger_type || '--') + '</div>';
+                    html += '<div class="small"><strong>items:</strong> ' + _escapeHtml(run.recommendation_count || 0) + '</div>';
+                    html += '</div></div>';
+
+                    html += '<div class="row g-2 small mb-2">';
+                    html += '<div class="col-md-3"><strong>BTC:</strong> ' + _escapeHtml(run.btc_price != null ? Number(run.btc_price).toFixed(2) : '--') + '</div>';
+                    html += '<div class="col-md-3"><strong>days_left:</strong> ' + _escapeHtml(run.days_left_in_month != null ? Number(run.days_left_in_month).toFixed(2) : '--') + '</div>';
+                    html += '<div class="col-md-3"><strong>prompt:</strong> ' + _escapeHtml(run.prompt_version || '--') + '</div>';
+                    html += '<div class="col-md-3"><strong>model:</strong> ' + _escapeHtml(run.model_id || '--') + '</div>';
+                    html += '</div>';
+
+                    if (run.trigger_reason) {
+                        html += '<div class="small mb-2"><strong>trigger reason:</strong> ' + _escapeHtml(run.trigger_reason) + '</div>';
+                    }
+                    if (run.operator_intent) {
+                        html += '<div class="small mb-2"><strong>operator intent:</strong> ' + _escapeHtml(run.operator_intent) + '</div>';
+                    }
+                    if (run.summary_text) {
+                        html += '<div class="small text-wrap-mobile"><strong>summary:</strong> ' + _escapeHtml(run.summary_text) + '</div>';
+                    }
+                    html += '</div></div>';
+
+                    html += '<div class="d-flex flex-wrap gap-2 mb-3 small">';
+                    const byKind = summary.by_kind || {};
+                    Object.keys(byKind).forEach(kind => {
+                        html += '<span class="badge rounded-pill text-bg-secondary">' + _escapeHtml(kind) + ': ' + _escapeHtml(byKind[kind]) + '</span>';
+                    });
+                    html += '</div>';
+
+                    html += '<div class="card shadow-sm mb-3"><div class="card-body p-3">';
+                    html += '<div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-2">';
+                    html += '<div><h3 class="h5 mb-1">Model Change Proposals</h3>';
+                    html += '<div class="small text-muted">agent 只能提案和 shadow 思路；是否批准由你决定。</div></div>';
+                    html += '<button class="btn btn-sm btn-outline-primary" onclick="autogenerateModelChangeProposals(this)">自动生成提案</button>';
+                    html += '</div>';
+                    if (!proposals.length) {
+                        html += '<div class="text-muted small">暂无提案。</div>';
+                    } else {
+                        proposals.forEach(proposal => {
+                            const statusClass = proposal.status === 'approved'
+                                ? 'text-bg-success'
+                                : proposal.status === 'rejected'
+                                    ? 'text-bg-danger'
+                                    : 'text-bg-warning';
+                            html += '<div class="border rounded p-3 mb-2">';
+                            html += '<div class="d-flex flex-wrap justify-content-between gap-2 mb-1">';
+                            html += '<div class="fw-semibold text-wrap-mobile">' + _escapeHtml(proposal.title || '--') + '</div>';
+                            html += '<div class="d-flex flex-wrap gap-1">';
+                            html += '<span class="badge rounded-pill ' + statusClass + '">' + _escapeHtml(proposal.status || '--') + '</span>';
+                            html += '<span class="badge rounded-pill text-bg-secondary">' + _escapeHtml(proposal.proposal_type || '--') + '</span>';
+                            html += '</div></div>';
+                            html += '<div class="small text-muted mb-2">created: ' + _escapeHtml(proposal.created_at_utc8 || '--') + '</div>';
+                            html += '<div class="small text-wrap-mobile"><strong>rationale:</strong> ' + _escapeHtml(proposal.rationale || '--') + '</div>';
+                            if (proposal.change_payload && Object.keys(proposal.change_payload).length) {
+                                html += '<div class="small mt-2 text-wrap-mobile"><strong>change:</strong> ' + _escapeHtml(JSON.stringify(proposal.change_payload)) + '</div>';
+                            }
+                            if (proposal.evidence_payload && Object.keys(proposal.evidence_payload).length) {
+                                html += '<div class="small mt-2 text-wrap-mobile"><strong>evidence:</strong> ' + _escapeHtml(JSON.stringify(proposal.evidence_payload)) + '</div>';
+                            }
+                            if (proposal.decision_notes) {
+                                html += '<div class="small mt-2 text-wrap-mobile"><strong>notes:</strong> ' + _escapeHtml(proposal.decision_notes) + '</div>';
+                            }
+                            const shadowEvals = Array.isArray(proposal.shadow_evals) ? proposal.shadow_evals : [];
+                            html += '<div class="border rounded bg-light p-2 mt-3">';
+                            html += '<div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-2">';
+                            html += '<div class="small fw-semibold">Shadow evals</div>';
+                            html += '<button class="btn btn-sm btn-outline-secondary" onclick="generateShadowEval(' + Number(proposal.id) + ', this)">生成 shadow eval</button>';
+                            html += '</div>';
+                            if (!shadowEvals.length) {
+                                html += '<div class="small text-muted">暂无 shadow eval。</div>';
+                            } else {
+                                shadowEvals.forEach(evalItem => {
+                                    const metrics = evalItem.metrics || {};
+                                    const baselineSignal = metrics.baseline_signal || {};
+                                    const candidateEstimate = metrics.candidate_estimate || {};
+                                    html += '<div class="border rounded bg-white p-2 mb-2 small">';
+                                    html += '<div class="d-flex flex-wrap justify-content-between gap-2">';
+                                    html += '<div><strong>' + _escapeHtml(metrics.evaluation_type || 'shadow_eval') + '</strong></div>';
+                                    html += '<div class="text-muted">' + _escapeHtml(evalItem.created_at_utc8 || '--') + '</div>';
+                                    html += '</div>';
+                                    html += '<div class="mt-1 text-wrap-mobile"><strong>baseline:</strong> ' + _escapeHtml(String(baselineSignal.label || '--')) + ' = ' + _escapeHtml(String(baselineSignal.count ?? '--')) + '</div>';
+                                    html += '<div class="mt-1 text-wrap-mobile"><strong>candidate:</strong> ' + _escapeHtml(String(candidateEstimate.label || '--')) + ' = ' + _escapeHtml(String(candidateEstimate.count ?? '--')) + '</div>';
+                                    html += '<div class="mt-1 text-wrap-mobile"><strong>estimated reduction:</strong> ' + _escapeHtml(String(metrics.estimated_relative_reduction_pct ?? '--')) + '%</div>';
+                                    html += '<div class="mt-1 text-wrap-mobile"><strong>confidence:</strong> ' + _escapeHtml(String(metrics.confidence || '--')) + ' / <strong>decision:</strong> ' + _escapeHtml(String(metrics.decision_hint || '--')) + '</div>';
+                                    if (evalItem.baseline_version || evalItem.candidate_version) {
+                                        html += '<div class="mt-1 text-wrap-mobile"><strong>version:</strong> ' + _escapeHtml(evalItem.baseline_version || '--') + ' → ' + _escapeHtml(evalItem.candidate_version || '--') + '</div>';
+                                    }
+                                    if (evalItem.notes) {
+                                        html += '<div class="mt-1 text-wrap-mobile text-muted">' + _escapeHtml(evalItem.notes) + '</div>';
+                                    }
+                                    html += '</div>';
+                                });
+                            }
+                            html += '</div>';
+                            if (proposal.status === 'proposed') {
+                                html += '<div class="d-flex flex-wrap gap-2 mt-3">';
+                                html += '<button class="btn btn-sm btn-success" onclick="reviewModelChangeProposal(' + Number(proposal.id) + ', \'approve\', this)">批准</button>';
+                                html += '<button class="btn btn-sm btn-outline-danger" onclick="reviewModelChangeProposal(' + Number(proposal.id) + ', \'reject\', this)">拒绝</button>';
+                                html += '</div>';
+                            }
+                            html += '</div>';
+                        });
+                    }
+                    html += '</div></div>';
+
+                    if (!items.length) {
+                        html += '<div class="card shadow-sm"><div class="card-body text-muted">本次运行未生成建议。</div></div>';
+                        root.innerHTML = html;
+                        return;
+                    }
+
+                    // ---- 状态筛选 tab ----
+                    // 基于 item.status + plan 终态推导真实展示状态:
+                    // plan-driven auto 路径不会推动 item.status,所以一个 approved item 若所有 plan
+                    // 都已 fired/disarmed/expired/superseded,从用户视角就是"已完成"。
+                    const _planTerminal = new Set(['fired','disarmed','expired','superseded']);
+                    function _effectiveItemStatus(item) {
+                        const s = String(item.status || '');
+                        if (s !== 'approved') return s;
+                        const plans = Array.isArray(item.action_plans) ? item.action_plans : [];
+                        if (!plans.length) return s;
+                        const allTerminal = plans.every(p => _planTerminal.has(String(p.status || '')));
+                        const anyFired = plans.some(p => String(p.status || '') === 'fired');
+                        if (allTerminal && anyFired) return 'order_submitted';
+                        return s;
+                    }
+                    const _filterDefs = [
+                        { key: 'all',       label: '全部',         match: (s) => true },
+                        { key: 'pending',   label: '待处理',       match: (s) => s === 'pending' },
+                        { key: 'approved',  label: '已批准/进行中', match: (s) => ['approved','executing','order_failed','cancel_failed'].indexOf(s) >= 0 },
+                        { key: 'done',      label: '已完成',       match: (s) => ['order_submitted','cancel_submitted','won','lost','expired'].indexOf(s) >= 0 },
+                        { key: 'rejected',  label: '已拒绝/暂缓',  match: (s) => ['rejected','deferred'].indexOf(s) >= 0 },
+                    ];
+                    const _activeKey = window.__recItemFilter || 'all';
+                    const _activeDef = _filterDefs.find(d => d.key === _activeKey) || _filterDefs[0];
+                    const _counts = {};
+                    _filterDefs.forEach(d => { _counts[d.key] = items.filter(it => d.match(_effectiveItemStatus(it))).length; });
+                    html += '<ul class="nav nav-pills flex-wrap gap-1 mb-3">';
+                    _filterDefs.forEach(d => {
+                        const _cls = d.key === _activeDef.key ? 'nav-link active' : 'nav-link';
+                        html += '<li class="nav-item"><a class="' + _cls + '" href="#" onclick="setRecItemFilter(\'' + d.key + '\'); return false;">'
+                              + _escapeHtml(d.label) + ' <span class="badge text-bg-light ms-1">' + _counts[d.key] + '</span></a></li>';
+                    });
+                    html += '</ul>';
+
+                    const _filteredItems = items.filter(it => _activeDef.match(_effectiveItemStatus(it)));
+                    if (!_filteredItems.length) {
+                        html += '<div class="card shadow-sm"><div class="card-body text-muted">该筛选下暂无 item。</div></div>';
+                    }
+
+                    _filteredItems.forEach(item => {
+                        const safeTitleJs = _escapeJsInHtmlAttr(item.title || '');
+                        const statusBadge = item.status === 'pending'
+                            ? 'text-bg-warning'
+                            : item.status === 'approved'
+                                ? 'text-bg-success'
+                                : item.status === 'order_submitted'
+                                    ? 'text-bg-success'
+                                    : item.status === 'order_failed'
+                                        ? 'text-bg-danger'
+                                    : item.status === 'rejected'
+                                        ? 'text-bg-danger'
+                                        : item.status === 'deferred'
+                                        ? 'text-bg-info'
+                                        : 'text-bg-secondary';
+                        const priorityBadge = item.priority_hint === '立即执行'
+                            ? 'text-bg-danger'
+                            : item.priority_hint === '挂单等待'
+                                ? 'text-bg-primary'
+                                : 'text-bg-secondary';
+                        html += '<div class="card shadow-sm mb-3"><div class="card-body p-3">';
+                        html += '<div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-2">';
+                        html += '<div><div class="fw-semibold text-wrap-mobile">' + _escapeHtml(item.title || '--') + '</div>';
+                        html += '<div class="small text-muted">' + _escapeHtml(item.source_section || '--') + ' / ' + _escapeHtml(item.item_kind || '--') + '</div></div>';
+                        html += '<div class="d-flex flex-wrap gap-1">';
+                        html += '<span class="badge rounded-pill ' + statusBadge + '">' + _escapeHtml(item.status || '--') + '</span>';
+                        if (item.priority_hint) {
+                            html += '<span class="badge rounded-pill ' + priorityBadge + '">' + _escapeHtml(item.priority_hint) + '</span>';
+                        }
+                        if (item.confidence_text) {
+                            html += '<span class="badge rounded-pill text-bg-info">' + _escapeHtml(item.confidence_text) + '</span>';
+                        }
+                        if (item.correlation_group) {
+                            html += '<span class="badge rounded-pill text-bg-dark">' + _escapeHtml(item.correlation_group) + '</span>';
+                        }
+                        html += '</div></div>';
+
+                        html += '<div class="row g-2 small">';
+                        html += '<div class="col-md-3"><strong>action:</strong> ' + _escapeHtml(item.action_type || '--') + '</div>';
+                        html += '<div class="col-md-3"><strong>direction:</strong> ' + _escapeHtml(item.direction || '--') + '</div>';
+                        html += '<div class="col-md-3"><strong>price:</strong> ' + _escapeHtml(item.suggested_price_text || '--') + '</div>';
+                        html += '<div class="col-md-3"><strong>size:</strong> ' + _escapeHtml(item.size_text || '--') + '</div>';
+                        html += '</div>';
+                        if (item.target_order_id) {
+                            html += '<div class="small mt-2"><strong>target order:</strong> ' + _escapeHtml(item.target_order_id) + '</div>';
+                        }
+
+                        if (item.strategy_type) {
+                            html += '<div class="small mt-2"><strong>strategy:</strong> ' + _escapeHtml(item.strategy_type) + '</div>';
+                        }
+                        if (item.edge_text) {
+                            html += '<div class="small mt-2"><strong>edge:</strong> ' + _escapeHtml(item.edge_text) + '</div>';
+                        }
+                        if (item.trigger_condition) {
+                            html += '<div class="small mt-2"><strong>trigger:</strong> ' + _escapeHtml(item.trigger_condition) + '</div>';
+                        }
+
+                        // 阶段4: 渲染 action_plans(每条 plan 一行,各自的 enable/disable)
+                        const plans = Array.isArray(item.action_plans) ? item.action_plans : [];
+                        if (plans.length > 0) {
+                            html += '<div class="mt-2 small"><strong>action plans:</strong>';
+                            html += '<ul class="list-unstyled mb-0 mt-1 ps-3" style="border-left:2px solid #e0e0e0;">';
+                            plans.forEach(function(plan) {
+                                const ts = plan.trigger_spec || {};
+                                let summary = plan.trigger_summary || '';
+                                if (!summary) {
+                                    if (ts.type === 'btc_price_threshold') {
+                                        summary = 'BTC ' + (ts.operator || '?') + ' ' + ts.value;
+                                    } else if (ts.type === 'immediate') {
+                                        summary = '立即可执行';
+                                    } else if (ts.type) {
+                                        summary = String(ts.type);
+                                    } else {
+                                        summary = '(无 trigger)';
+                                    }
+                                }
+                                const ttl = plan.expires_at ? '，到期 ' + plan.expires_at : '';
+                                let statusBadge = '';
+                                const st = plan.status || 'proposed';
+                                const badgeMap = { proposed:'secondary', armed:'success', executing:'info', fired:'primary', failed:'danger', expired:'warning', disarmed:'light', superseded:'light' };
+                                const cls = badgeMap[st] || 'secondary';
+                                statusBadge = ' <span class="badge text-bg-' + cls + '">' + _escapeHtml(st) + '</span>';
+                                // 价格 / size / 方向 — 优先取 armed 冻结快照,其次 suggested
+                                const armed = plan.armed_execution_payload || {};
+                                const sugg = plan.suggested_execution_payload || {};
+                                const _side = armed.direction || sugg.side || '';
+                                const _priceCents = (sugg.price_cents != null) ? sugg.price_cents
+                                                  : (armed.price != null ? Math.round(Number(armed.price) * 100) : null);
+                                const _sizeText = sugg.size_text
+                                                  || (armed.size_shares != null ? (Number(armed.size_shares).toFixed(0) + ' 股') : '')
+                                                  || (armed.size != null ? (Number(armed.size).toFixed(0) + ' 股') : '');
+                                const _targetOid = sugg.target_order_id || '';
+                                const _bits = [];
+                                if (_side) { _bits.push(_escapeHtml(_side)); }
+                                if (_priceCents != null) { _bits.push('@' + _escapeHtml(String(_priceCents)) + '¢'); }
+                                if (_sizeText) { _bits.push(_escapeHtml(String(_sizeText))); }
+                                if (_targetOid) { _bits.push('cancel oid=' + _escapeHtml(String(_targetOid).slice(0, 16))); }
+                                const _orderBits = _bits.length ? ' <span class="text-muted">[' + _bits.join(' ') + ']</span>' : '';
+                                html += '<li class="mb-1">';
+                                html += '<code>#' + Number(plan.ordinal || 0) + ' ' + _escapeHtml(plan.action_type || '?') + '</code> ';
+                                html += _escapeHtml(summary + ttl) + _orderBits + statusBadge;
+                                // per-plan 控制按钮: 仅在 item.status=approved 时可控制
+                                if (item.status === 'approved') {
+                                    if (st === 'proposed' && (plan.action_type === 'buy' || plan.action_type === 'sell')) {
+                                        const _isParsed = plan.trigger_parse_status === 'parsed';
+                                        const _label = _isParsed ? '启用自动' : '立即挂单';
+                                        const _cls = _isParsed ? 'btn-warning' : 'btn-primary';
+                                        html += ' <button class="btn btn-sm ' + _cls + ' py-0 px-2 ms-2" style="font-size:11px;" onclick="enableAutoPlan(' + Number(plan.id) + ', this)">' + _label + '</button>';
+                                    } else if (st === 'armed') {
+                                        html += ' <button class="btn btn-sm btn-outline-secondary py-0 px-2 ms-2" style="font-size:11px;" onclick="disableAutoPlan(' + Number(plan.id) + ', this)">关闭自动</button>';
+                                    }
+                                    // 忽略按钮:任何 proposed plan 均可由用户主动放弃,避免 item 因残留 proposed 一直停在 approved。
+                                    if (st === 'proposed') {
+                                        html += ' <button class="btn btn-sm btn-outline-danger py-0 px-2 ms-1" style="font-size:11px;" onclick="dismissPlan(' + Number(plan.id) + ', this)" title="标记此 plan 已放弃,不再执行">忽略</button>';
+                                    }
+                                } else if (item.status === 'pending' && st === 'proposed' && (plan.action_type === 'buy' || plan.action_type === 'sell')) {
+                                    html += ' <span class="text-muted ms-2" style="font-size:11px;">⇡ 先点「批准执行」即可启用</span>';
+                                }
+                                // executing 状态下提供修复入口(record_action 与 mark_plan_fired 之间崩溃会卡)
+                                if (st === 'executing') {
+                                    html += ' <button class="btn btn-sm btn-outline-danger py-0 px-2 ms-2" style="font-size:11px;" onclick="repairExecutingPlan(' + Number(plan.id) + ', this)">修复 executing</button>';
+                                }
+                                if (plan.fired_order_id) {
+                                    html += '<div class="text-muted ps-3"><small>fired @ ' + _escapeHtml(plan.fired_at || '') + ' order=' + _escapeHtml(plan.fired_order_id) + '</small></div>';
+                                }
+                                html += '</li>';
+                            });
+                            html += '</ul></div>';
+                        } else if (item.trigger_parse_status && item.trigger_parse_status !== 'parsed') {
+                            html += '<div class="small mt-2 text-muted"><strong>auto trigger:</strong> 仅人工执行 (' + _escapeHtml(item.trigger_parse_status) + ')</div>';
+                        }
+                        if (item.reason) {
+                            html += '<div class="small mt-2 text-wrap-mobile"><strong>reason:</strong> ' + _escapeHtml(item.reason) + '</div>';
+                        }
+                        if (item.latest_feedback) {
+                            const fb = item.latest_feedback;
+                            html += '<div class="alert alert-light border mt-3 mb-0 small">';
+                            html += '<div><strong>latest feedback:</strong> ' + _escapeHtml(fb.decision || '--') + ' @ ' + _escapeHtml(fb.created_at_utc8 || '--') + '</div>';
+                            if (Array.isArray(fb.reason_tags) && fb.reason_tags.length) {
+                                html += '<div class="mt-1"><strong>tags:</strong> ' + fb.reason_tags.map(tag => '<span class="badge rounded-pill text-bg-light border text-dark me-1">' + _escapeHtml(tag) + '</span>').join('') + '</div>';
+                            }
+                            if (fb.feedback_text) {
+                                html += '<div class="mt-1 text-wrap-mobile"><strong>note:</strong> ' + _escapeHtml(fb.feedback_text) + '</div>';
+                            }
+                            html += '</div>';
+                        }
+                        if (item.latest_action) {
+                            const act = item.latest_action;
+                            html += '<div class="alert alert-light border mt-3 mb-0 small">';
+                            html += '<div><strong>latest action:</strong> ' + _escapeHtml(act.action_type || '--') + ' / ' + _escapeHtml(act.status || '--') + ' @ ' + _escapeHtml(act.created_at_utc8 || '--') + '</div>';
+                            if (act.order_id) {
+                                html += '<div class="mt-1"><strong>order_id:</strong> ' + _escapeHtml(act.order_id) + '</div>';
+                            }
+                            if (act.error_text) {
+                                html += '<div class="mt-1 text-danger"><strong>error:</strong> ' + _escapeHtml(act.error_text) + '</div>';
+                            }
+                            html += '</div>';
+                        }
+                        html += '<div class="d-flex flex-wrap gap-2 mt-3">';
+                        const _terminalStatuses = ['order_submitted', 'cancel_submitted', 'won', 'lost', 'expired', 'executing'];
+                        const _isTerminal = _terminalStatuses.indexOf(item.status) >= 0;
+                        if (_isTerminal) {
+                            html += '<span class="text-muted small align-self-center">已进入终态（' + _escapeHtml(item.status) + '），不可再反馈或执行</span>';
+                            html += '<button class="btn btn-sm btn-outline-info" onclick="recordRecommendationOutcome(' + Number(item.id) + ', \'' + safeTitleJs + '\')">登记结果</button>';
+                        } else {
+                            html += '<button class="btn btn-sm btn-success" onclick="openRecommendationFeedbackModal(' + Number(item.id) + ', \'execute\', \'' + safeTitleJs + '\')">批准执行</button>';
+                            html += '<button class="btn btn-sm btn-outline-danger" onclick="openRecommendationFeedbackModal(' + Number(item.id) + ', \'reject\', \'' + safeTitleJs + '\')">不执行</button>';
+                            html += '<button class="btn btn-sm btn-outline-warning" onclick="openRecommendationFeedbackModal(' + Number(item.id) + ', \'defer\', \'' + safeTitleJs + '\')">暂缓</button>';
+                            html += '<button class="btn btn-sm btn-outline-secondary" onclick="openRecommendationFeedbackModal(' + Number(item.id) + ', \'read\', \'' + safeTitleJs + '\')">已读</button>';
+                            if ((item.status === 'approved' || item.status === 'order_failed' || item.status === 'cancel_failed') && (item.action_type === 'buy' || item.action_type === 'sell' || item.action_type === 'cancel')) {
+                                const _planList = Array.isArray(item.action_plans) ? item.action_plans : [];
+                                const _planTakingOver = _planList.some(p => ['armed','executing','fired'].indexOf(String(p && p.status || '')) >= 0);
+                                if (!_planTakingOver) {
+                                    html += '<button class="btn btn-sm btn-primary" onclick="openRecommendationExecution(' + Number(item.id) + ')">' + (item.action_type === 'cancel' ? '撤单执行' : '下单执行') + '</button>';
+                                } else {
+                                    html += '<span class="text-muted small align-self-center">已交由 action plan 自动执行,不再提供 item 级手动下单</span>';
+                                }
+                            }
+                        }
+                        html += '</div>';
+                        html += '</div></div>';
+                    });
+
+                    root.innerHTML = html;
+                })
+                .catch(error => {
+                    document.getElementById('recommendations-content').innerHTML =
+                        '<div class="alert alert-danger">加载 recommendations 失败: ' + _escapeHtml(String(error)) + '</div>';
+                });
+        }
+
+        function autogenerateModelChangeProposals(btn) {
+            if (!btn && typeof event !== 'undefined' && event && event.currentTarget) { btn = event.currentTarget; }
+            if (btn && btn.disabled) { return; }
+            if (btn) { btn.disabled = true; }
+            fetchJsonSafe('/api/model_change_proposals/autogenerate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            })
+                .then(data => {
+                    const count = Number(data.created_count || 0);
+                    const shadowCount = Number(data.shadow_eval_count || 0);
+                    let msg = count > 0
+                        ? ('已生成 ' + count + ' 条提案，附带 ' + shadowCount + ' 条 shadow eval')
+                        : '没有新的提案可生成';
+                    const errs = Array.isArray(data.shadow_eval_errors) ? data.shadow_eval_errors : [];
+                    if (errs.length > 0) {
+                        msg += '\n\n⚠️ ' + errs.length + ' 条 shadow eval 失败：\n  - '
+                            + errs.slice(0, 5).map(e =>
+                                (e && (e.proposal_id || e.id) ? ('#' + (e.proposal_id || e.id) + ': ') : '')
+                                + (e && (e.error || e.message) ? (e.error || e.message) : JSON.stringify(e))
+                              ).join('\n  - ');
+                        if (errs.length > 5) {
+                            msg += '\n  ... (+' + (errs.length - 5) + ' 条)';
+                        }
+                    }
+                    alert(msg);
+                    loadRecommendationsTab();
+                })
+                .catch(error => alert('生成提案失败: ' + error.message))
+                .finally(() => { if (btn) { btn.disabled = false; } });
+        }
+
+        function enableAutoPlan(planId, btn) {
+            if (!confirm('启用自动执行后,当 trigger 条件命中时系统会自动调用 buy/sell。\n\n本操作会冻结当前的 market_id/token_id/价格/估算 size。\n\n确定要启用吗?')) { return; }
+            if (btn) { btn.disabled = true; }
+            fetch('/api/recommendation_plans/' + encodeURIComponent(planId) + '/enable', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+            })
+                .then(r => r.json().then(data => ({ ok: r.ok, data })))
+                .then(({ ok, data }) => {
+                    if (!ok) {
+                        alert('启用失败: ' + (data.error || '未知错误') + (data.code ? ' [' + data.code + ']' : ''));
+                        return;
+                    }
+                    alert('已启用自动执行 plan #' + planId + '。frozen size=' + (data.frozen_payload && data.frozen_payload.size));
+                    loadRecommendationsTab();
+                })
+                .catch(err => alert('启用失败: ' + err.message))
+                .finally(() => { if (btn) { btn.disabled = false; } });
+        }
+
+        function repairExecutingPlan(planId, btn) {
+            const target = prompt('修复 plan #' + planId + ' 卡 executing → 输入目标状态:\n  fired   = 订单已挂出(需要 order_id)\n  disarmed = 确认未挂出,放弃\n  armed   = 重新尝试自动触发', 'fired');
+            if (!target) { return; }
+            const t = String(target).trim().toLowerCase();
+            if (['fired','disarmed','armed'].indexOf(t) < 0) { alert('target 必须 in fired/disarmed/armed'); return; }
+            let orderId = null;
+            if (t === 'fired') {
+                orderId = prompt('请输入已挂出的 order_id', '') || '';
+                if (!orderId.trim()) { alert('fired 必须给 order_id'); return; }
+            }
+            const reason = prompt('修复原因(必填,会进 audit)', 'manual repair');
+            if (!reason) { return; }
+            if (btn) { btn.disabled = true; }
+            fetch('/api/recommendation_plans/' + encodeURIComponent(planId) + '/repair_executing', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target_status: t, reason: reason, order_id: orderId }),
+            })
+                .then(r => r.json().then(data => ({ ok: r.ok, data })))
+                .then(({ ok, data }) => {
+                    if (!ok) { alert('修复失败: ' + (data.error || '未知')); return; }
+                    alert('plan #' + planId + ' 已修复 → ' + t);
+                    loadRecommendationsTab();
+                })
+                .catch(err => alert('修复失败: ' + err.message))
+                .finally(() => { if (btn) { btn.disabled = false; } });
+        }
+
+        function disableAutoPlan(planId, btn) {
+            const reason = prompt('关闭自动执行 plan #' + planId + ' 的原因(可留空)', '') || 'user_disabled';
+            if (btn) { btn.disabled = true; }
+            fetch('/api/recommendation_plans/' + encodeURIComponent(planId) + '/disable', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: reason }),
+            })
+                .then(r => r.json().then(data => ({ ok: r.ok, data })))
+                .then(({ ok, data }) => {
+                    if (!ok) { alert('关闭失败: ' + (data.error || '未知错误')); return; }
+                    loadRecommendationsTab();
+                })
+                .catch(err => alert('关闭失败: ' + err.message))
+                .finally(() => { if (btn) { btn.disabled = false; } });
+        }
+
+        function dismissPlan(planId, btn) {
+            if (!confirm('忽略 plan #' + planId + ' ？\n该 plan 将永久标记为 disarmed,不再执行。')) { return; }
+            if (btn) { btn.disabled = true; }
+            fetch('/api/recommendation_plans/' + encodeURIComponent(planId) + '/disable', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'user_dismiss' }),
+            })
+                .then(r => r.json().then(data => ({ ok: r.ok, data })))
+                .then(({ ok, data }) => {
+                    if (!ok) { alert('忽略失败: ' + (data.error || '未知错误')); return; }
+                    loadRecommendationsTab();
+                })
+                .catch(err => alert('忽略失败: ' + err.message))
+                .finally(() => { if (btn) { btn.disabled = false; } });
+        }
+
+        function recordRecommendationOutcome(itemId, title) {
+            const labelInput = prompt('登记结果 - 输入 outcome_label（won / lost / breakeven / expired / unknown）\n标题: ' + title, 'won');
+            if (labelInput === null) { return; }
+            const label = String(labelInput || '').trim().toLowerCase();
+            if (!label) { return; }
+            const allowed = ['won', 'lost', 'breakeven', 'expired', 'unknown'];
+            if (allowed.indexOf(label) < 0) {
+                alert('outcome_label 必须是 ' + allowed.join(' / '));
+                return;
+            }
+            const pnlRaw = prompt('PnL（USD，可留空）', '');
+            if (pnlRaw === null) { return; }
+            let pnl = null;
+            if (String(pnlRaw).trim() !== '') {
+                pnl = Number(pnlRaw);
+                if (!isFinite(pnl)) { alert('PnL 非数字'); return; }
+            }
+            const notes = prompt('备注（可选）', '') || '';
+            const hit = (label === 'won') ? true : (label === 'lost' ? false : null);
+            const revisionReason = prompt('如本条 item 已有 outcome 记录，请填写【修订理由】（首次登记可留空，但若已存在 final outcome 后端会拒绝空白）', '') || '';
+            fetchJsonSafe('/api/recommendations/' + encodeURIComponent(itemId) + '/outcome', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    outcome_label: label,
+                    hit: hit,
+                    pnl: pnl,
+                    notes: notes,
+                    revision_reason: revisionReason,
+                }),
+            })
+                .then(() => loadRecommendationsTab())
+                .catch(error => alert('登记结果失败: ' + error.message));
+        }
+
+        function releaseStaleExecuting(itemId) {
+            const reason = prompt('解除 executing - 请填写理由（必填，例如：已确认订单失败 / 已确认订单成功并将手工登记 outcome）', '');
+            if (reason === null) { return; }
+            const reasonNorm = String(reason || '').trim();
+            if (!reasonNorm) { alert('reason 不能为空'); return; }
+            const newStatus = prompt('解除后的目标状态（order_failed / cancel_failed / approved）。\n注意：若该 item 已存在 submitted 订单且未确认成败，强烈建议选 order_failed/cancel_failed', 'order_failed');
+            if (newStatus === null) { return; }
+            const ack = confirm('如果后端检测到该 item 已存在 submitted action（订单可能已发出但回写失败），是否承认风险并强制释放？\n点击"确定"= 承认风险并继续；点击"取消"= 让后端默认拒绝以保护资金。');
+            fetchJsonSafe('/api/recommendations/' + encodeURIComponent(itemId) + '/release_executing', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    reason: reasonNorm,
+                    new_status: String(newStatus || 'order_failed').trim().toLowerCase(),
+                    acknowledge_possible_duplicate: ack,
+                }),
+            })
+                .then(() => loadRecommendationsTab())
+                .catch(error => alert('解除 executing 失败: ' + error.message));
+        }
+
+        function generateShadowEval(proposalId, btn) {
+            if (!btn && typeof event !== 'undefined' && event && event.currentTarget) { btn = event.currentTarget; }
+            if (btn && btn.disabled) { return; }
+            if (btn) { btn.disabled = true; }
+            fetchJsonSafe('/api/model_change_proposals/' + encodeURIComponent(proposalId) + '/shadow_eval', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            })
+                .then(() => loadRecommendationsTab())
+                .catch(error => alert('生成 shadow eval 失败: ' + error.message))
+                .finally(() => { if (btn) { btn.disabled = false; } });
+        }
+
+        function reviewModelChangeProposal(proposalId, decision, btn) {
+            if (!btn && typeof event !== 'undefined' && event && event.currentTarget) { btn = event.currentTarget; }
+            if (btn && btn.disabled) { return; }
+            const notes = prompt(decision === 'approve' ? '批准备注（可选）' : '拒绝原因（建议填写）', '') || '';
+            if (btn) { btn.disabled = true; }
+            fetchJsonSafe('/api/model_change_proposals/' + encodeURIComponent(proposalId) + '/review', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    decision: decision,
+                    decision_notes: notes,
+                }),
+            })
+                .then(() => loadRecommendationsTab())
+                .catch(error => alert('提案审批失败: ' + error.message))
+                .finally(() => { if (btn) { btn.disabled = false; } });
+        }
+
+        function openRecommendationFeedbackModal(itemId, decision, title) {
+            document.getElementById('recFeedbackItemId').value = String(itemId || '');
+            document.getElementById('recFeedbackDecision').value = String(decision || '');
+            document.getElementById('recFeedbackTitle').textContent = String(title || '—');
+            document.getElementById('recFeedbackText').value = '';
+            document.getElementById('recAllowLearning').checked = true;
+            document.querySelectorAll('.rec-reason-tag').forEach(el => { el.checked = false; });
+
+            const decisionMap = {
+                execute: {
+                    title: '批准执行反馈',
+                    hint: '保存后 item 进入 approved。卡片中若挂有 action plans（含 trigger 的"何时挂/撤什么单"），可对每条 plan 单独点「启用自动」让 watcher 在 trigger 命中时自动下单；没有 action plan 或为非买卖类建议则仅作记录，需要人工跟进。',
+                    submitLabel: '确认批准执行',
+                    submitClass: 'btn btn-success',
+                },
+                reject: {
+                    title: '不执行反馈',
+                    hint: '请尽量补充不执行原因，方便模型学习你的判断边界。',
+                    submitLabel: '确认不执行',
+                    submitClass: 'btn btn-danger',
+                },
+                defer: {
+                    title: '暂缓反馈',
+                    hint: '适合“暂时不做，但后面可能做”的情况。',
+                    submitLabel: '确认暂缓',
+                    submitClass: 'btn btn-warning',
+                },
+                read: {
+                    title: '已读反馈',
+                    hint: '适合仅标记看过，不代表批准执行。',
+                    submitLabel: '标记已读',
+                    submitClass: 'btn btn-secondary',
+                },
+            };
+            const meta = decisionMap[decision] || { title: '建议反馈', hint: '', submitLabel: '保存反馈', submitClass: 'btn btn-primary' };
+            document.getElementById('recommendationFeedbackModalLabel').textContent = meta.title;
+            document.getElementById('recFeedbackActionHint').textContent = meta.hint;
+            const submitBtn = document.getElementById('recFeedbackSubmitBtn');
+            if (submitBtn) {
+                submitBtn.textContent = meta.submitLabel;
+                submitBtn.className = meta.submitClass;
+            }
+            // 按 decision 切换原因标签可见性:execute 显示正向标签,reject 显示否决标签,defer/read 显示推迟标签
+            const visibleGroups = {
+                execute: ['execute'],
+                reject: ['reject'],
+                defer: ['defer'],
+                read: ['defer'],
+            }[decision] || ['execute', 'reject', 'defer'];
+            document.querySelectorAll('.rec-reason-group').forEach(el => {
+                const grp = el.getAttribute('data-decision-group') || '';
+                el.style.display = visibleGroups.indexOf(grp) >= 0 ? '' : 'none';
+            });
+
+            if (!recommendationFeedbackModal) {
+                recommendationFeedbackModal = new bootstrap.Modal(document.getElementById('recommendationFeedbackModal'));
+            }
+            recommendationFeedbackModal.show();
+        }
+
+        function submitRecommendationFeedback() {
+            const itemId = Number(document.getElementById('recFeedbackItemId').value || 0);
+            const decision = String(document.getElementById('recFeedbackDecision').value || '').trim();
+            const feedbackText = String(document.getElementById('recFeedbackText').value || '').trim();
+            const allowModelLearning = document.getElementById('recAllowLearning').checked;
+            const reasonTags = Array.from(document.querySelectorAll('.rec-reason-tag:checked')).map(el => el.value);
+            if (!itemId || !decision) {
+                alert('缺少 item_id 或 decision');
+                return;
+            }
+            const submitBtn = document.getElementById('recFeedbackSubmitBtn');
+            if (submitBtn && submitBtn.disabled) { return; }
+            if (submitBtn) { submitBtn.disabled = true; }
+
+            fetchJsonSafe('/api/recommendations/feedback', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    item_id: itemId,
+                    decision: decision,
+                    reason_tags: reasonTags,
+                    feedback_text: feedbackText,
+                    allow_model_learning: allowModelLearning,
+                }),
+            })
+                .then(() => {
+                    if (recommendationFeedbackModal) {
+                        recommendationFeedbackModal.hide();
+                    }
+                    loadRecommendationsTab();
+                })
+                .catch(error => alert('保存反馈失败: ' + error.message))
+                .finally(() => { if (submitBtn) { submitBtn.disabled = false; } });
+        }
+
+        function openRecommendationExecution(itemId) {
+            fetchJsonSafe('/api/recommendations/' + encodeURIComponent(itemId) + '/execution_preview')
+                .then(data => {
+                    if (data.error) {
+                        alert('执行预览失败: ' + data.error);
+                        return;
+                    }
+                    const checks = Array.isArray(data.checks) ? data.checks : [];
+                    const failChecks = checks.filter(check => check.status === 'fail');
+                    const warnChecks = checks.filter(check => check.status === 'warn');
+                    if (!data.allow_execute) {
+                        const failText = failChecks.length
+                            ? failChecks.map(check => '- ' + check.message).join('\n')
+                            : '未通过 preflight 检查。';
+                        alert('当前不能执行：\n' + failText);
+                        return;
+                    }
+                    if (warnChecks.length) {
+                        const warnText = warnChecks.map(check => '- ' + check.message).join('\n');
+                        const ok = confirm('执行前提醒：\n' + warnText + '\n\n仍然打开下单弹窗吗？');
+                        if (!ok) {
+                            return;
+                        }
+                    }
+                    const preset = {
+                        inputMode: data.input_mode,
+                        inputValue: data.input_value,
+                        recommendationItemId: data.item_id,
+                    };
+                    if (data.action_type === 'buy') {
+                        openBuyModal(data.market_id, data.token_id, data.price, preset);
+                    } else if (data.action_type === 'sell') {
+                        openSellModal(data.market_id, data.token_id, data.price, preset);
+                    } else if (data.action_type === 'cancel') {
+                        executeRecommendationCancel(data);
+                    } else {
+                        alert('该建议暂不支持自动填充执行');
+                    }
+                })
+                .catch(error => alert('执行预览失败: ' + error.message));
+        }
+
+        function executeRecommendationCancel(data) {
+            const target = data.cancel_target || {};
+            const summary = [
+                target.order_id ? ('order_id: ' + target.order_id) : '',
+                target.outcome ? ('outcome: ' + target.outcome) : '',
+                target.side ? ('side: ' + target.side) : '',
+                target.price != null ? ('price: ' + target.price) : '',
+                target.original_size != null ? ('size: ' + target.original_size) : '',
+            ].filter(Boolean).join('\n');
+            const ok = confirm('确认执行撤单？\n' + (summary || '未找到更多挂单摘要'));
+            if (!ok) {
+                return;
+            }
+            fetchJsonSafe('/api/cancel', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    order_id: data.order_id,
+                    recommendation_item_id: data.item_id,
+                }),
+            })
+                .then(() => {
+                    alert('撤单请求已提交');
+                    loadRecommendationsTab();
+                })
+                .catch(error => alert('撤单失败: ' + error.message));
         }
 
         const TRADE_TABLE_PAGE_SIZE = 12;
@@ -625,6 +1458,20 @@
                 .replace(/>/g, '&gt;')
                 .replace(/"/g, '&quot;')
                 .replace(/'/g, '&#39;');
+        }
+
+        // 安全转义：要嵌入 onclick="fn('VALUE')" 形式时使用。
+        // 同时处理 HTML 属性边界 (" / &) 与 JS 字符串边界 (\\ / ') 与脚本闭合 (<).
+        // 修复第三轮审查 #2：旧 safeTitleJs 只转 \\ 和 '，AI 生成的 title 含 " 即可逃逸属性。
+        function _escapeJsInHtmlAttr(s) {
+            return String(s ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/\\/g, '\\\\')
+                .replace(/'/g, "\\'")
+                .replace(/"/g, '&quot;')
+                .replace(/</g, '\\u003c')
+                .replace(/>/g, '\\u003e')
+                .replace(/\r?\n/g, '\\n');
         }
 
         function _renderStrategyParamsPanel(data) {
@@ -1495,27 +2342,39 @@
             }
         }
 
-        function openBuyModal(marketId, tokenId, price) {
+        function openBuyModal(marketId, tokenId, price, preset) {
             currentAction = 'buy';
-            currentData = { market_id: marketId, token_id: tokenId };
+            currentData = {
+                market_id: marketId,
+                token_id: tokenId,
+                recommendation_item_id: preset && preset.recommendationItemId ? preset.recommendationItemId : null,
+            };
             document.getElementById('orderModalLabel').innerText = 'Create Buy Order';
             document.getElementById('priceInput').value = price;
-            document.getElementById('modeQuantity').checked = true;
-            document.getElementById('amountOrSizeInput').value = '';
-            document.getElementById('amountOrSizeInput').placeholder = 'Enter quantity';
+            const inputMode = (preset && preset.inputMode) ? preset.inputMode : 'quantity';
+            document.getElementById('modeAmount').checked = inputMode === 'amount';
+            document.getElementById('modeQuantity').checked = inputMode !== 'amount';
+            document.getElementById('amountOrSizeInput').value = (preset && preset.inputValue != null) ? preset.inputValue : '';
+            document.getElementById('amountOrSizeInput').placeholder = inputMode === 'amount' ? 'Enter amount in USD' : 'Enter quantity';
             document.getElementById('amountOrSizeInput').step = '0.01';
             updateAmountOrSizeLabel();
             new bootstrap.Modal(document.getElementById('orderModal')).show();
         }
 
-        function openSellModal(marketId, tokenId, price) {
+        function openSellModal(marketId, tokenId, price, preset) {
             currentAction = 'sell';
-            currentData = { market_id: marketId, token_id: tokenId };
+            currentData = {
+                market_id: marketId,
+                token_id: tokenId,
+                recommendation_item_id: preset && preset.recommendationItemId ? preset.recommendationItemId : null,
+            };
             document.getElementById('orderModalLabel').innerText = 'Create Sell Order';
             document.getElementById('priceInput').value = price;
-            document.getElementById('modeQuantity').checked = true;
-            document.getElementById('amountOrSizeInput').value = '';
-            document.getElementById('amountOrSizeInput').placeholder = 'Enter quantity';
+            const inputMode = (preset && preset.inputMode) ? preset.inputMode : 'quantity';
+            document.getElementById('modeAmount').checked = inputMode === 'amount';
+            document.getElementById('modeQuantity').checked = inputMode !== 'amount';
+            document.getElementById('amountOrSizeInput').value = (preset && preset.inputValue != null) ? preset.inputValue : '';
+            document.getElementById('amountOrSizeInput').placeholder = inputMode === 'amount' ? 'Enter amount in USD' : 'Enter quantity';
             document.getElementById('amountOrSizeInput').step = '0.01';
             updateAmountOrSizeLabel();
             new bootstrap.Modal(document.getElementById('orderModal')).show();
@@ -1529,7 +2388,12 @@
                     body: JSON.stringify({ order_id: orderId })
                 })
                 .then(data => {
-                    alert('Order cancelled');
+                    if (data && data.recommendation_sync_error) {
+                        alert('订单已撤销，但建议状态同步失败：' + data.recommendation_sync_error
+                            + '\n\n请到 Recommendations 页签手动核对该 item 的状态。');
+                    } else {
+                        alert('Order cancelled');
+                    }
                     loadOrders();
                     loadBalance();
                 })
@@ -1548,6 +2412,8 @@
         });
 
         document.getElementById('submitOrder').addEventListener('click', function() {
+            const submitBtn = this;
+            if (submitBtn.disabled) { return; }
             const price = parseFloat(document.getElementById('priceInput').value);
             const raw = document.getElementById('amountOrSizeInput').value;
             if (!price || price <= 0 || raw === '' || isNaN(parseFloat(raw))) return;
@@ -1564,6 +2430,7 @@
             currentData.price = price;
             currentData.size = size;
             const url = currentAction === 'buy' ? '/api/buy' : '/api/sell';
+            submitBtn.disabled = true;
             fetchJsonSafe(url, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1573,13 +2440,19 @@
                 if (data.error) {
                     alert('Error: ' + data.error);
                 } else {
-                    alert('Order created: ' + data.order_id);
+                    let msg = 'Order created: ' + data.order_id;
+                    if (data.recommendation_sync_error) {
+                        msg += '\n\n⚠️ 订单已发出，但建议状态同步失败：' + data.recommendation_sync_error
+                            + '\n请到 Recommendations 页签手动核对该 item 的状态，避免重复执行。';
+                    }
+                    alert(msg);
                     bootstrap.Modal.getInstance(document.getElementById('orderModal')).hide();
                     loadOrders();
                     loadBalance();
                 }
             })
-            .catch(error => alert('下单失败: ' + error.message));
+            .catch(error => alert('下单失败: ' + error.message))
+            .finally(() => { submitBtn.disabled = false; });
         });
 
         // Load data on page load
@@ -1588,6 +2461,7 @@
         loadEvents();
         loadPositions();
         loadOrders();
+        loadRecommendationsTab();
         load5mTradeTab();
 
         // Refresh every 30 seconds
@@ -1597,6 +2471,7 @@
             loadEvents();
             loadPositions();
             loadOrders();
+            loadRecommendationsTab();
             load5mTradeTab();
         }, 30000);
     </script>

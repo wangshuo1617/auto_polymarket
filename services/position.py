@@ -85,12 +85,22 @@ def format_matched_data(matched_results: list) -> list:
             "相关挂单": []
         }
         for order in orders:
+            try:
+                original_size = float(order.get("original_size", 0) or 0)
+            except (TypeError, ValueError):
+                original_size = 0.0
+            try:
+                size_matched = float(order.get("size_matched", 0) or 0)
+            except (TypeError, ValueError):
+                size_matched = 0.0
             formatted_item["相关挂单"].append({
+                "挂单ID": order.get("id", "未知"),
                 "猜测结果": order.get("side", "未知"),
                 "挂单方向": order.get("outcome", "未知"),
                 "挂单价格": order.get("price", 0),
                 "挂单数量": order.get("original_size", 0),
-                "已成交数量": order.get("size_matched", 0)
+                "已成交数量": order.get("size_matched", 0),
+                "剩余数量": max(original_size - size_matched, 0.0),
             })
         formatted.append(formatted_item)
     return formatted

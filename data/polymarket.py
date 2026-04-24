@@ -31,6 +31,7 @@ from py_clob_client.clob_types import (
     PartialCreateOrderOptions,
     OrderType,
     PostOrdersArgs,
+    BookParams,
 )
 from py_clob_client.order_builder.builder import ROUNDING_CONFIG
 from py_clob_client.order_builder.helpers import round_down
@@ -798,6 +799,42 @@ def get_event_token_id(market_slug:str=None):
 def get_order_book(token_id: str, profile: Optional[str] = None):
     clob_client = get_client(profile)
     return clob_client.get_order_book(token_id)
+
+
+def get_best_prices(token_ids: List[str], profile: Optional[str] = None) -> Dict[str, Dict[str, Optional[float]]]:
+    """批量获取一组 token 的 best bid / best ask。
+
+    返回 {token_id: {"best_bid": float|None, "best_ask": float|None}}。
+    Polymarket /prices 接口约定：side=BUY 返回 best bid（买方愿付最高价），
+    side=SELL 返回 best ask（卖方愿收最低价）。失败的 token 用 None 占位，避免拖垮整体。
+    """
+    result: Dict[str, Dict[str, Optional[float]]] = {tid: {"best_bid": None, "best_ask": None} for tid in token_ids}
+    if not token_ids:
+        return result
+    try:
+        clob_client = get_client(profile)
+        params = []
+        for tid in token_ids:
+            params.append(BookParams(token_id=str(tid), side="BUY"))
+            params.append(BookParams(token_id=str(tid), side="SELL"))
+        prices = clob_client.get_prices(params)  # {token_id: {"BUY": "0.12", "SELL": "0.13"}}
+    except Exception as exc:
+        logger.warning("get_best_prices batch failed: error=%s", exc)
+        return result
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    for tid in token_ids:
+        entry = prices.get(str(tid)) or {}
+        result[tid] = {
+            "best_bid": _f(entry.get("BUY")),
+            "best_ask": _f(entry.get("SELL")),
+        }
+    return result
 
 def get_balance_allowance(profile: Optional[str] = None) -> str:
     """返回当前可用 USDC 余额，如 $123.45"""
