@@ -7,7 +7,8 @@ import re
 import secrets
 import subprocess
 import sys
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, List
 from zoneinfo import ZoneInfo
@@ -217,6 +218,474 @@ def api_events():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+# ---------- 交易讨论室 (Chat with AI) ----------
+# 复用 position_analyze 用的同一套 Gemini Pro + Search Grounding，
+# 让用户可以拿"上一份完整 AI 报告 + 实时持仓/挂单/余额 + 当前 events 价格"作为上下文
+# 跟 AI 自由提问。前端把多轮历史存 localStorage,服务端是无状态的。
+_CHAT_MAX_HISTORY_TURNS = 20  # 每边最多带 20 条进 prompt,防 token 爆炸
+_CHAT_MAX_USER_MESSAGE_LEN = 4000  # 单条用户消息上限,防止粘贴超长内容刷爆 API
+_CHAT_DEFAULT_SESSION_ID = "default"  # 当前 dashboard 单用户,固定一个 session
+_CHAT_HISTORY_LOAD_LIMIT = 200  # GET /api/chat/history 一次最多回多少条
+_chat_table_ready = False
+_chat_table_lock = __import__("threading").Lock()
+
+
+def _ensure_chat_table() -> None:
+    """首次访问时创建 chat_messages 表(幂等)。"""
+    global _chat_table_ready
+    if _chat_table_ready:
+        return
+    with _chat_table_lock:
+        if _chat_table_ready:
+            return
+        with get_conn(autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id          BIGSERIAL PRIMARY KEY,
+                    session_id  TEXT NOT NULL DEFAULT 'default',
+                    role        TEXT NOT NULL CHECK (role IN ('user','assistant')),
+                    content     TEXT NOT NULL,
+                    sources     JSONB,
+                    latency_ms  INTEGER,
+                    model       TEXT,
+                    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_session_created
+                    ON chat_messages (session_id, created_at);
+                """
+            )
+        _chat_table_ready = True
+
+
+def _save_chat_message(role: str, content: str, *, sources=None, latency_ms=None, model=None,
+                       session_id: str = _CHAT_DEFAULT_SESSION_ID) -> None:
+    _ensure_chat_table()
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO chat_messages (session_id, role, content, sources, latency_ms, model)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                session_id,
+                role,
+                content,
+                psycopg2.extras.Json(sources) if sources else None,
+                latency_ms,
+                model,
+            ),
+        )
+
+
+def _load_chat_history(session_id: str = _CHAT_DEFAULT_SESSION_ID, limit: int = _CHAT_HISTORY_LOAD_LIMIT) -> list:
+    _ensure_chat_table()
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, role, content, sources, latency_ms, model,
+                   EXTRACT(EPOCH FROM created_at) * 1000 AS ts
+            FROM chat_messages
+            WHERE session_id = %s
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (session_id, limit),
+        )
+        rows = cur.fetchall()
+    rows.reverse()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "role": r["role"],
+            "content": r["content"],
+            "sources": r["sources"] or [],
+            "latency_ms": r["latency_ms"],
+            "model": r["model"],
+            "ts": int(r["ts"]) if r["ts"] is not None else None,
+        })
+    return out
+
+
+def _clear_chat_history(session_id: str = _CHAT_DEFAULT_SESSION_ID) -> int:
+    _ensure_chat_table()
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM chat_messages WHERE session_id = %s", (session_id,))
+        return cur.rowcount
+
+
+def _load_chat_context_blob() -> dict:
+    """收集供 AI 参考的实时上下文。失败的子项不阻塞,用 None 占位。"""
+    blob: dict = {"generated_at": datetime.now(timezone.utc).isoformat()}
+
+    # 上一份完整 AI 报告(JSON)
+    try:
+        report_path = Path(__file__).resolve().parent / "last_report.json"
+        if report_path.exists():
+            with report_path.open("r", encoding="utf-8") as f:
+                blob["last_ai_report"] = json.load(f)
+        else:
+            blob["last_ai_report"] = None
+    except Exception as exc:
+        logger.warning("chat: load last_report.json failed: %s", exc)
+        blob["last_ai_report"] = {"error": str(exc)}
+
+    # 持仓
+    try:
+        positions = get_positions(profile=APP_PM_PROFILE) or []
+        blob["positions"] = [
+            {
+                "title": p.get("title"),
+                "outcome": p.get("outcome"),
+                "size": p.get("size"),
+                "avgPrice": p.get("avgPrice"),
+                "curPrice": p.get("curPrice"),
+                "currentValue": p.get("currentValue"),
+                "percentPnl": p.get("percentPnl"),
+                "endDate": p.get("endDate"),
+                "conditionId": p.get("conditionId"),
+            }
+            for p in positions
+        ]
+    except Exception as exc:
+        logger.warning("chat: get_positions failed: %s", exc)
+        blob["positions"] = {"error": str(exc)}
+
+    # 挂单
+    try:
+        orders = get_open_orders(profile=APP_PM_PROFILE) or []
+        blob["open_orders"] = [
+            {
+                "market_id": o.get("market") or o.get("market_id") or o.get("condition_id"),
+                "side": o.get("side"),
+                "price": o.get("price"),
+                "original_size": o.get("original_size"),
+                "size_matched": o.get("size_matched"),
+                "outcome": o.get("outcome"),
+                "asset_id": o.get("asset_id"),
+                "created_at": o.get("created_at"),
+            }
+            for o in orders
+        ]
+    except Exception as exc:
+        logger.warning("chat: get_open_orders failed: %s", exc)
+        blob["open_orders"] = {"error": str(exc)}
+
+    # USDC 余额(gross)
+    try:
+        blob["usdc_balance"] = get_balance_allowance(profile=APP_PM_PROFILE)
+    except Exception as exc:
+        logger.warning("chat: get_balance_allowance failed: %s", exc)
+        blob["usdc_balance"] = None
+
+    # 本月 event 各 strike 的最新 best bid/ask + mid
+    try:
+        ev = get_event_token_id()
+        token_ids = []
+        for m in (ev.get("markets") or []):
+            for tid in (m.get("token_id") or []):
+                if tid:
+                    token_ids.append(str(tid))
+        prices = get_best_prices(token_ids, profile=APP_PM_PROFILE) if token_ids else {}
+        markets_brief = []
+        for m in (ev.get("markets") or []):
+            outs = m.get("outcomes") or []
+            mids = m.get("outcomePrices") or []
+            tids = m.get("token_id") or []
+            rows = []
+            for i, oc in enumerate(outs):
+                tid = str(tids[i]) if i < len(tids) else None
+                px = prices.get(tid) if tid else None
+                rows.append({
+                    "outcome": oc,
+                    "mid": mids[i] if i < len(mids) else None,
+                    "best_bid": (px or {}).get("best_bid"),
+                    "best_ask": (px or {}).get("best_ask"),
+                })
+            markets_brief.append({"question": m.get("question"), "outcomes": rows})
+        blob["polymarket_event"] = {"event_name": ev.get("event_name"), "markets": markets_brief}
+    except Exception as exc:
+        logger.warning("chat: load polymarket event failed: %s", exc)
+        blob["polymarket_event"] = {"error": str(exc)}
+
+    # 当前 BTC 现价
+    try:
+        blob["btc_spot_price"] = get_btc_price()
+    except Exception as exc:
+        logger.warning("chat: get_btc_price failed: %s", exc)
+        blob["btc_spot_price"] = None
+
+    return blob
+
+
+def _build_chat_system_instruction(context_blob: dict) -> str:
+    """系统 prompt: 角色定义 + 实时上下文 JSON。"""
+    context_json = json.dumps(context_blob, ensure_ascii=False, default=str, indent=2)
+    return (
+        "你是这个 Polymarket 月度 BTC 价格事件交易系统的内置策略助手。\n"
+        "用户会基于自己的交易想法问你问题,你的任务是结合下面提供的实时上下文(持仓、挂单、"
+        "USDC 余额、本月 event 各 strike 的 best bid/ask、上一份完整 AI 报告)与你掌握的市场/链上/"
+        "宏观信息,给出**具体、可操作、考虑了已有仓位与资金限制**的建议。\n"
+        "\n"
+        "**回答风格要求:**\n"
+        "- 中文为主,涉及代码/symbol/价格用英文/数字保持精确\n"
+        "- 直接给观点,不要客套\n"
+        "- 如果用户问的方向你不认同,**坦诚反驳并说理由**;不要无条件附和\n"
+        "- 引用具体数字时直接从上下文里取,不要瞎猜;不确定就说不确定\n"
+        "- 如果建议下单,给出**方向(Yes/No)、目标价区间(美分)、size(USDC 或 share 数)、止盈止损位**;"
+        "  但**不要替用户执行**,告诉他去 events tab 自己挂单\n"
+        "- 必要时使用 Google Search 查最新新闻/ETF 流向/美股盘前等市场状态\n"
+        "\n"
+        "**实时上下文 (system-injected, 用户不可见):**\n"
+        "```json\n"
+        f"{context_json}\n"
+        "```\n"
+    )
+
+
+@app.route('/api/chat/history', methods=['GET'])
+def api_chat_history():
+    try:
+        history = _load_chat_history()
+        return jsonify({"messages": history})
+    except Exception as e:
+        logger.exception("api_chat_history error")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/chat/history', methods=['DELETE'])
+def api_chat_history_clear():
+    try:
+        n = _clear_chat_history()
+        return jsonify({"deleted": n})
+    except Exception as e:
+        logger.exception("api_chat_history_clear error")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/chat', methods=['POST'])
+def api_chat():
+    """对话接口。前端只需发"新一条 user 消息";服务端从 PG 读历史拼上下文,并把 user+assistant 写回 PG。
+
+    兼容旧契约: 若 body 带 messages 数组,取最后一条 user;若带 message 字段,作为单条 user。
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        messages = body.get("messages")
+        single_msg = body.get("message")
+
+        if isinstance(single_msg, str) and single_msg.strip():
+            user_text = single_msg.strip()
+        elif isinstance(messages, list) and messages:
+            last = messages[-1]
+            if not isinstance(last, dict) or last.get("role") != "user":
+                return jsonify({"error": "messages 末尾必须是 user 消息"}), 400
+            user_text = str(last.get("content") or "").strip()
+        else:
+            return jsonify({"error": "缺少 message 或 messages"}), 400
+
+        if not user_text:
+            return jsonify({"error": "消息内容为空"}), 400
+        if len(user_text) > _CHAT_MAX_USER_MESSAGE_LEN:
+            return jsonify({"error": f"单条消息超过 {_CHAT_MAX_USER_MESSAGE_LEN} 字符上限"}), 400
+
+        # 1) 先把 user 消息持久化
+        _save_chat_message("user", user_text)
+
+        # 2) 从 PG 加载历史(已含刚写入的 user),取最近 N 轮喂给 Gemini
+        full_history = _load_chat_history()
+        recent = full_history[-_CHAT_MAX_HISTORY_TURNS * 2:]
+
+        # 构造上下文
+        context_blob = _load_chat_context_blob()
+        system_instruction = _build_chat_system_instruction(context_blob)
+
+        # 调 Gemini Pro + Search Grounding
+        from google import genai as _genai
+        from google.genai import types as _gtypes
+        from config import GOOGLE_API_KEY, GEMINI_MODEL_ID
+
+        if not GOOGLE_API_KEY:
+            return jsonify({"error": "GOOGLE_API_KEY 未设置"}), 500
+
+        client = _genai.Client(api_key=GOOGLE_API_KEY)
+        contents = []
+        for m in recent:
+            text = str(m.get("content") or "")
+            if not text:
+                continue
+            mapped_role = "user" if m.get("role") == "user" else "model"
+            contents.append(_gtypes.Content(role=mapped_role, parts=[_gtypes.Part(text=text)]))
+
+        config = _gtypes.GenerateContentConfig(
+            system_instruction=system_instruction,
+            tools=[_gtypes.Tool(google_search=_gtypes.GoogleSearch())],
+            temperature=0.5,
+            max_output_tokens=4096,
+        )
+
+        t0 = time.monotonic()
+        response = client.models.generate_content(
+            model=GEMINI_MODEL_ID,
+            contents=contents,
+            config=config,
+        )
+        latency_ms = int((time.monotonic() - t0) * 1000)
+
+        reply_text = (getattr(response, "text", None) or "").strip()
+        if not reply_text:
+            return jsonify({"error": "Gemini 返回空响应,可能触发 safety/上下文过长"}), 502
+
+        sources = []
+        try:
+            cand = (response.candidates or [None])[0]
+            gm = getattr(cand, "grounding_metadata", None) if cand else None
+            chunks = getattr(gm, "grounding_chunks", None) if gm else None
+            if chunks:
+                seen = set()
+                for c in chunks:
+                    web = getattr(c, "web", None)
+                    if not web:
+                        continue
+                    url = getattr(web, "uri", None)
+                    if not url or url in seen:
+                        continue
+                    seen.add(url)
+                    sources.append({"url": url, "title": getattr(web, "title", None) or url})
+        except Exception:
+            pass
+
+        # 3) 持久化 assistant 回复
+        _save_chat_message("assistant", reply_text, sources=sources,
+                           latency_ms=latency_ms, model=GEMINI_MODEL_ID)
+
+        logger.info("chat: reply ok latency=%dms in_msgs=%d out_chars=%d sources=%d",
+                    latency_ms, len(contents), len(reply_text), len(sources))
+        return jsonify({
+            "reply": reply_text,
+            "sources": sources,
+            "model": GEMINI_MODEL_ID,
+            "latency_ms": latency_ms,
+            "context_summary": {
+                "positions_count": len(context_blob.get("positions") or []) if isinstance(context_blob.get("positions"), list) else 0,
+                "open_orders_count": len(context_blob.get("open_orders") or []) if isinstance(context_blob.get("open_orders"), list) else 0,
+                "usdc_balance": context_blob.get("usdc_balance"),
+                "btc_spot_price": context_blob.get("btc_spot_price"),
+                "has_last_ai_report": bool(context_blob.get("last_ai_report")),
+            },
+        })
+    except Exception as e:
+        logger.exception("api_chat error")
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================================
+# 手动挂单的"BTC 价格触达"延迟触发
+# ============================================================================
+from services.manual_pending_orders import (
+    insert_pending_order as _mpo_insert,
+    list_pending_orders as _mpo_list,
+    cancel_pending_order as _mpo_cancel,
+    VALID_OPS as _MPO_VALID_OPS,
+)
+
+
+def _maybe_queue_manual_pending(action: str, data: dict, recommendation_item_id):
+    """若 request 带 trigger_op + trigger_btc_price,把订单写入 manual_pending_orders 并返回 jsonify 响应。
+    否则返回 None,让上层走立即下单路径。
+    """
+    op = (data.get('trigger_op') or '').strip()
+    raw_price = data.get('trigger_btc_price')
+    if not op and raw_price in (None, ''):
+        return None  # 走立即下单
+    if recommendation_item_id is not None and str(recommendation_item_id).strip() != "":
+        return jsonify({'error': '推荐执行不支持延迟触发,请立即下单或在 Recommendations 页签操作'}), 400
+    if op not in _MPO_VALID_OPS:
+        return jsonify({'error': f'trigger_op 必须是 {_MPO_VALID_OPS}'}), 400
+    try:
+        trigger_btc_price = float(raw_price)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'trigger_btc_price 必须是数字'}), 400
+
+    expires_at = None
+    raw_expiry_hours = data.get('trigger_expiry_hours')
+    if raw_expiry_hours is not None and raw_expiry_hours != '':
+        try:
+            hours = float(raw_expiry_hours)
+            if hours <= 0 or hours > 24 * 30:
+                raise ValueError("hours out of range")
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=hours)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'trigger_expiry_hours 必须是 (0, 720] 的数字(小时)'}), 400
+
+    extra: dict = {'profile': APP_PM_PROFILE}
+    raw_offset = data.get('trigger_market_offset')
+    if raw_offset is not None and raw_offset != '':
+        if action != 'sell':
+            return jsonify({'error': 'trigger_market_offset 当前仅支持 sell'}), 400
+        try:
+            offset = float(raw_offset)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'trigger_market_offset 必须是数字'}), 400
+        if offset < -0.5 or offset > 0.5:
+            return jsonify({'error': 'trigger_market_offset 必须在 [-0.5, 0.5]'}), 400
+        extra['trigger_market_offset'] = offset
+
+    try:
+        row = _mpo_insert(
+            action=action,
+            market_id=str(data['market_id']),
+            token_id=str(data['token_id']),
+            price=float(data['price']),
+            size=float(data['size']),
+            trigger_op=op,
+            trigger_btc_price=trigger_btc_price,
+            expires_at=expires_at,
+            notes=str(data.get('trigger_notes') or '')[:500] or None,
+            requested_by=session.get('user') or 'dashboard',
+            extra=extra,
+        )
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 400
+    except Exception as e:
+        logger.exception("queue manual pending order failed")
+        return jsonify({'error': f'排队失败: {e}'}), 500
+
+    logger.info("manual pending order queued: id=%s action=%s op=%s threshold=%s",
+                row.get('id'), action, op, trigger_btc_price)
+    return jsonify({
+        'queued': True,
+        'pending_id': row.get('id'),
+        'pending': row,
+        'message': f"已排队: BTC {op} {trigger_btc_price} 时下 {action} 单 (有效期至 {row.get('expires_at')})",
+    })
+
+
+@app.route('/api/manual_pending', methods=['GET'])
+def api_manual_pending_list():
+    try:
+        include_finished = (request.args.get('include_finished') or '').lower() in ('1', 'true', 'yes')
+        rows = _mpo_list(include_finished=include_finished)
+        return jsonify({'orders': rows})
+    except Exception as e:
+        logger.exception("api_manual_pending_list error")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/manual_pending/<int:order_id>', methods=['DELETE'])
+def api_manual_pending_cancel(order_id: int):
+    try:
+        row = _mpo_cancel(order_id)
+        if not row:
+            return jsonify({'error': '订单不存在或已不是 pending 状态'}), 404
+        return jsonify({'cancelled': True, 'order': row})
+    except Exception as e:
+        logger.exception("api_manual_pending_cancel error")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/positions')
 def api_positions():
     try:
@@ -315,6 +784,9 @@ def api_buy():
     if not all([market_id, token_id, price, size]):
         logger.warning("api_buy missing parameters: has market_id=%s token_id=%s price=%s size=%s", bool(market_id), bool(token_id), price, size)
         return jsonify({'error': 'Missing parameters'}), 400
+    queued = _maybe_queue_manual_pending('buy', data, recommendation_item_id)
+    if queued is not None:
+        return queued
     if recommendation_item_id is not None and str(recommendation_item_id).strip() != "":
         # 第三轮审查 #1：服务端硬绑定校验，防止用 item_id 越权下别的市场/超大 size
         try:
@@ -413,6 +885,9 @@ def api_sell():
     if not all([market_id, token_id, price, size]):
         logger.warning("api_sell missing parameters: has market_id=%s token_id=%s price=%s size=%s", bool(market_id), bool(token_id), price, size)
         return jsonify({'error': 'Missing parameters'}), 400
+    queued = _maybe_queue_manual_pending('sell', data, recommendation_item_id)
+    if queued is not None:
+        return queued
     if recommendation_item_id is not None and str(recommendation_item_id).strip() != "":
         # 第三轮审查 #1：服务端硬绑定校验
         try:

@@ -32,11 +32,12 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from py_clob_client.clob_types import OrderType  # noqa: E402
 
-from data.polymarket import buy_order, sell_order  # noqa: E402
+from data.polymarket import buy_order, sell_order, get_best_prices  # noqa: E402
 from services.five_minute_trade.watchers import ChainlinkBTCPriceWatcher  # noqa: E402
 from services.recommendation_db import RecommendationDB  # noqa: E402
 from services.recommendation_trigger import auto_trigger_db as atdb  # noqa: E402
 from services.recommendation_trigger.engine import TriggerEngine, _PlanEntry  # noqa: E402
+from services import manual_pending_orders as _mpo  # noqa: E402
 
 logger = logging.getLogger("recommendation_auto_executor")
 
@@ -241,11 +242,103 @@ def main() -> int:
     engine = TriggerEngine(execute_fn=_execute, rate_capacity_per_minute=RATE_LIMIT_PER_MINUTE)
     engine.start()
 
+    # 手动延迟挂单表幂等建表
+    try:
+        _mpo.ensure_table()
+    except Exception:  # noqa: BLE001
+        logger.exception("manual_pending_orders ensure_table 失败,继续")
+
+    _last_expiry_sweep = [0.0]
+
+    def _process_manual_pending(price: float) -> None:
+        try:
+            triggered = _mpo.fetch_triggered_orders(price)
+        except Exception:  # noqa: BLE001
+            logger.exception("manual_pending fetch_triggered 失败")
+            return
+        for order in triggered:
+            order_id = order.get('id')
+            try:
+                claimed = _mpo.try_claim_order(order_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("manual_pending claim 失败 id=%s", order_id)
+                continue
+            if not claimed:
+                continue  # 已被别人/前一次 tick claim
+            action = claimed['action']
+            limit_price = float(claimed['price'])
+            extra = claimed.get('extra') or {}
+            offset = extra.get('trigger_market_offset') if isinstance(extra, dict) else None
+            if offset is not None:
+                try:
+                    quotes = get_best_prices([claimed['token_id']], profile=AUTO_EXECUTOR_PM_PROFILE)
+                    best_bid = (quotes.get(claimed['token_id']) or {}).get('best_bid')
+                except Exception:  # noqa: BLE001
+                    logger.exception("[manual_pending %s] 获取 best_bid 失败", order_id)
+                    best_bid = None
+                if not best_bid or best_bid <= 0:
+                    _mpo.mark_order_failed(order_id, error_message="无法获取 best_bid,放弃市价挂单")
+                    continue
+                computed = round(best_bid + float(offset), 3)
+                computed = max(0.01, min(0.99, computed))
+                logger.info("[manual_pending %s] market mode: best_bid=%s offset=%s -> price=%s",
+                            order_id, best_bid, offset, computed)
+                limit_price = computed
+
+            logger.info("[manual_pending %s] FIRE action=%s op=%s thr=%s btc=%s market=%s price=%s size=%s",
+                        order_id, action, claimed['trigger_op'], claimed['trigger_btc_price'],
+                        price, claimed['market_id'], limit_price, claimed['size'])
+            if DRY_RUN:
+                logger.info("[manual_pending %s] DRY-RUN 不真实下单", order_id)
+                _mpo.mark_order_failed(order_id, error_message="dry-run, not executed")
+                continue
+            try:
+                if action == 'buy':
+                    fired_id = buy_order(
+                        market_id=claimed['market_id'],
+                        token_id=claimed['token_id'],
+                        price=limit_price,
+                        size=float(claimed['size']),
+                        profile=AUTO_EXECUTOR_PM_PROFILE,
+                    )
+                else:
+                    fired_id = sell_order(
+                        market_id=claimed['market_id'],
+                        token_id=claimed['token_id'],
+                        price=limit_price,
+                        size=float(claimed['size']),
+                        profile=AUTO_EXECUTOR_PM_PROFILE,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[manual_pending %s] 下单异常", order_id)
+                _mpo.mark_order_failed(order_id, error_message=f"{type(exc).__name__}: {exc}")
+                continue
+            if not fired_id:
+                _mpo.mark_order_failed(order_id, error_message=f"{action}_order returned empty id")
+                continue
+            _mpo.mark_order_fired(order_id, fired_order_id=str(fired_id))
+            logger.info("[manual_pending %s] DONE order_id=%s", order_id, fired_id)
+
     def _on_btc(payload: dict[str, Any]) -> None:
         try:
-            engine.enqueue_btc_price(float(payload.get("last_price")), payload.get("update_time"))
+            price = float(payload.get("last_price"))
+        except (TypeError, ValueError):
+            return
+        try:
+            engine.enqueue_btc_price(price, payload.get("update_time"))
         except (TypeError, ValueError):
             pass
+        _process_manual_pending(price)
+        # 每 60s 扫一次过期 pending
+        now_ts = time.time()
+        if now_ts - _last_expiry_sweep[0] > 60:
+            _last_expiry_sweep[0] = now_ts
+            try:
+                n = _mpo.expire_overdue_orders()
+                if n:
+                    logger.info("manual_pending 过期清理: %s", n)
+            except Exception:  # noqa: BLE001
+                logger.exception("manual_pending expire_overdue_orders 失败")
 
     watcher = ChainlinkBTCPriceWatcher(symbol="btcusdt", callback=_on_btc)
     watcher.start()
