@@ -814,8 +814,8 @@ def get_best_prices(token_ids: List[str], profile: Optional[str] = None) -> Dict
         clob_client = get_client(profile)
         params = []
         for tid in token_ids:
-            params.append(BookParams(token_id=str(tid), side="BUY"))
-            params.append(BookParams(token_id=str(tid), side="SELL"))
+            params.append({"token_id": str(tid), "side": "BUY"})
+            params.append({"token_id": str(tid), "side": "SELL"})
         prices = clob_client.get_prices(params)  # {token_id: {"BUY": "0.12", "SELL": "0.13"}}
     except Exception as exc:
         logger.warning("get_best_prices batch failed: error=%s", exc)
