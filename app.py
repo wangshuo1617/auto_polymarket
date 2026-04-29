@@ -23,7 +23,7 @@ from services.five_minute_trade.param_registry import (
 )
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
-from py_clob_client.clob_types import (
+from py_clob_client_v2.clob_types import (
     OrderArgs,
     CreateOrderOptions,
     BalanceAllowanceParams,

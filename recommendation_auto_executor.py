@@ -30,7 +30,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from py_clob_client.clob_types import OrderType  # noqa: E402
+from py_clob_client_v2.clob_types import OrderType  # noqa: E402
 
 from data.polymarket import buy_order, sell_order, get_best_prices  # noqa: E402
 from services.five_minute_trade.watchers import ChainlinkBTCPriceWatcher  # noqa: E402

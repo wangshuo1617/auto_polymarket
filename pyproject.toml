@@ -12,13 +12,14 @@ dependencies = [
     "pandas>=2.3.3",
     "playwright>=1.57.0",
     "psycopg2-binary>=2.9.9",
-    "py-clob-client>=0.34.5",
+    "py-clob-client-v2>=1.0.0",
     "websocket-client>=1.9.0",
     "yfinance>=1.1.0",
     "polymarket-apis>=0.4.3",
     "flask>=3.0.0",
     "duckdb>=1.2.2",
     "py-builder-relayer-client",
+    "py-clob-client-v2>=1.0.0",
 ]
 
 [tool.uv.sources]

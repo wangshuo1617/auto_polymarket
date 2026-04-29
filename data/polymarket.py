@@ -20,9 +20,9 @@ if str(_project_root) not in sys.path:
 
 import requests
 import httpx
-import py_clob_client.http_helpers.helpers as clob_http_helpers
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
+import py_clob_client_v2.http_helpers.helpers as clob_http_helpers
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
     OrderArgs,
     CreateOrderOptions,
     BalanceAllowanceParams,
@@ -33,9 +33,9 @@ from py_clob_client.clob_types import (
     PostOrdersArgs,
     BookParams,
 )
-from py_clob_client.order_builder.builder import ROUNDING_CONFIG
-from py_clob_client.order_builder.helpers import round_down
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
+from py_clob_client_v2.order_builder.helpers import round_down
+from py_clob_client_v2.order_builder.constants import BUY, SELL
 from datetime import datetime, timezone
 from config import (
     POLYMARKET_KEY,
@@ -108,7 +108,7 @@ def get_polymarket_context(profile: Optional[str] = None) -> PolymarketContext:
             signature_type=2,
             funder=wallet,
         )
-        creds = temp_client.create_or_derive_api_creds()
+        creds = temp_client.create_or_derive_api_key()
         profile_client = ClobClient(
             host,
             key=private_key,
@@ -492,7 +492,7 @@ def get_open_orders(profile: Optional[str] = None) -> list:
     clob_client = get_client(profile)
     logger.info("get_open_orders called")
     try:
-        response = clob_client.get_orders()
+        response = clob_client.get_open_orders()
         count = len(response) if isinstance(response, list) else "non-list"
         logger.info("get_open_orders success: count=%s", count)
         return response
@@ -598,7 +598,6 @@ def buy_order(
                 price=price,
                 size=normalized_size,
                 side=BUY,
-                fee_rate_bps=fee_rate_bps,
             ),
             options=CreateOrderOptions(
                 tick_size=str(meta["minimum_tick_size"]),
@@ -646,14 +645,13 @@ def sell_order(
                 price=normalized_price,
                 size=submit_size,
                 side=SELL,
-                fee_rate_bps=fee_rate_bps,
             ),
             options=PartialCreateOrderOptions(
                 tick_size=str(meta["minimum_tick_size"]),
                 neg_risk=bool(meta.get("neg_risk", False)),
             ),
         )
-        return clob_client.post_order(signed_order, orderType=order_type)
+        return clob_client.post_order(signed_order, order_type=order_type)
 
     def _is_retryable_server_error(err_msg: str) -> bool:
         text = str(err_msg or "").lower()
@@ -719,7 +717,8 @@ def sell_order(
 
 def cancel_order(order_id: str, profile: Optional[str] = None):
     clob_client = get_client(profile)
-    return clob_client.cancel(order_id)
+    from py_clob_client_v2.clob_types import OrderPayload
+    return clob_client.cancel_order(OrderPayload(orderID=order_id))
 
 
 def get_order_detail(order_id: str, profile: Optional[str] = None) -> Optional[Dict[str, Any]]:
