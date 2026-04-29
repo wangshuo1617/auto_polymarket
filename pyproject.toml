@@ -19,7 +19,6 @@ dependencies = [
     "flask>=3.0.0",
     "duckdb>=1.2.2",
     "py-builder-relayer-client",
-    "py-clob-client-v2>=1.0.0",
 ]
 
 [tool.uv.sources]
