@@ -54,6 +54,7 @@ from data.polymarket import (
     get_balance_allowance,
     get_event_token_id,
     get_best_prices,
+    get_last_order_error,
 )
 
 app = Flask(__name__)
@@ -823,6 +824,7 @@ def api_buy():
             profile=APP_PM_PROFILE,
         )
         if order_id is None:
+            error_detail = get_last_order_error() or "Order placement failed (null order_id)"
             if recommendation_item_id:
                 try:
                     _recommendation_db.record_action(
@@ -831,12 +833,12 @@ def api_buy():
                         status="failed",
                         request_payload=data,
                         response_payload={"order_id": None},
-                        error_text="Order placement failed (null order_id)",
+                        error_text=error_detail,
                     )
                 except Exception:
                     logger.exception("record buy action failed")
-            logger.warning("api_buy returned null order_id: market_id=%s price=%s size=%s", market_id, price, size)
-            return jsonify({'error': 'Order placement failed (null order_id)', 'order_id': None}), 500
+            logger.warning("api_buy returned null order_id: market_id=%s price=%s size=%s reason=%s", market_id, price, size, error_detail)
+            return jsonify({'error': error_detail, 'order_id': None}), 500
         recommendation_sync_error = None
         if recommendation_item_id:
             try:
@@ -925,6 +927,7 @@ def api_sell():
             order_type=OrderType.GTC,
         )
         if order_id is None:
+            error_detail = get_last_order_error() or "Order placement failed (null order_id)"
             if recommendation_item_id:
                 try:
                     _recommendation_db.record_action(
@@ -933,12 +936,12 @@ def api_sell():
                         status="failed",
                         request_payload=data,
                         response_payload={"order_id": None},
-                        error_text="Order placement failed (null order_id)",
+                        error_text=error_detail,
                     )
                 except Exception:
                     logger.exception("record sell action failed")
-            logger.warning("api_sell returned null order_id: market_id=%s price=%s size=%s", market_id, price, size)
-            return jsonify({'error': 'Order placement failed (null order_id)', 'order_id': None}), 500
+            logger.warning("api_sell returned null order_id: market_id=%s price=%s size=%s reason=%s", market_id, price, size, error_detail)
+            return jsonify({'error': error_detail, 'order_id': None}), 500
         recommendation_sync_error = None
         if recommendation_item_id:
             try:

@@ -248,8 +248,12 @@
                     </form>
                 </div>
                 <div class="modal-footer">
+                    <div id="orderSubmitError" class="text-danger small me-auto" style="display:none; max-width: 60%; white-space: pre-wrap; word-break: break-word;"></div>
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-                    <button type="button" class="btn btn-primary" id="submitOrder">Submit</button>
+                    <button type="button" class="btn btn-primary" id="submitOrder">
+                        <span id="submitOrderSpinner" class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true" style="display:none;"></span>
+                        <span id="submitOrderLabel">Submit</span>
+                    </button>
                 </div>
             </div>
         </div>
@@ -2517,6 +2521,8 @@
         }
 
         function resetTriggerFields() {
+            const errBox = document.getElementById('orderSubmitError');
+            if (errBox) { errBox.textContent = ''; errBox.style.display = 'none'; }
             document.getElementById('triggerImmediate').checked = true;
             document.getElementById('triggerBtc').checked = false;
             document.getElementById('triggerBtcFields').style.display = 'none';
@@ -2586,6 +2592,23 @@
         document.getElementById('submitOrder').addEventListener('click', function() {
             const submitBtn = this;
             if (submitBtn.disabled) { return; }
+            const spinner = document.getElementById('submitOrderSpinner');
+            const label = document.getElementById('submitOrderLabel');
+            const errBox = document.getElementById('orderSubmitError');
+            const setBusy = (busy) => {
+                submitBtn.disabled = busy;
+                if (spinner) spinner.style.display = busy ? 'inline-block' : 'none';
+                if (label) label.textContent = busy ? 'Submitting…' : 'Submit';
+            };
+            const showError = (msg) => {
+                if (!errBox) { alert(msg); return; }
+                errBox.textContent = '❌ ' + msg;
+                errBox.style.display = 'block';
+            };
+            const clearError = () => {
+                if (errBox) { errBox.textContent = ''; errBox.style.display = 'none'; }
+            };
+            clearError();
             const triggerMode = document.querySelector('input[name="orderTriggerMode"]:checked');
             const isDeferred = triggerMode && triggerMode.value === 'btc';
             const useMarketSell = isDeferred && currentAction === 'sell'
@@ -2594,23 +2617,23 @@
             const priceRaw = document.getElementById('priceInput').value;
             const price = parseFloat(priceRaw);
             const raw = document.getElementById('amountOrSizeInput').value;
-            if (raw === '' || isNaN(parseFloat(raw))) return;
+            if (raw === '' || isNaN(parseFloat(raw))) { showError('请输入有效的金额或张数'); return; }
             // 当走"触发时按市价"路径时,price 仅用于计算 size(按 amount 模式时);限价由 executor 重算
-            if (!useMarketSell && (!price || price <= 0)) return;
+            if (!useMarketSell && (!price || price <= 0)) { showError('请输入有效的价格'); return; }
             const isAmount = document.getElementById('modeAmount').checked;
             let size;
             if (isAmount) {
                 const amount = parseFloat(raw);
-                if (amount <= 0) return;
+                if (amount <= 0) { showError('金额必须 > 0'); return; }
                 if (useMarketSell) {
-                    alert('"触发时按市价"暂不支持按金额输入,请改用 Quantity 输入张数');
+                    showError('"触发时按市价"暂不支持按金额输入,请改用 Quantity 输入张数');
                     return;
                 }
                 size = Math.round(amount / price * 100) / 100;
             } else {
                 size = Math.round(parseFloat(raw) * 100) / 100;
             }
-            if (size <= 0) return;
+            if (size <= 0) { showError('size 必须 > 0'); return; }
             // 占位 price:走 market 路径时给 executor 一个合法 fallback,真正限价在 fire 时算
             currentData.price = useMarketSell ? 0.5 : price;
             currentData.size = size;
@@ -2619,7 +2642,7 @@
                 const op = document.getElementById('triggerOpInput').value;
                 const thrRaw = document.getElementById('triggerBtcPriceInput').value;
                 const thr = parseFloat(thrRaw);
-                if (!thr || thr <= 0) { alert('请输入有效的 BTC 触发价'); return; }
+                if (!thr || thr <= 0) { showError('请输入有效的 BTC 触发价'); return; }
                 currentData.trigger_op = op;
                 currentData.trigger_btc_price = thr;
                 const hours = parseFloat(document.getElementById('triggerExpiryHoursInput').value);
@@ -2632,7 +2655,7 @@
             }
 
             const url = currentAction === 'buy' ? '/api/buy' : '/api/sell';
-            submitBtn.disabled = true;
+            setBusy(true);
             fetchJsonSafe(url, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -2640,7 +2663,7 @@
             })
             .then(data => {
                 if (data.error) {
-                    alert('Error: ' + data.error);
+                    showError(data.error);
                 } else if (data.queued) {
                     alert('✅ ' + (data.message || ('已排队 pending_id=' + data.pending_id)));
                     bootstrap.Modal.getInstance(document.getElementById('orderModal')).hide();
@@ -2657,8 +2680,8 @@
                     loadBalance();
                 }
             })
-            .catch(error => alert('下单失败: ' + error.message))
-            .finally(() => { submitBtn.disabled = false; });
+            .catch(error => showError('下单失败: ' + (error.message || error)))
+            .finally(() => { setBusy(false); });
         });
 
         // Load data on page load

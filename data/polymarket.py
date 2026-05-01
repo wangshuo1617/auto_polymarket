@@ -13,6 +13,45 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+# 线程本地存储：用于 buy_order/sell_order 在返回 None 时把底层错误信息暴露给上层调用方
+# (例如 dashboard 需要把 'service not ready' / 'not enough balance' 等真实原因展示给用户)
+_last_order_error = threading.local()
+
+
+def _set_last_order_error(msg: Optional[str]) -> None:
+    _last_order_error.value = msg
+
+
+def get_last_order_error() -> Optional[str]:
+    return getattr(_last_order_error, "value", None)
+
+
+def clear_last_order_error() -> None:
+    _last_order_error.value = None
+
+
+def _friendly_clob_error(exc: BaseException) -> str:
+    """把 PolyApiException / 普通 Exception 转成更适合给前端展示的中文友好提示。
+    保留底层原始信息以便排查。
+    """
+    raw = str(exc) if exc is not None else ""
+    low = raw.lower()
+    # 常见错误模式 -> 友好提示
+    if "service not ready" in low or "status_code=425" in low:
+        return f"Polymarket 服务暂时不可用 (HTTP 425),请稍后重试。原始: {raw}"
+    if "not enough balance / allowance" in low:
+        return f"余额或授权不足,无法成交。原始: {raw}"
+    if "order_version_mismatch" in low:
+        return f"订单版本不匹配,可能 SDK 与 CLOB 协议版本不一致。原始: {raw}"
+    if "minimum_tick_size" in low or "tick size" in low:
+        return f"价格未对齐到最小 tick size。原始: {raw}"
+    if "status_code=429" in low or "rate limit" in low:
+        return f"请求过于频繁 (HTTP 429),请稍后重试。原始: {raw}"
+    if "status_code=502" in low or "status_code=503" in low or "status_code=504" in low:
+        return f"Polymarket 网关临时错误,请稍后重试。原始: {raw}"
+    return raw or exc.__class__.__name__
+
+
 # 添加项目根目录到 sys.path，以便可以导入 config
 _project_root = Path(__file__).resolve().parent.parent
 if str(_project_root) not in sys.path:
@@ -551,11 +590,13 @@ def buy_order(
     profile: Optional[str] = None,
     market_meta: Optional[Dict[str, Any]] = None,
 ):
+    clear_last_order_error()
     clob_client = get_client(profile)
     logger.info("buy_order called: market_id=%s token_id=%s price=%s size=%s", market_id, _token_id_short(token_id), price, size)
     meta = market_meta or get_market_metadata(market_id, profile=profile)
     if not meta or meta.get("minimum_tick_size") is None:
         logger.error("buy_order missing market metadata: market_id=%s", market_id)
+        _set_last_order_error("无法获取市场元数据 (minimum_tick_size)")
         return None
     normalized_size = normalize_order_size(size=size, tick_size=meta["minimum_tick_size"])
     if normalized_size <= 0:
@@ -565,6 +606,7 @@ def buy_order(
             _token_id_short(token_id),
             size,
         )
+        _set_last_order_error(f"size 归一化后 <= 0 (原始 size={size}, tick_size={meta['minimum_tick_size']})")
         return None
     if abs(normalized_size - float(size)) > 1e-12:
         logger.info(
@@ -610,6 +652,7 @@ def buy_order(
         return order_id
     except Exception as e:
         logger.exception("buy_order create_and_post_order failed: market_id=%s token_id=%s price=%s size=%s error=%s", market_id, _token_id_short(token_id), price, size, e)
+        _set_last_order_error(_friendly_clob_error(e))
         return None
 
 
@@ -622,14 +665,17 @@ def sell_order(
     market_meta: Optional[Dict[str, Any]] = None,
     order_type: OrderType = OrderType.FAK,  # <--- 核心新增：默认使用 FAK 拒绝挂单被套
 ):
+    clear_last_order_error()
     clob_client = get_client(profile)
     logger.info("sell_order called: market_id=%s token_id=%s price=%s size=%s type=%s", market_id, _token_id_short(token_id), price, size, order_type)
     meta = market_meta or get_market_metadata(market_id, profile=profile)
     if not meta or meta.get("minimum_tick_size") is None:
+        _set_last_order_error("无法获取市场元数据 (minimum_tick_size)")
         return None
 
     normalized_size = normalize_order_size(size=size, tick_size=meta["minimum_tick_size"])
     if normalized_size <= 0:
+        _set_last_order_error(f"size 归一化后 <= 0 (原始 size={size}, tick_size={meta['minimum_tick_size']})")
         return None
 
     normalized_price = _clamp_order_price(price=float(price), tick_size=meta["minimum_tick_size"])
@@ -692,6 +738,7 @@ def sell_order(
                 continue
             if not is_balance_err:
                 logger.exception("sell_order failed: %s", e)
+                _set_last_order_error(_friendly_clob_error(e))
                 return None
 
             # --- 救回那段死代码：自动降量重试机制 ---
@@ -704,6 +751,9 @@ def sell_order(
             
             if retry_size <= 0 or retry_size + 1e-12 >= normalized_size:
                 logger.warning("sell_order 真实余额验证失败: 目标=%.6f, 实际=%.6f", normalized_size, available_balance)
+                _set_last_order_error(
+                    f"余额不足且无法降量重试: 目标 size={normalized_size:.6f}, 链上可用={available_balance:.6f}"
+                )
                 return None
 
             try:
@@ -712,6 +762,7 @@ def sell_order(
                 return retry_resp.get("orderID") if isinstance(retry_resp, dict) else None
             except Exception as retry_err:
                 logger.exception("sell_order 降量重试依然失败: %s", retry_err)
+                _set_last_order_error(_friendly_clob_error(retry_err))
                 return None
     return None
 
