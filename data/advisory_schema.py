@@ -275,10 +275,48 @@ FOR EACH ROW EXECUTE FUNCTION manual_trades_validate_snapshot();
 """
 
 
+_DDL_INPUT_QUOTE_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS input_quote_snapshots (
+    id                  BIGSERIAL PRIMARY KEY,
+    captured_at_utc     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source              TEXT NOT NULL,
+    per_token_quote     JSONB NOT NULL,
+    inputs_hash         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS input_quote_snapshots_captured_idx
+    ON input_quote_snapshots (captured_at_utc DESC);
+"""
+
+_DDL_PATH_VIEWS = """
+CREATE TABLE IF NOT EXISTS path_views (
+    id                              BIGSERIAL PRIMARY KEY,
+    generated_at                    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    as_of_utc                       TIMESTAMPTZ NOT NULL,
+    path_observation_snapshot_id    BIGINT NOT NULL
+        REFERENCES path_observation_snapshots(id),
+    input_quote_snapshot_id         BIGINT
+        REFERENCES input_quote_snapshots(id),
+    current_btc_price               DOUBLE PRECISION NOT NULL,
+    sigma_daily                     DOUBLE PRECISION NOT NULL,
+    sigma_source                    TEXT NOT NULL,
+    sigma_is_iv                     BOOLEAN NOT NULL DEFAULT FALSE,
+    drift_daily                     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    days_left                       DOUBLE PRECISION NOT NULL,
+    per_token_fair                  JSONB NOT NULL,
+    inputs_hash                     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS path_views_gen_idx
+    ON path_views (generated_at DESC);
+CREATE INDEX IF NOT EXISTS path_views_path_obs_idx
+    ON path_views (path_observation_snapshot_id);
+"""
+
 _DDL_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("path_observation_snapshots", _DDL_PATH_OBSERVATION_SNAPSHOTS),
     ("settlement_feed_versions", _DDL_SETTLEMENT_FEED_VERSIONS),
     ("settlement_feed_records", _DDL_SETTLEMENT_FEED_RECORDS),
+    ("input_quote_snapshots", _DDL_INPUT_QUOTE_SNAPSHOTS),
+    ("path_views", _DDL_PATH_VIEWS),
     ("market_view_batches", _DDL_MARKET_VIEW_BATCHES),
     ("market_view_snapshots", _DDL_MARKET_VIEW_SNAPSHOTS),
     ("market_view_latest", _DDL_MARKET_VIEW_LATEST),
