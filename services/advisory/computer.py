@@ -142,6 +142,18 @@ def _compute_one_view(
         target_usdc = round(min(total_net_value_usdc * 0.20,
                                 total_net_value_usdc * fractional), 2)
 
+    # 减仓 / 清仓: 持有 + 按 bid 重算 edge_bid<0 (卖出价已低于公允) → target=0 全清.
+    # 仅 ask-edge 翻负但 bid-edge 仍 >=0 时只是不该加仓, 不强制平.
+    if (
+        position.current_usdc is not None and position.current_usdc > 0
+        and fair_value is not None and 0.0 < fair_value < 1.0
+        and quote.best_bid is not None and quote.best_bid > 0
+        and halt is None
+    ):
+        edge_bid = (quote.best_bid - fair_value) / fair_value
+        if edge_bid < 0:
+            target_usdc = 0.0
+
     delta_usdc = None
     if target_usdc is not None and position.current_usdc is not None:
         delta_usdc = target_usdc - position.current_usdc
