@@ -353,6 +353,36 @@ def collect_manual_trades_24h() -> dict:
     }
 
 
+def collect_fills_poller_staleness() -> dict:
+    """v2 B4: report freshness of advisory_chain_fills_poller per profile."""
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT profile, last_success_at, last_error, last_error_at
+            FROM advisory_chain_fills_poller_state
+            ORDER BY profile
+        """)
+        rows = cur.fetchall()
+    by_profile: dict = {}
+    worst_age: float | None = None
+    for profile, last_ok, last_err, last_err_at in rows:
+        age = (now - last_ok).total_seconds() if last_ok else None
+        by_profile[profile] = {
+            "last_success_at": last_ok.isoformat() if last_ok else None,
+            "staleness_seconds": age,
+            "last_error": last_err,
+            "last_error_at": last_err_at.isoformat() if last_err_at else None,
+        }
+        if age is not None and (worst_age is None or age > worst_age):
+            worst_age = age
+    return {
+        "by_profile": by_profile,
+        "worst_staleness_seconds": worst_age,
+        "n_profiles": len(by_profile),
+    }
+
+
 # ---------------------------------------------------------------------------
 #  Alerting
 # ---------------------------------------------------------------------------
@@ -442,6 +472,41 @@ def evaluate_alerts(metrics: dict, thresholds: dict) -> list[dict]:
             "value": n_flips,
         })
 
+    # 6. fills_poller staleness (v2 B4)
+    fp = metrics.get("fills_poller_staleness", {})
+    max_stale = thresholds.get("max_fills_poller_staleness_sec", 300)
+    by_p = fp.get("by_profile") or {}
+    if not by_p:
+        alerts.append({
+            "metric": "fills_poller_staleness",
+            "severity": "high",
+            "message": "no advisory_chain_fills_poller_state rows found",
+        })
+    else:
+        for profile, info in by_p.items():
+            stale = info.get("staleness_seconds")
+            if stale is None:
+                alerts.append({
+                    "metric": "fills_poller_staleness",
+                    "severity": "high",
+                    "message": f"fills_poller[{profile}] never succeeded",
+                })
+            elif stale > max_stale:
+                alerts.append({
+                    "metric": "fills_poller_staleness",
+                    "severity": "high",
+                    "message": f"fills_poller[{profile}] last success "
+                               f"{stale:.0f}s ago > {max_stale:.0f}s",
+                    "value": stale,
+                })
+            if info.get("last_error"):
+                alerts.append({
+                    "metric": "fills_poller_staleness",
+                    "severity": "medium",
+                    "message": f"fills_poller[{profile}] last_error: "
+                               f"{(info['last_error'] or '')[:200]}",
+                })
+
     return alerts
 
 
@@ -457,6 +522,7 @@ def collect_all(window_hours: int) -> dict:
         "disputed_count": collect_disputed_count(),
         "settlement_state_flips": collect_state_flips(),
         "manual_trades_24h": collect_manual_trades_24h(),
+        "fills_poller_staleness": collect_fills_poller_staleness(),
     }
 
 
@@ -526,6 +592,8 @@ def main():
                         help="Threshold for disputed_count alert (default 0).")
     parser.add_argument("--max-state-flips-24h", type=int, default=0,
                         help="Threshold for settlement_state_flips alert (default 0).")
+    parser.add_argument("--max-fills-poller-staleness-sec", type=float, default=300,
+                        help="Threshold for advisory chain fills poller staleness (default 300s).")
     parser.add_argument("--alert-email", action="store_true",
                         help="Send SMTP email to config.TO_EMAIL when alerts fire "
                              "(R4). Dedup + cooldown via logs/.advisory_alert_state.json.")
@@ -542,6 +610,7 @@ def main():
         "max_settlement_missing": args.max_settlement_missing,
         "max_disputed": args.max_disputed,
         "max_state_flips_24h": args.max_state_flips_24h,
+        "max_fills_poller_staleness_sec": args.max_fills_poller_staleness_sec,
     }
 
     metrics = collect_all(args.batch_window_hours)
