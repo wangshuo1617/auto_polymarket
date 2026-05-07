@@ -10,7 +10,6 @@ TARGET_DIR="/etc/systemd/system"
 
 SERVICES=(
   auto-poly-btc-monitor
-  auto-poly-5m-trade
   auto-poly-app
   auto-poly-usdc-monitor
   auto-poly-recommendation-executor
