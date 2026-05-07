@@ -215,6 +215,51 @@ def _fetch_quotes(token_ids: list[str]) -> dict[str, TokenQuote]:
             for tid, v in raw.items()}
 
 
+def _fetch_positions_from_chain_fills(
+    token_ids: list[str],
+    quotes: dict[str, TokenQuote],
+) -> dict[str, TokenPosition]:
+    """聚合 advisory_chain_fills 的净 shares, 用 best_bid 估值得到 current_usdc.
+
+    - 只覆盖当前 universe 中的 token_id (历史持仓不污染本批次)
+    - shares ≤ 1e-9 视为已清仓, 不写入 (保持与 portfolio API 一致)
+    - 缺 best_bid 时用 0.5 兜底, 防止整列消失 (会标注 quote_missing)
+    """
+    if not token_ids:
+        return {}
+    from data.database import get_conn  # 避免顶层循环导入
+    out: dict[str, TokenPosition] = {}
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT token_id,
+                       SUM(CASE WHEN side='buy'  THEN size_shares ELSE 0 END) -
+                       SUM(CASE WHEN side='sell' THEN size_shares ELSE 0 END) AS net_shares
+                FROM advisory_chain_fills
+                WHERE token_id = ANY(%s)
+                GROUP BY token_id
+                """,
+                (list(token_ids),),
+            )
+            rows = cur.fetchall()
+    except Exception:
+        logger.exception("advisory_chain_fills aggregation failed; positions empty")
+        return {}
+    for tid, net in rows:
+        shares = float(net or 0.0)
+        if shares <= 1e-9:
+            continue
+        q = quotes.get(tid)
+        bid = (q.best_bid if q else None)
+        mark = bid if (bid is not None and bid > 0) else 0.5
+        out[tid] = TokenPosition(current_usdc=shares * mark, target_usdc=None)
+    logger.info("positions derived from chain_fills: %d (out of %d tokens)",
+                len(out), len(token_ids))
+    return out
+
+
 def _estimate_volatility_and_drift() -> tuple[float, str, float, str, float, float, str]:
     """Return (sigma_daily, sigma_source, drift_daily, drift_source,
     fallback_high_7d, fallback_low_7d, fallback_source).
@@ -286,6 +331,9 @@ def assemble_batch_inputs(slug: str, max_strikes: int = 6,
 
     quotes = _fetch_quotes(token_ids)
 
+    # 链上派生持仓 (advisory_chain_fills 净 shares × best_bid 估值)
+    positions = _fetch_positions_from_chain_fills(token_ids, quotes)
+
     # P2: pull active user thesis (if any) so it propagates into BatchInputs
     # and inputs_hash. Best-effort: any failure → no thesis, batch continues.
     thesis_text: Optional[str] = None
@@ -313,7 +361,7 @@ def assemble_batch_inputs(slug: str, max_strikes: int = 6,
         universe=universe,
         descriptors=descriptors,
         quotes=quotes,
-        positions={},
+        positions=positions,
         btc_tick=BtcTickState(
             source="binance_avgPrice",
             version="advisory-runner-v1",
