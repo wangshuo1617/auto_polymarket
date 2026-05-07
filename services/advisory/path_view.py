@@ -104,47 +104,54 @@ def _compute_one(
 
     strike = float(token.strike_usd)
     base.distance_pct = abs(strike - current_price) / current_price * 100.0
-    direction = "above" if token.side_above else "below"
 
-    # Step 0: path-to-date 短路 — 月度市场任意时刻触及即算 Yes
-    if direction == "above" and path_max >= strike:
+    # 关键: yes/no 是同一个 barrier 事件的互补结果.
+    # market_above = 该 condition 的 yes 视角下的方向 (i.e. yes token 的 side_above).
+    # 当前 token 若是 yes (outcome_index=0) → side_above 即为 market 方向;
+    # 若是 no (outcome_index=1) → side_above 已被 inputs.py 反向, 还原为 market 方向需取 not.
+    is_no_token = (token.outcome_index == 1)
+    market_above = (not token.side_above) if is_no_token else bool(token.side_above)
+    direction = "above" if market_above else "below"
+
+    # Step 0: path-to-date 短路 — yes 已触及 barrier, yes=1, no=0
+    yes_touched = (
+        (direction == "above" and path_max >= strike)
+        or (direction == "below" and path_min <= strike)
+    )
+    if yes_touched:
         base.p_touch_to_date = True
-        base.fair_raw = 1.0
-        base.fair_wick_adjusted = 1.0
-        base.fair_calibrated = 1.0
-        base.note = "touched_to_date"
-        return base
-    if direction == "below" and path_min <= strike:
-        base.p_touch_to_date = True
-        base.fair_raw = 1.0
-        base.fair_wick_adjusted = 1.0
-        base.fair_calibrated = 1.0
-        base.note = "touched_to_date"
+        p_yes = 1.0
+        fair = 0.0 if is_no_token else 1.0
+        base.fair_raw = fair
+        base.fair_wick_adjusted = fair
+        base.fair_calibrated = fair
+        base.note = "touched_to_date" + ("_no_loser" if is_no_token else "")
         return base
 
-    # Step 1: GBM barrier touch (复用 profit_optimizer)
-    fair_raw = _barrier_touch_prob(
+    # Step 1: GBM barrier touch (yes 视角)
+    p_yes_raw = _barrier_touch_prob(
         current_price, strike, direction, drift_daily, sigma_daily, days_left,
         sigma_is_iv=sigma_is_iv,
     )
-    base.fair_raw = fair_raw
+    base.fair_raw = (1.0 - p_yes_raw) if is_no_token else p_yes_raw
 
-    # Step 3: wick adjustment — 在 strike 上加/减 buffer 重算, 取较保守 (低估) 值
+    # Step 3: wick adjustment — yes 视角下的保守值
     if wick_buffer_pct > 0:
         if direction == "above":
             adj_strike = strike * (1.0 + wick_buffer_pct)
         else:
             adj_strike = strike * (1.0 - wick_buffer_pct)
-        fair_wick = _barrier_touch_prob(
+        p_yes_wick = _barrier_touch_prob(
             current_price, adj_strike, direction, drift_daily, sigma_daily, days_left,
             sigma_is_iv=sigma_is_iv,
         )
-        base.fair_wick_adjusted = fair_wick
     else:
-        base.fair_wick_adjusted = fair_raw
+        p_yes_wick = p_yes_raw
+    base.fair_wick_adjusted = (1.0 - p_yes_wick) if is_no_token else p_yes_wick
 
-    # 校准 (calibration bias correction)
-    base.fair_calibrated = _calibrate_p_yes(base.fair_wick_adjusted, base.distance_pct)
+    # 校准 (calibration bias correction) — calibrator 输入是 p_yes, 然后再翻转
+    p_yes_cal = _calibrate_p_yes(p_yes_wick, base.distance_pct)
+    base.fair_calibrated = (1.0 - p_yes_cal) if is_no_token else p_yes_cal
     return base
 
 
