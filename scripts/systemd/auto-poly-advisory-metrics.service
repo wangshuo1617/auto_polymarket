@@ -1,0 +1,13 @@
+[Unit]
+Description=Auto Polymarket - Advisory Metrics + Alert Email (R4)
+After=auto-poly-advisory-batch.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/auto_polymarket
+EnvironmentFile=-/root/auto_polymarket/.env
+Environment=LD_PRELOAD=
+# 阈值可以通过 .env 覆盖 (Environment 不支持引号转义复杂值, 故走 .env)
+ExecStart=/usr/bin/env uv run scripts/advisory_metrics.py --check --alert-email
+# exit 2 (有告警) 不算 systemd 失败 — 邮件已发, 下次 timer 再跑
+SuccessExitStatus=0 2

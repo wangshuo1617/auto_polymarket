@@ -1,0 +1,23 @@
+[Unit]
+Description=Auto Polymarket - Advisory Settlement Refresher (R2)
+After=network-online.target
+Wants=network-online.target
+
+StartLimitIntervalSec=300
+StartLimitBurst=5
+[Service]
+Type=exec
+WorkingDirectory=/root/auto_polymarket
+EnvironmentFile=-/root/auto_polymarket/.env
+Environment=POLYMARKET_PROFILE=analyze
+Environment=FOREGROUND=1
+Environment=LD_PRELOAD=
+ExecStart=/bin/bash scripts/restart_advisory_settlement.sh
+Restart=on-failure
+RestartSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

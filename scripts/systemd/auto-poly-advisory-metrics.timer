@@ -1,0 +1,11 @@
+[Unit]
+Description=Auto Polymarket - Advisory Metrics Timer (every 5min)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Unit=auto-poly-advisory-metrics.service
+
+[Install]
+WantedBy=timers.target

@@ -14,14 +14,18 @@ SERVICES=(
   auto-poly-app
   auto-poly-usdc-monitor
   auto-poly-recommendation-executor
+  auto-poly-advisory-batch
+  auto-poly-advisory-settlement
 )
 
 EXTRA_UNITS=(
   auto-poly-btc-monitor-freshness.service
+  auto-poly-advisory-metrics.service
 )
 
 TIMERS=(
   auto-poly-btc-monitor-freshness.timer
+  auto-poly-advisory-metrics.timer
 )
 
 echo "=========================================="
