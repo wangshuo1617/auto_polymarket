@@ -62,6 +62,7 @@ class BatchInputs:
     as_of_utc: Optional[datetime] = None
     user_thesis_text: Optional[str] = None
     user_thesis_id: Optional[int] = None
+    total_net_value_usdc: Optional[float] = None  # wallet USDC + 全部活跃持仓 mark
 
 
 def select_current_month_slug() -> str:
@@ -215,20 +216,25 @@ def _fetch_quotes(token_ids: list[str]) -> dict[str, TokenQuote]:
             for tid, v in raw.items()}
 
 
-def _fetch_positions_from_chain_fills(
+def _fetch_positions_and_net_value(
     token_ids: list[str],
     quotes: dict[str, TokenQuote],
-) -> dict[str, TokenPosition]:
+) -> tuple[dict[str, TokenPosition], Optional[float]]:
     """聚合 advisory_chain_fills 的净 shares, 用 best_bid 估值得到 current_usdc.
 
-    - 只覆盖当前 universe 中的 token_id (历史持仓不污染本批次)
-    - shares ≤ 1e-9 视为已清仓, 不写入 (保持与 portfolio API 一致)
-    - 缺 best_bid 时用 0.5 兜底, 防止整列消失 (会标注 quote_missing)
+    返回 (positions_map_for_universe, total_net_value_usdc).
+
+    - positions: 仅本批 universe 内的 token (避免污染 batch view)
+    - total_net_value: wallet USDC 余额 + **全部** 活跃链上持仓 mark
+      (universe 外的也算入, 用于 Kelly sizing 的 net_value 基数)
     """
     if not token_ids:
-        return {}
+        return {}, None
     from data.database import get_conn  # 避免顶层循环导入
-    out: dict[str, TokenPosition] = {}
+    universe_set = set(token_ids)
+    positions: dict[str, TokenPosition] = {}
+    all_active: list[tuple[str, float]] = []  # (token_id, net_shares)
+
     try:
         with get_conn() as conn:
             cur = conn.cursor()
@@ -238,26 +244,55 @@ def _fetch_positions_from_chain_fills(
                        SUM(CASE WHEN side='buy'  THEN size_shares ELSE 0 END) -
                        SUM(CASE WHEN side='sell' THEN size_shares ELSE 0 END) AS net_shares
                 FROM advisory_chain_fills
-                WHERE token_id = ANY(%s)
                 GROUP BY token_id
                 """,
-                (list(token_ids),),
             )
-            rows = cur.fetchall()
+            for tid, net in cur.fetchall():
+                shares = float(net or 0.0)
+                if shares > 1e-9:
+                    all_active.append((tid, shares))
     except Exception:
         logger.exception("advisory_chain_fills aggregation failed; positions empty")
-        return {}
-    for tid, net in rows:
-        shares = float(net or 0.0)
-        if shares <= 1e-9:
-            continue
-        q = quotes.get(tid)
-        bid = (q.best_bid if q else None)
+        return {}, None
+
+    # 取 universe 外活跃 token 的 best_bid (额外一次 CLOB call)
+    extra_ids = [tid for tid, _ in all_active if tid not in universe_set]
+    extra_quotes: dict[str, dict] = {}
+    if extra_ids:
+        try:
+            from data.polymarket import get_best_prices as _gbp
+            extra_quotes = _gbp(extra_ids, profile="analyze") or {}
+        except Exception:
+            logger.exception("extra-universe quotes fetch failed; mark with 0.5")
+
+    total_mark = 0.0
+    for tid, shares in all_active:
+        if tid in universe_set:
+            q = quotes.get(tid)
+            bid = q.best_bid if q else None
+        else:
+            bid = (extra_quotes.get(tid) or {}).get("best_bid")
         mark = bid if (bid is not None and bid > 0) else 0.5
-        out[tid] = TokenPosition(current_usdc=shares * mark, target_usdc=None)
-    logger.info("positions derived from chain_fills: %d (out of %d tokens)",
-                len(out), len(token_ids))
-    return out
+        usd = shares * mark
+        total_mark += usd
+        if tid in universe_set:
+            positions[tid] = TokenPosition(current_usdc=usd, target_usdc=None)
+
+    # wallet USDC 余额 (analyze profile)
+    wallet_usdc: float = 0.0
+    try:
+        from data.polymarket import get_balance_allowance
+        raw = get_balance_allowance(profile="analyze")
+        wallet_usdc = float(str(raw).replace("$", "").replace(",", "").strip() or 0.0)
+    except Exception:
+        logger.exception("get_balance_allowance failed; wallet usdc=0")
+
+    total_net_value = wallet_usdc + total_mark
+    logger.info(
+        "positions: universe=%d active=%d wallet_usdc=%.2f total_mark=%.2f net_value=%.2f",
+        len(positions), len(all_active), wallet_usdc, total_mark, total_net_value,
+    )
+    return positions, total_net_value
 
 
 def _estimate_volatility_and_drift() -> tuple[float, str, float, str, float, float, str]:
@@ -331,8 +366,8 @@ def assemble_batch_inputs(slug: str, max_strikes: int = 6,
 
     quotes = _fetch_quotes(token_ids)
 
-    # 链上派生持仓 (advisory_chain_fills 净 shares × best_bid 估值)
-    positions = _fetch_positions_from_chain_fills(token_ids, quotes)
+    # 链上派生持仓 + 总净值 (用于 Kelly sizing)
+    positions, total_net_value = _fetch_positions_and_net_value(token_ids, quotes)
 
     # P2: pull active user thesis (if any) so it propagates into BatchInputs
     # and inputs_hash. Best-effort: any failure → no thesis, batch continues.
@@ -370,4 +405,5 @@ def assemble_batch_inputs(slug: str, max_strikes: int = 6,
         as_of_utc=now_utc,
         user_thesis_text=thesis_text,
         user_thesis_id=thesis_id,
+        total_net_value_usdc=total_net_value,
     )

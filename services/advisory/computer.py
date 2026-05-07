@@ -79,6 +79,7 @@ def _compute_one_view(
     position: TokenPosition,
     days_left: float,
     inputs_hash: str,
+    total_net_value_usdc: Optional[float] = None,
 ) -> MarketView:
     halt = state.halt_reason
     fvs = state.fair_value_status
@@ -124,9 +125,26 @@ def _compute_one_view(
             apr = (fair_value / quote.best_ask - 1.0) * 365.0 / days_left
         ranking = edge_buy
 
+    # Kelly target (quarter-Kelly + 20% net-value cap).
+    # 仅当 fair / ask 都可用 + 未 halt + edge > 0 + total_net_value 可知时计算.
+    # 不会写到 position.target_usdc (避免污染 input dataclass), 直接进入 payload.
+    target_usdc: Optional[float] = position.target_usdc
+    if (
+        target_usdc is None
+        and total_net_value_usdc is not None and total_net_value_usdc > 0
+        and fair_value is not None and 0.0 < fair_value < 1.0
+        and quote.best_ask is not None and 0.0 < quote.best_ask < 1.0
+        and edge_buy is not None and edge_buy > 0
+    ):
+        # Kelly = (p − price) / (1 − price); quarter-Kelly + 20% cap
+        kelly = max(0.0, (fair_value - quote.best_ask) / max(1e-6, 1.0 - quote.best_ask))
+        fractional = 0.25 * kelly
+        target_usdc = round(min(total_net_value_usdc * 0.20,
+                                total_net_value_usdc * fractional), 2)
+
     delta_usdc = None
-    if position.target_usdc is not None and position.current_usdc is not None:
-        delta_usdc = position.target_usdc - position.current_usdc
+    if target_usdc is not None and position.current_usdc is not None:
+        delta_usdc = target_usdc - position.current_usdc
 
     payload = {
         "token_id": token.token_id,
@@ -146,7 +164,7 @@ def _compute_one_view(
         "edge_buy_active": edge_buy,
         "expected_apr_by_intent": apr,
         "ranking_score": ranking,
-        "target_position_usdc": position.target_usdc,
+        "target_position_usdc": target_usdc,
         "current_position_usdc": position.current_usdc,
         "delta_usdc": delta_usdc,
         "path_view_fair_raw": fair.fair_raw if fair else None,
@@ -166,7 +184,7 @@ def _compute_one_view(
         edge_buy_active=edge_buy,
         expected_apr_by_intent=apr,
         ranking_score=ranking,
-        target_position_usdc=position.target_usdc,
+        target_position_usdc=target_usdc,
         current_position_usdc=position.current_usdc,
         delta_usdc=delta_usdc,
         view_payload=payload,
@@ -287,6 +305,7 @@ def run_advisory_batch(
     days_left: float,
     quotes: dict[str, TokenQuote],
     positions: dict[str, TokenPosition],
+    total_net_value_usdc: Optional[float] = None,
     risk_config_version: str = "advisory-mvp-v1",
     drift_daily: float = 0.0,
     input_quote_snapshot_id: Optional[int] = None,
@@ -376,7 +395,8 @@ def run_advisory_batch(
             fair = path_view.per_token_fair.get(tok.token_id)
             quote = quotes.get(tok.token_id, TokenQuote())
             pos = positions.get(tok.token_id, TokenPosition())
-            views.append(_compute_one_view(tok, state, fair, quote, pos, days_left, inputs_hash))
+            views.append(_compute_one_view(tok, state, fair, quote, pos, days_left, inputs_hash,
+                                           total_net_value_usdc=total_net_value_usdc))
 
         # step 1+2+3+4 in single transaction
         with get_conn() as conn:

@@ -124,6 +124,7 @@ def _run_one(slug: str, max_strikes: int) -> dict:
         days_left=inputs.days_left,
         quotes=inputs.quotes,
         positions=inputs.positions,
+        total_net_value_usdc=inputs.total_net_value_usdc,
         as_of_utc=inputs.as_of_utc,
         user_thesis_id=inputs.user_thesis_id,
     )
