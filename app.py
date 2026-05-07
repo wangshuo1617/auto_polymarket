@@ -65,10 +65,13 @@ app.secret_key = os.getenv("DASHBOARD_SECRET_KEY") or secrets.token_hex(32)
 try:
     from services.advisory.dashboard import advisory_bp
     app.register_blueprint(advisory_bp)
+    from services.advisory.manual_trade_writer import auto_record_manual_trade as _advisory_auto_record
 except Exception as _adv_exc:  # pragma: no cover - defensive
     logging.getLogger(__name__).warning(
         "advisory blueprint not registered: %s", _adv_exc
     )
+    def _advisory_auto_record(**_kwargs):  # type: ignore[no-redef]
+        return None
 
 # 第五轮加固 #1：默认不信任 X-Forwarded-For（任何外部用户都能伪造该 header 污染 audit 字段）。
 # 部署在可信反向代理后时，运维需显式设置 DASHBOARD_TRUST_PROXY=1。
@@ -865,6 +868,13 @@ def api_buy():
                                  recommendation_item_id, order_id)
                 recommendation_sync_error = str(rec_err)
         logger.info("api_buy success: order_id=%s", order_id)
+        # Advisory P2-bonus: best-effort mirror to manual_trades. Skips
+        # silently if token has no advisory snapshot. Never raises.
+        _advisory_auto_record(
+            token_id=token_id, side="buy",
+            price=float(price), size_shares=float(size),
+            user_note=f"dashboard order_id={order_id}",
+        )
         resp = {'order_id': order_id}
         if recommendation_sync_error:
             resp['recommendation_sync_error'] = recommendation_sync_error
@@ -968,6 +978,11 @@ def api_sell():
                                  recommendation_item_id, order_id)
                 recommendation_sync_error = str(rec_err)
         logger.info("api_sell success: order_id=%s", order_id)
+        _advisory_auto_record(
+            token_id=token_id, side="sell",
+            price=float(price), size_shares=float(size),
+            user_note=f"dashboard order_id={order_id}",
+        )
         resp = {'order_id': order_id}
         if recommendation_sync_error:
             resp['recommendation_sync_error'] = recommendation_sync_error
