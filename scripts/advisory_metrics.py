@@ -22,6 +22,9 @@ Advisory metrics + alerts (A6).
     LD_PRELOAD="" uv run scripts/advisory_metrics.py --json
     LD_PRELOAD="" uv run scripts/advisory_metrics.py --check
         # 任一阈值超限则 exit code 2; --json 模式同时输出 alerts 数组
+    LD_PRELOAD="" uv run scripts/advisory_metrics.py --check --alert-email
+        # 同上, 且若有告警则向 config.TO_EMAIL 发送一封 SMTP 邮件
+        # (带去重 + 冷却, 状态文件 logs/.advisory_alert_state.json)
 
 阈值 (CLI 可覆盖):
 - --max-batch-freshness-sec      默认 600 (10 min, dashboard staleness 5 min 的 2x)
@@ -51,6 +54,130 @@ if _PROJECT_ROOT not in sys.path:
 from data.database import get_conn  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+#  Email alert bridge (R4) — dedup + cooldown
+# ---------------------------------------------------------------------------
+
+ALERT_STATE_PATH = os.path.join("logs", ".advisory_alert_state.json")
+
+
+def _alert_fingerprint(alerts: list[dict]) -> str:
+    key = sorted((a.get("metric"), a.get("severity")) for a in alerts)
+    return json.dumps(key, sort_keys=True)
+
+
+def _load_alert_state() -> dict:
+    try:
+        with open(ALERT_STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_alert_state(state: dict) -> None:
+    os.makedirs(os.path.dirname(ALERT_STATE_PATH) or ".", exist_ok=True)
+    tmp = ALERT_STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, default=str)
+    os.replace(tmp, ALERT_STATE_PATH)
+
+
+def _format_alert_email(alerts: list[dict], metrics: dict) -> tuple[str, str]:
+    """Return (subject, plain_text_body) for the alert email."""
+    severities = sorted({a.get("severity", "warn").upper() for a in alerts})
+    subject = f"[advisory-alert] {len(alerts)} alert(s) " + "/".join(severities)
+
+    lines = [
+        "Advisory pipeline alerts fired:",
+        "",
+    ]
+    for a in alerts:
+        lines.append(f"  [{a.get('severity', 'warn').upper():<8}] "
+                     f"{a.get('metric')}: {a.get('message')}")
+    lines.append("")
+    lines.append("--- Snapshot metrics ---")
+    bf = metrics.get("batch_freshness", {})
+    sc = metrics.get("settlement_coverage", {})
+    bfr = metrics.get("batch_failure_rate", {})
+    lines.append(
+        f"batch_freshness: id={bf.get('latest_batch_id')} "
+        f"age={bf.get('age_seconds')}s status={bf.get('status')}"
+    )
+    lines.append(
+        f"settlement_coverage: version={sc.get('version')} "
+        f"status={sc.get('refresh_status')} missing={sc.get('missing_condition_count')}"
+    )
+    lines.append(
+        f"batch_failure_rate: window={bfr.get('window_hours')}h "
+        f"rate={bfr.get('failure_rate')} total={bfr.get('total_count')}"
+    )
+    lines.append("")
+    lines.append(f"generated_at_utc: {datetime.now(timezone.utc).isoformat()}")
+    return subject, "\n".join(lines)
+
+
+def maybe_send_alert_email(alerts: list[dict], metrics: dict,
+                           cooldown_seconds: float = 3600.0,
+                           dry_run: bool = False) -> dict:
+    """If alerts exist and (fingerprint changed OR cooldown elapsed), send email.
+
+    Returns a status dict describing what happened (sent / skipped / failed).
+    Persists state in `logs/.advisory_alert_state.json` so repeat cron runs
+    don't spam the inbox.
+    """
+    if not alerts:
+        # clear last fingerprint so next alert (even same as before) is treated as fresh
+        state = _load_alert_state()
+        if state.get("last_fingerprint"):
+            state["last_clear_at_utc"] = datetime.now(timezone.utc).isoformat()
+            state["last_fingerprint"] = None
+            _save_alert_state(state)
+        return {"action": "none", "reason": "no alerts"}
+
+    state = _load_alert_state()
+    fp = _alert_fingerprint(alerts)
+    last_fp = state.get("last_fingerprint")
+    last_sent_iso = state.get("last_sent_at_utc")
+
+    if last_fp == fp and last_sent_iso:
+        try:
+            last_sent = datetime.fromisoformat(last_sent_iso)
+            age = (datetime.now(timezone.utc) - last_sent).total_seconds()
+            if age < cooldown_seconds:
+                return {
+                    "action": "skipped",
+                    "reason": f"same fingerprint within cooldown ({age:.0f}s < {cooldown_seconds:.0f}s)",
+                    "fingerprint": fp,
+                }
+        except ValueError:
+            pass
+
+    subject, body = _format_alert_email(alerts, metrics)
+
+    if dry_run:
+        return {"action": "dry_run", "subject": subject, "body_preview": body[:200]}
+
+    try:
+        from notifications.email import EmailSender  # local import: avoid hard dep when unused
+        from config import TO_EMAIL
+        if not TO_EMAIL:
+            return {"action": "failed", "reason": "TO_EMAIL not configured"}
+        sender = EmailSender()
+        ok = sender.send_email(TO_EMAIL, subject, body, content_type="plain")
+    except Exception as exc:
+        logger.exception("alert email send raised")
+        return {"action": "failed", "reason": f"exception: {exc}"}
+
+    if not ok:
+        return {"action": "failed", "reason": "EmailSender.send_email returned False"}
+
+    state["last_fingerprint"] = fp
+    state["last_sent_at_utc"] = datetime.now(timezone.utc).isoformat()
+    state["last_alert_count"] = len(alerts)
+    _save_alert_state(state)
+    return {"action": "sent", "subject": subject, "fingerprint": fp}
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +526,14 @@ def main():
                         help="Threshold for disputed_count alert (default 0).")
     parser.add_argument("--max-state-flips-24h", type=int, default=0,
                         help="Threshold for settlement_state_flips alert (default 0).")
+    parser.add_argument("--alert-email", action="store_true",
+                        help="Send SMTP email to config.TO_EMAIL when alerts fire "
+                             "(R4). Dedup + cooldown via logs/.advisory_alert_state.json.")
+    parser.add_argument("--alert-cooldown-sec", type=float, default=3600.0,
+                        help="Suppress repeat emails for the same alert fingerprint "
+                             "within this window (default 3600s = 1h).")
+    parser.add_argument("--alert-email-dry-run", action="store_true",
+                        help="With --alert-email, format the email but don't send.")
     args = parser.parse_args()
 
     thresholds = {
@@ -413,14 +548,30 @@ def main():
     alerts = evaluate_alerts(metrics, thresholds)
 
     if args.json:
-        print(json.dumps({
+        out = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "thresholds": thresholds,
             "metrics": metrics,
             "alerts": alerts,
-        }, indent=2, default=str))
+        }
     else:
         _print_text(metrics, alerts)
+        out = None
+
+    if args.alert_email:
+        email_status = maybe_send_alert_email(
+            alerts, metrics,
+            cooldown_seconds=args.alert_cooldown_sec,
+            dry_run=args.alert_email_dry_run,
+        )
+        if args.json:
+            out["alert_email"] = email_status  # type: ignore[index]
+        else:
+            print(f"alert_email: {email_status['action']} "
+                  f"({email_status.get('reason') or email_status.get('subject') or ''})")
+
+    if args.json:
+        print(json.dumps(out, indent=2, default=str))
 
     return 2 if (args.check and alerts) else 0
 
