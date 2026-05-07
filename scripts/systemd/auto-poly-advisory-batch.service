@@ -12,6 +12,7 @@ EnvironmentFile=-/root/auto_polymarket/.env
 Environment=POLYMARKET_PROFILE=analyze
 Environment=FOREGROUND=1
 Environment=LD_PRELOAD=
+Environment=ADVISORY_BATCH_INTERVAL=3600
 ExecStart=/bin/bash scripts/restart_advisory_batch.sh
 Restart=on-failure
 RestartSec=60

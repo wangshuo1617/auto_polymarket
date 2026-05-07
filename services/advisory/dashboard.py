@@ -33,8 +33,8 @@ logger = logging.getLogger(__name__)
 
 advisory_bp = Blueprint("advisory", __name__)
 
-# 推荐数据 staleness 阈值 (5 分钟内的 batch 才展示, 超过显示 "数据陈旧" 横幅)
-STALENESS_THRESHOLD = timedelta(minutes=5)
+# 推荐数据 staleness 阈值 (advisory batch 每小时跑一次, 留 10min slack → 70min)
+STALENESS_THRESHOLD = timedelta(minutes=70)
 
 
 # ---------------------------------------------------------------------------
