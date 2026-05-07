@@ -1,0 +1,12 @@
+[Unit]
+Description=Auto Polymarket - Advisory Edge-Flip Alerts Timer (every 5min)
+
+[Timer]
+# 5min 跑一次: fair 仍是 hourly batch 输出, 但 ask 5min 重取, 用于及时发现 ask 上抬吃掉 edge 的情况
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=auto-poly-advisory-edge-alerts.service
+
+[Install]
+WantedBy=timers.target
