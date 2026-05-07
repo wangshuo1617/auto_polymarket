@@ -55,6 +55,20 @@
 
   <div id="content"></div>
 
+  <h1 style="margin-top: 32px;">Calibration (per 6h job)</h1>
+  <div class="meta" id="calib-meta">加载中…</div>
+  <div id="calib-latest" style="margin-bottom: 12px;"></div>
+  <table id="calib-table" style="width:100%;border-collapse:collapse;font-size:12px;">
+    <thead><tr style="background:#f5f5f5;">
+      <th style="padding:6px;border:1px solid #ddd;text-align:left;">run_at (UTC)</th>
+      <th style="padding:6px;border:1px solid #ddd;">N snapshots</th>
+      <th style="padding:6px;border:1px solid #ddd;">Brier</th>
+      <th style="padding:6px;border:1px solid #ddd;">N trades</th>
+      <th style="padding:6px;border:1px solid #ddd;">PnL (USDC)</th>
+    </tr></thead>
+    <tbody id="calib-body"></tbody>
+  </table>
+
   <h1 style="margin-top: 32px;">My Thesis (BTC 走势自由文本判断)</h1>
   <div class="meta" id="thesis-meta">加载中…</div>
   <div id="thesis-current" style="margin-bottom: 12px;"></div>
@@ -412,6 +426,46 @@ async function clearThesis() {
 
 loadThesis();
 setInterval(loadThesis, 60000);
+
+// --- Calibration history (P3) ---
+async function loadCalibration() {
+  try {
+    const r = await fetch('/api/advisory/calibration?limit=20');
+    const j = await r.json();
+    const meta = document.getElementById('calib-meta');
+    const latest = document.getElementById('calib-latest');
+    const body = document.getElementById('calib-body');
+    if (!r.ok) { meta.textContent = '错误: ' + (j.error || r.status); return; }
+    meta.textContent = `共 ${j.count} 次 run (timer 每 6h)`;
+    if (j.runs.length === 0) {
+      latest.innerHTML = '<em>暂无 calibration run; timer 启动后 ~10min 出现首条</em>';
+      body.innerHTML = '';
+      return;
+    }
+    const head = j.runs[0];
+    const buckets = (head.calibration && head.calibration.buckets) || [];
+    const bucketRows = buckets.map(b => `<tr><td style="padding:3px 6px;border:1px solid #eee;">${b.bucket}</td><td style="padding:3px 6px;border:1px solid #eee;text-align:right;">${b.n}</td><td style="padding:3px 6px;border:1px solid #eee;text-align:right;">${b.mean_predicted}</td><td style="padding:3px 6px;border:1px solid #eee;text-align:right;">${b.mean_realized}</td><td style="padding:3px 6px;border:1px solid #eee;text-align:right;color:${b.calibration_gap >= 0 ? '#2e7d32' : '#c62828'};">${b.calibration_gap >= 0 ? '+' : ''}${b.calibration_gap}</td></tr>`).join('');
+    latest.innerHTML = `<div style="background:#f5f5f5;padding:10px 12px;border-left:3px solid #1976d2;">
+      <strong>最新 run #${head.id}</strong> @ ${head.run_at}<br>
+      Brier=${head.brier !== null ? head.brier.toFixed(4) : '—'} · N=${head.n_snapshots} · Trades=${head.n_trades_settled}/${head.n_trades} settled · PnL=${head.total_pnl_usdc !== null ? head.total_pnl_usdc.toFixed(2) : '—'}
+      <table style="width:100%;margin-top:8px;border-collapse:collapse;font-size:11px;">
+        <thead><tr style="background:#eee;"><th style="padding:3px 6px;border:1px solid #ddd;">bucket</th><th>N</th><th>predicted</th><th>realized</th><th>gap</th></tr></thead>
+        <tbody>${bucketRows || '<tr><td colspan=5><em>无桶数据</em></td></tr>'}</tbody>
+      </table></div>`;
+    body.innerHTML = j.runs.map(run => `<tr>
+      <td style="padding:4px 6px;border:1px solid #eee;">${run.run_at}</td>
+      <td style="padding:4px 6px;border:1px solid #eee;text-align:right;">${run.n_snapshots}</td>
+      <td style="padding:4px 6px;border:1px solid #eee;text-align:right;">${run.brier !== null ? run.brier.toFixed(4) : '—'}</td>
+      <td style="padding:4px 6px;border:1px solid #eee;text-align:right;">${run.n_trades_settled}/${run.n_trades}</td>
+      <td style="padding:4px 6px;border:1px solid #eee;text-align:right;color:${(run.total_pnl_usdc || 0) >= 0 ? '#2e7d32' : '#c62828'};">${run.total_pnl_usdc !== null ? run.total_pnl_usdc.toFixed(2) : '—'}</td>
+    </tr>`).join('');
+  } catch (e) {
+    document.getElementById('calib-meta').textContent = '网络错误: ' + e;
+  }
+}
+
+loadCalibration();
+setInterval(loadCalibration, 300000);  // 5min
 </script>
 </body>
 </html>

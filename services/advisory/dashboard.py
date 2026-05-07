@@ -453,3 +453,47 @@ def api_user_thesis_clear():
         logger.exception("clear_active_thesis failed")
         return jsonify({"error": str(exc)}), 500
     return jsonify({"cleared": n})
+
+
+# ---------------------------------------------------------------------------
+#  Calibration history (P3) — 由 systemd timer 每 6h 写入 advisory_calibration_runs
+# ---------------------------------------------------------------------------
+
+@advisory_bp.route("/api/advisory/calibration", methods=["GET"])
+def api_calibration_runs():
+    try:
+        limit = int(request.args.get("limit", 20))
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 200))
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, run_at, since_utc, n_snapshots, brier,
+                       n_trades, n_trades_settled, total_pnl_usdc,
+                       calibration_json, trades_json
+                FROM advisory_calibration_runs
+                ORDER BY run_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        logger.exception("calibration runs query failed")
+        return jsonify({"error": str(exc)}), 500
+    runs = [{
+        "id": int(r[0]),
+        "run_at": r[1].astimezone(timezone.utc).isoformat() if r[1] else None,
+        "since_utc": r[2].astimezone(timezone.utc).isoformat() if r[2] else None,
+        "n_snapshots": int(r[3] or 0),
+        "brier": float(r[4]) if r[4] is not None else None,
+        "n_trades": int(r[5] or 0),
+        "n_trades_settled": int(r[6] or 0),
+        "total_pnl_usdc": float(r[7]) if r[7] is not None else None,
+        "calibration": r[8],
+        "trades": r[9],
+    } for r in rows]
+    return jsonify({"runs": runs, "count": len(runs)})

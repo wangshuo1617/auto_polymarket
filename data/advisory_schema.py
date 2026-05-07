@@ -331,6 +331,24 @@ CREATE INDEX IF NOT EXISTS advisory_user_theses_active_idx
 """
 
 
+_DDL_CALIBRATION_RUNS = """
+CREATE TABLE IF NOT EXISTS advisory_calibration_runs (
+    id              BIGSERIAL PRIMARY KEY,
+    run_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    since_utc       TIMESTAMPTZ,
+    n_snapshots     INTEGER NOT NULL DEFAULT 0,
+    brier           DOUBLE PRECISION,
+    n_trades        INTEGER NOT NULL DEFAULT 0,
+    n_trades_settled INTEGER NOT NULL DEFAULT 0,
+    total_pnl_usdc  DOUBLE PRECISION,
+    calibration_json JSONB NOT NULL,
+    trades_json     JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS advisory_calibration_runs_run_at_idx
+    ON advisory_calibration_runs (run_at DESC);
+"""
+
+
 _DDL_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("path_observation_snapshots", _DDL_PATH_OBSERVATION_SNAPSHOTS),
     ("settlement_feed_versions", _DDL_SETTLEMENT_FEED_VERSIONS),
@@ -343,6 +361,7 @@ _DDL_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("manual_trades", _DDL_MANUAL_TRADES),
     ("manual_trades_trigger", _DDL_MANUAL_TRADES_TRIGGER),
     ("advisory_user_theses", _DDL_USER_THESES),
+    ("advisory_calibration_runs", _DDL_CALIBRATION_RUNS),
 )
 
 

@@ -21,11 +21,13 @@ SERVICES=(
 EXTRA_UNITS=(
   auto-poly-btc-monitor-freshness.service
   auto-poly-advisory-metrics.service
+  auto-poly-advisory-calibration.service
 )
 
 TIMERS=(
   auto-poly-btc-monitor-freshness.timer
   auto-poly-advisory-metrics.timer
+  auto-poly-advisory-calibration.timer
 )
 
 echo "=========================================="

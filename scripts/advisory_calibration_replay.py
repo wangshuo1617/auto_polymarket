@@ -262,6 +262,34 @@ def trade_summary(trades: list[TradeReplay]) -> dict:
 # ---------- CLI ----------
 
 
+def _persist_run(since: Optional[datetime], snap_summary: dict, trade_sum: dict) -> int:
+    """写入 advisory_calibration_runs, 返回 row id."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO advisory_calibration_runs
+                (since_utc, n_snapshots, brier, n_trades, n_trades_settled,
+                 total_pnl_usdc, calibration_json, trades_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+            RETURNING id
+            """,
+            (
+                since,
+                snap_summary.get("n", 0),
+                snap_summary.get("brier"),
+                trade_sum.get("n", 0),
+                trade_sum.get("n_settled", 0),
+                trade_sum.get("total_pnl_usdc"),
+                json.dumps(snap_summary, default=str),
+                json.dumps(trade_sum, default=str),
+            ),
+        )
+        rid = cur.fetchone()[0]
+        conn.commit()
+        return int(rid)
+
+
 def _parse_since(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
@@ -314,6 +342,8 @@ def main():
                         help="Emit JSON summary instead of text table.")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-trade detail (text mode only).")
+    parser.add_argument("--persist", action="store_true",
+                        help="Persist run summary into advisory_calibration_runs.")
     args = parser.parse_args()
 
     since = _parse_since(args.since)
@@ -322,6 +352,9 @@ def main():
 
     snap_summary = calibration_summary(snapshots)
     trade_sum = trade_summary(trades)
+
+    if args.persist:
+        _persist_run(since, snap_summary, trade_sum)
 
     if args.json:
         print(json.dumps({
