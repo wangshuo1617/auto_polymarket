@@ -1,0 +1,10 @@
+[Unit]
+Description=Auto Polymarket - Advisory Chain Fills Poller (v2 B1, oneshot)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/auto_polymarket
+EnvironmentFile=-/root/auto_polymarket/.env
+Environment=LD_PRELOAD=
+ExecStart=/usr/bin/env uv run scripts/advisory_chain_fills_poll.py --quiet
+SuccessExitStatus=0
