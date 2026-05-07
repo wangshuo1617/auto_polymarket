@@ -46,7 +46,7 @@ if _PROJECT_ROOT not in sys.path:
 from services.advisory.computer import run_advisory_batch  # noqa: E402
 from services.advisory.inputs import (  # noqa: E402
     assemble_batch_inputs,
-    select_current_month_slug,
+    select_active_month_slug,
 )
 
 logger = logging.getLogger("advisory_batch_runner")
@@ -158,7 +158,8 @@ def _interruptible_sleep(seconds: float, state: RunnerState) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Advisory batch runner (R1, systemd-friendly)")
     parser.add_argument("--slug", default=None,
-                        help="Polymarket event slug; default = current month BTC event")
+                        help="Polymarket event slug; default = active month BTC event "
+                             "(auto-rolls forward at month end via select_active_month_slug)")
     parser.add_argument("--interval", type=float, default=300.0,
                         help="Seconds between successful iterations (default 300 = 5min)")
     parser.add_argument("--max-strikes", type=int, default=6,
@@ -178,7 +179,7 @@ def main():
                 args.interval, args.max_strikes, args.once)
 
     while not state.stop:
-        slug = args.slug or select_current_month_slug()
+        slug = args.slug or select_active_month_slug()
         state.iterations += 1
         t0 = time.monotonic()
         try:

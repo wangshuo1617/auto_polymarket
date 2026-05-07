@@ -48,7 +48,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from services.advisory.inputs import (  # noqa: E402
     fetch_descriptors,
-    select_current_month_slug,
+    select_active_month_slug,
 )
 from services.advisory.settlement_adapter import refresh_settlement_feed  # noqa: E402
 
@@ -140,7 +140,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Advisory settlement refresher (R2, systemd-friendly)")
     parser.add_argument("--slug", default=None,
-                        help="Polymarket event slug; default = current month BTC event")
+                        help="Polymarket event slug; default = active month BTC event "
+                             "(auto-rolls forward at month end via select_active_month_slug)")
     parser.add_argument("--interval", type=float, default=600.0,
                         help="Seconds between successful iterations (default 600 = 10min)")
     parser.add_argument("--max-strikes", type=int, default=8,
@@ -160,7 +161,7 @@ def main():
                 args.interval, args.max_strikes, args.once)
 
     while not state.stop:
-        slug = args.slug or select_current_month_slug()
+        slug = args.slug or select_active_month_slug()
         state.iterations += 1
         t0 = time.monotonic()
         try:

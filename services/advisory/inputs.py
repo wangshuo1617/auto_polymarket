@@ -12,6 +12,7 @@ Public API:
     fetch_descriptors(slug, max_strikes) -> list[ConditionDescriptor]
     parse_slug_to_month_end(slug) -> datetime
     select_current_month_slug() -> str
+    select_active_month_slug(now=None, lookahead_months=2) -> str
 """
 
 from __future__ import annotations
@@ -53,6 +54,71 @@ class BatchInputs:
 
 def select_current_month_slug() -> str:
     return f"what-price-will-bitcoin-hit-in-{datetime.now(timezone.utc).strftime('%B-%Y').lower()}"
+
+
+def _slug_for_month(year: int, month: int) -> str:
+    month_name = calendar.month_name[month].lower()
+    return f"what-price-will-bitcoin-hit-in-{month_name}-{year}"
+
+
+def _advance_month(year: int, month: int, delta: int) -> tuple[int, int]:
+    idx = (month - 1) + delta
+    return year + idx // 12, (idx % 12) + 1
+
+
+def _slug_has_live_markets(slug: str) -> bool:
+    """Probe gamma: True iff event resolves and has at least one market.
+
+    Any exception (404, network, parse) → False so caller can advance month.
+    Note: a slug with markets that have all already settled still returns True
+    here; settlement_adapter handles those rows correctly. We only skip slugs
+    that gamma cannot resolve at all (e.g., next month not yet listed).
+    """
+    try:
+        event = get_event_token_id(slug)
+    except Exception as exc:
+        logger.info("slug probe failed slug=%s err=%s", slug, exc)
+        return False
+    markets = event.get("markets") or []
+    if not markets:
+        logger.info("slug probe: %s has zero markets", slug)
+        return False
+    return True
+
+
+def select_active_month_slug(now: Optional[datetime] = None,
+                             lookahead_months: int = 2) -> str:
+    """Pick the slug for the active BTC month-end event with month-rollover handoff.
+
+    Strategy:
+    1. Start from `now`'s calendar month (UTC).
+    2. If month-end has already passed (rare — `now` is past the 23:59 of last
+       day), advance to next month immediately.
+    3. Probe gamma: if event resolves with ≥1 market → use it.
+    4. Otherwise advance 1 month and re-probe; cap at `lookahead_months`
+       advances (default 2 = current/next/next+1).
+    5. If nothing works, fall back to current-month slug (downstream will
+       surface a clear error rather than silently picking a stale slug).
+    """
+    now = now or datetime.now(timezone.utc)
+    year, month = now.year, now.month
+
+    current_end = parse_slug_to_month_end(_slug_for_month(year, month))
+    if current_end is not None and now > current_end:
+        year, month = _advance_month(year, month, 1)
+
+    for offset in range(lookahead_months + 1):
+        y, m = _advance_month(year, month, offset)
+        slug = _slug_for_month(y, m)
+        if _slug_has_live_markets(slug):
+            if offset > 0:
+                logger.info("active month slug rolled forward by %d month(s) -> %s", offset, slug)
+            return slug
+
+    fallback = _slug_for_month(year, month)
+    logger.warning("no live slug found within +%d months; falling back to %s",
+                   lookahead_months, fallback)
+    return fallback
 
 
 def parse_slug_to_month_end(slug: str) -> Optional[datetime]:
