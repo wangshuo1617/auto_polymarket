@@ -349,6 +349,146 @@ CREATE INDEX IF NOT EXISTS advisory_calibration_runs_run_at_idx
 """
 
 
+# ---------------------------------------------------------------------------
+#  V2: Intent / Fill 双源拆分 (plan-advisory-v2.md)
+#  - advisory_intents: dashboard 三类意图 (place_buy / place_sell / cancel)
+#  - advisory_chain_fills: 链上 activity 事实 cache (60s poller 写入)
+#  - advisory_chain_fills_poller_state: poller 增量游标
+# ---------------------------------------------------------------------------
+
+INTENT_KINDS = ("place_buy", "place_sell", "cancel")
+INTENT_STATUSES = (
+    "open",
+    "filled",
+    "partial",
+    "cancelled_clean",
+    "cancelled_with_fills",
+    "rejected",
+    "orphan",
+)
+INTENT_SUBMISSION_STATUSES = ("submitted", "rejected", "unknown")
+
+_DDL_ADVISORY_INTENTS = """
+CREATE TABLE IF NOT EXISTS advisory_intents (
+    id                                       BIGSERIAL PRIMARY KEY,
+    created_at                               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    kind                                     TEXT NOT NULL {kind_check},
+    token_id                                 TEXT,
+    intended_side                            TEXT CHECK (intended_side IS NULL OR intended_side IN ('buy','sell')),
+    intended_price                           DOUBLE PRECISION
+        CHECK (intended_price IS NULL OR (intended_price > 0 AND intended_price < 1)),
+    intended_size_shares                     DOUBLE PRECISION
+        CHECK (intended_size_shares IS NULL OR intended_size_shares > 0),
+    intended_size_usdc                       DOUBLE PRECISION
+        CHECK (intended_size_usdc IS NULL OR intended_size_usdc > 0),
+    fair_at_decision                         DOUBLE PRECISION,
+    edge_at_decision                         DOUBLE PRECISION,
+    market_view_snapshot_id_at_decision      BIGINT REFERENCES market_view_snapshots(id),
+    cancel_target_order_id                   TEXT,
+    cancel_target_intent_id                  BIGINT REFERENCES advisory_intents(id),
+    user_note                                TEXT,
+    polymarket_order_id                      TEXT,
+    submission_status                        TEXT NOT NULL DEFAULT 'unknown' {submission_check},
+    submission_payload_json                  JSONB,
+    intent_status                            TEXT NOT NULL DEFAULT 'open' {status_check},
+    linked_fill_ids                          BIGINT[] NOT NULL DEFAULT '{{}}',
+    last_status_check_at                     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS advisory_intents_open_idx
+    ON advisory_intents (intent_status)
+    WHERE intent_status IN ('open', 'partial');
+CREATE INDEX IF NOT EXISTS advisory_intents_token_idx
+    ON advisory_intents (token_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS advisory_intents_order_idx
+    ON advisory_intents (polymarket_order_id)
+    WHERE polymarket_order_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS advisory_intents_kind_created_idx
+    ON advisory_intents (kind, created_at DESC);
+""".format(
+    kind_check=_enum_check("kind", INTENT_KINDS),
+    submission_check=_enum_check("submission_status", INTENT_SUBMISSION_STATUSES),
+    status_check=_enum_check("intent_status", INTENT_STATUSES),
+)
+
+# advisory_intents 一致性 trigger:
+# - place_buy / place_sell 必须有 token_id + intended_side + intended_price + intended_size_shares
+# - cancel 必须有 cancel_target_order_id 或 cancel_target_intent_id 至少一个
+# - intended_side 必须与 kind 后缀一致 (place_buy → buy, place_sell → sell)
+_DDL_ADVISORY_INTENTS_TRIGGER = """
+CREATE OR REPLACE FUNCTION advisory_intents_validate()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.kind IN ('place_buy', 'place_sell') THEN
+        IF NEW.token_id IS NULL OR NEW.intended_side IS NULL
+           OR NEW.intended_price IS NULL OR NEW.intended_size_shares IS NULL THEN
+            RAISE EXCEPTION
+                'advisory_intents: place_* requires token_id + intended_side + intended_price + intended_size_shares';
+        END IF;
+        IF (NEW.kind = 'place_buy' AND NEW.intended_side <> 'buy')
+           OR (NEW.kind = 'place_sell' AND NEW.intended_side <> 'sell') THEN
+            RAISE EXCEPTION
+                'advisory_intents: kind=% inconsistent with intended_side=%',
+                NEW.kind, NEW.intended_side;
+        END IF;
+    ELSIF NEW.kind = 'cancel' THEN
+        IF NEW.cancel_target_order_id IS NULL AND NEW.cancel_target_intent_id IS NULL THEN
+            RAISE EXCEPTION
+                'advisory_intents: cancel requires cancel_target_order_id or cancel_target_intent_id';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS advisory_intents_validate_trg ON advisory_intents;
+CREATE TRIGGER advisory_intents_validate_trg
+BEFORE INSERT OR UPDATE ON advisory_intents
+FOR EACH ROW EXECUTE FUNCTION advisory_intents_validate();
+"""
+
+CHAIN_FILL_PROFILES = ("analyze", "trade")
+
+_DDL_ADVISORY_CHAIN_FILLS = """
+CREATE TABLE IF NOT EXISTS advisory_chain_fills (
+    id                  BIGSERIAL PRIMARY KEY,
+    tx_hash             TEXT NOT NULL,
+    log_index           INTEGER NOT NULL DEFAULT 0,
+    fill_timestamp      TIMESTAMPTZ NOT NULL,
+    token_id            TEXT NOT NULL,
+    side                TEXT NOT NULL CHECK (side IN ('buy','sell')),
+    price               DOUBLE PRECISION NOT NULL CHECK (price > 0 AND price < 1),
+    size_shares         DOUBLE PRECISION NOT NULL CHECK (size_shares > 0),
+    size_usdc           DOUBLE PRECISION NOT NULL CHECK (size_usdc > 0),
+    wallet_address      TEXT NOT NULL,
+    profile             TEXT NOT NULL {profile_check},
+    market_slug         TEXT,
+    event_slug          TEXT,
+    raw_json            JSONB NOT NULL,
+    fetched_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (tx_hash, log_index, token_id)
+);
+CREATE INDEX IF NOT EXISTS advisory_chain_fills_ts_idx
+    ON advisory_chain_fills (fill_timestamp DESC);
+CREATE INDEX IF NOT EXISTS advisory_chain_fills_token_ts_idx
+    ON advisory_chain_fills (token_id, fill_timestamp DESC);
+CREATE INDEX IF NOT EXISTS advisory_chain_fills_wallet_ts_idx
+    ON advisory_chain_fills (wallet_address, fill_timestamp DESC);
+CREATE INDEX IF NOT EXISTS advisory_chain_fills_profile_ts_idx
+    ON advisory_chain_fills (profile, fill_timestamp DESC);
+""".format(profile_check=_enum_check("profile", CHAIN_FILL_PROFILES))
+
+_DDL_ADVISORY_CHAIN_FILLS_POLLER_STATE = """
+CREATE TABLE IF NOT EXISTS advisory_chain_fills_poller_state (
+    profile             TEXT PRIMARY KEY {profile_check},
+    last_success_at     TIMESTAMPTZ,
+    last_window_end_ts  BIGINT,
+    last_error          TEXT,
+    last_error_at       TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+""".format(profile_check=_enum_check("profile", CHAIN_FILL_PROFILES))
+
+
 _DDL_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("path_observation_snapshots", _DDL_PATH_OBSERVATION_SNAPSHOTS),
     ("settlement_feed_versions", _DDL_SETTLEMENT_FEED_VERSIONS),
@@ -362,6 +502,10 @@ _DDL_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("manual_trades_trigger", _DDL_MANUAL_TRADES_TRIGGER),
     ("advisory_user_theses", _DDL_USER_THESES),
     ("advisory_calibration_runs", _DDL_CALIBRATION_RUNS),
+    ("advisory_intents", _DDL_ADVISORY_INTENTS),
+    ("advisory_intents_trigger", _DDL_ADVISORY_INTENTS_TRIGGER),
+    ("advisory_chain_fills", _DDL_ADVISORY_CHAIN_FILLS),
+    ("advisory_chain_fills_poller_state", _DDL_ADVISORY_CHAIN_FILLS_POLLER_STATE),
 )
 
 
