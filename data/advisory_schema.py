@@ -211,68 +211,9 @@ CREATE INDEX IF NOT EXISTS market_view_latest_seq_idx
     ON market_view_latest (batch_sequence DESC);
 """
 
-# manual_trades: snapshot 级 FK + token_id 一致性 (advisory v1.2/v1.3 修复).
-# token_id 一致性用 trigger 强制 — DDL CHECK 不能跨表查 snapshot.token_id.
-_DDL_MANUAL_TRADES = """
-CREATE TABLE IF NOT EXISTS manual_trades (
-    id                                       BIGSERIAL PRIMARY KEY,
-    created_at                               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    executed_at_utc                          TIMESTAMPTZ NOT NULL,
-    token_id                                 TEXT NOT NULL,
-    side                                     TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
-    price_usdc                               DOUBLE PRECISION NOT NULL CHECK (price_usdc > 0 AND price_usdc < 1),
-    size_usdc                                DOUBLE PRECISION NOT NULL CHECK (size_usdc > 0),
-    market_view_snapshot_id_at_decision      BIGINT NOT NULL
-        REFERENCES market_view_snapshots(id),
-    user_note                                TEXT
-);
-CREATE INDEX IF NOT EXISTS manual_trades_token_exec_idx
-    ON manual_trades (token_id, executed_at_utc DESC);
-CREATE INDEX IF NOT EXISTS manual_trades_snapshot_idx
-    ON manual_trades (market_view_snapshot_id_at_decision);
-"""
-
-# trigger: 拒绝写入 snapshot.token_id != manual_trades.token_id
-# 拒绝写入引用的 batch.status != 'complete'
-_DDL_MANUAL_TRADES_TRIGGER = """
-CREATE OR REPLACE FUNCTION manual_trades_validate_snapshot()
-RETURNS TRIGGER AS $$
-DECLARE
-    snap_token  TEXT;
-    snap_batch  BIGINT;
-    batch_st    TEXT;
-BEGIN
-    SELECT token_id, batch_id INTO snap_token, snap_batch
-    FROM market_view_snapshots
-    WHERE id = NEW.market_view_snapshot_id_at_decision;
-
-    IF snap_token IS NULL THEN
-        RAISE EXCEPTION 'manual_trades: referenced snapshot % not found',
-            NEW.market_view_snapshot_id_at_decision;
-    END IF;
-
-    IF snap_token <> NEW.token_id THEN
-        RAISE EXCEPTION
-            'manual_trades.token_id (%) != snapshot.token_id (%) for snapshot_id=%',
-            NEW.token_id, snap_token, NEW.market_view_snapshot_id_at_decision;
-    END IF;
-
-    SELECT status INTO batch_st FROM market_view_batches WHERE id = snap_batch;
-    IF batch_st <> 'complete' THEN
-        RAISE EXCEPTION
-            'manual_trades: snapshot % belongs to batch % with status=% (must be complete)',
-            NEW.market_view_snapshot_id_at_decision, snap_batch, batch_st;
-    END IF;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS manual_trades_validate_snapshot_trg ON manual_trades;
-CREATE TRIGGER manual_trades_validate_snapshot_trg
-BEFORE INSERT OR UPDATE OF token_id, market_view_snapshot_id_at_decision ON manual_trades
-FOR EACH ROW EXECUTE FUNCTION manual_trades_validate_snapshot();
-"""
+# NOTE (v2 D1 cleanup, 2026-05-07): manual_trades 已退役, 由 advisory_intents
+# (决策意图) + advisory_chain_fills (链上事实) 取代. 历史数据归档为
+# manual_trades_archived_2026_05_07 (PG 中保留 90 天).
 
 
 _DDL_INPUT_QUOTE_SNAPSHOTS = """
@@ -498,8 +439,6 @@ _DDL_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("market_view_batches", _DDL_MARKET_VIEW_BATCHES),
     ("market_view_snapshots", _DDL_MARKET_VIEW_SNAPSHOTS),
     ("market_view_latest", _DDL_MARKET_VIEW_LATEST),
-    ("manual_trades", _DDL_MANUAL_TRADES),
-    ("manual_trades_trigger", _DDL_MANUAL_TRADES_TRIGGER),
     ("advisory_user_theses", _DDL_USER_THESES),
     ("advisory_calibration_runs", _DDL_CALIBRATION_RUNS),
     ("advisory_intents", _DDL_ADVISORY_INTENTS),

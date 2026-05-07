@@ -55,18 +55,14 @@
 
   <div id="content"></div>
 
-  <h1 style="margin-top: 32px;">Reconcile (manual_trades vs on-chain)</h1>
+  <h1 style="margin-top: 32px;">Reconcile v2 (intents ⇄ chain_fills)</h1>
   <div class="meta">
     时间窗口:
     <select id="recon-hours" onchange="loadReconcile()">
       <option value="24">24h</option>
-      <option value="48">48h</option>
-      <option value="168" selected>7d</option>
-    </select>
-    profile:
-    <select id="recon-profile" onchange="loadReconcile()">
-      <option value="analyze" selected>analyze</option>
-      <option value="trade">trade</option>
+      <option value="72" selected>72h</option>
+      <option value="168">7d</option>
+      <option value="720">30d</option>
     </select>
     <span id="recon-meta" style="margin-left:12px;"></span>
   </div>
@@ -103,47 +99,77 @@
     注: 写入 advisory_user_theses 表; 通过 inputs_hash 让下一 batch 失效旧缓存. 当前未连入 AI 调用 (advisory pipeline 还无 AI).
   </div>
 
-  <h1 style="margin-top: 32px;">Portfolio (manual_trades 派生)</h1>
+  <h1 style="margin-top: 32px;">Portfolio (advisory_chain_fills 派生)</h1>
   <div class="meta" id="portfolio-meta">加载中…</div>
   <div id="portfolio-content"></div>
 
-  <div class="modal-bg" id="modal-bg">
-    <div class="modal">
-      <h3>记录手动下单</h3>
-      <div class="meta" id="modal-token-info"></div>
-
-      <label>方向 (side)</label>
-      <select id="f-side">
-        <option value="buy">buy</option>
-        <option value="sell">sell</option>
-      </select>
-
-      <label>成交价 USDC (0 &lt; price &lt; 1)</label>
-      <input type="number" id="f-price" step="0.001" min="0.001" max="0.999" />
-
-      <label>下单 size (USDC)</label>
-      <input type="number" id="f-size" step="1" min="1" />
-
-      <label>备注 (可选)</label>
-      <textarea id="f-note" placeholder="为什么下这一单 / 心理价位 / etc"></textarea>
-
-      <div id="form-msg"></div>
-
-      <div class="modal-actions">
-        <button class="btn-cancel" onclick="closeModal()">取消</button>
-        <button class="btn-submit" id="btn-submit" onclick="submitTrade()">记录</button>
-      </div>
-    </div>
-  </div>
-
 <script>
 let CURRENT_SNAPSHOTS = {};   // snapshot_id -> snapshot row
-let CURRENT_SNAPSHOT_ID = null;
 
 function fmt(v, digits) {
   if (v === null || v === undefined) return '—';
   if (typeof v === 'number') return v.toFixed(digits ?? 4);
   return String(v);
+}
+
+// 把 market_slug + view_payload 组装为 "month-up to/down to TARGET-yes/no" 友好标签
+// 兼容两种 slug:
+//   per-condition (旧 chain_fills): "will-bitcoin-reach-90k-in-may-2026"  → 直接从 slug 解析
+//   parent event (snapshots/portfolio): "what-price-will-bitcoin-hit-in-may-2026"
+//     → 月份从 slug 解析, target/direction 从 view_payload (strike_usd, side_above, outcome_index)
+function _formatTarget(strike) {
+  if (strike == null || isNaN(strike)) return '?';
+  const k = strike / 1000;
+  return (Number.isInteger(k) ? k.toString() : k.toFixed(1).replace(/\.0$/, '')) + 'k';
+}
+function _ynLabel(outcome_index) {
+  if (outcome_index === 0) return 'yes';
+  if (outcome_index === 1) return 'no';
+  return '?';
+}
+function _monthFromSlug(slug) {
+  const m = slug && slug.match(/-in-([a-z]+)/i);
+  return m ? m[1].toLowerCase() : '?';
+}
+function formatTokenLabel(slug, vpOrIdx) {
+  if (!slug) return '—';
+  // 兼容旧调用 (传 outcome_index 数字 / null)
+  let vp = null, oi = null;
+  if (typeof vpOrIdx === 'number' || vpOrIdx === null || vpOrIdx === undefined) {
+    oi = (typeof vpOrIdx === 'number') ? vpOrIdx : null;
+  } else {
+    vp = vpOrIdx;
+    oi = (vp.outcome_index !== undefined) ? vp.outcome_index : null;
+  }
+
+  // path 1: per-condition slug
+  const m = slug.match(/^will-bitcoin-(reach|dip-to)-([0-9]+k?)-in-([a-z]+)/i);
+  if (m) {
+    const dir = (m[1].toLowerCase() === 'reach') ? 'up to' : 'down to';
+    let target = m[2].toLowerCase();
+    if (!target.endsWith('k')) {
+      const n = parseInt(target, 10);
+      if (!isNaN(n)) target = _formatTarget(n);
+    }
+    return `${m[3].toLowerCase()}-${dir} ${target}-${_ynLabel(oi)}`;
+  }
+
+  // path 2: parent event slug + view_payload
+  if (vp && vp.strike_usd != null) {
+    const month = _monthFromSlug(slug);
+    // direction by token: side_above XOR (outcome_index===1)
+    // 简化: 若 outcome_index=0 (yes), market 方向就是 token 方向; 用 side_above 直读
+    // 若 outcome_index=1 (no), market 方向 = !side_above
+    let marketAbove;
+    if (oi === 0) marketAbove = !!vp.side_above;
+    else if (oi === 1) marketAbove = !vp.side_above;
+    else marketAbove = !!vp.side_above;
+    const dir = marketAbove ? 'up to' : 'down to';
+    return `${month}-${dir} ${_formatTarget(vp.strike_usd)}-${_ynLabel(oi)}`;
+  }
+
+  // fallback: truncated slug
+  return slug.length > 40 ? slug.slice(0, 40) + '…' : slug;
 }
 
 function pillFor(s) {
@@ -204,7 +230,7 @@ async function load() {
 
   let html = `<table>
     <thead><tr>
-      <th class="txt">market_slug / token</th>
+      <th class="txt">market / outcome</th>
       <th class="txt">state</th>
       <th class="num">fair</th>
       <th class="num">edge</th>
@@ -212,15 +238,13 @@ async function load() {
       <th class="num">target $</th>
       <th class="num">current $</th>
       <th class="num">delta $</th>
-      <th class="txt">action</th>
     </tr></thead><tbody>`;
   for (const s of rows) {
     const cls = s.halt_reason ? 'halt' : (s.resolution_state === 'settled' ? 'settled' : '');
-    const slugShort = (s.market_slug || '').slice(0, 32);
+    const label = formatTokenLabel(s.market_slug, s.view_payload || null);
     const tokShort = (s.token_id || '').slice(0, 10) + '…';
-    const disabled = s.halt_reason ? 'disabled' : '';
     html += `<tr class="${cls}">
-      <td class="txt"><div>${slugShort}</div><div style="color:#999;font-size:11px">${tokShort}</div></td>
+      <td class="txt"><div title="${s.market_slug || ''}">${label}</div><div style="color:#999;font-size:11px" title="${s.token_id || ''}">${tokShort}</div></td>
       <td class="txt">${pillFor(s)}</td>
       <td class="num">${fmt(s.fair_value_for_edge, 3)}</td>
       <td class="num">${fmt(s.edge_buy_active, 3)}</td>
@@ -228,67 +252,15 @@ async function load() {
       <td class="num">${fmt(s.target_position_usdc, 2)}</td>
       <td class="num">${fmt(s.current_position_usdc, 2)}</td>
       <td class="num">${fmt(s.delta_usdc, 2)}</td>
-      <td class="txt"><button class="record" ${disabled} onclick="openModal(${s.id})">记录已下单</button></td>
     </tr>`;
   }
   html += '</tbody></table>';
   content.innerHTML = html;
 }
 
-function openModal(snapshotId) {
-  const s = CURRENT_SNAPSHOTS[snapshotId];
-  if (!s) return;
-  CURRENT_SNAPSHOT_ID = snapshotId;
-  document.getElementById('modal-token-info').innerHTML =
-    `${s.market_slug}<br>token=${s.token_id}<br>fair=${fmt(s.fair_value_for_edge, 3)} (snapshot_id=${snapshotId})`;
-  document.getElementById('f-side').value = 'buy';
-  document.getElementById('f-price').value = s.fair_value_for_edge ? (s.fair_value_for_edge * 0.95).toFixed(3) : '';
-  document.getElementById('f-size').value = '';
-  document.getElementById('f-note').value = '';
-  document.getElementById('form-msg').innerHTML = '';
-  document.getElementById('modal-bg').classList.add('show');
-}
-
-function closeModal() {
-  document.getElementById('modal-bg').classList.remove('show');
-  CURRENT_SNAPSHOT_ID = null;
-}
-
-async function submitTrade() {
-  const s = CURRENT_SNAPSHOTS[CURRENT_SNAPSHOT_ID];
-  if (!s) return;
-  const btn = document.getElementById('btn-submit');
-  const msg = document.getElementById('form-msg');
-  btn.disabled = true; msg.innerHTML = '提交中…';
-
-  const body = {
-    token_id: s.token_id,
-    side: document.getElementById('f-side').value,
-    price_usdc: parseFloat(document.getElementById('f-price').value),
-    size_usdc: parseFloat(document.getElementById('f-size').value),
-    market_view_snapshot_id_at_decision: CURRENT_SNAPSHOT_ID,
-    user_note: document.getElementById('f-note').value || null,
-  };
-
-  try {
-    const r = await fetch('/api/advisory/manual_trades', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const data = await r.json();
-    if (r.ok) {
-      msg.innerHTML = `<span class="ok">✓ 记录成功 id=${data.id}</span>`;
-      setTimeout(closeModal, 800);
-    } else {
-      msg.innerHTML = `<span class="err">失败 (${r.status}): ${data.error || '未知错误'}</span>`;
-    }
-  } catch (e) {
-    msg.innerHTML = `<span class="err">网络错误: ${e}</span>`;
-  } finally {
-    btn.disabled = false;
-  }
-}
+function openModal() { /* removed: manual_trades 已退役 (advisory v2) */ }
+function closeModal() { /* removed */ }
+async function submitTrade() { /* removed */ }
 
 load();
 setInterval(load, 30000);  // 30s 自动刷新
@@ -320,12 +292,12 @@ function renderPortfolio(data) {
 
   const positions = data.positions || [];
   if (positions.length === 0) {
-    content.innerHTML = '<div class="empty">暂无 manual_trades 记录</div>';
+    content.innerHTML = '<div class="empty">暂无 advisory 持仓 (链上)</div>';
     return;
   }
   let html = `<table>
     <thead><tr>
-      <th class="txt">market_slug / token</th>
+      <th class="txt">market / outcome</th>
       <th class="num">shares</th>
       <th class="num">avg entry</th>
       <th class="num">净投入 $</th>
@@ -338,7 +310,7 @@ function renderPortfolio(data) {
       <th class="txt">last trade</th>
     </tr></thead><tbody>`;
   for (const p of positions) {
-    const slug = (p.market_slug || '').slice(0, 32);
+    const label = formatTokenLabel(p.market_slug, p);
     const tok = (p.token_id || '').slice(0, 10) + '…';
     const pnl = p.unrealized_pnl_usdc;
     const pnlColor = (pnl == null) ? '' :
@@ -355,7 +327,7 @@ function renderPortfolio(data) {
       ? new Date(p.last_trade_at).toISOString().replace('T', ' ').slice(0, 16) + 'Z'
       : '—';
     html += `<tr>
-      <td class="txt"><div>${slug}</div><div style="color:#999;font-size:11px">${tok}</div></td>
+      <td class="txt"><div title="${p.market_slug || ''}">${label}</div><div style="color:#999;font-size:11px" title="${p.token_id || ''}">${tok}</div></td>
       <td class="num">${fmt(p.shares, 2)}</td>
       <td class="num">${fmt(p.avg_entry_price, 3)}</td>
       <td class="num">${fmt(p.net_invested_usdc, 2)}</td>
@@ -484,63 +456,87 @@ async function loadCalibration() {
 loadCalibration();
 setInterval(loadCalibration, 300000);  // 5min
 
-// --- Reconcile (P4) ---
+// --- Reconcile v2 (C3) — 6 类视图 ---
 async function loadReconcile() {
   const hours = document.getElementById('recon-hours').value;
-  const profile = document.getElementById('recon-profile').value;
   const meta = document.getElementById('recon-meta');
   const sum = document.getElementById('recon-summary');
   meta.textContent = '加载中…';
   try {
-    const r = await fetch(`/api/advisory/reconcile?hours=${hours}&profile=${profile}`);
+    const r = await fetch(`/api/advisory/reconcile_v2?hours=${hours}&limit=50`);
     const j = await r.json();
     if (!r.ok) { meta.textContent = '错误: ' + (j.error || r.status); return; }
-    meta.textContent = `${j.since_utc} → ${j.until_utc}`;
-    const drift = (j.matched || []).filter(m => Math.abs(m.price_drift) > 0.01).length;
+    const c = j.counts || {};
+    meta.textContent = `as_of=${j.as_of} · window=${j.window_hours}h`;
+    const cell = (label, val, bg) =>
+      `<div style="background:${bg};padding:10px;border-radius:4px;">
+         <strong>${val}</strong><br><span style="font-size:11px;color:#666;">${label}</span></div>`;
     sum.innerHTML = `
-      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;font-size:13px;">
-        <div style="background:#e3f2fd;padding:10px;border-radius:4px;"><strong>${j.n_onchain}</strong><br><span style="font-size:11px;color:#666;">on-chain fills</span></div>
-        <div style="background:#fff3e0;padding:10px;border-radius:4px;"><strong>${j.n_manual}</strong><br><span style="font-size:11px;color:#666;">manual_trades</span></div>
-        <div style="background:#e8f5e9;padding:10px;border-radius:4px;"><strong>${j.n_matched}</strong><br><span style="font-size:11px;color:#666;">matched (drift>1¢: ${drift})</span></div>
-        <div style="background:#ffebee;padding:10px;border-radius:4px;"><strong>${j.n_unmatched_onchain}</strong><br><span style="font-size:11px;color:#666;">链上有库无</span></div>
-        <div style="background:#f3e5f5;padding:10px;border-radius:4px;"><strong>${j.n_unmatched_manual}</strong><br><span style="font-size:11px;color:#666;">库有链无 (撤单)</span></div>
+      <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px;font-size:13px;">
+        ${cell('matched', c.matched || 0, '#e8f5e9')}
+        ${cell('partial', c.partial || 0, '#fff8e1')}
+        ${cell('orphan', c.orphan || 0, '#ffebee')}
+        ${cell('cancelled_clean', c.cancelled_clean || 0, '#eceff1')}
+        ${cell('cancelled_with_fills', c.cancelled_with_fills || 0, '#fce4ec')}
+        ${cell('chain_fills_no_intent', c.chain_fills_no_intent || 0, '#e3f2fd')}
       </div>
-      ${renderReconList('未匹配 on-chain (前 20)', j.unmatched_onchain.slice(0, 20), 'onchain')}
-      ${renderReconList('未匹配 manual_trades (前 20)', j.unmatched_manual.slice(0, 20), 'manual')}
-      ${renderMatched((j.matched || []).filter(m => Math.abs(m.price_drift) > 0.01).slice(0, 20))}
+      ${renderIntentList('matched (前 20)', j.matched.slice(0, 20))}
+      ${renderIntentList('partial (前 20)', j.partial.slice(0, 20))}
+      ${renderIntentList('orphan (前 20)', j.orphan.slice(0, 20))}
+      ${renderIntentList('cancelled_with_fills (前 20)', j.cancelled_with_fills.slice(0, 20))}
+      ${renderIntentList('cancelled_clean (前 20)', j.cancelled_clean.slice(0, 20))}
+      ${renderChainFillsNoIntent(j.chain_fills_no_intent.slice(0, 20))}
     `;
   } catch (e) {
     meta.textContent = '网络错误: ' + e;
   }
 }
 
-function renderReconList(title, items, kind) {
-  if (!items.length) return '';
-  const rows = items.map(x => kind === 'onchain'
-    ? `<tr><td>${new Date(x.timestamp*1000).toISOString().slice(0,19)}Z</td><td>${x.side}</td><td>${x.size_shares}</td><td>${x.price}</td><td>${x.slug}</td></tr>`
-    : `<tr><td>${new Date(x.recorded_at_ts*1000).toISOString().slice(0,19)}Z</td><td>${x.side}</td><td>$${x.size_usdc}</td><td>${x.price_usdc}</td><td>${escapeHtml(x.user_note || '')}</td></tr>`
-  ).join('');
-  const head = kind === 'onchain'
-    ? '<th>ts</th><th>side</th><th>shares</th><th>price</th><th>slug</th>'
-    : '<th>ts</th><th>side</th><th>size</th><th>price</th><th>note</th>';
+function renderIntentList(title, items) {
+  if (!items || !items.length) return '';
+  const rows = items.map(x => {
+    const slip = x.slippage_cents;
+    const slipColor = (slip !== null && slip !== undefined && Math.abs(slip) > 1) ? '#c62828' : '#666';
+    const slipDisp = (slip === null || slip === undefined) ? '—'
+      : `${slip >= 0 ? '+' : ''}${slip.toFixed(2)}¢`;
+    return `<tr>
+      <td>${x.created_at ? x.created_at.slice(0,19).replace('T',' ') : ''}</td>
+      <td>${x.intended_side || ''}</td>
+      <td>${(x.token_id || '').slice(0,8)}…</td>
+      <td>${x.intended_price !== null ? Number(x.intended_price).toFixed(4) : '—'}</td>
+      <td>${x.fill_avg_price !== null && x.fill_avg_price !== undefined ? Number(x.fill_avg_price).toFixed(4) : '—'}</td>
+      <td style="color:${slipColor};">${slipDisp}</td>
+      <td>${Number(x.intended_size_shares || 0).toFixed(0)}</td>
+      <td>${Number(x.fill_total_shares || 0).toFixed(0)}</td>
+      <td>${x.fill_count || 0}</td>
+      <td>${x.polymarket_order_id ? x.polymarket_order_id.slice(0,10) + '…' : '—'}</td>
+    </tr>`;
+  }).join('');
   return `<details style="margin-top:12px;"><summary style="cursor:pointer;font-weight:bold;">${title}</summary>
     <table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:6px;">
-      <thead><tr style="background:#f5f5f5;">${head}</tr></thead>
-      <tbody>${rows}</tbody></table></details>`;
+      <thead><tr style="background:#f5f5f5;">
+        <th>created_at</th><th>side</th><th>token</th><th>intended</th><th>fill_avg</th>
+        <th>slip</th><th>intended_sh</th><th>filled_sh</th><th>fills</th><th>order_id</th>
+      </tr></thead><tbody>${rows}</tbody></table></details>`;
 }
 
-function renderMatched(items) {
-  if (!items.length) return '';
+function renderChainFillsNoIntent(items) {
+  if (!items || !items.length) return '';
   const rows = items.map(x => `<tr>
-    <td>${x.manual_id}</td><td>${x.side}</td>
-    <td>${x.manual_price.toFixed(4)}</td><td>${x.onchain_price.toFixed(4)}</td>
-    <td style="color:${Math.abs(x.price_drift)>0.02?'#c62828':'#f57c00'};">${x.price_drift >= 0 ? '+' : ''}${x.price_drift.toFixed(4)}</td>
-    <td>${x.delta_seconds}s</td>
+    <td>${x.fill_timestamp ? x.fill_timestamp.slice(0,19).replace('T',' ') : ''}</td>
+    <td>${x.side}</td>
+    <td>${(x.token_id || '').slice(0,8)}…</td>
+    <td>${Number(x.price || 0).toFixed(4)}</td>
+    <td>${Number(x.size_shares || 0).toFixed(0)}</td>
+    <td>$${Number(x.size_usdc || 0).toFixed(2)}</td>
+    <td title="${x.market_slug || ''}">${formatTokenLabel(x.market_slug, null)}</td>
+    <td>${x.profile}</td>
   </tr>`).join('');
-  return `<details style="margin-top:12px;" open><summary style="cursor:pointer;font-weight:bold;color:#c62828;">⚠ 价格漂移 > 1¢ (前 20)</summary>
+  return `<details style="margin-top:12px;" open><summary style="cursor:pointer;font-weight:bold;color:#1565c0;">chain_fills_no_intent (前 20) — 链上有 fill 但 dashboard 无意图记录</summary>
     <table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:6px;">
-      <thead><tr style="background:#f5f5f5;"><th>mid</th><th>side</th><th>manual</th><th>chain</th><th>drift</th><th>Δt</th></tr></thead>
-      <tbody>${rows}</tbody></table></details>`;
+      <thead><tr style="background:#f5f5f5;">
+        <th>fill_ts</th><th>side</th><th>token</th><th>price</th><th>shares</th><th>usdc</th><th>market</th><th>profile</th>
+      </tr></thead><tbody>${rows}</tbody></table></details>`;
 }
 
 loadReconcile();

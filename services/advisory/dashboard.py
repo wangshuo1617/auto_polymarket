@@ -4,9 +4,7 @@ Advisory dashboard blueprint (A5).
 提供 advisory-only fair-value rebalancer 的 dashboard 接入:
 - GET /recommendations            — 推荐表 HTML
 - GET /api/advisory/recommendations — 最新 complete batch 的 token MarketView (JSON)
-- POST /api/advisory/manual_trades — 记录用户手动下单
-- GET /api/advisory/manual_trades  — 列出最近 manual trades
-- GET /api/advisory/portfolio      — manual_trades 派生持仓 + 最新快照对照 (P1)
+- GET /api/advisory/portfolio      — advisory_chain_fills 派生持仓 + 最新快照对照 (v2 C2)
 - GET /api/advisory/user_thesis    — 当前 active 自由文本判断 (P2)
 - POST /api/advisory/user_thesis   — 设置/替换 active 自由文本判断
 - DELETE /api/advisory/user_thesis — 清除 active 自由文本判断
@@ -16,8 +14,8 @@ Advisory dashboard blueprint (A5).
   (latest 是 per-token 累加, universe 收缩后会污染推荐)
 - Staleness 全局兜底: latest_complete.batch_completed_at 距今超过 STALENESS_THRESHOLD
   → 整个推荐区块替换为 "数据陈旧" 横幅, 不展示任何 token 行
-- manual_trades 写入必须透传 dashboard 当前展示的 snapshot_id; PG trigger 强制
-  (a) batch.status='complete' (b) snapshot.token_id == manual_trades.token_id
+- v2 重构后, dashboard 下单写 advisory_intents (intent_writer), 链上事实由
+  advisory_chain_fills (poller + worker 关联) 派生.
 """
 
 from __future__ import annotations
@@ -113,134 +111,8 @@ def api_recommendations():
     })
 
 
-@advisory_bp.route("/api/advisory/manual_trades", methods=["POST"])
-def api_manual_trade_create():
-    """
-    记录用户手动下单. 必填 (token_id, side, price_usdc, size_usdc, snapshot_id);
-    可选 (executed_at_utc, user_note). 后端依赖 PG trigger 校验 snapshot 一致性
-    (token_id 匹配 + batch.status='complete'); trigger 异常会以 409 返回.
-    """
-    payload = request.get_json(silent=True) or {}
-    required = ("token_id", "side", "price_usdc", "size_usdc",
-                "market_view_snapshot_id_at_decision")
-    missing = [k for k in required if payload.get(k) in (None, "")]
-    if missing:
-        return jsonify({"error": f"missing required fields: {missing}"}), 400
-
-    side = str(payload["side"]).lower()
-    if side not in ("buy", "sell"):
-        return jsonify({"error": f"side must be buy or sell, got {side!r}"}), 400
-
-    try:
-        price = float(payload["price_usdc"])
-        size = float(payload["size_usdc"])
-        snap_id = int(payload["market_view_snapshot_id_at_decision"])
-    except (TypeError, ValueError) as exc:
-        return jsonify({"error": f"numeric field parse error: {exc}"}), 400
-
-    if not (0.0 < price < 1.0):
-        return jsonify({"error": "price_usdc must be in (0, 1)"}), 400
-    if size <= 0:
-        return jsonify({"error": "size_usdc must be > 0"}), 400
-
-    executed_at_raw = payload.get("executed_at_utc")
-    if executed_at_raw:
-        try:
-            executed_at = datetime.fromisoformat(str(executed_at_raw).replace("Z", "+00:00"))
-            if executed_at.tzinfo is None:
-                executed_at = executed_at.replace(tzinfo=timezone.utc)
-        except ValueError as exc:
-            return jsonify({"error": f"executed_at_utc invalid ISO 8601: {exc}"}), 400
-    else:
-        executed_at = datetime.now(timezone.utc)
-
-    note: Optional[str] = payload.get("user_note") or None
-    if note and len(note) > 1024:
-        note = note[:1024]
-
-    try:
-        with get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO manual_trades
-                    (executed_at_utc, token_id, side, price_usdc, size_usdc,
-                     market_view_snapshot_id_at_decision, user_note)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                RETURNING id, created_at
-                """,
-                (executed_at, str(payload["token_id"]), side, price, size, snap_id, note),
-            )
-            new_id, created_at = cur.fetchone()
-            conn.commit()
-    except Exception as exc:
-        # PG trigger raise EXCEPTION 会落到这里 (psycopg2.errors.RaiseException)
-        msg = str(exc)
-        logger.warning("manual_trade insert rejected: %s", msg)
-        # snapshot 不存在 / token_id 不匹配 / batch 未 complete → 409 Conflict
-        if "snapshot" in msg.lower() or "manual_trades" in msg.lower():
-            return jsonify({"error": msg}), 409
-        return jsonify({"error": msg}), 500
-
-    return jsonify({
-        "id": new_id,
-        "created_at": created_at.astimezone(timezone.utc).isoformat()
-            if isinstance(created_at, datetime) else None,
-        "executed_at_utc": executed_at.astimezone(timezone.utc).isoformat(),
-    }), 201
-
-
-@advisory_bp.route("/api/advisory/manual_trades", methods=["GET"])
-def api_manual_trade_list():
-    """列出最近 manual trades; 默认 50 条, 可 ?limit=N (max 200)."""
-    try:
-        limit = min(int(request.args.get("limit", 50)), 200)
-    except (TypeError, ValueError):
-        limit = 50
-
-    try:
-        with get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT mt.id, mt.created_at, mt.executed_at_utc, mt.token_id,
-                       mt.side, mt.price_usdc, mt.size_usdc,
-                       mt.market_view_snapshot_id_at_decision, mt.user_note,
-                       s.market_slug, s.condition_id, s.fair_value_for_edge
-                FROM manual_trades mt
-                LEFT JOIN market_view_snapshots s
-                    ON s.id = mt.market_view_snapshot_id_at_decision
-                ORDER BY mt.executed_at_utc DESC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            rows = cur.fetchall()
-    except Exception as exc:
-        logger.exception("manual_trades list failed")
-        return jsonify({"error": str(exc)}), 500
-
-    out = []
-    for r in rows:
-        (tid, created, exec_at, token, side, price, size, snap_id, note,
-         slug, cid, fair) = r
-        out.append({
-            "id": tid,
-            "created_at": created.astimezone(timezone.utc).isoformat()
-                if isinstance(created, datetime) else None,
-            "executed_at_utc": exec_at.astimezone(timezone.utc).isoformat()
-                if isinstance(exec_at, datetime) else None,
-            "token_id": token,
-            "side": side,
-            "price_usdc": float(price) if price is not None else None,
-            "size_usdc": float(size) if size is not None else None,
-            "snapshot_id": snap_id,
-            "market_slug": slug,
-            "condition_id": cid,
-            "fair_at_decision": float(fair) if fair is not None else None,
-            "user_note": note,
-        })
-    return jsonify({"trades": out, "count": len(out)})
+# v2 D1: POST/GET /api/advisory/manual_trades 已移除. 写入 → intent_writer
+# (透过 /api/buy /api/sell /api/cancel 自动捕获); 读取 → advisory_intents 视图.
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +221,9 @@ def api_portfolio():
             "token_id": token_id,
             "market_slug": slug,
             "condition_id": cid,
+            "outcome_index": (vp.get("outcome_index") if isinstance(vp, dict) else None),
+            "strike_usd": (vp.get("strike_usd") if isinstance(vp, dict) else None),
+            "side_above": (vp.get("side_above") if isinstance(vp, dict) else None),
             "shares": shares,
             "avg_entry_price": avg_entry,
             "net_invested_usdc": net_invested,
@@ -470,27 +345,8 @@ def api_calibration_runs():
     return jsonify({"runs": runs, "count": len(runs)})
 
 
-# ---------------------------------------------------------------------------
-#  Reconcile (P4) — manual_trades vs on-chain activity diff
-# ---------------------------------------------------------------------------
-
-@advisory_bp.route("/api/advisory/reconcile", methods=["GET"])
-def api_reconcile():
-    try:
-        hours = float(request.args.get("hours", 24))
-    except (TypeError, ValueError):
-        hours = 24.0
-    hours = max(0.5, min(hours, 168.0))
-    profile = request.args.get("profile", "analyze")
-    if profile not in ("analyze", "trade"):
-        return jsonify({"error": "profile must be analyze or trade"}), 400
-    try:
-        from services.advisory.reconcile import reconcile
-        rep = reconcile(hours=hours, profile=profile).to_dict()
-    except Exception as exc:
-        logger.exception("reconcile failed")
-        return jsonify({"error": str(exc)}), 500
-    return jsonify(rep)
+# v2 D1: GET /api/advisory/reconcile (manual_trades vs activity API) 已移除.
+# 由 /api/advisory/reconcile_v2 取代.
 
 
 # ---------------------------------------------------------------------------
