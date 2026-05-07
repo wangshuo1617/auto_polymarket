@@ -491,3 +491,34 @@ def api_reconcile():
         logger.exception("reconcile failed")
         return jsonify({"error": str(exc)}), 500
     return jsonify(rep)
+
+
+# ---------------------------------------------------------------------------
+#  Reconcile v2 (C3) — advisory_intents ⇄ advisory_chain_fills, 6 类视图
+# ---------------------------------------------------------------------------
+#  与 v1 的差异:
+#   - 数据源: intents (决策) + chain_fills (链上事实) + worker 维护的关联,
+#     不再从 manual_trades+activity API 当场撮合;
+#   - 输出 6 个独立 tab: matched / partial / orphan /
+#     cancelled_clean / cancelled_with_fills / chain_fills_no_intent;
+#   - 每条 row 自带 fills[] 详情和 slippage_cents (C4 用), 便于前端展开.
+
+@advisory_bp.route("/api/advisory/reconcile_v2", methods=["GET"])
+def api_reconcile_v2():
+    try:
+        hours = int(float(request.args.get("hours", 72)))
+    except (TypeError, ValueError):
+        hours = 72
+    hours = max(1, min(hours, 720))
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(limit, 1000))
+    try:
+        from services.advisory.reconcile_v2 import reconcile_v2
+        rep = reconcile_v2(hours=hours, limit_per_class=limit).to_dict()
+    except Exception as exc:
+        logger.exception("reconcile_v2 failed")
+        return jsonify({"error": str(exc)}), 500
+    return jsonify(rep)
