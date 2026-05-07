@@ -9,6 +9,7 @@ Pure functions that fetch real-data inputs needed by
 Public API:
     BatchInputs (dataclass)
     assemble_batch_inputs(slug, max_strikes, btc_now=None) -> BatchInputs
+    fetch_descriptors(slug, max_strikes) -> list[ConditionDescriptor]
     parse_slug_to_month_end(slug) -> datetime
     select_current_month_slug() -> str
 """
@@ -113,6 +114,21 @@ def _fetch_universe(slug: str, max_strikes: int, btc_now: float
             token_ids.append(tid)
 
     return universe, list(descriptors_dict.values()), token_ids
+
+
+def fetch_descriptors(slug: str, max_strikes: int = 6,
+                      btc_now: Optional[float] = None) -> list[ConditionDescriptor]:
+    """Lightweight helper for settlement_refresher: fetch descriptors only.
+
+    Reuses the same nearest-strike selection as the batch runner so refresh
+    coverage matches what the batch will actually consume.
+    """
+    if btc_now is None:
+        btc_now = float(get_btc_price() or 0.0)
+        if btc_now <= 0:
+            raise RuntimeError("Failed to fetch BTC price for descriptor selection")
+    _, descriptors, _ = _fetch_universe(slug, max_strikes, btc_now)
+    return descriptors
 
 
 def _fetch_quotes(token_ids: list[str]) -> dict[str, TokenQuote]:
