@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <title>Advisory Recommendations</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 24px; color: #222; }
+    h1 { margin: 0 0 12px; font-size: 20px; }
+    .meta { color: #666; font-size: 13px; margin-bottom: 16px; }
+    .stale-banner { background: #fff3cd; border: 1px solid #ffeeba; color: #856404;
+                    padding: 12px 16px; border-radius: 6px; margin-bottom: 16px; font-weight: bold; }
+    .empty { color: #999; padding: 24px; text-align: center; border: 1px dashed #ccc; border-radius: 6px; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { padding: 6px 8px; border-bottom: 1px solid #eee; text-align: right; vertical-align: middle; }
+    th { background: #f7f7f7; text-align: left; position: sticky; top: 0; }
+    th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    th.txt, td.txt { text-align: left; }
+    tr.halt { background: #fafafa; color: #888; }
+    tr.settled { background: #e8f5e9; }
+    .pill { display: inline-block; padding: 2px 6px; border-radius: 10px; font-size: 11px; }
+    .pill-open { background: #e3f2fd; color: #1565c0; }
+    .pill-settled { background: #c8e6c9; color: #2e7d32; }
+    .pill-locked { background: #fff8e1; color: #ef6c00; }
+    .pill-halt { background: #ffebee; color: #c62828; }
+    button.record { background: #1976d2; color: white; border: 0; padding: 4px 10px;
+                    border-radius: 4px; cursor: pointer; font-size: 12px; }
+    button.record:hover { background: #1565c0; }
+    button.record:disabled { background: #ccc; cursor: not-allowed; }
+    .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: none;
+                align-items: center; justify-content: center; z-index: 1000; }
+    .modal-bg.show { display: flex; }
+    .modal { background: white; padding: 20px 24px; border-radius: 8px; min-width: 360px;
+             box-shadow: 0 6px 30px rgba(0,0,0,0.2); }
+    .modal h3 { margin: 0 0 12px; }
+    .modal label { display: block; margin: 8px 0 4px; font-size: 13px; color: #555; }
+    .modal input, .modal select, .modal textarea {
+      width: 100%; padding: 6px 8px; box-sizing: border-box;
+      border: 1px solid #ccc; border-radius: 4px; font-size: 13px;
+    }
+    .modal textarea { resize: vertical; min-height: 60px; }
+    .modal-actions { margin-top: 16px; text-align: right; }
+    .modal-actions button { margin-left: 8px; padding: 6px 14px; border-radius: 4px;
+                            border: 0; cursor: pointer; font-size: 13px; }
+    .btn-cancel { background: #eee; color: #333; }
+    .btn-submit { background: #1976d2; color: white; }
+    .err { color: #c62828; font-size: 12px; margin-top: 8px; }
+    .ok { color: #2e7d32; font-size: 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Advisory Recommendations</h1>
+  <div class="meta" id="meta">加载中…</div>
+
+  <div id="stale-banner" class="stale-banner" style="display: none;"></div>
+
+  <div id="content"></div>
+
+  <div class="modal-bg" id="modal-bg">
+    <div class="modal">
+      <h3>记录手动下单</h3>
+      <div class="meta" id="modal-token-info"></div>
+
+      <label>方向 (side)</label>
+      <select id="f-side">
+        <option value="buy">buy</option>
+        <option value="sell">sell</option>
+      </select>
+
+      <label>成交价 USDC (0 &lt; price &lt; 1)</label>
+      <input type="number" id="f-price" step="0.001" min="0.001" max="0.999" />
+
+      <label>下单 size (USDC)</label>
+      <input type="number" id="f-size" step="1" min="1" />
+
+      <label>备注 (可选)</label>
+      <textarea id="f-note" placeholder="为什么下这一单 / 心理价位 / etc"></textarea>
+
+      <div id="form-msg"></div>
+
+      <div class="modal-actions">
+        <button class="btn-cancel" onclick="closeModal()">取消</button>
+        <button class="btn-submit" id="btn-submit" onclick="submitTrade()">记录</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+let CURRENT_SNAPSHOTS = {};   // snapshot_id -> snapshot row
+let CURRENT_SNAPSHOT_ID = null;
+
+function fmt(v, digits) {
+  if (v === null || v === undefined) return '—';
+  if (typeof v === 'number') return v.toFixed(digits ?? 4);
+  return String(v);
+}
+
+function pillFor(s) {
+  if (s.halt_reason) {
+    return `<span class="pill pill-halt" title="${s.halt_reason}">halt</span>`;
+  }
+  if (s.resolution_state === 'settled') return '<span class="pill pill-settled">settled</span>';
+  if (s.resolution_state === 'locked_event_occurred') return '<span class="pill pill-locked">locked-hit</span>';
+  if (s.resolution_state === 'locked_event_missed') return '<span class="pill pill-locked">locked-miss</span>';
+  return '<span class="pill pill-open">open</span>';
+}
+
+async function load() {
+  const r = await fetch('/api/advisory/recommendations');
+  const meta = document.getElementById('meta');
+  const banner = document.getElementById('stale-banner');
+  const content = document.getElementById('content');
+
+  if (!r.ok) {
+    meta.textContent = '加载失败: HTTP ' + r.status;
+    return;
+  }
+  const data = await r.json();
+
+  if (data.status === 'no_batch') {
+    meta.textContent = '当前无 complete batch';
+    content.innerHTML = '<div class="empty">尚无可展示的推荐数据</div>';
+    return;
+  }
+
+  const b = data.batch;
+  meta.textContent = `Batch #${b.id} (seq=${b.batch_sequence}) completed_at=${b.batch_completed_at} tokens=${b.token_count}`;
+
+  if (data.stale) {
+    banner.textContent = `⚠️ 数据陈旧 (超过 ${data.staleness_threshold_seconds}s 阈值), 已暂停推荐展示。请检查 batch worker 是否在运行。`;
+    banner.style.display = 'block';
+    content.innerHTML = '';
+    return;
+  }
+  banner.style.display = 'none';
+
+  CURRENT_SNAPSHOTS = {};
+  data.snapshots.forEach(s => { CURRENT_SNAPSHOTS[s.id] = s; });
+
+  if (data.snapshots.length === 0) {
+    content.innerHTML = '<div class="empty">该 batch 无 snapshot</div>';
+    return;
+  }
+
+  // 按 ranking_score DESC 排序 (NULL 在最后)
+  const rows = data.snapshots.slice().sort((a, b) => {
+    const av = a.ranking_score, bv = b.ranking_score;
+    if (av === null && bv === null) return 0;
+    if (av === null) return 1;
+    if (bv === null) return -1;
+    return bv - av;
+  });
+
+  let html = `<table>
+    <thead><tr>
+      <th class="txt">market_slug / token</th>
+      <th class="txt">state</th>
+      <th class="num">fair</th>
+      <th class="num">edge</th>
+      <th class="num">APR</th>
+      <th class="num">target $</th>
+      <th class="num">current $</th>
+      <th class="num">delta $</th>
+      <th class="txt">action</th>
+    </tr></thead><tbody>`;
+  for (const s of rows) {
+    const cls = s.halt_reason ? 'halt' : (s.resolution_state === 'settled' ? 'settled' : '');
+    const slugShort = (s.market_slug || '').slice(0, 32);
+    const tokShort = (s.token_id || '').slice(0, 10) + '…';
+    const disabled = s.halt_reason ? 'disabled' : '';
+    html += `<tr class="${cls}">
+      <td class="txt"><div>${slugShort}</div><div style="color:#999;font-size:11px">${tokShort}</div></td>
+      <td class="txt">${pillFor(s)}</td>
+      <td class="num">${fmt(s.fair_value_for_edge, 3)}</td>
+      <td class="num">${fmt(s.edge_buy_active, 3)}</td>
+      <td class="num">${fmt(s.expected_apr_by_intent, 2)}</td>
+      <td class="num">${fmt(s.target_position_usdc, 2)}</td>
+      <td class="num">${fmt(s.current_position_usdc, 2)}</td>
+      <td class="num">${fmt(s.delta_usdc, 2)}</td>
+      <td class="txt"><button class="record" ${disabled} onclick="openModal(${s.id})">记录已下单</button></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  content.innerHTML = html;
+}
+
+function openModal(snapshotId) {
+  const s = CURRENT_SNAPSHOTS[snapshotId];
+  if (!s) return;
+  CURRENT_SNAPSHOT_ID = snapshotId;
+  document.getElementById('modal-token-info').innerHTML =
+    `${s.market_slug}<br>token=${s.token_id}<br>fair=${fmt(s.fair_value_for_edge, 3)} (snapshot_id=${snapshotId})`;
+  document.getElementById('f-side').value = 'buy';
+  document.getElementById('f-price').value = s.fair_value_for_edge ? (s.fair_value_for_edge * 0.95).toFixed(3) : '';
+  document.getElementById('f-size').value = '';
+  document.getElementById('f-note').value = '';
+  document.getElementById('form-msg').innerHTML = '';
+  document.getElementById('modal-bg').classList.add('show');
+}
+
+function closeModal() {
+  document.getElementById('modal-bg').classList.remove('show');
+  CURRENT_SNAPSHOT_ID = null;
+}
+
+async function submitTrade() {
+  const s = CURRENT_SNAPSHOTS[CURRENT_SNAPSHOT_ID];
+  if (!s) return;
+  const btn = document.getElementById('btn-submit');
+  const msg = document.getElementById('form-msg');
+  btn.disabled = true; msg.innerHTML = '提交中…';
+
+  const body = {
+    token_id: s.token_id,
+    side: document.getElementById('f-side').value,
+    price_usdc: parseFloat(document.getElementById('f-price').value),
+    size_usdc: parseFloat(document.getElementById('f-size').value),
+    market_view_snapshot_id_at_decision: CURRENT_SNAPSHOT_ID,
+    user_note: document.getElementById('f-note').value || null,
+  };
+
+  try {
+    const r = await fetch('/api/advisory/manual_trades', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      msg.innerHTML = `<span class="ok">✓ 记录成功 id=${data.id}</span>`;
+      setTimeout(closeModal, 800);
+    } else {
+      msg.innerHTML = `<span class="err">失败 (${r.status}): ${data.error || '未知错误'}</span>`;
+    }
+  } catch (e) {
+    msg.innerHTML = `<span class="err">网络错误: ${e}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+load();
+setInterval(load, 30000);  // 30s 自动刷新
+</script>
+</body>
+</html>

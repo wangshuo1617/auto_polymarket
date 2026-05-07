@@ -60,6 +60,16 @@ from data.polymarket import (
 app = Flask(__name__)
 app.secret_key = os.getenv("DASHBOARD_SECRET_KEY") or secrets.token_hex(32)
 
+# Advisory blueprint (fair-value rebalancer recommendations + manual trade log).
+# 受 before_request 全局认证保护; 失败导入不应阻断 dashboard 主功能.
+try:
+    from services.advisory.dashboard import advisory_bp
+    app.register_blueprint(advisory_bp)
+except Exception as _adv_exc:  # pragma: no cover - defensive
+    logging.getLogger(__name__).warning(
+        "advisory blueprint not registered: %s", _adv_exc
+    )
+
 # 第五轮加固 #1：默认不信任 X-Forwarded-For（任何外部用户都能伪造该 header 污染 audit 字段）。
 # 部署在可信反向代理后时，运维需显式设置 DASHBOARD_TRUST_PROXY=1。
 _DASHBOARD_TRUST_PROXY = (os.getenv("DASHBOARD_TRUST_PROXY", "0").strip() == "1")
