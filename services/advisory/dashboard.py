@@ -497,3 +497,26 @@ def api_calibration_runs():
         "trades": r[9],
     } for r in rows]
     return jsonify({"runs": runs, "count": len(runs)})
+
+
+# ---------------------------------------------------------------------------
+#  Reconcile (P4) — manual_trades vs on-chain activity diff
+# ---------------------------------------------------------------------------
+
+@advisory_bp.route("/api/advisory/reconcile", methods=["GET"])
+def api_reconcile():
+    try:
+        hours = float(request.args.get("hours", 24))
+    except (TypeError, ValueError):
+        hours = 24.0
+    hours = max(0.5, min(hours, 168.0))
+    profile = request.args.get("profile", "analyze")
+    if profile not in ("analyze", "trade"):
+        return jsonify({"error": "profile must be analyze or trade"}), 400
+    try:
+        from services.advisory.reconcile import reconcile
+        rep = reconcile(hours=hours, profile=profile).to_dict()
+    except Exception as exc:
+        logger.exception("reconcile failed")
+        return jsonify({"error": str(exc)}), 500
+    return jsonify(rep)

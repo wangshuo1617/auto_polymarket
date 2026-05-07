@@ -55,6 +55,23 @@
 
   <div id="content"></div>
 
+  <h1 style="margin-top: 32px;">Reconcile (manual_trades vs on-chain)</h1>
+  <div class="meta">
+    时间窗口:
+    <select id="recon-hours" onchange="loadReconcile()">
+      <option value="24">24h</option>
+      <option value="48">48h</option>
+      <option value="168" selected>7d</option>
+    </select>
+    profile:
+    <select id="recon-profile" onchange="loadReconcile()">
+      <option value="analyze" selected>analyze</option>
+      <option value="trade">trade</option>
+    </select>
+    <span id="recon-meta" style="margin-left:12px;"></span>
+  </div>
+  <div id="recon-summary" style="margin-top:8px;"></div>
+
   <h1 style="margin-top: 32px;">Calibration (per 6h job)</h1>
   <div class="meta" id="calib-meta">加载中…</div>
   <div id="calib-latest" style="margin-bottom: 12px;"></div>
@@ -466,6 +483,68 @@ async function loadCalibration() {
 
 loadCalibration();
 setInterval(loadCalibration, 300000);  // 5min
+
+// --- Reconcile (P4) ---
+async function loadReconcile() {
+  const hours = document.getElementById('recon-hours').value;
+  const profile = document.getElementById('recon-profile').value;
+  const meta = document.getElementById('recon-meta');
+  const sum = document.getElementById('recon-summary');
+  meta.textContent = '加载中…';
+  try {
+    const r = await fetch(`/api/advisory/reconcile?hours=${hours}&profile=${profile}`);
+    const j = await r.json();
+    if (!r.ok) { meta.textContent = '错误: ' + (j.error || r.status); return; }
+    meta.textContent = `${j.since_utc} → ${j.until_utc}`;
+    const drift = (j.matched || []).filter(m => Math.abs(m.price_drift) > 0.01).length;
+    sum.innerHTML = `
+      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;font-size:13px;">
+        <div style="background:#e3f2fd;padding:10px;border-radius:4px;"><strong>${j.n_onchain}</strong><br><span style="font-size:11px;color:#666;">on-chain fills</span></div>
+        <div style="background:#fff3e0;padding:10px;border-radius:4px;"><strong>${j.n_manual}</strong><br><span style="font-size:11px;color:#666;">manual_trades</span></div>
+        <div style="background:#e8f5e9;padding:10px;border-radius:4px;"><strong>${j.n_matched}</strong><br><span style="font-size:11px;color:#666;">matched (drift>1¢: ${drift})</span></div>
+        <div style="background:#ffebee;padding:10px;border-radius:4px;"><strong>${j.n_unmatched_onchain}</strong><br><span style="font-size:11px;color:#666;">链上有库无</span></div>
+        <div style="background:#f3e5f5;padding:10px;border-radius:4px;"><strong>${j.n_unmatched_manual}</strong><br><span style="font-size:11px;color:#666;">库有链无 (撤单)</span></div>
+      </div>
+      ${renderReconList('未匹配 on-chain (前 20)', j.unmatched_onchain.slice(0, 20), 'onchain')}
+      ${renderReconList('未匹配 manual_trades (前 20)', j.unmatched_manual.slice(0, 20), 'manual')}
+      ${renderMatched((j.matched || []).filter(m => Math.abs(m.price_drift) > 0.01).slice(0, 20))}
+    `;
+  } catch (e) {
+    meta.textContent = '网络错误: ' + e;
+  }
+}
+
+function renderReconList(title, items, kind) {
+  if (!items.length) return '';
+  const rows = items.map(x => kind === 'onchain'
+    ? `<tr><td>${new Date(x.timestamp*1000).toISOString().slice(0,19)}Z</td><td>${x.side}</td><td>${x.size_shares}</td><td>${x.price}</td><td>${x.slug}</td></tr>`
+    : `<tr><td>${new Date(x.recorded_at_ts*1000).toISOString().slice(0,19)}Z</td><td>${x.side}</td><td>$${x.size_usdc}</td><td>${x.price_usdc}</td><td>${escapeHtml(x.user_note || '')}</td></tr>`
+  ).join('');
+  const head = kind === 'onchain'
+    ? '<th>ts</th><th>side</th><th>shares</th><th>price</th><th>slug</th>'
+    : '<th>ts</th><th>side</th><th>size</th><th>price</th><th>note</th>';
+  return `<details style="margin-top:12px;"><summary style="cursor:pointer;font-weight:bold;">${title}</summary>
+    <table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:6px;">
+      <thead><tr style="background:#f5f5f5;">${head}</tr></thead>
+      <tbody>${rows}</tbody></table></details>`;
+}
+
+function renderMatched(items) {
+  if (!items.length) return '';
+  const rows = items.map(x => `<tr>
+    <td>${x.manual_id}</td><td>${x.side}</td>
+    <td>${x.manual_price.toFixed(4)}</td><td>${x.onchain_price.toFixed(4)}</td>
+    <td style="color:${Math.abs(x.price_drift)>0.02?'#c62828':'#f57c00'};">${x.price_drift >= 0 ? '+' : ''}${x.price_drift.toFixed(4)}</td>
+    <td>${x.delta_seconds}s</td>
+  </tr>`).join('');
+  return `<details style="margin-top:12px;" open><summary style="cursor:pointer;font-weight:bold;color:#c62828;">⚠ 价格漂移 > 1¢ (前 20)</summary>
+    <table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:6px;">
+      <thead><tr style="background:#f5f5f5;"><th>mid</th><th>side</th><th>manual</th><th>chain</th><th>drift</th><th>Δt</th></tr></thead>
+      <tbody>${rows}</tbody></table></details>`;
+}
+
+loadReconcile();
+setInterval(loadReconcile, 600000);  // 10min
 </script>
 </body>
 </html>
