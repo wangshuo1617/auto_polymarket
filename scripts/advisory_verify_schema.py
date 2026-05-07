@@ -59,7 +59,9 @@ EXPECTED_TABLES = (
     "market_view_batches",
     "market_view_snapshots",
     "market_view_latest",
-    "manual_trades",
+    "advisory_intents",
+    "advisory_chain_fills",
+    "advisory_chain_fills_poller_state",
 )
 
 

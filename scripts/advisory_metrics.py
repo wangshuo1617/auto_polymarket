@@ -15,7 +15,6 @@ Advisory metrics + alerts (A6).
                                  的 condition_id 数 (人工需关注)
 - settlement_state_flip_count — 最近 24h 内同一 condition_id 跨版本发生
                                  settlement_state 翻转的次数 (e.g. settled→disputed)
-- manual_trades_24h           — 最近 24h 用户手动下单数 + 总 size_usdc
 
 用法:
     LD_PRELOAD="" uv run scripts/advisory_metrics.py
@@ -333,26 +332,6 @@ def collect_state_flips(window_hours: int = 24) -> dict:
     }
 
 
-def collect_manual_trades_24h() -> dict:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT side, COUNT(*), COALESCE(SUM(size_usdc), 0)
-            FROM manual_trades
-            WHERE executed_at_utc >= %s
-            GROUP BY side
-        """, (cutoff,))
-        rows = cur.fetchall()
-    by_side = {side: {"count": int(n), "total_size_usdc": float(s)} for side, n, s in rows}
-    total = sum(v["count"] for v in by_side.values())
-    return {
-        "window_hours": 24,
-        "total_trades": total,
-        "by_side": by_side,
-    }
-
-
 def collect_fills_poller_staleness() -> dict:
     """v2 B4: report freshness of advisory_chain_fills_poller per profile."""
     now = datetime.now(timezone.utc)
@@ -521,7 +500,6 @@ def collect_all(window_hours: int) -> dict:
         "batch_failure_rate": collect_batch_failure_rate(window_hours),
         "disputed_count": collect_disputed_count(),
         "settlement_state_flips": collect_state_flips(),
-        "manual_trades_24h": collect_manual_trades_24h(),
         "fills_poller_staleness": collect_fills_poller_staleness(),
     }
 
@@ -560,8 +538,7 @@ def _print_text(metrics: dict, alerts: list) -> None:
     for f in sf.get("flips", [])[:5]:
         print(f"  - {f['condition_id']}: {f['from']} -> {f['to']} (v{f['version']})")
 
-    mt = metrics["manual_trades_24h"]
-    print(f"manual_trades_24h: total={mt['total_trades']} by_side={mt['by_side']}")
+    # manual_trades_24h removed in v2 D1 cleanup (2026-05-07)
 
     print()
     print("=" * 72)

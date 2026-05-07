@@ -7,9 +7,6 @@
 
 2. data/advisory_schema.py 必含:
    - market_view_batches.batch_completed_at 列
-   - manual_trades_validate_snapshot trigger function
-   - trigger function body 校验 snapshot.token_id == NEW.token_id
-   - trigger function body 校验 batch.status='complete'
 
 调用: `LD_PRELOAD="" uv run python scripts/advisory_lint.py`
 退出码: 0=ok, 1=任一不变量违反。
@@ -175,22 +172,12 @@ def lint_enums() -> list[str]:
 
 
 def lint_schema_invariants() -> list[str]:
-    """v1.3 R3 修复: batch_completed_at 列 + manual_trades trigger 必须存在且校验 token_id+complete."""
+    """v1.3 R3 修复: batch_completed_at 列必须存在."""
     violations: list[str] = []
     src = SCHEMA_FILE.read_text(encoding="utf-8")
 
     if "batch_completed_at" not in src:
         violations.append("market_view_batches.batch_completed_at 列缺失")
-
-    # trigger 函数应该校验 snapshot.token_id != NEW.token_id
-    if "snap_token <> NEW.token_id" not in src and "NEW.token_id <> snap_token" not in src:
-        violations.append("manual_trades trigger 缺少 snapshot.token_id == NEW.token_id 校验")
-
-    if "batch_st <> 'complete'" not in src:
-        violations.append("manual_trades trigger 缺少 batch.status='complete' 校验")
-
-    if "BEFORE INSERT OR UPDATE" not in src or "manual_trades_validate_snapshot_trg" not in src:
-        violations.append("manual_trades_validate_snapshot_trg trigger 未正确创建")
 
     # step 4 atomic 写入: 调用方代码尚未实现, 但 schema 必须允许 — batch_completed_at 必须 nullable
     # 此处仅静态校验 DDL 中无 NOT NULL on batch_completed_at
