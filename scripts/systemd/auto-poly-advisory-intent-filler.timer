@@ -1,0 +1,12 @@
+[Unit]
+Description=Run advisory intent_filler every 60s
+Requires=auto-poly-advisory-intent-filler.service
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=auto-poly-advisory-intent-filler.service
+
+[Install]
+WantedBy=timers.target

@@ -23,6 +23,7 @@ EXTRA_UNITS=(
   auto-poly-advisory-metrics.service
   auto-poly-advisory-calibration.service
   auto-poly-advisory-fills-poller.service
+  auto-poly-advisory-intent-filler.service
 )
 
 TIMERS=(
@@ -30,6 +31,7 @@ TIMERS=(
   auto-poly-advisory-metrics.timer
   auto-poly-advisory-calibration.timer
   auto-poly-advisory-fills-poller.timer
+  auto-poly-advisory-intent-filler.timer
 )
 
 echo "=========================================="
