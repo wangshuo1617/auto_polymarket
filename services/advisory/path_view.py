@@ -44,8 +44,12 @@ from .market_state_adapter import TokenContext
 
 logger = logging.getLogger(__name__)
 
-# wick buffer 默认关闭 (advisory MVP) — 上调到 0.001~0.005 可对 1s wick 做风险扣减
-DEFAULT_WICK_BUFFER_PCT = 0.0
+# wick buffer (P3, 2026-05-07): strike·(1±0.002) 即 0.2% 缓冲, 同时用于:
+#   - Step 0 path-to-date: 须穿透 strike·(1+wick) 才算 yes 已触及 (避免 1s 数据
+#     极值误判 settlement)
+#   - Step 3 GBM: 用调整后的 strike 算 barrier touch (对未来 wick 风险扣减)
+# 配合 _FAT_TAIL_MULT_REALIZED=1.15, sweep 验证 Brier 0.0623→0.0572.
+DEFAULT_WICK_BUFFER_PCT = 0.002
 
 
 @dataclass
@@ -113,11 +117,14 @@ def _compute_one(
     market_above = (not token.side_above) if is_no_token else bool(token.side_above)
     direction = "above" if market_above else "below"
 
-    # Step 0: path-to-date 短路 — yes 已触及 barrier, yes=1, no=0
-    yes_touched = (
-        (direction == "above" and path_max >= strike)
-        or (direction == "below" and path_min <= strike)
-    )
+    # Step 0: path-to-date 短路 — yes 已触及 barrier (含 wick_buffer).
+    # 用 strike·(1±wick) 作为穿透阈值, 避免 1s 数据短暂 wick 误判结算.
+    if direction == "above":
+        touch_thresh = strike * (1.0 + wick_buffer_pct)
+        yes_touched = path_max >= touch_thresh
+    else:
+        touch_thresh = strike * (1.0 - wick_buffer_pct)
+        yes_touched = path_min <= touch_thresh
     if yes_touched:
         base.p_touch_to_date = True
         p_yes = 1.0

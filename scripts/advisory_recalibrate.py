@@ -127,7 +127,9 @@ def _yes_won_for_market(market: dict) -> Optional[bool]:
     return nums[yes_idx] == 1.0
 
 
-def _build_samples_for_slug(slug: str, all_klines: list) -> list[_Sample]:
+def _build_samples_for_slug(slug: str, all_klines: list,
+                            fat_tail_mult: Optional[float] = None,
+                            wick_pct: float = 0.0) -> list[_Sample]:
     window = parse_slug_to_month_window(slug)
     if window is None:
         return []
@@ -194,17 +196,24 @@ def _build_samples_for_slug(slug: str, all_klines: list) -> list[_Sample]:
             path_max = max(highs) if highs else btc_spot
             path_min = min(lows) if lows else btc_spot
 
-            # Step 0
-            yes_touched = (
-                (direction == "above" and path_max >= strike)
-                or (direction == "below" and path_min <= strike)
-            )
+            # Step 0: path-to-date with optional wick (require strictly beyond strike·(1±wick))
+            if direction == "above":
+                touch_thresh = strike * (1.0 + wick_pct)
+                yes_touched = path_max >= touch_thresh
+                bgm_strike = strike * (1.0 + wick_pct)
+            else:
+                touch_thresh = strike * (1.0 - wick_pct)
+                yes_touched = path_min <= touch_thresh
+                bgm_strike = strike * (1.0 - wick_pct)
             if yes_touched:
                 p_pred = 1.0
             else:
                 days_left = max(0.001, (month_end - pred_t).total_seconds() / 86400.0)
+                # horizon-dependent fat_tail if callable
+                ft = fat_tail_mult(days_left) if callable(fat_tail_mult) else fat_tail_mult
                 p_pred = _barrier_touch_prob(
-                    btc_spot, strike, direction, mu, sigma, days_left, sigma_is_iv=False,
+                    btc_spot, bgm_strike, direction, mu, sigma, days_left,
+                    sigma_is_iv=False, fat_tail_mult=ft,
                 )
 
             distance_pct = abs(strike - btc_spot) / btc_spot * 100.0
@@ -219,7 +228,7 @@ def _build_samples_for_slug(slug: str, all_klines: list) -> list[_Sample]:
     return samples
 
 
-def _bucketize(samples: list[_Sample]) -> list[tuple[float, float, int]]:
+def _bucketize(samples: list[_Sample], silent: bool = False) -> list[tuple[float, float, int]]:
     """Return list of (distance_midpoint, bias_pp, n) per bucket."""
     out: list[tuple[float, float, int]] = []
     for lo, hi in _BUCKETS:
@@ -233,10 +242,69 @@ def _bucketize(samples: list[_Sample]) -> list[tuple[float, float, int]]:
         mean_real = sum(s.realized_event for s in bucket) / n
         bias_pp = (mean_pred - mean_real) * 100.0
         mid = (lo + hi) / 2.0
-        logger.info("bucket [%g, %g): n=%d  pred=%.3f  real=%.3f  bias_pp=%+.1f",
-                    lo, hi, n, mean_pred, mean_real, bias_pp)
+        if not silent:
+            logger.info("bucket [%g, %g): n=%d  pred=%.3f  real=%.3f  bias_pp=%+.1f",
+                        lo, hi, n, mean_pred, mean_real, bias_pp)
         out.append((mid, round(bias_pp, 1), n))
     return out
+
+
+def _brier_and_mae(samples: list[_Sample]) -> tuple[float, float]:
+    if not samples:
+        return float("nan"), float("nan")
+    n = len(samples)
+    brier = sum((s.p_predicted_event - s.realized_event) ** 2 for s in samples) / n
+    mae = sum(abs(s.p_predicted_event - s.realized_event) for s in samples) / n
+    return brier, mae
+
+
+def _weighted_abs_bias(buckets: list[tuple[float, float, int]]) -> float:
+    total_n = sum(n for _, _, n in buckets)
+    if total_n == 0:
+        return float("nan")
+    return sum(abs(b) * n for _, b, n in buckets) / total_n
+
+
+def _ft_const(c: float):
+    def f(_T: float) -> float:
+        return c
+    f.__name__ = f"const({c})"
+    return f
+
+
+def _ft_horizon(a: float, b: float, t0: float):
+    """Horizon-dependent: a + b * (t0/max(T, t0))^0.5 — fatter at short T."""
+    def f(T: float) -> float:
+        return a + b * (t0 / max(T, t0)) ** 0.5
+    f.__name__ = f"horizon(a={a},b={b},t0={t0})"
+    return f
+
+
+def _run_sweep(slugs: list[str], all_klines: list) -> None:
+    configs: list[tuple[str, object, float]] = [
+        ("baseline ft=1.35  wick=0",       _ft_const(1.35), 0.0),
+        ("ft=1.10            wick=0",      _ft_const(1.10), 0.0),
+        ("ft=1.15            wick=0",      _ft_const(1.15), 0.0),
+        ("ft=1.20            wick=0",      _ft_const(1.20), 0.0),
+        ("ft=1.25            wick=0",      _ft_const(1.25), 0.0),
+        ("ft=1.20           wick=0.001",   _ft_const(1.20), 0.001),
+        ("ft=1.20           wick=0.002",   _ft_const(1.20), 0.002),
+        ("ft=1.15           wick=0.001",   _ft_const(1.15), 0.001),
+        ("ft=1.15           wick=0.002",   _ft_const(1.15), 0.002),
+        ("horizon(1.10,0.30,5)  wick=0.001", _ft_horizon(1.10, 0.30, 5.0), 0.001),
+        ("horizon(1.10,0.40,5)  wick=0.001", _ft_horizon(1.10, 0.40, 5.0), 0.001),
+        ("horizon(1.05,0.30,5)  wick=0.001", _ft_horizon(1.05, 0.30, 5.0), 0.001),
+    ]
+    print(f"\n{'config':<42}  {'brier':>7}  {'mae':>7}  {'wabs_bias_pp':>12}")
+    print("-" * 75)
+    for label, ft, wick in configs:
+        all_samples: list[_Sample] = []
+        for slug in slugs:
+            all_samples.extend(_build_samples_for_slug(slug, all_klines, ft, wick))
+        brier, mae = _brier_and_mae(all_samples)
+        buckets = _bucketize(all_samples, silent=True)
+        wabs = _weighted_abs_bias(buckets)
+        print(f"{label:<42}  {brier:>7.4f}  {mae:>7.4f}  {wabs:>12.2f}")
 
 
 def main(start: tuple[int, int] = (2025, 11),
@@ -265,8 +333,11 @@ def main(start: tuple[int, int] = (2025, 11),
                 datetime.fromtimestamp(all_klines[-1][0]/1000, timezone.utc).date())
 
     all_samples: list[_Sample] = []
+    # main recalibration uses the new production defaults: ft=1.15, wick=0.002
+    ft_main = _ft_const(1.15)
+    wick_main = 0.002
     for slug in slugs:
-        s = _build_samples_for_slug(slug, all_klines)
+        s = _build_samples_for_slug(slug, all_klines, ft_main, wick_main)
         logger.info("slug %s → %d samples", slug, len(s))
         all_samples.extend(s)
 
@@ -287,4 +358,16 @@ def main(start: tuple[int, int] = (2025, 11),
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "sweep":
+        # Quick sweep of (fat_tail, wick) configurations
+        now = datetime.now(timezone.utc)
+        prev_y, prev_m = (now.year, now.month - 1) if now.month > 1 else (now.year - 1, 12)
+        slugs = _iter_slugs(2025, 11, prev_y, prev_m)
+        end_window = parse_slug_to_month_window(slugs[-1])
+        fetch_end_ms = int(end_window[1].timestamp() * 1000) + 86400000
+        span_days = (end_window[1] - parse_slug_to_month_window(slugs[0])[0]).days + 75
+        all_klines = _fetch_klines_until(fetch_end_ms, span_days)
+        logger.info("fetched %d klines for sweep", len(all_klines))
+        _run_sweep(slugs, all_klines)
+    else:
+        main()

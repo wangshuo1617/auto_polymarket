@@ -10,6 +10,7 @@ import re
 from math import erf, exp, log, sqrt
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 ET_TIMEZONE = ZoneInfo("America/New_York")
@@ -21,19 +22,20 @@ logger = logging.getLogger(__name__)
 #   - 使用历史已实现波动率时，σ×1.35 最优 (Brier 0.1161, 中远距离校准误差 <5pp)
 #   - 使用 Deribit IV 时，IV 已含 vol risk premium (≈ realized × 1.12)，
 #     等效目标 σ 不变 → IV 模式乘数 ≈ 1.35/1.12 ≈ 1.20
-_FAT_TAIL_MULT_REALIZED = 1.35
-_FAT_TAIL_MULT_IV = 1.20
+_FAT_TAIL_MULT_REALIZED = 1.15
+_FAT_TAIL_MULT_IV = 1.05
 
-# 重新校准 (P1b, 2026-05-07): 636 个样本横跨 Nov'25-Apr'26 (Dec'25 月度市场不存在).
-# 模型升级 (动态 drift + EWMA σ + 1s path-to-date) 后, 8-15% 桶 bias 翻号 (-6 → +13).
-# 模型整体倾向于过高估 p_yes (touch probability), 主要集中在中近距离 3-15%.
+# 重新校准 (P1b+P2+P3, 2026-05-07): 636 个样本 (Nov'25-Apr'26, 缺 Dec'25).
+# 配套模型: dynamic drift + EWMA σ + 1s path-to-date + fat_tail=1.15 + wick=0.002.
+# 残余 bias 已显著降低 (peak 8-15% bucket: P1b 13.4pp → P2/P3 后 4.3pp);
+# 整体仍微高估 p_yes, 用以下分段线性插值最后修正.
 _CALIBRATION_CONTROL_POINTS: list[tuple[float, float, int]] = [
     (0.0,    0.0,   0),   # at-the-money: 无修正
-    (1.5,    3.9,  34),   # 0-3% 桶中点
-    (5.5,   11.6,  57),   # 3-8% 桶中点
-    (11.5,  13.4,  81),   # 8-15% 桶中点
-    (22.5,   6.6, 149),   # 15-30% 桶中点
-    (50.0,   1.2, 297),   # 30%+ 桶中点 (回归至接近零)
+    (1.5,    3.2,  34),   # 0-3% 桶中点
+    (5.5,    7.1,  57),   # 3-8% 桶中点
+    (11.5,   4.3,  81),   # 8-15% 桶中点
+    (22.5,   3.6, 149),   # 15-30% 桶中点
+    (50.0,   0.6, 297),   # 30%+ 桶中点 (回归至接近零)
     (80.0,   0.0,   0),   # 极远距离: 衰减至零
 ]
 _CALIBRATION_BIAS_CAP_PP = 15.0  # 最大校正幅度上限
@@ -242,6 +244,7 @@ def _barrier_touch_prob(
     days_left: float,
     *,
     sigma_is_iv: bool = False,
+    fat_tail_mult: Optional[float] = None,
 ) -> float:
     """
     首次触及概率（反射原理 / reflection principle）。
@@ -262,9 +265,11 @@ def _barrier_touch_prob(
         - 行权距离 8-15%: 原始模型预测 37%，实际 54%（低估 +17pp）
         - 行权距离 15-30%: 原始模型预测 11%，实际 21%（低估 +10pp）
 
-      σ 来源不同，乘数不同:
-        - 已实现波动率: ×1.35 (Brier 0.1194→0.1161, 8-15% 误差 +18pp→+5pp)
-        - Deribit IV: ×1.20 (IV 已含 vol risk premium ≈ realized×1.12)
+      σ 来源不同，乘数不同 (P2 重新校准, 2026-05-07, 636 样本):
+        - 已实现波动率: ×1.15 (Brier 0.0623→0.0572, wabs_bias 5.21pp→2.55pp,
+          配合 wick_buffer=0.002; 旧 1.35 与 1s path-to-date + EWMA σ 后
+          系统性高估 p_yes 5pp+)
+        - Deribit IV: ×1.05 (按 IV/realized ≈1.10 比例缩放)
 
     sigma_is_iv: True 表示 sigma_daily 来自 Deribit IV，使用较小乘数。
     """
@@ -274,7 +279,10 @@ def _barrier_touch_prob(
         else:
             return 1.0 if current_price <= strike else 0.0
 
-    fat_tail_mult = _FAT_TAIL_MULT_IV if sigma_is_iv else _FAT_TAIL_MULT_REALIZED
+    fat_tail_mult = (
+        fat_tail_mult if fat_tail_mult is not None
+        else (_FAT_TAIL_MULT_IV if sigma_is_iv else _FAT_TAIL_MULT_REALIZED)
+    )
     sigma_adj = sigma_daily * fat_tail_mult
 
     # log-drift: μ_log = μ_simple - σ²/2 (Itō 修正)
