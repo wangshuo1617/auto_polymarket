@@ -120,6 +120,7 @@ def _run_one(slug: str, max_strikes: int) -> dict:
         sigma_daily=inputs.sigma_daily,
         sigma_source=inputs.sigma_source,
         sigma_is_iv=False,
+        drift_daily=inputs.drift_daily,
         days_left=inputs.days_left,
         quotes=inputs.quotes,
         positions=inputs.positions,

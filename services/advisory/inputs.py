@@ -31,6 +31,13 @@ from services.profit_optimizer import _extract_strike_and_direction
 from services.advisory.computer import TokenQuote, TokenPosition
 from services.advisory.market_state_adapter import TokenContext, BtcTickState
 from services.advisory.settlement_adapter import ConditionDescriptor
+from services.advisory.path_metrics import (
+    parse_slug_to_month_window,
+    compute_path_extrema_with_fallback,
+    klines_to_log_returns,
+    compute_drift_daily,
+    compute_ewma_sigma,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +49,11 @@ class BatchInputs:
     days_left: float
     sigma_daily: float
     sigma_source: str
+    drift_daily: float
+    drift_source: str
     path_max_btc: float
     path_min_btc: float
+    path_source: str
     universe: list[TokenContext]
     descriptors: list[ConditionDescriptor]
     quotes: dict[str, TokenQuote]
@@ -205,22 +215,40 @@ def _fetch_quotes(token_ids: list[str]) -> dict[str, TokenQuote]:
             for tid, v in raw.items()}
 
 
-def _estimate_volatility() -> tuple[float, float, float, str]:
-    klines = get_1d_klines_data(limit=30) or []
+def _estimate_volatility_and_drift() -> tuple[float, str, float, str, float, float, str]:
+    """Return (sigma_daily, sigma_source, drift_daily, drift_source,
+    fallback_high_7d, fallback_low_7d, fallback_source).
+
+    σ source: EWMA (λ=0.94) over up to 60 daily log returns. Falls back to
+    realized 30d profile / ATR if klines are unavailable.
+    Drift: shrunk sample mean log return over up to 60 days.
+    """
+    klines = get_1d_klines_data(limit=60) or []
     profile = build_daily_volatility_profile(klines, atr_period=14)
     realized_pct = float(profile.get("realized_vol_daily_pct") or 0.0)
-    if realized_pct <= 0:
+
+    returns = klines_to_log_returns(klines, n=60)
+    sigma_ewma, ewma_src = compute_ewma_sigma(returns, lam=0.94)
+    drift, drift_src = compute_drift_daily(returns, shrink_full_n=60)
+
+    if sigma_ewma > 0:
+        sigma_daily = sigma_ewma
+        sigma_source = ewma_src
+    elif realized_pct > 0:
+        sigma_daily = realized_pct / 100.0
+        sigma_source = f"realized_vol_30d({realized_pct}%)"
+    else:
         atr_pct = float(profile.get("atr_pct") or 1.8)
         sigma_daily = max(0.008, atr_pct / 100.0 * 0.8)
-        source = f"atr_fallback({atr_pct}%)"
-    else:
-        sigma_daily = realized_pct / 100.0
-        source = f"realized_vol_30d({realized_pct}%)"
+        sigma_source = f"atr_fallback({atr_pct}%)"
 
     recent7 = klines[-7:] if len(klines) >= 7 else klines
     highs = [float(k[2]) for k in recent7]
     lows = [float(k[3]) for k in recent7]
-    return sigma_daily, max(highs) if highs else 0.0, min(lows) if lows else 0.0, source
+    fb_high = max(highs) if highs else 0.0
+    fb_low = min(lows) if lows else 0.0
+    fb_src = f"7d_klines(n={len(recent7)})"
+    return sigma_daily, sigma_source, drift, drift_src, fb_high, fb_low, fb_src
 
 
 def assemble_batch_inputs(slug: str, max_strikes: int = 6,
@@ -240,7 +268,18 @@ def assemble_batch_inputs(slug: str, max_strikes: int = 6,
     if btc_now <= 0:
         raise RuntimeError("Binance returned 0 BTC price")
 
-    sigma_daily, path_max, path_min, sigma_source = _estimate_volatility()
+    sigma_daily, sigma_source, drift_daily, drift_source, \
+        fb_high, fb_low, fb_src = _estimate_volatility_and_drift()
+
+    month_window = parse_slug_to_month_window(slug)
+    if month_window is None:
+        path_max, path_min, path_source = fb_high, fb_low, fb_src
+    else:
+        m_start, m_end = month_window
+        path_max, path_min, path_source = compute_path_extrema_with_fallback(
+            m_start, m_end, fb_high, fb_low, fb_src,
+        )
+
     universe, descriptors, token_ids = _fetch_universe(slug, max_strikes, btc_now)
     if not universe:
         raise RuntimeError(f"no tokens parsed from event slug={slug}")
@@ -266,8 +305,11 @@ def assemble_batch_inputs(slug: str, max_strikes: int = 6,
         days_left=days_left,
         sigma_daily=sigma_daily,
         sigma_source=sigma_source,
+        drift_daily=drift_daily,
+        drift_source=drift_source,
         path_max_btc=max(path_max, btc_now),
         path_min_btc=min(path_min, btc_now) if path_min > 0 else btc_now,
+        path_source=path_source,
         universe=universe,
         descriptors=descriptors,
         quotes=quotes,
