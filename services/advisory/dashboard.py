@@ -244,68 +244,39 @@ def api_manual_trade_list():
 
 
 # ---------------------------------------------------------------------------
-#  Portfolio (P1) — manual_trades 派生当前持仓 + 最新 advisory 快照对照
+#  Portfolio (P1) — advisory_chain_fills 派生当前持仓 + 最新 advisory 快照对照
 # ---------------------------------------------------------------------------
-#  说明: advisory v1.3 不存储 target sizing (没有 sizer 模块), 因此 "diff" 仅展示
-#       (a) manual_trades 派生的当前持仓 (净 shares / 加权成本 / 净投入)
-#       (b) 最新 complete batch 中该 token 的 fair / best_bid / best_ask /
-#           edge_buy_active / halt_reason
-#       (c) mark-to-best_bid 的未实现 PnL
-#  on-chain 实际持仓对账由 P4 处理; 这里仅用 manual_trades 自报数据.
+#  v2 重构: 数据源由 manual_trades 切换为 advisory_chain_fills (链上事实).
+#       好处:
+#       (a) 不再需要"用户主动记录" — dashboard 之外的下单(直链/Builder/外部钱包)
+#           只要钱包在 advisory universe 内, 持仓自动反映;
+#       (b) 取消的订单不会污染持仓 (取消未成交, 链上不出现 fill);
+#       (c) shares 直接来自 transferLog, 不再 size_usdc / price 间接派生 → 更准.
+#  返回 schema 与 v1 兼容; 仅增加 fill_count = buy_count + sell_count 在 totals 中.
+#  on-chain 实际持仓对账由 P4 处理; 这里仅用 advisory_chain_fills 自报数据.
 
 @advisory_bp.route("/api/advisory/portfolio", methods=["GET"])
 def api_portfolio():
     """
-    返回 manual_trades 聚合得到的每个 token 净持仓, 配上最新 advisory 快照行情.
-
-    响应:
-        {
-          "as_of": "2026-...",
-          "positions": [
-            {
-              "token_id": "...",
-              "market_slug": "...", "condition_id": "...",
-              "shares": float, "avg_entry_price": float|None,
-              "net_invested_usdc": float,
-              "buy_count": int, "sell_count": int,
-              "first_trade_at": iso, "last_trade_at": iso,
-              "latest_snapshot_id": int|None,
-              "latest_snapshot_at": iso|None,
-              "fair_value_for_edge": float|None,
-              "best_bid": float|None, "best_ask": float|None,
-              "edge_buy_active": bool|None, "halt_reason": str|None,
-              "mark_value_usdc": float|None,
-              "unrealized_pnl_usdc": float|None
-            }, ...
-          ],
-          "totals": {
-            "open_position_count": int,
-            "net_invested_usdc": float,
-            "mark_value_usdc": float,
-            "unrealized_pnl_usdc": float
-          }
-        }
+    返回 advisory_chain_fills 聚合得到的每个 token 净持仓, 配上最新 advisory 快照行情.
     """
     try:
         with get_conn() as conn:
             cur = conn.cursor()
-            # 聚合 manual_trades 到 token 粒度. shares = size_usdc / price.
-            # 净 shares 和净投入按 buy 正向、sell 反向累计;
-            # avg_entry 仅在净 shares > 0 时给出 (用净投入 / 净 shares).
             cur.execute(
                 """
                 WITH agg AS (
                     SELECT
                         token_id,
-                        SUM(CASE WHEN side='buy'  THEN size_usdc / price_usdc ELSE 0 END) AS shares_buy,
-                        SUM(CASE WHEN side='sell' THEN size_usdc / price_usdc ELSE 0 END) AS shares_sell,
+                        SUM(CASE WHEN side='buy'  THEN size_shares ELSE 0 END) AS shares_buy,
+                        SUM(CASE WHEN side='sell' THEN size_shares ELSE 0 END) AS shares_sell,
                         SUM(CASE WHEN side='buy'  THEN size_usdc ELSE 0 END) AS usdc_buy,
                         SUM(CASE WHEN side='sell' THEN size_usdc ELSE 0 END) AS usdc_sell,
                         SUM(CASE WHEN side='buy'  THEN 1 ELSE 0 END) AS buy_count,
                         SUM(CASE WHEN side='sell' THEN 1 ELSE 0 END) AS sell_count,
-                        MIN(executed_at_utc) AS first_trade_at,
-                        MAX(executed_at_utc) AS last_trade_at
-                    FROM manual_trades
+                        MIN(fill_timestamp) AS first_trade_at,
+                        MAX(fill_timestamp) AS last_trade_at
+                    FROM advisory_chain_fills
                     GROUP BY token_id
                 ),
                 latest AS (
