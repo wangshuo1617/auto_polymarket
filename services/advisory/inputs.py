@@ -1,0 +1,184 @@
+"""
+Advisory batch input assembly (R1 dependency).
+
+Pure functions that fetch real-data inputs needed by
+`services.advisory.computer.run_advisory_batch`. Extracted from V1 driver
+(`scripts/advisory_run_batch_e2e.py`) so the long-running batch runner
+(`scripts/advisory_batch_runner.py`) can reuse the same logic.
+
+Public API:
+    BatchInputs (dataclass)
+    assemble_batch_inputs(slug, max_strikes, btc_now=None) -> BatchInputs
+    parse_slug_to_month_end(slug) -> datetime
+    select_current_month_slug() -> str
+"""
+
+from __future__ import annotations
+
+import calendar
+import logging
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+
+from data.binance import get_btc_price, get_1d_klines_data
+from data.polymarket import get_event_token_id, get_best_prices
+from services.volatility import build_daily_volatility_profile
+from services.profit_optimizer import _extract_strike_and_direction
+from services.advisory.computer import TokenQuote, TokenPosition
+from services.advisory.market_state_adapter import TokenContext, BtcTickState
+from services.advisory.settlement_adapter import ConditionDescriptor
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BatchInputs:
+    slug: str
+    btc_price: float
+    days_left: float
+    sigma_daily: float
+    sigma_source: str
+    path_max_btc: float
+    path_min_btc: float
+    universe: list[TokenContext]
+    descriptors: list[ConditionDescriptor]
+    quotes: dict[str, TokenQuote]
+    positions: dict[str, TokenPosition] = field(default_factory=dict)
+    btc_tick: Optional[BtcTickState] = None
+    as_of_utc: Optional[datetime] = None
+
+
+def select_current_month_slug() -> str:
+    return f"what-price-will-bitcoin-hit-in-{datetime.now(timezone.utc).strftime('%B-%Y').lower()}"
+
+
+def parse_slug_to_month_end(slug: str) -> Optional[datetime]:
+    m = re.search(r"in-([a-z]+)-(\d{4})$", slug)
+    if not m:
+        return None
+    month_name, year = m.group(1), int(m.group(2))
+    month_map = {n.lower(): i for i, n in enumerate(calendar.month_name) if n}
+    month = month_map.get(month_name)
+    if not month:
+        return None
+    last_day = calendar.monthrange(year, month)[1]
+    return datetime(year, month, last_day, 23, 59, 59, tzinfo=timezone.utc)
+
+
+def _fetch_universe(slug: str, max_strikes: int, btc_now: float
+                    ) -> tuple[list[TokenContext], list[ConditionDescriptor], list[str]]:
+    event = get_event_token_id(slug)
+    descriptors_dict: dict[str, ConditionDescriptor] = {}
+    universe: list[TokenContext] = []
+    token_ids: list[str] = []
+
+    parsed = []
+    for m in event.get("markets", []):
+        strike, direction = _extract_strike_and_direction(m.get("question") or "")
+        if strike is None:
+            continue
+        parsed.append({**m, "_strike": strike, "_direction": direction})
+
+    parsed.sort(key=lambda x: abs(x["_strike"] - btc_now))
+    parsed = parsed[:max_strikes]
+
+    for m in parsed:
+        cond_id = m["market_id"]
+        outcomes = m.get("outcomes") or []
+        token_id_pair = m.get("token_id") or []
+        if len(token_id_pair) != 2 or len(outcomes) != 2:
+            logger.warning("skip market %s outcomes=%s tokens=%s", cond_id, outcomes, token_id_pair)
+            continue
+
+        descriptors_dict[cond_id] = ConditionDescriptor(
+            condition_id=cond_id,
+            market_slug=slug,
+            clob_token_ids=tuple(str(t) for t in token_id_pair),
+        )
+
+        for idx, (outcome, tok) in enumerate(zip(outcomes, token_id_pair)):
+            tid = str(tok)
+            side_above = (m["_direction"] == "above") if outcome.lower() == "yes" else \
+                         (m["_direction"] != "above")
+            universe.append(TokenContext(
+                token_id=tid,
+                condition_id=cond_id,
+                market_slug=slug,
+                outcome_index=idx,
+                strike_usd=float(m["_strike"]),
+                side_above=side_above,
+            ))
+            token_ids.append(tid)
+
+    return universe, list(descriptors_dict.values()), token_ids
+
+
+def _fetch_quotes(token_ids: list[str]) -> dict[str, TokenQuote]:
+    raw = get_best_prices(token_ids, profile="analyze")
+    return {tid: TokenQuote(best_bid=v.get("best_bid"), best_ask=v.get("best_ask"))
+            for tid, v in raw.items()}
+
+
+def _estimate_volatility() -> tuple[float, float, float, str]:
+    klines = get_1d_klines_data(limit=30) or []
+    profile = build_daily_volatility_profile(klines, atr_period=14)
+    realized_pct = float(profile.get("realized_vol_daily_pct") or 0.0)
+    if realized_pct <= 0:
+        atr_pct = float(profile.get("atr_pct") or 1.8)
+        sigma_daily = max(0.008, atr_pct / 100.0 * 0.8)
+        source = f"atr_fallback({atr_pct}%)"
+    else:
+        sigma_daily = realized_pct / 100.0
+        source = f"realized_vol_30d({realized_pct}%)"
+
+    recent7 = klines[-7:] if len(klines) >= 7 else klines
+    highs = [float(k[2]) for k in recent7]
+    lows = [float(k[3]) for k in recent7]
+    return sigma_daily, max(highs) if highs else 0.0, min(lows) if lows else 0.0, source
+
+
+def assemble_batch_inputs(slug: str, max_strikes: int = 6,
+                          btc_now: Optional[float] = None) -> BatchInputs:
+    """全部真实数据采集 + 装配, 返回 BatchInputs.
+
+    抛出 RuntimeError 如果 BTC 价无法获取或 universe 为空。
+    """
+    now_utc = datetime.now(timezone.utc)
+    month_end = parse_slug_to_month_end(slug)
+    if month_end is None:
+        raise ValueError(f"cannot parse month-end from slug: {slug}")
+    days_left = max(0.0, (month_end - now_utc).total_seconds() / 86400.0)
+
+    if btc_now is None:
+        btc_now = float(get_btc_price() or 0.0)
+    if btc_now <= 0:
+        raise RuntimeError("Binance returned 0 BTC price")
+
+    sigma_daily, path_max, path_min, sigma_source = _estimate_volatility()
+    universe, descriptors, token_ids = _fetch_universe(slug, max_strikes, btc_now)
+    if not universe:
+        raise RuntimeError(f"no tokens parsed from event slug={slug}")
+
+    quotes = _fetch_quotes(token_ids)
+
+    return BatchInputs(
+        slug=slug,
+        btc_price=btc_now,
+        days_left=days_left,
+        sigma_daily=sigma_daily,
+        sigma_source=sigma_source,
+        path_max_btc=max(path_max, btc_now),
+        path_min_btc=min(path_min, btc_now) if path_min > 0 else btc_now,
+        universe=universe,
+        descriptors=descriptors,
+        quotes=quotes,
+        positions={},
+        btc_tick=BtcTickState(
+            source="binance_avgPrice",
+            version="advisory-runner-v1",
+            latest_tick_ts_utc=now_utc,
+        ),
+        as_of_utc=now_utc,
+    )
