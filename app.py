@@ -65,12 +65,17 @@ app.secret_key = os.getenv("DASHBOARD_SECRET_KEY") or secrets.token_hex(32)
 try:
     from services.advisory.dashboard import advisory_bp
     app.register_blueprint(advisory_bp)
-    from services.advisory.manual_trade_writer import auto_record_manual_trade as _advisory_auto_record
+    from services.advisory.intent_writer import (
+        record_place_intent as _advisory_record_place,
+        record_cancel_intent as _advisory_record_cancel,
+    )
 except Exception as _adv_exc:  # pragma: no cover - defensive
     logging.getLogger(__name__).warning(
         "advisory blueprint not registered: %s", _adv_exc
     )
-    def _advisory_auto_record(**_kwargs):  # type: ignore[no-redef]
+    def _advisory_record_place(**_kwargs):  # type: ignore[no-redef]
+        return None
+    def _advisory_record_cancel(**_kwargs):  # type: ignore[no-redef]
         return None
 
 # 第五轮加固 #1：默认不信任 X-Forwarded-For（任何外部用户都能伪造该 header 污染 audit 字段）。
@@ -868,12 +873,13 @@ def api_buy():
                                  recommendation_item_id, order_id)
                 recommendation_sync_error = str(rec_err)
         logger.info("api_buy success: order_id=%s", order_id)
-        # Advisory P2-bonus: best-effort mirror to manual_trades. Skips
-        # silently if token has no advisory snapshot. Never raises.
-        _advisory_auto_record(
+        # Advisory v2 A3: write place_buy intent (captures fair/edge snapshot).
+        _advisory_record_place(
             token_id=token_id, side="buy",
             price=float(price), size_shares=float(size),
-            user_note=f"dashboard order_id={order_id}",
+            polymarket_order_id=order_id,
+            user_note="dashboard",
+            submission_payload=data,
         )
         resp = {'order_id': order_id}
         if recommendation_sync_error:
@@ -978,10 +984,12 @@ def api_sell():
                                  recommendation_item_id, order_id)
                 recommendation_sync_error = str(rec_err)
         logger.info("api_sell success: order_id=%s", order_id)
-        _advisory_auto_record(
+        _advisory_record_place(
             token_id=token_id, side="sell",
             price=float(price), size_shares=float(size),
-            user_note=f"dashboard order_id={order_id}",
+            polymarket_order_id=order_id,
+            user_note="dashboard",
+            submission_payload=data,
         )
         resp = {'order_id': order_id}
         if recommendation_sync_error:
@@ -1054,6 +1062,12 @@ def api_cancel():
                                  recommendation_item_id, order_id)
                 recommendation_sync_error = str(rec_err)
         logger.info("api_cancel success: order_id=%s result=%s", order_id, result)
+        # Advisory v2 A4: mirror cancel as cancel intent.
+        _advisory_record_cancel(
+            order_id=str(order_id),
+            user_note="dashboard",
+            submission_payload=data,
+        )
         resp = {'result': result}
         if recommendation_sync_error:
             resp['recommendation_sync_error'] = recommendation_sync_error
