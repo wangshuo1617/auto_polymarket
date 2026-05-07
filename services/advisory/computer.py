@@ -144,7 +144,7 @@ def _compute_one_view(
 
     # 减仓 / 清仓: 持有 + 按 bid 重算 edge_bid<0 (卖出价已低于公允) → target=0 全清.
     # 仅 ask-edge 翻负但 bid-edge 仍 >=0 时只是不该加仓, 不强制平.
-    # 锁利: 持有 + bid_edge >= +10% (市场超付) → target=0 全清拿大头.
+    # (锁利逻辑暂时去掉: bid >> fair 时人工判断, 避免过早出场)
     if (
         position.current_usdc is not None and position.current_usdc > 0
         and fair_value is not None and 0.0 < fair_value < 1.0
@@ -152,7 +152,7 @@ def _compute_one_view(
         and halt is None
     ):
         edge_bid = (quote.best_bid - fair_value) / fair_value
-        if edge_bid < 0 or edge_bid >= 0.10:
+        if edge_bid < 0:
             target_usdc = 0.0
 
     delta_usdc = None
