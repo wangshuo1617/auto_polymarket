@@ -24,18 +24,16 @@ logger = logging.getLogger(__name__)
 _FAT_TAIL_MULT_REALIZED = 1.35
 _FAT_TAIL_MULT_IV = 1.20
 
-# ── 校准偏差修正 (Calibration Bias Correction) ──────────────────────
-# 回测 85 个已结算月度 BTC 市场 (Nov'25-Apr'26) 的校准分析。
-# 模型在不同行权距离上存在系统性偏差，使用分段线性插值 + 小样本收缩修正。
-# 控制点: (distance_pct, raw_bias_pp, sample_n)
-#   bias > 0 表示模型高估 p_yes，bias < 0 表示低估。
+# 重新校准 (P1b, 2026-05-07): 636 个样本横跨 Nov'25-Apr'26 (Dec'25 月度市场不存在).
+# 模型升级 (动态 drift + EWMA σ + 1s path-to-date) 后, 8-15% 桶 bias 翻号 (-6 → +13).
+# 模型整体倾向于过高估 p_yes (touch probability), 主要集中在中近距离 3-15%.
 _CALIBRATION_CONTROL_POINTS: list[tuple[float, float, int]] = [
     (0.0,    0.0,   0),   # at-the-money: 无修正
-    (1.5,    9.0,   6),   # 0-3% 桶中点
-    (5.5,   23.0,   7),   # 3-8% 桶中点
-    (11.5,  -6.0,  13),   # 8-15% 桶中点
-    (22.5,   0.3,  19),   # 15-30% 桶中点
-    (50.0,   5.0,  40),   # 30%+ 桶中点
+    (1.5,    3.9,  34),   # 0-3% 桶中点
+    (5.5,   11.6,  57),   # 3-8% 桶中点
+    (11.5,  13.4,  81),   # 8-15% 桶中点
+    (22.5,   6.6, 149),   # 15-30% 桶中点
+    (50.0,   1.2, 297),   # 30%+ 桶中点 (回归至接近零)
     (80.0,   0.0,   0),   # 极远距离: 衰减至零
 ]
 _CALIBRATION_BIAS_CAP_PP = 15.0  # 最大校正幅度上限
