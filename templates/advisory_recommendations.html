@@ -55,6 +55,10 @@
 
   <div id="content"></div>
 
+  <h1 style="margin-top: 32px;">Portfolio (manual_trades 派生)</h1>
+  <div class="meta" id="portfolio-meta">加载中…</div>
+  <div id="portfolio-content"></div>
+
   <div class="modal-bg" id="modal-bg">
     <div class="modal">
       <h3>记录手动下单</h3>
@@ -240,6 +244,88 @@ async function submitTrade() {
 
 load();
 setInterval(load, 30000);  // 30s 自动刷新
+
+// --- Portfolio (P1) ---
+async function loadPortfolio() {
+  try {
+    const r = await fetch('/api/advisory/portfolio');
+    const data = await r.json();
+    if (!r.ok) {
+      document.getElementById('portfolio-meta').textContent = '错误: ' + (data.error || r.status);
+      return;
+    }
+    renderPortfolio(data);
+  } catch (e) {
+    document.getElementById('portfolio-meta').textContent = '网络错误: ' + e;
+  }
+}
+
+function renderPortfolio(data) {
+  const meta = document.getElementById('portfolio-meta');
+  const content = document.getElementById('portfolio-content');
+  const t = data.totals || {};
+  meta.innerHTML =
+    `as_of: ${data.as_of} · open_positions: ${t.open_position_count} · ` +
+    `净投入: ${fmt(t.net_invested_usdc, 2)} USDC · ` +
+    `市值(@bid): ${fmt(t.mark_value_usdc, 2)} · ` +
+    `未实现 PnL: <strong>${fmt(t.unrealized_pnl_usdc, 2)}</strong> USDC`;
+
+  const positions = data.positions || [];
+  if (positions.length === 0) {
+    content.innerHTML = '<div class="empty">暂无 manual_trades 记录</div>';
+    return;
+  }
+  let html = `<table>
+    <thead><tr>
+      <th class="txt">market_slug / token</th>
+      <th class="num">shares</th>
+      <th class="num">avg entry</th>
+      <th class="num">净投入 $</th>
+      <th class="num">fair</th>
+      <th class="num">bid / ask</th>
+      <th class="num">市值 $</th>
+      <th class="num">unrealized PnL $</th>
+      <th class="txt">advisory</th>
+      <th class="num">trades (B/S)</th>
+      <th class="txt">last trade</th>
+    </tr></thead><tbody>`;
+  for (const p of positions) {
+    const slug = (p.market_slug || '').slice(0, 32);
+    const tok = (p.token_id || '').slice(0, 10) + '…';
+    const pnl = p.unrealized_pnl_usdc;
+    const pnlColor = (pnl == null) ? '' :
+                     (pnl > 0 ? 'color:#2e7d32' : (pnl < 0 ? 'color:#c62828' : ''));
+    let advisoryPill = '—';
+    if (p.halt_reason) {
+      advisoryPill = `<span class="pill pill-halt" title="${p.halt_reason}">halt</span>`;
+    } else if (p.edge_buy_active === true) {
+      advisoryPill = `<span class="pill pill-open">edge BUY</span>`;
+    } else if (p.edge_buy_active === false) {
+      advisoryPill = `<span class="pill pill-locked">no edge</span>`;
+    }
+    const lastTrade = p.last_trade_at
+      ? new Date(p.last_trade_at).toISOString().replace('T', ' ').slice(0, 16) + 'Z'
+      : '—';
+    html += `<tr>
+      <td class="txt"><div>${slug}</div><div style="color:#999;font-size:11px">${tok}</div></td>
+      <td class="num">${fmt(p.shares, 2)}</td>
+      <td class="num">${fmt(p.avg_entry_price, 3)}</td>
+      <td class="num">${fmt(p.net_invested_usdc, 2)}</td>
+      <td class="num">${fmt(p.fair_value_for_edge, 3)}</td>
+      <td class="num">${fmt(p.best_bid, 3)} / ${fmt(p.best_ask, 3)}</td>
+      <td class="num">${fmt(p.mark_value_usdc, 2)}</td>
+      <td class="num" style="${pnlColor}"><strong>${fmt(pnl, 2)}</strong></td>
+      <td class="txt">${advisoryPill}</td>
+      <td class="num">${p.buy_count}/${p.sell_count}</td>
+      <td class="txt" style="font-size:11px;color:#666">${lastTrade}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  content.innerHTML = html;
+}
+
+loadPortfolio();
+setInterval(loadPortfolio, 30000);
 </script>
 </body>
 </html>

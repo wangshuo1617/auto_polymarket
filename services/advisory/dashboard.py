@@ -6,6 +6,7 @@ Advisory dashboard blueprint (A5).
 - GET /api/advisory/recommendations — 最新 complete batch 的 token MarketView (JSON)
 - POST /api/advisory/manual_trades — 记录用户手动下单
 - GET /api/advisory/manual_trades  — 列出最近 manual trades
+- GET /api/advisory/portfolio      — manual_trades 派生持仓 + 最新快照对照 (P1)
 
 数据契约 (plan-advisory §5):
 - 路由数据源严格走 `get_latest_complete_batch_views()`, 不读 market_view_latest
@@ -237,3 +238,171 @@ def api_manual_trade_list():
             "user_note": note,
         })
     return jsonify({"trades": out, "count": len(out)})
+
+
+# ---------------------------------------------------------------------------
+#  Portfolio (P1) — manual_trades 派生当前持仓 + 最新 advisory 快照对照
+# ---------------------------------------------------------------------------
+#  说明: advisory v1.3 不存储 target sizing (没有 sizer 模块), 因此 "diff" 仅展示
+#       (a) manual_trades 派生的当前持仓 (净 shares / 加权成本 / 净投入)
+#       (b) 最新 complete batch 中该 token 的 fair / best_bid / best_ask /
+#           edge_buy_active / halt_reason
+#       (c) mark-to-best_bid 的未实现 PnL
+#  on-chain 实际持仓对账由 P4 处理; 这里仅用 manual_trades 自报数据.
+
+@advisory_bp.route("/api/advisory/portfolio", methods=["GET"])
+def api_portfolio():
+    """
+    返回 manual_trades 聚合得到的每个 token 净持仓, 配上最新 advisory 快照行情.
+
+    响应:
+        {
+          "as_of": "2026-...",
+          "positions": [
+            {
+              "token_id": "...",
+              "market_slug": "...", "condition_id": "...",
+              "shares": float, "avg_entry_price": float|None,
+              "net_invested_usdc": float,
+              "buy_count": int, "sell_count": int,
+              "first_trade_at": iso, "last_trade_at": iso,
+              "latest_snapshot_id": int|None,
+              "latest_snapshot_at": iso|None,
+              "fair_value_for_edge": float|None,
+              "best_bid": float|None, "best_ask": float|None,
+              "edge_buy_active": bool|None, "halt_reason": str|None,
+              "mark_value_usdc": float|None,
+              "unrealized_pnl_usdc": float|None
+            }, ...
+          ],
+          "totals": {
+            "open_position_count": int,
+            "net_invested_usdc": float,
+            "mark_value_usdc": float,
+            "unrealized_pnl_usdc": float
+          }
+        }
+    """
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            # 聚合 manual_trades 到 token 粒度. shares = size_usdc / price.
+            # 净 shares 和净投入按 buy 正向、sell 反向累计;
+            # avg_entry 仅在净 shares > 0 时给出 (用净投入 / 净 shares).
+            cur.execute(
+                """
+                WITH agg AS (
+                    SELECT
+                        token_id,
+                        SUM(CASE WHEN side='buy'  THEN size_usdc / price_usdc ELSE 0 END) AS shares_buy,
+                        SUM(CASE WHEN side='sell' THEN size_usdc / price_usdc ELSE 0 END) AS shares_sell,
+                        SUM(CASE WHEN side='buy'  THEN size_usdc ELSE 0 END) AS usdc_buy,
+                        SUM(CASE WHEN side='sell' THEN size_usdc ELSE 0 END) AS usdc_sell,
+                        SUM(CASE WHEN side='buy'  THEN 1 ELSE 0 END) AS buy_count,
+                        SUM(CASE WHEN side='sell' THEN 1 ELSE 0 END) AS sell_count,
+                        MIN(executed_at_utc) AS first_trade_at,
+                        MAX(executed_at_utc) AS last_trade_at
+                    FROM manual_trades
+                    GROUP BY token_id
+                ),
+                latest AS (
+                    SELECT DISTINCT ON (s.token_id)
+                        s.token_id, s.id AS snapshot_id, s.generated_at,
+                        s.market_slug, s.condition_id,
+                        s.fair_value_for_edge, s.edge_buy_active,
+                        s.halt_reason, s.view_payload
+                    FROM market_view_snapshots s
+                    ORDER BY s.token_id, s.id DESC
+                )
+                SELECT
+                    a.token_id,
+                    a.shares_buy, a.shares_sell, a.usdc_buy, a.usdc_sell,
+                    a.buy_count, a.sell_count,
+                    a.first_trade_at, a.last_trade_at,
+                    l.snapshot_id, l.generated_at, l.market_slug, l.condition_id,
+                    l.fair_value_for_edge, l.edge_buy_active, l.halt_reason,
+                    l.view_payload
+                FROM agg a
+                LEFT JOIN latest l ON l.token_id = a.token_id
+                ORDER BY (a.usdc_buy - a.usdc_sell) DESC
+                """,
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        logger.exception("portfolio aggregation failed")
+        return jsonify({"error": str(exc)}), 500
+
+    positions = []
+    total_invested = 0.0
+    total_mark = 0.0
+    total_pnl = 0.0
+    open_count = 0
+
+    for r in rows:
+        (token_id, sh_buy, sh_sell, u_buy, u_sell, n_buy, n_sell,
+         first_at, last_at, snap_id, snap_at, slug, cid,
+         fair, edge_buy, halt, vp) = r
+
+        shares = float((sh_buy or 0) - (sh_sell or 0))
+        net_invested = float((u_buy or 0) - (u_sell or 0))
+        avg_entry = (net_invested / shares) if shares > 1e-9 else None
+
+        # view_payload JSONB 取 best_bid/best_ask
+        best_bid = best_ask = None
+        if isinstance(vp, dict):
+            best_bid = vp.get("best_bid")
+            best_ask = vp.get("best_ask")
+        elif isinstance(vp, str):
+            try:
+                import json as _json
+                _vp = _json.loads(vp)
+                best_bid = _vp.get("best_bid")
+                best_ask = _vp.get("best_ask")
+            except Exception:
+                pass
+
+        mark_value = unrealized = None
+        if shares > 1e-9 and best_bid is not None:
+            mark_value = shares * float(best_bid)
+            unrealized = mark_value - net_invested
+            total_mark += mark_value
+            total_pnl += unrealized
+            open_count += 1
+        if shares > 1e-9:
+            total_invested += net_invested
+
+        positions.append({
+            "token_id": token_id,
+            "market_slug": slug,
+            "condition_id": cid,
+            "shares": shares,
+            "avg_entry_price": avg_entry,
+            "net_invested_usdc": net_invested,
+            "buy_count": int(n_buy or 0),
+            "sell_count": int(n_sell or 0),
+            "first_trade_at": first_at.astimezone(timezone.utc).isoformat()
+                if isinstance(first_at, datetime) else None,
+            "last_trade_at": last_at.astimezone(timezone.utc).isoformat()
+                if isinstance(last_at, datetime) else None,
+            "latest_snapshot_id": snap_id,
+            "latest_snapshot_at": snap_at.astimezone(timezone.utc).isoformat()
+                if isinstance(snap_at, datetime) else None,
+            "fair_value_for_edge": float(fair) if fair is not None else None,
+            "best_bid": float(best_bid) if best_bid is not None else None,
+            "best_ask": float(best_ask) if best_ask is not None else None,
+            "edge_buy_active": bool(edge_buy) if edge_buy is not None else None,
+            "halt_reason": halt,
+            "mark_value_usdc": mark_value,
+            "unrealized_pnl_usdc": unrealized,
+        })
+
+    return jsonify({
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "positions": positions,
+        "totals": {
+            "open_position_count": open_count,
+            "net_invested_usdc": total_invested,
+            "mark_value_usdc": total_mark,
+            "unrealized_pnl_usdc": total_pnl,
+        },
+    })
