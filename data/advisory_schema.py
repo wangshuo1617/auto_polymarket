@@ -311,6 +311,26 @@ CREATE INDEX IF NOT EXISTS path_views_path_obs_idx
     ON path_views (path_observation_snapshot_id);
 """
 
+
+# advisory_user_theses (P2): user 自由文本判断 (e.g. "我觉得 BTC 接下来会冲 90k").
+# 持久化到 PG, 由 inputs.assemble_batch_inputs 注入 BatchInputs.user_thesis_text;
+# 改变文本 → inputs_hash 改变 → 触发新 batch (cache invalidation).
+# 当前未连入 AI prompt (advisory pipeline 暂无 AI 调用); 文本随 batch 一起记录,
+# 后续 AI 上线后可直接消费.
+_DDL_USER_THESES = """
+CREATE TABLE IF NOT EXISTS advisory_user_theses (
+    id              BIGSERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL,
+    thesis_text     TEXT NOT NULL CHECK (length(thesis_text) BETWEEN 1 AND 4000),
+    cleared_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS advisory_user_theses_active_idx
+    ON advisory_user_theses (expires_at DESC)
+    WHERE cleared_at IS NULL;
+"""
+
+
 _DDL_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("path_observation_snapshots", _DDL_PATH_OBSERVATION_SNAPSHOTS),
     ("settlement_feed_versions", _DDL_SETTLEMENT_FEED_VERSIONS),
@@ -322,6 +342,7 @@ _DDL_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("market_view_latest", _DDL_MARKET_VIEW_LATEST),
     ("manual_trades", _DDL_MANUAL_TRADES),
     ("manual_trades_trigger", _DDL_MANUAL_TRADES_TRIGGER),
+    ("advisory_user_theses", _DDL_USER_THESES),
 )
 
 

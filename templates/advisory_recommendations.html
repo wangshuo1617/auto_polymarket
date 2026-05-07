@@ -55,6 +55,23 @@
 
   <div id="content"></div>
 
+  <h1 style="margin-top: 32px;">My Thesis (BTC 走势自由文本判断)</h1>
+  <div class="meta" id="thesis-meta">加载中…</div>
+  <div id="thesis-current" style="margin-bottom: 12px;"></div>
+  <textarea id="thesis-input" rows="3" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px;"
+            placeholder="例如: 我认为接下来 24h BTC 大概率冲 90k, 之后回踩 85k. 影响下一 batch 的 inputs_hash. (留空 = 不修改)"></textarea>
+  <div style="margin-top: 8px;">
+    <label style="font-size: 12px; color: #666;">TTL 小时:</label>
+    <input type="number" id="thesis-ttl" value="6" min="0.5" max="72" step="0.5"
+           style="width: 60px; padding: 4px; border: 1px solid #ccc; border-radius: 4px;" />
+    <button onclick="submitThesis()" style="background: #1976d2; color: white; border: 0; padding: 6px 14px; border-radius: 4px; cursor: pointer;">保存 (替换 active)</button>
+    <button onclick="clearThesis()" style="background: #eee; color: #333; border: 0; padding: 6px 14px; border-radius: 4px; cursor: pointer; margin-left: 8px;">清除 active</button>
+    <span id="thesis-msg" style="margin-left: 12px; font-size: 12px;"></span>
+  </div>
+  <div class="meta" style="margin-top: 6px; font-size: 11px; color: #888;">
+    注: 写入 advisory_user_theses 表; 通过 inputs_hash 让下一 batch 失效旧缓存. 当前未连入 AI 调用 (advisory pipeline 还无 AI).
+  </div>
+
   <h1 style="margin-top: 32px;">Portfolio (manual_trades 派生)</h1>
   <div class="meta" id="portfolio-meta">加载中…</div>
   <div id="portfolio-content"></div>
@@ -326,6 +343,75 @@ function renderPortfolio(data) {
 
 loadPortfolio();
 setInterval(loadPortfolio, 30000);
+
+// --- User Thesis (P2) ---
+async function loadThesis() {
+  try {
+    const r = await fetch('/api/advisory/user_thesis');
+    const j = await r.json();
+    const meta = document.getElementById('thesis-meta');
+    const cur = document.getElementById('thesis-current');
+    if (!r.ok) { meta.textContent = '错误: ' + (j.error || r.status); return; }
+    if (!j.active) {
+      meta.textContent = '当前无 active thesis';
+      cur.innerHTML = '';
+      return;
+    }
+    meta.textContent = `active id=${j.active.id} · 创建 ${j.active.created_at} · 过期 ${j.active.expires_at}`;
+    cur.innerHTML = `<div style="background:#f5f5f5;padding:10px 12px;border-left:3px solid #1976d2;font-size:13px;white-space:pre-wrap;">${escapeHtml(j.active.thesis_text)}</div>`;
+  } catch (e) {
+    document.getElementById('thesis-meta').textContent = '网络错误: ' + e;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function submitThesis() {
+  const text = document.getElementById('thesis-input').value.trim();
+  const ttl = parseFloat(document.getElementById('thesis-ttl').value) || 6;
+  const msg = document.getElementById('thesis-msg');
+  if (!text) { msg.textContent = '空文本; 不修改'; msg.style.color = '#c62828'; return; }
+  msg.textContent = '提交中…';
+  try {
+    const r = await fetch('/api/advisory/user_thesis', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({thesis_text: text, ttl_hours: ttl}),
+    });
+    const j = await r.json();
+    if (r.ok) {
+      msg.textContent = `✓ 已设置 id=${j.active.id}`; msg.style.color = '#2e7d32';
+      document.getElementById('thesis-input').value = '';
+      loadThesis();
+    } else {
+      msg.textContent = `失败: ${j.error}`; msg.style.color = '#c62828';
+    }
+  } catch (e) {
+    msg.textContent = '网络错误: ' + e; msg.style.color = '#c62828';
+  }
+}
+
+async function clearThesis() {
+  const msg = document.getElementById('thesis-msg');
+  if (!confirm('确认清除当前 active thesis?')) return;
+  try {
+    const r = await fetch('/api/advisory/user_thesis', {method: 'DELETE'});
+    const j = await r.json();
+    if (r.ok) {
+      msg.textContent = `✓ 已清除 ${j.cleared} 条`; msg.style.color = '#2e7d32';
+      loadThesis();
+    } else {
+      msg.textContent = `失败: ${j.error}`; msg.style.color = '#c62828';
+    }
+  } catch (e) {
+    msg.textContent = '网络错误: ' + e; msg.style.color = '#c62828';
+  }
+}
+
+loadThesis();
+setInterval(loadThesis, 60000);
 </script>
 </body>
 </html>

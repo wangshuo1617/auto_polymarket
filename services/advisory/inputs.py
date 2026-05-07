@@ -50,6 +50,8 @@ class BatchInputs:
     positions: dict[str, TokenPosition] = field(default_factory=dict)
     btc_tick: Optional[BtcTickState] = None
     as_of_utc: Optional[datetime] = None
+    user_thesis_text: Optional[str] = None
+    user_thesis_id: Optional[int] = None
 
 
 def select_current_month_slug() -> str:
@@ -245,6 +247,19 @@ def assemble_batch_inputs(slug: str, max_strikes: int = 6,
 
     quotes = _fetch_quotes(token_ids)
 
+    # P2: pull active user thesis (if any) so it propagates into BatchInputs
+    # and inputs_hash. Best-effort: any failure → no thesis, batch continues.
+    thesis_text: Optional[str] = None
+    thesis_id: Optional[int] = None
+    try:
+        from services.advisory.user_thesis import get_active_thesis
+        active = get_active_thesis()
+        if active:
+            thesis_text = active.thesis_text
+            thesis_id = active.id
+    except Exception:
+        logger.exception("user_thesis lookup failed; proceeding without")
+
     return BatchInputs(
         slug=slug,
         btc_price=btc_now,
@@ -263,4 +278,6 @@ def assemble_batch_inputs(slug: str, max_strikes: int = 6,
             latest_tick_ts_utc=now_utc,
         ),
         as_of_utc=now_utc,
+        user_thesis_text=thesis_text,
+        user_thesis_id=thesis_id,
     )

@@ -7,6 +7,9 @@ Advisory dashboard blueprint (A5).
 - POST /api/advisory/manual_trades — 记录用户手动下单
 - GET /api/advisory/manual_trades  — 列出最近 manual trades
 - GET /api/advisory/portfolio      — manual_trades 派生持仓 + 最新快照对照 (P1)
+- GET /api/advisory/user_thesis    — 当前 active 自由文本判断 (P2)
+- POST /api/advisory/user_thesis   — 设置/替换 active 自由文本判断
+- DELETE /api/advisory/user_thesis — 清除 active 自由文本判断
 
 数据契约 (plan-advisory §5):
 - 路由数据源严格走 `get_latest_complete_batch_views()`, 不读 market_view_latest
@@ -406,3 +409,47 @@ def api_portfolio():
             "unrealized_pnl_usdc": total_pnl,
         },
     })
+
+
+# ---------------------------------------------------------------------------
+#  User thesis (P2) — 自由文本判断, 写入 BatchInputs / inputs_hash
+# ---------------------------------------------------------------------------
+
+@advisory_bp.route("/api/advisory/user_thesis", methods=["GET"])
+def api_user_thesis_get():
+    try:
+        from services.advisory.user_thesis import get_active_thesis
+        active = get_active_thesis()
+    except Exception as exc:
+        logger.exception("get_active_thesis failed")
+        return jsonify({"error": str(exc)}), 500
+    if active is None:
+        return jsonify({"active": None})
+    return jsonify({"active": active.to_dict()})
+
+
+@advisory_bp.route("/api/advisory/user_thesis", methods=["POST"])
+def api_user_thesis_set():
+    payload = request.get_json(silent=True) or {}
+    text = payload.get("thesis_text")
+    ttl = payload.get("ttl_hours", 6)
+    try:
+        from services.advisory.user_thesis import set_thesis
+        active = set_thesis(text, ttl_hours=ttl)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logger.exception("set_thesis failed")
+        return jsonify({"error": str(exc)}), 500
+    return jsonify({"active": active.to_dict()}), 201
+
+
+@advisory_bp.route("/api/advisory/user_thesis", methods=["DELETE"])
+def api_user_thesis_clear():
+    try:
+        from services.advisory.user_thesis import clear_active_thesis
+        n = clear_active_thesis()
+    except Exception as exc:
+        logger.exception("clear_active_thesis failed")
+        return jsonify({"error": str(exc)}), 500
+    return jsonify({"cleared": n})

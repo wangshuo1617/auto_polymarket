@@ -175,6 +175,7 @@ def _canonical_inputs_hash(
     *, path_view_id: int, input_quote_snapshot_id: Optional[int],
     path_observation_inputs_hash: str, settlement_feed_version: Optional[int],
     settlement_refresh_effect_hash: str, risk_config_version: str,
+    user_thesis_id: Optional[int] = None,
 ) -> str:
     payload = {
         "path_view_id": path_view_id,
@@ -183,6 +184,7 @@ def _canonical_inputs_hash(
         "settlement_feed_version": settlement_feed_version,
         "settlement_refresh_effect_hash": settlement_refresh_effect_hash,
         "risk_config_version": risk_config_version,
+        "user_thesis_id": user_thesis_id,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -286,6 +288,7 @@ def run_advisory_batch(
     drift_daily: float = 0.0,
     input_quote_snapshot_id: Optional[int] = None,
     as_of_utc: Optional[datetime] = None,
+    user_thesis_id: Optional[int] = None,
 ) -> BatchResult:
     """完整 4-step batch (plan-advisory §4.2):
       step 0:  create batch row status=started
@@ -360,6 +363,7 @@ def run_advisory_batch(
             settlement_feed_version=refresh_result.settlement_feed_version,
             settlement_refresh_effect_hash=refresh_result.effect_hash,
             risk_config_version=risk_config_version,
+            user_thesis_id=user_thesis_id,
         )
 
         # step 2: build views per token

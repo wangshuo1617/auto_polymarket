@@ -69,6 +69,7 @@ def run_e2e(slug: str, max_strikes: int) -> dict:
         quotes=inputs.quotes,
         positions=inputs.positions,
         as_of_utc=inputs.as_of_utc,
+        user_thesis_id=inputs.user_thesis_id,
     )
 
     from data.database import get_conn
