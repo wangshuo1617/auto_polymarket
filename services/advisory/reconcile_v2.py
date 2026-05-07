@@ -127,8 +127,11 @@ def _list_chain_fills_no_intent(cur, since: datetime, limit: int) -> list[dict]:
         )
         SELECT f.id, f.fill_timestamp, f.token_id, f.side, f.price,
                f.size_shares, f.size_usdc, f.tx_hash, f.log_index,
-               f.wallet_address, f.profile, f.market_slug, f.event_slug
+               f.wallet_address, f.profile, f.market_slug, f.event_slug,
+               (s.view_payload->>'outcome_index')::int AS outcome_index
         FROM advisory_chain_fills f
+        LEFT JOIN market_view_latest l ON l.token_id = f.token_id
+        LEFT JOIN market_view_snapshots s ON s.id = l.snapshot_id
         WHERE f.fill_timestamp >= %s
           AND f.id NOT IN (SELECT fid FROM all_linked)
         ORDER BY f.fill_timestamp DESC, f.id DESC

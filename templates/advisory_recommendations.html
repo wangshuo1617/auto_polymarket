@@ -529,7 +529,7 @@ function renderChainFillsNoIntent(items) {
     <td>${Number(x.price || 0).toFixed(4)}</td>
     <td>${Number(x.size_shares || 0).toFixed(0)}</td>
     <td>$${Number(x.size_usdc || 0).toFixed(2)}</td>
-    <td title="${x.market_slug || ''}">${formatTokenLabel(x.market_slug, null)}</td>
+    <td title="${x.market_slug || ''}">${formatTokenLabel(x.market_slug, x.outcome_index !== undefined ? x.outcome_index : null)}</td>
     <td>${x.profile}</td>
   </tr>`).join('');
   return `<details style="margin-top:12px;" open><summary style="cursor:pointer;font-weight:bold;color:#1565c0;">chain_fills_no_intent (前 20) — 链上有 fill 但 dashboard 无意图记录</summary>
