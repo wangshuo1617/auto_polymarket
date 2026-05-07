@@ -56,7 +56,7 @@ def _save_state(state: dict) -> None:
 
 
 def _fetch_latest_fair_for_tokens(token_ids: list[str]) -> dict[str, dict]:
-    """token_id -> {fair, slug, outcome_index, days_left, batch_id}"""
+    """token_id -> {fair, slug, outcome_index, side_above, strike_usd, days_left, batch_id}"""
     out: dict[str, dict] = {}
     if not token_ids:
         return out
@@ -67,27 +67,71 @@ def _fetch_latest_fair_for_tokens(token_ids: list[str]) -> dict[str, dict]:
             SELECT DISTINCT ON (token_id)
                    token_id, batch_id, market_slug, fair_value_for_edge,
                    view_payload->>'outcome_index',
-                   view_payload->>'days_left'
+                   view_payload->>'days_left',
+                   view_payload->>'side_above',
+                   view_payload->>'strike_usd'
             FROM market_view_snapshots
             WHERE token_id = ANY(%s)
             ORDER BY token_id, batch_id DESC
             """,
             (list(token_ids),),
         )
-        for tid, bid, slug, fair, oi, dl in cur.fetchall():
+        for tid, bid, slug, fair, oi, dl, sa, strike in cur.fetchall():
             out[tid] = {
                 "fair": float(fair) if fair is not None else None,
                 "slug": slug,
                 "outcome_index": int(oi) if oi is not None else None,
                 "days_left": float(dl) if dl is not None else None,
+                "side_above": (str(sa).lower() == "true") if sa is not None else None,
+                "strike_usd": float(strike) if strike is not None else None,
                 "batch_id": bid,
             }
     return out
 
 
-def _label(slug: str, oi: Optional[int]) -> str:
+def _format_target(strike_usd: Optional[float]) -> str:
+    if strike_usd is None:
+        return "?"
+    k = strike_usd / 1000.0
+    return f"{int(k)}k" if k.is_integer() else f"{k:.1f}".rstrip("0").rstrip(".") + "k"
+
+
+def _month_from_slug(slug: str) -> str:
+    import re
+    m = re.search(r"-in-([a-z]+)", slug or "", re.IGNORECASE)
+    return m.group(1).lower() if m else "?"
+
+
+def _label(slug: str, oi: Optional[int], side_above: Optional[bool] = None,
+           strike_usd: Optional[float] = None) -> str:
+    """与前端 formatTokenLabel 对齐: '{month}-{up to|down to} {N}k-{yes|no}'"""
+    import re
     side = "yes" if oi == 0 else ("no" if oi == 1 else "?")
-    return f"{slug}::{side}"
+    if not slug:
+        return "—"
+    # path 1: per-condition slug e.g. "will-bitcoin-reach-90k-in-may-2026"
+    m = re.match(r"^will-bitcoin-(reach|dip-to)-([0-9]+k?)-in-([a-z]+)", slug, re.IGNORECASE)
+    if m:
+        direction = "up to" if m.group(1).lower() == "reach" else "down to"
+        target = m.group(2).lower()
+        if not target.endswith("k"):
+            try:
+                target = _format_target(float(target) * 1000)
+            except ValueError:
+                pass
+        return f"{m.group(3).lower()}-{direction} {target}-{side}"
+    # path 2: parent event slug + side_above + strike_usd
+    if strike_usd is not None and side_above is not None:
+        if oi == 0:
+            market_above = bool(side_above)
+        elif oi == 1:
+            market_above = not bool(side_above)
+        else:
+            market_above = bool(side_above)
+        direction = "up to" if market_above else "down to"
+        return f"{_month_from_slug(slug)}-{direction} {_format_target(strike_usd)}-{side}"
+    # fallback
+    return (slug[:40] + "…") if len(slug) > 40 else f"{slug}::{side}"
 
 
 def collect_position_token_ids(profile: str = "analyze") -> list[str]:
@@ -135,6 +179,8 @@ def detect_flips(token_ids: list[str], min_prev_edge: float):
             flips.append({
                 "token_id": tid, "slug": f["slug"],
                 "outcome_index": f["outcome_index"],
+                "side_above": f.get("side_above"),
+                "strike_usd": f.get("strike_usd"),
                 "prev_edge": prev_edge, "curr_edge": edge,
                 "fair": fair, "ask": ask,
                 "prev_ask": last.get("last_ask"),
@@ -155,7 +201,7 @@ def _format_email(flips: list[dict]) -> tuple[str, str]:
     ]
     for f in flips:
         lines.append(
-            f"{_label(f['slug'], f['outcome_index'])[:55]:<55} "
+            f"{_label(f['slug'], f['outcome_index'], f.get('side_above'), f.get('strike_usd'))[:55]:<55} "
             f"{f['prev_edge']:>+10.4f} {f['curr_edge']:>+10.4f} "
             f"{(f.get('prev_ask') or 0):>9.4f} {f['ask']:>9.4f} "
             f"{f['fair']:>9.4f} {(f.get('days_left') or 0):>6.2f}"
