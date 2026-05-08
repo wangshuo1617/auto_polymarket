@@ -77,11 +77,11 @@ def _ai_min_interval_hours() -> float:
 
 
 def _ai_focus_tokens() -> int:
-    """每次 AI 调用只分析最接近现价的 N 个 token, 默认 6。"""
+    """每次 AI 调用只分析最接近现价的 N 个 *未触发* token, 默认 8。"""
     try:
-        return max(1, int(os.environ.get("ADVISORY_PATHVIEW_AI_FOCUS_TOKENS", "6")))
+        return max(1, int(os.environ.get("ADVISORY_PATHVIEW_AI_FOCUS_TOKENS", "8")))
     except Exception:
-        return 6
+        return 8
 
 
 def _last_ai_run_at(batch_id: int) -> Optional[datetime]:
@@ -119,11 +119,16 @@ def _should_run_ai_now() -> tuple[bool, str]:
 
 
 def _select_focus_tokens(tokens: list, spot: Optional[float], n: int) -> list:
-    """挑选最接近现价的 n 个 token (按 |strike - spot|)。"""
+    """挑选最接近现价的 n 个 *未触发* token (按 |strike - spot|).
+    fair_value_status != 'available' 的 token (locked_event_occurred /
+    locked_event_missed / settled) 已经触发或锁定, 不再进入 AI 分析子集."""
     if not tokens:
         return []
-    if spot is None or spot <= 0 or n >= len(tokens):
-        return list(tokens)
+    pool = [t for t in tokens if (t.get("fair_value_status") or "available") == "available"]
+    if not pool:
+        return []
+    if spot is None or spot <= 0 or n >= len(pool):
+        return list(pool)
 
     def _dist(t):
         s = t.get("strike_usd")
@@ -132,7 +137,7 @@ def _select_focus_tokens(tokens: list, spot: Optional[float], n: int) -> list:
         except Exception:
             return float("inf")
 
-    return sorted(tokens, key=_dist)[:n]
+    return sorted(pool, key=_dist)[:n]
 
 
 
