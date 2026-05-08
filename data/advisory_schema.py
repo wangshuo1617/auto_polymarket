@@ -433,6 +433,56 @@ CREATE TABLE IF NOT EXISTS advisory_chain_fills_poller_state (
 """.format(profile_check=_enum_check("profile", CHAIN_FILL_PROFILES))
 
 
+# ---------------------------------------------------------------------------
+# Phase B (AI PathView) — shadow tables, NEVER mutated by GBM production path.
+# 由 services.advisory.pathview_shadow.run_shadow_batch 写入, 仅供 B4 对比用.
+# ---------------------------------------------------------------------------
+
+PATHVIEW_SHADOW_SOURCES = ("ai", "gbm_baseline_replay")
+PATHVIEW_SHADOW_VALIDATION = ("passed", "passed_with_warnings", "failed", "fatal")
+
+_DDL_PATHVIEW_SHADOW_RUNS = """
+CREATE TABLE IF NOT EXISTS advisory_pathview_shadow_runs (
+    id                       BIGSERIAL PRIMARY KEY,
+    batch_id                 BIGINT NOT NULL REFERENCES market_view_batches(id),
+    generated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source                   TEXT NOT NULL {source_check},
+    model_id                 TEXT,
+    model_version            TEXT,
+    prompt_version           TEXT,
+    request_latency_ms       INTEGER,
+    inputs_hash              TEXT,
+    raw_payload              JSONB,
+    validation_status        TEXT NOT NULL {validation_check},
+    validation_errors        JSONB,
+    validation_warnings      JSONB,
+    notes                    TEXT
+);
+CREATE INDEX IF NOT EXISTS advisory_pathview_shadow_runs_batch_idx
+    ON advisory_pathview_shadow_runs (batch_id);
+CREATE INDEX IF NOT EXISTS advisory_pathview_shadow_runs_source_gen_idx
+    ON advisory_pathview_shadow_runs (source, generated_at DESC);
+""".format(
+    source_check=_enum_check("source", PATHVIEW_SHADOW_SOURCES),
+    validation_check=_enum_check("validation_status", PATHVIEW_SHADOW_VALIDATION),
+)
+
+_DDL_PATHVIEW_SHADOW_VIEWS = """
+CREATE TABLE IF NOT EXISTS advisory_pathview_shadow_views (
+    run_id              BIGINT NOT NULL REFERENCES advisory_pathview_shadow_runs(id) ON DELETE CASCADE,
+    token_id            TEXT NOT NULL,
+    p_event_yes         DOUBLE PRECISION,
+    fair_event          DOUBLE PRECISION,
+    fair_non_event      DOUBLE PRECISION,
+    fair_value_status   TEXT,
+    components          JSONB,
+    PRIMARY KEY (run_id, token_id)
+);
+CREATE INDEX IF NOT EXISTS advisory_pathview_shadow_views_token_idx
+    ON advisory_pathview_shadow_views (token_id);
+"""
+
+
 _DDL_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("path_observation_snapshots", _DDL_PATH_OBSERVATION_SNAPSHOTS),
     ("settlement_feed_versions", _DDL_SETTLEMENT_FEED_VERSIONS),
@@ -448,6 +498,8 @@ _DDL_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("advisory_intents_trigger", _DDL_ADVISORY_INTENTS_TRIGGER),
     ("advisory_chain_fills", _DDL_ADVISORY_CHAIN_FILLS),
     ("advisory_chain_fills_poller_state", _DDL_ADVISORY_CHAIN_FILLS_POLLER_STATE),
+    ("advisory_pathview_shadow_runs", _DDL_PATHVIEW_SHADOW_RUNS),
+    ("advisory_pathview_shadow_views", _DDL_PATHVIEW_SHADOW_VIEWS),
 )
 
 

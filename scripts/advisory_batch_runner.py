@@ -129,6 +129,15 @@ def _run_one(slug: str, max_strikes: int) -> dict:
         user_thesis_id=inputs.user_thesis_id,
         sigma_panel=inputs.sigma_panel,
     )
+
+    # Phase B1 shadow: 完全旁路 — 失败也不影响生产 batch
+    try:
+        from services.advisory.pathview_shadow import record_baseline_replay
+        if result.status == "complete" and result.batch_id:
+            record_baseline_replay(result.batch_id)
+    except Exception:
+        logger.exception("shadow baseline replay failed (non-fatal)")
+
     return {
         "batch_id": result.batch_id,
         "batch_sequence": result.batch_sequence,
