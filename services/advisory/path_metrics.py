@@ -169,3 +169,33 @@ def compute_ewma_sigma(returns: list[float], lam: float = 0.94) -> tuple[float, 
         var = lam * var + (1.0 - lam) * (r * r)
     sigma = math.sqrt(var)
     return sigma, f"ewma_lam{lam}_n{len(returns)}({sigma * 100:.2f}%)"
+
+
+def compute_realized_sigma(returns: list[float], n: Optional[int] = None) -> float:
+    """Sample stdev of log returns (daily σ).
+
+    Uses last `n` returns if specified. Returns 0 for <2 samples.
+    """
+    rets = returns[-n:] if (n is not None and len(returns) > n) else list(returns)
+    if len(rets) < 2:
+        return 0.0
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var)
+
+
+def compute_sigma_panel(returns: list[float],
+                        windows: tuple[int, ...] = (7, 14, 30, 60),
+                        ewma_lam: float = 0.94) -> dict:
+    """Compute multi-window σ panel for diagnostics / regime detection.
+
+    Returns dict with realized_{n}d for each window + ewma_lam{λ}.
+    All values are daily σ (decimal, not percent). 0.0 when insufficient data.
+    """
+    panel: dict = {}
+    for w in windows:
+        panel[f"realized_{w}d"] = round(compute_realized_sigma(returns, n=w), 8)
+    ewma_sigma, _ = compute_ewma_sigma(returns, lam=ewma_lam)
+    panel[f"ewma_lam{ewma_lam}"] = round(ewma_sigma, 8)
+    panel["n_returns"] = len(returns)
+    return panel

@@ -145,8 +145,11 @@ CREATE TABLE IF NOT EXISTS market_view_batches (
     status                          TEXT NOT NULL DEFAULT 'started' {status_check},
     batch_completed_at              TIMESTAMPTZ,
     failure_step                    TEXT,
-    failure_error                   TEXT
+    failure_error                   TEXT,
+    sigma_panel                     JSONB
 );
+ALTER TABLE market_view_batches
+    ADD COLUMN IF NOT EXISTS sigma_panel JSONB;
 CREATE INDEX IF NOT EXISTS market_view_batches_status_seq_idx
     ON market_view_batches (status, batch_sequence DESC);
 CREATE INDEX IF NOT EXISTS market_view_batches_completed_idx

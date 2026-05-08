@@ -71,6 +71,7 @@ def run_e2e(slug: str, max_strikes: int) -> dict:
         total_net_value_usdc=inputs.total_net_value_usdc,
         as_of_utc=inputs.as_of_utc,
         user_thesis_id=inputs.user_thesis_id,
+        sigma_panel=inputs.sigma_panel,
     )
 
     from data.database import get_conn

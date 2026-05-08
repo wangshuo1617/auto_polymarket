@@ -37,6 +37,7 @@ from services.advisory.path_metrics import (
     klines_to_log_returns,
     compute_drift_daily,
     compute_ewma_sigma,
+    compute_sigma_panel,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ class BatchInputs:
     user_thesis_text: Optional[str] = None
     user_thesis_id: Optional[int] = None
     total_net_value_usdc: Optional[float] = None  # wallet USDC + 全部活跃持仓 mark
+    sigma_panel: Optional[dict] = None  # 多窗口 σ 诊断 (realized 7/14/30/60d + EWMA)
 
 
 def select_current_month_slug() -> str:
@@ -295,21 +297,34 @@ def _fetch_positions_and_net_value(
     return positions, total_net_value
 
 
-def _estimate_volatility_and_drift() -> tuple[float, str, float, str, float, float, str]:
+def _estimate_volatility_and_drift() -> tuple[float, str, float, str, float, float, str, dict]:
     """Return (sigma_daily, sigma_source, drift_daily, drift_source,
-    fallback_high_7d, fallback_low_7d, fallback_source).
+    fallback_high_7d, fallback_low_7d, fallback_source, sigma_panel).
 
-    σ source: EWMA (λ=0.94) over up to 60 daily log returns. Falls back to
-    realized 30d profile / ATR if klines are unavailable.
-    Drift: shrunk sample mean log return over up to 60 days.
+    σ source: EWMA over up to N daily log returns (N from env).
+    Falls back to realized 30d profile / ATR if klines unavailable.
+    Drift: shrunk sample mean log return over up to N days.
+
+    Env config:
+      ADVISORY_SIGMA_WINDOW_DAYS  (default 60) — how many klines to fetch
+      ADVISORY_SIGMA_EWMA_LAMBDA  (default 0.94) — EWMA decay
     """
-    klines = get_1d_klines_data(limit=60) or []
+    import os
+    window_n = int(os.environ.get("ADVISORY_SIGMA_WINDOW_DAYS", "60") or 60)
+    ewma_lam = float(os.environ.get("ADVISORY_SIGMA_EWMA_LAMBDA", "0.94") or 0.94)
+    window_n = max(7, min(window_n, 365))
+    ewma_lam = max(0.5, min(ewma_lam, 0.999))
+
+    klines = get_1d_klines_data(limit=window_n) or []
     profile = build_daily_volatility_profile(klines, atr_period=14)
     realized_pct = float(profile.get("realized_vol_daily_pct") or 0.0)
 
-    returns = klines_to_log_returns(klines, n=60)
-    sigma_ewma, ewma_src = compute_ewma_sigma(returns, lam=0.94)
-    drift, drift_src = compute_drift_daily(returns, shrink_full_n=60)
+    returns = klines_to_log_returns(klines, n=window_n)
+    sigma_ewma, ewma_src = compute_ewma_sigma(returns, lam=ewma_lam)
+    drift, drift_src = compute_drift_daily(returns, shrink_full_n=window_n)
+
+    panel = compute_sigma_panel(returns, windows=(7, 14, 30, 60), ewma_lam=ewma_lam)
+    panel["window_n_env"] = window_n
 
     if sigma_ewma > 0:
         sigma_daily = sigma_ewma
@@ -328,7 +343,7 @@ def _estimate_volatility_and_drift() -> tuple[float, str, float, str, float, flo
     fb_high = max(highs) if highs else 0.0
     fb_low = min(lows) if lows else 0.0
     fb_src = f"7d_klines(n={len(recent7)})"
-    return sigma_daily, sigma_source, drift, drift_src, fb_high, fb_low, fb_src
+    return sigma_daily, sigma_source, drift, drift_src, fb_high, fb_low, fb_src, panel
 
 
 def assemble_batch_inputs(slug: str, max_strikes: int = 6,
@@ -349,7 +364,7 @@ def assemble_batch_inputs(slug: str, max_strikes: int = 6,
         raise RuntimeError("Binance returned 0 BTC price")
 
     sigma_daily, sigma_source, drift_daily, drift_source, \
-        fb_high, fb_low, fb_src = _estimate_volatility_and_drift()
+        fb_high, fb_low, fb_src, sigma_panel = _estimate_volatility_and_drift()
 
     month_window = parse_slug_to_month_window(slug)
     if month_window is None:
@@ -406,4 +421,5 @@ def assemble_batch_inputs(slug: str, max_strikes: int = 6,
         user_thesis_text=thesis_text,
         user_thesis_id=thesis_id,
         total_net_value_usdc=total_net_value,
+        sigma_panel=sigma_panel,
     )

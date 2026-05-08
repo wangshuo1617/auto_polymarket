@@ -334,6 +334,7 @@ def run_advisory_batch(
     input_quote_snapshot_id: Optional[int] = None,
     as_of_utc: Optional[datetime] = None,
     user_thesis_id: Optional[int] = None,
+    sigma_panel: Optional[dict] = None,
 ) -> BatchResult:
     """完整 4-step batch (plan-advisory §4.2):
       step 0:  create batch row status=started
@@ -434,7 +435,8 @@ def run_advisory_batch(
                       settlement_feed_version = %s,
                       settlement_refresh_state = %s::jsonb,
                       settlement_refresh_effect_hash = %s,
-                      inputs_hash = %s
+                      inputs_hash = %s,
+                      sigma_panel = %s::jsonb
                     WHERE id = %s
                     """,
                     (
@@ -449,6 +451,7 @@ def run_advisory_batch(
                         }),
                         refresh_result.effect_hash,
                         inputs_hash,
+                        json.dumps(sigma_panel) if sigma_panel else None,
                         batch_id,
                     ),
                 )
