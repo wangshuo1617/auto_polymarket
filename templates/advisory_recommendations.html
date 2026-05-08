@@ -275,11 +275,23 @@ async function load() {
       <th class="num">target $</th>
       <th class="num">current $</th>
       <th class="num">delta $</th>
+      <th class="num" title="AI PathView shadow fair (gemini-3.1-pro). 鼠标悬停查看理由; 仅最近 6 个 strike. 该列不参与下单决策.">AI fair</th>
     </tr></thead><tbody>`;
   for (const s of rows) {
     const cls = s.halt_reason ? 'halt' : (s.resolution_state === 'settled' ? 'settled' : '');
     const label = formatTokenLabel(s.market_slug, s.view_payload || null);
     const tokShort = (s.token_id || '').slice(0, 10) + '…';
+    const ai = s.ai_shadow;
+    let aiCell = '<span style="color:#bbb">—</span>';
+    if (ai && ai.fair_event !== null && ai.fair_event !== undefined) {
+      const baseFair = s.fair_value_for_edge;
+      const diff = (typeof baseFair === 'number') ? (ai.fair_event - baseFair) : null;
+      const diffClr = diff === null ? '#888' : (Math.abs(diff) >= 0.20 ? '#c62828' : (Math.abs(diff) >= 0.05 ? '#ef6c00' : '#2e7d32'));
+      const diffTxt = diff === null ? '' : `<div style="color:${diffClr};font-size:11px">${diff >= 0 ? '+' : ''}${diff.toFixed(3)}</div>`;
+      const tip = (ai.rationale_short || '(无理由文本)').replace(/"/g, '&quot;')
+                 + `\n— status: ${ai.fair_value_status || '?'}; p_yes=${(ai.p_event_yes ?? 0).toFixed(3)}`;
+      aiCell = `<div title="${tip}" style="cursor:help">${fmt(ai.fair_event, 3)}${diffTxt}</div>`;
+    }
     html += `<tr class="${cls}">
       <td class="txt"><div title="${s.market_slug || ''}">${label}</div><div style="color:#999;font-size:11px" title="${s.token_id || ''}">${tokShort}</div></td>
       <td class="txt">${pillFor(s)}</td>
@@ -289,9 +301,28 @@ async function load() {
       <td class="num">${fmt(s.target_position_usdc, 2)}</td>
       <td class="num">${fmt(s.current_position_usdc, 2)}</td>
       <td class="num">${fmt(s.delta_usdc, 2)}</td>
+      <td class="num">${aiCell}</td>
     </tr>`;
   }
   html += '</tbody></table>';
+
+  // AI shadow run 元信息 banner (放在表上方)
+  const aiRun = data.ai_shadow_run;
+  if (aiRun) {
+    const sumTip = (aiRun.summary || '').replace(/"/g, '&quot;');
+    const notesTip = (aiRun.ai_notes || '').replace(/"/g, '&quot;');
+    const stClr = aiRun.validation_status === 'passed' ? '#2e7d32'
+                : aiRun.validation_status === 'passed_with_warnings' ? '#ef6c00' : '#c62828';
+    const aiBanner = `<div style="background:#f3f7ff;border:1px solid #cfe0ff;padding:8px 12px;border-radius:6px;margin-bottom:10px;font-size:12px;">
+      <b>AI PathView shadow</b> (${aiRun.model_id || '?'} / ${aiRun.prompt_version || '?'})
+      · run #${aiRun.id} · ${aiRun.generated_at || ''}
+      · status=<span style="color:${stClr}">${aiRun.validation_status}</span>
+      · latency ${aiRun.latency_ms}ms
+      <div style="margin-top:4px;color:#333;cursor:help" title="${sumTip}"><b>summary:</b> ${(aiRun.summary || '').slice(0, 180)}${(aiRun.summary || '').length > 180 ? '…' : ''}</div>
+      <div style="margin-top:2px;color:#555;cursor:help" title="${notesTip}"><b>notes:</b> ${(aiRun.ai_notes || '').slice(0, 180)}${(aiRun.ai_notes || '').length > 180 ? '…' : ''}</div>
+    </div>`;
+    html = aiBanner + html;
+  }
   content.innerHTML = html;
 }
 

@@ -66,6 +66,76 @@ def _serialize_snapshot(s: dict) -> dict:
     return out
 
 
+def _fetch_latest_ai_shadow_for_batch(batch_id: int) -> dict:
+    """返回最新一次 source='ai' 的 PathView shadow run 数据.
+    结构: {"run": {...}, "by_token": {token_id: {fair_event, p_event_yes, fair_value_status, rationale_short}}}
+    若无任何 AI run, 返回 {"run": None, "by_token": {}}.
+    """
+    out = {"run": None, "by_token": {}}
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, generated_at, model_id, prompt_version, validation_status,
+                       request_latency_ms, raw_payload
+                FROM advisory_pathview_shadow_runs
+                WHERE batch_id = %s AND source = 'ai'
+                ORDER BY generated_at DESC
+                LIMIT 1
+                """,
+                (batch_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return out
+            run_id, gen_at, model_id, prompt_v, status, latency, payload = row
+            if isinstance(payload, str):
+                import json
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            payload = payload or {}
+            out["run"] = {
+                "id": run_id,
+                "generated_at": gen_at.astimezone(timezone.utc).isoformat() if isinstance(gen_at, datetime) else None,
+                "model_id": model_id,
+                "prompt_version": prompt_v,
+                "validation_status": status,
+                "latency_ms": latency,
+                "summary": payload.get("market_view_summary"),
+                "ai_notes": payload.get("ai_notes"),
+                "key_levels": payload.get("key_levels"),
+            }
+
+            cur.execute(
+                """
+                SELECT token_id, fair_event, p_event_yes, fair_value_status, components
+                FROM advisory_pathview_shadow_views
+                WHERE run_id = %s
+                """,
+                (run_id,),
+            )
+            for tk, fair, p_yes, fv_status, comp in cur.fetchall():
+                if isinstance(comp, str):
+                    import json
+                    try:
+                        comp = json.loads(comp)
+                    except Exception:
+                        comp = {}
+                comp = comp or {}
+                out["by_token"][tk] = {
+                    "fair_event": fair,
+                    "p_event_yes": p_yes,
+                    "fair_value_status": fv_status,
+                    "rationale_short": comp.get("rationale_short"),
+                }
+    except Exception:
+        logger.exception("_fetch_latest_ai_shadow_for_batch failed")
+    return out
+
+
 @advisory_bp.route("/api/advisory/recommendations", methods=["GET"])
 def api_recommendations():
     """返回最新 complete batch 的 MarketView 列表, 按 ranking_score DESC 排序."""
@@ -97,6 +167,17 @@ def api_recommendations():
         completed_iso = None
 
     # plan §5.1 staleness 兜底: 不展示任何 token 行, 由前端渲染横幅
+    snapshots_out = []
+    ai_shadow = {"run": None, "by_token": {}}
+    if not is_stale:
+        ai_shadow = _fetch_latest_ai_shadow_for_batch(batch.get("id"))
+        ai_by_token = ai_shadow.get("by_token") or {}
+        for s in snapshots:
+            row = _serialize_snapshot(s)
+            ai_row = ai_by_token.get(row.get("token_id"))
+            row["ai_shadow"] = ai_row  # None 表示当前 token 不在 AI focus 子集
+            snapshots_out.append(row)
+
     return jsonify({
         "status": "stale" if is_stale else "ok",
         "stale": is_stale,
@@ -107,7 +188,8 @@ def api_recommendations():
             "batch_completed_at": completed_iso,
             "token_count": batch.get("token_count"),
         },
-        "snapshots": [] if is_stale else [_serialize_snapshot(s) for s in snapshots],
+        "ai_shadow_run": ai_shadow.get("run"),
+        "snapshots": snapshots_out,
     })
 
 
