@@ -50,6 +50,14 @@
 <body>
   <h1>Advisory Recommendations</h1>
   <div class="meta" id="meta">加载中…</div>
+  <div style="margin-bottom: 12px;">
+    <button id="btn-rerun-batch" onclick="rerunBatchNow()"
+            style="background: #1976d2; color: white; border: 0; padding: 6px 14px;
+                   border-radius: 4px; cursor: pointer; font-size: 13px;">
+      ▶ 立即重跑 batch
+    </button>
+    <span id="rerun-msg" style="margin-left: 12px; font-size: 12px; color: #555;"></span>
+  </div>
 
   <div id="stale-banner" class="stale-banner" style="display: none;"></div>
 
@@ -180,6 +188,35 @@ function pillFor(s) {
   if (s.resolution_state === 'locked_event_occurred') return '<span class="pill pill-locked">locked-hit</span>';
   if (s.resolution_state === 'locked_event_missed') return '<span class="pill pill-locked">locked-miss</span>';
   return '<span class="pill pill-open">open</span>';
+}
+
+async function rerunBatchNow() {
+  const btn = document.getElementById('btn-rerun-batch');
+  const msg = document.getElementById('rerun-msg');
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = '⏳ 跑批中…';
+  msg.style.color = '#555';
+  msg.textContent = '后台执行 advisory_batch_runner --once (~5s)…';
+  try {
+    const r = await fetch('/api/advisory/run_batch_now', { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) {
+      msg.style.color = '#c62828';
+      msg.textContent = '失败: ' + (data.error || ('HTTP ' + r.status));
+      return;
+    }
+    msg.style.color = '#2e7d32';
+    msg.textContent = `✓ 写入 batch #${data.batch_id} (tokens=${data.token_count}, ${data.elapsed_seconds}s) — 刷新数据中…`;
+    await load();
+    await loadPortfolio();
+  } catch (e) {
+    msg.style.color = '#c62828';
+    msg.textContent = '失败: ' + e;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
 }
 
 async function load() {

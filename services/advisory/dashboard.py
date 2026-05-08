@@ -302,6 +302,82 @@ def api_user_thesis_clear():
 
 
 # ---------------------------------------------------------------------------
+#  Manual batch trigger — 立即跑一次 advisory_batch_runner --once
+# ---------------------------------------------------------------------------
+
+@advisory_bp.route("/api/advisory/run_batch_now", methods=["POST"])
+def api_run_batch_now():
+    """Spawn a single advisory batch iteration synchronously and return new batch_id.
+
+    Reads ADVISORY_BATCH_MAX_STRIKES env (matching the systemd service config).
+    Blocks up to 60s waiting for the subprocess; returns the latest batch_id +
+    completion_at + duration so the frontend can decide whether to refresh.
+    """
+    import os
+    import subprocess
+    import time
+
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    max_strikes = int(os.environ.get("ADVISORY_BATCH_MAX_STRIKES", "12"))
+
+    # snapshot current latest batch_id to detect a new one was written
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(id) FROM market_view_batches WHERE status='complete'")
+        prev_id = cur.fetchone()[0] or 0
+
+    cmd = [
+        "uv", "run", "scripts/advisory_batch_runner.py",
+        "--once", "--max-strikes", str(max_strikes),
+    ]
+    env = os.environ.copy()
+    env.setdefault("LD_PRELOAD", "")
+    env.setdefault("POLYMARKET_PROFILE", "analyze")
+
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd, cwd=project_root, env=env,
+            capture_output=True, text=True, timeout=60.0,
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "batch runner timed out (>60s)"}), 504
+    elapsed = time.monotonic() - t0
+
+    if proc.returncode != 0:
+        logger.error("manual run_batch_now failed rc=%d stderr=%s",
+                     proc.returncode, proc.stderr[-2000:])
+        return jsonify({
+            "error": "batch runner exited non-zero",
+            "returncode": proc.returncode,
+            "stderr_tail": proc.stderr[-1000:],
+        }), 500
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, status, batch_completed_at, token_count
+                       FROM market_view_batches
+                       WHERE status='complete'
+                       ORDER BY id DESC LIMIT 1""")
+        row = cur.fetchone()
+    if not row or row[0] <= prev_id:
+        return jsonify({
+            "error": "no new complete batch written",
+            "previous_batch_id": prev_id,
+            "stdout_tail": proc.stdout[-1000:],
+        }), 500
+
+    return jsonify({
+        "batch_id": row[0],
+        "status": row[1],
+        "batch_completed_at": row[2].isoformat() if row[2] else None,
+        "token_count": row[3],
+        "previous_batch_id": prev_id,
+        "elapsed_seconds": round(elapsed, 2),
+    })
+
+
+# ---------------------------------------------------------------------------
 #  Calibration history (P3) — 由 systemd timer 每 6h 写入 advisory_calibration_runs
 # ---------------------------------------------------------------------------
 
