@@ -57,6 +57,36 @@ BUILDER_SECRET = os.getenv("BUILDER_SECRET")
 BUILDER_PASSPHRASE = os.getenv("BUILDER_PASSPHRASE")
 BUILDER_ADDRESS = os.getenv("BUILDER_ADDRESS")
 
+
+def _normalize_builder_code(raw: str | None) -> str | None:
+    """规范化 Polymarket builder code 为 bytes32 hex。"""
+    if not raw:
+        return None
+    code = raw.strip()
+    if code.startswith("0x") and len(code) == 66:
+        try:
+            int(code, 16)
+            return code.lower()
+        except ValueError:
+            pass
+    hex_body = code[2:] if code.startswith("0x") else code
+    try:
+        int(hex_body, 16)
+        if len(hex_body) <= 64:
+            return "0x" + hex_body.rjust(64, "0").lower()
+    except ValueError:
+        pass
+    try:
+        from eth_utils import keccak
+        return "0x" + keccak(text=code).hex()
+    except Exception:
+        return None
+
+
+POLYMARKET_BUILDER_CODE = _normalize_builder_code(os.getenv("POLYMARKET_BUILDER_CODE"))
+# bytes32 全零, 表示无 builder code (CLOB 默认值)
+_BUILDER_CODE_ZERO = "0x" + "0" * 64
+
 # PostgreSQL 连接字符串 (TimescaleDB)。
 # 格式: postgresql://user:password@host:port/dbname
 PG_DSN = os.getenv("PG_DSN", "")

@@ -84,6 +84,8 @@ from config import (
     PM_ANALYZE_KEY,
     PM_ANALYZE_WALLET_ADDRESS,
     POLYMARKET_PROFILE,
+    POLYMARKET_BUILDER_CODE,
+    _BUILDER_CODE_ZERO,
 )
 
 
@@ -640,6 +642,7 @@ def buy_order(
                 price=price,
                 size=normalized_size,
                 side=BUY,
+                builder_code=POLYMARKET_BUILDER_CODE or _BUILDER_CODE_ZERO,
             ),
             options=CreateOrderOptions(
                 tick_size=str(meta["minimum_tick_size"]),
@@ -691,6 +694,7 @@ def sell_order(
                 price=normalized_price,
                 size=submit_size,
                 side=SELL,
+                builder_code=POLYMARKET_BUILDER_CODE or _BUILDER_CODE_ZERO,
             ),
             options=PartialCreateOrderOptions(
                 tick_size=str(meta["minimum_tick_size"]),
