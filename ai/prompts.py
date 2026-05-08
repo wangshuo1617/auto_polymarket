@@ -1064,23 +1064,34 @@ PATHVIEW_AI_SCHEMA = {
 
 PATHVIEW_AI_SYSTEM_INSTRUCTION = """你是 BTC Polymarket 月度市场的 PathView 估值专家。
 
-你的任务: 基于本 batch 提供的 BTC 实时上下文 (现价 / 近期实现 σ / IV 参考 / days_left / 关键 K 线) +
-本 batch 全部 token 的 strike + side, 给出每个 token 的 fair value (后验事件概率)。
+你的任务: 综合 BTC 实时上下文 (现价、近期实现 σ、IV、4h/1d K 线、波动率画像、
+资金费率、ETF 资金流、现货 L2 盘口的买卖墙) 来修正 GBM 对各 strike 的触达概率,
+并给出每个 focus token 的 fair value (后验事件概率)。
+
+为什么需要你 (相对 GBM baseline 的优势):
+- GBM 假设对数正态, 不识别**心理关口** (整数 strike 的支撑/压力)。
+- GBM 不知道**事件驱动** (FOMC、ETF 净流入冲击、大额清算等)。
+- GBM 不识别**当前盘面结构** (趋势、近期 high/low、买卖墙位置)。
+你需要利用上下文中的 K 线、波动率画像、资金费率、ETF 流入、BTC 现货深度
+对 GBM 的"价位等可能性触达"假设做出**有方向性的修正**, 输出每个 focus token
+的 fair value。
 
 硬性约束:
-1. 输出 JSON 必须严格符合 PATHVIEW_AI_SCHEMA, 否则会被回滚 GBM baseline。
+1. 输出 JSON 必须严格符合 PATHVIEW_AI_SCHEMA, 否则 shadow row 标 failed。
 2. as_of_utc 必须等于上下文给出的 batch_as_of_utc (允许 600s 内)。
 3. sigma_daily ∈ [0.001, 0.30], 通常落在 [0.005, 0.05]。
 4. 同一 market 内的 yes/no token: fair_event + 互补 token 的 fair_event ≈ 1 (容差 0.5%)。
-5. 单调性: 在同一方向上, strike 越远 fair_event 越低 (touch-above) 或越高 (touch-below)。
-6. 你必须为每一个 token_id 输出一项, 不可遗漏。
-7. 不要给出交易建议或仓位 — 只回答 fair value。
-8. ai_notes 用中文, 自由表达对 GBM baseline 的不同意见或当前批次特殊情况。
+5. 单调性: 同一 side 的 token, strike 越远 fair_event 越低 (touch-above) 或越高 (touch-below)。
+   反向偏差 > 0.05 会被 R7 判 fail。
+6. per_token 数组只覆盖 user prompt 中给出的 focus tokens, 不要补全其他 token。
+7. 不要给出交易建议 / 仓位 — 只回答 fair value 与一句话理由。
+8. ai_notes 用中文, 自由表达对 GBM baseline 的不同意见、近期催化剂、买卖墙关键位等。
 
 风格:
-- rationale_short ≤ 60 字, 中文。
-- 不要 hallucinate 不存在的 token_id。
-- 你的 fair 会与 GBM baseline 在 shadow 层对照打分; 偏差超过 40% 会被标记 R10。
+- rationale_short ≤ 60 字, 中文, 一句话。
+- 不要 hallucinate token_id / strike / 价位。
+- 你的 fair 会与 GBM baseline 在 shadow 层对照打分; 偏差 > 0.40 R6 fail, > 0.20 R6 warning。
+- key_levels 用于人审, 标注关键阻力/支撑/事件预期价位 (3-6 个即可, 不强制命中 strike)。
 """
 
 
@@ -1093,17 +1104,36 @@ gbm_baseline_sigma_daily: {gbm_sigma}
 gbm_baseline_drift_daily: {gbm_drift}
 sigma_source: {sigma_source}
 
-=== Recent BTC realized vol (panels, 1d) ===
+=== Recent BTC realized vol panels ===
 {btc_panels}
+
+=== BTC daily volatility profile (regime, ATR%, IV ref, etc.) ===
+{daily_vol_profile_json}
+
+=== BTC market sentiment & funding (恐贪指数, RSI, 资金费率, OI, ETF 净流入等) ===
+{market_sentiment_json}
+
+=== BTC spot L2 depth summary (Binance BTCUSDT, top 5 walls + ±0.5%/1%/2%/3%/5% bands) ===
+说明: imbalance>0 表示买盘较厚 (上方阻力较弱, 易突破); <0 表示卖盘较厚 (上方有压力)。
+top_buy_walls / top_sell_walls 给出 5 个最大墙位, size_usd 衡量"墙厚度", price 即关键支撑/压力位。
+{btc_depth_json}
+
+=== BTC 4h K-line (recent {n_4h} candles, [open_time, open, high, low, close, volume]) ===
+{btc_4h_k_json}
+
+=== BTC 1d K-line (recent {n_1d} candles) ===
+{btc_1d_k_json}
 
 === Focus tokens (本次仅需分析这 {n_tokens} 个最接近现价的 token) ===
 {tokens_json}
 
-=== GBM baseline fair (per token, 仅供对比, 你可以同意或不同意) ===
+=== GBM baseline fair (per focus token, 仅供对比, 你可以同意或不同意) ===
 {baseline_fair_json}
 
 === Output ===
-按 PATHVIEW_AI_SCHEMA 严格输出 JSON。per_token 数组只需覆盖上述 focus tokens 即可 (不要补其他 token)。
+按 PATHVIEW_AI_SCHEMA 严格输出 JSON。per_token 数组只覆盖上述 focus tokens (不要补其他 token)。
+每个 token 必须给 rationale_short (≤60 字, 例如"上方有 8.2 万整数压力 + 5K 美元卖墙, 触达概率下调")。
+ai_notes 中可以指出哪些 strike 受到买卖墙 / 整数关口影响最大、原因为何。
 """
 
 
@@ -1115,7 +1145,11 @@ def get_pathview_ai_user_prompt(
     *, batch_id: int, batch_as_of_utc: str, current_btc_price: float,
     days_left: float, gbm_sigma: float, gbm_drift: float, sigma_source: str,
     btc_panels: dict, tokens: list[dict], baseline_fair_by_token: dict,
+    market_context: dict | None = None,
 ) -> str:
+    mc = market_context or {}
+    btc_4h = mc.get("btc_4h_k_data") or []
+    btc_1d = mc.get("btc_1d_k_data") or []
     return PATHVIEW_AI_USER_PROMPT_TEMPLATE.format(
         batch_id=batch_id,
         batch_as_of_utc=batch_as_of_utc,
@@ -1125,6 +1159,13 @@ def get_pathview_ai_user_prompt(
         gbm_drift=gbm_drift,
         sigma_source=sigma_source,
         btc_panels=json.dumps(btc_panels, ensure_ascii=False, indent=2),
+        daily_vol_profile_json=json.dumps(mc.get("daily_volatility_profile") or {}, ensure_ascii=False, indent=2),
+        market_sentiment_json=json.dumps(mc.get("market_sentiment_and_funding") or {}, ensure_ascii=False, indent=2),
+        btc_depth_json=json.dumps(mc.get("btc_spot_depth_summary") or {}, ensure_ascii=False, indent=2),
+        n_4h=len(btc_4h),
+        btc_4h_k_json=json.dumps(btc_4h, ensure_ascii=False),
+        n_1d=len(btc_1d),
+        btc_1d_k_json=json.dumps(btc_1d, ensure_ascii=False),
         n_tokens=len(tokens),
         tokens_json=json.dumps(tokens, ensure_ascii=False, indent=2),
         baseline_fair_json=json.dumps(baseline_fair_by_token, ensure_ascii=False, indent=2),

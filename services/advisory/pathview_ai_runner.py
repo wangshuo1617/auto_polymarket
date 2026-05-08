@@ -26,6 +26,43 @@ from services.advisory.pathview_validator import validate_pathview_payload
 logger = logging.getLogger(__name__)
 
 
+def _safe_call(label: str, fn, *args, default=None, **kwargs):
+    """Best-effort context fetch — log & return default on failure so the
+    AI run still proceeds with partial context."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        logger.warning("pathview_ai context fetch %s failed: %s", label, exc)
+        return default
+
+
+def _fetch_market_context() -> dict:
+    """Pull the same BTC + sentiment context production analyze_market sees,
+    plus a BTC spot L2 depth summary so AI can spot key support/resistance walls.
+
+    NOTE: We deliberately do NOT pass Polymarket token orderbooks — those would
+    anchor the AI to current market consensus and defeat the shadow comparison.
+    """
+    from data.binance import (
+        get_4h_klines_data, get_1d_klines_data, get_btc_spot_depth_summary,
+    )
+    from services.volatility import build_daily_volatility_profile
+    from services.market_sentiment import get_market_sentiment_and_funding
+
+    btc_4h = _safe_call("btc_4h", get_4h_klines_data, limit=12, default=[]) or []
+    btc_1d = _safe_call("btc_1d", get_1d_klines_data, limit=14, default=[]) or []
+    dvp = _safe_call("dvol_profile", build_daily_volatility_profile, btc_1d, default={}) or {}
+    sentiment = _safe_call("sentiment", get_market_sentiment_and_funding, default={}) or {}
+    btc_depth = _safe_call("btc_depth", get_btc_spot_depth_summary, default={}) or {}
+    return {
+        "btc_4h_k_data": btc_4h,
+        "btc_1d_k_data": btc_1d,
+        "daily_volatility_profile": dvp,
+        "market_sentiment_and_funding": sentiment,
+        "btc_spot_depth_summary": btc_depth,
+    }
+
+
 def ai_enabled() -> bool:
     raw = os.environ.get("ADVISORY_PATHVIEW_AI_ENABLED", "0").strip()
     return raw not in ("", "0", "false", "no", "off")
@@ -104,7 +141,7 @@ def _ai_model_version() -> str:
 
 
 def _ai_prompt_version() -> str:
-    return os.environ.get("ADVISORY_PATHVIEW_AI_PROMPT_VERSION", "b3_v1")
+    return os.environ.get("ADVISORY_PATHVIEW_AI_PROMPT_VERSION", "b3_v3")
 
 
 def _fetch_batch_context(batch_id: int) -> Optional[dict]:
@@ -229,6 +266,8 @@ def run_ai_pathview_for_batch(batch_id: int) -> Optional[int]:
             notes="researcher_unavailable",
         )
 
+    market_ctx = _fetch_market_context()
+
     panels = {
         "sigma_source": ctx.get("sigma_source"),
         "gbm_sigma_daily": ctx.get("sigma_daily"),
@@ -251,6 +290,7 @@ def run_ai_pathview_for_batch(batch_id: int) -> Optional[int]:
             btc_panels=panels,
             tokens=focus_tokens,
             baseline_fair_by_token=focus_baseline,
+            market_context=market_ctx,
         )
     except Exception as exc:
         latency = int((time.time() - t0) * 1000)

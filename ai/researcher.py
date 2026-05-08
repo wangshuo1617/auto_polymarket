@@ -5,7 +5,7 @@ Uses Google Gemini API with Google Search Grounding for market research.
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from google import genai
 from google.genai import types
 
@@ -340,8 +340,9 @@ def analyze_pathview_for_advisory(
     btc_panels: dict,
     tokens: list,
     baseline_fair_by_token: dict,
+    market_context: Optional[dict] = None,
     temperature: float = 0.3,
-    max_output_tokens: int = 16384,
+    max_output_tokens: int = 32768,
 ) -> Dict[str, Any]:
     """B3: AI PathView shadow estimator. Returns parsed JSON dict matching
     PATHVIEW_AI_SCHEMA. Caller must validate via pathview_validator before
@@ -365,6 +366,7 @@ def analyze_pathview_for_advisory(
         btc_panels=btc_panels,
         tokens=tokens,
         baseline_fair_by_token=baseline_fair_by_token,
+        market_context=market_context or {},
     )
     response = client.models.generate_content(
         model=GEMINI_MODEL_ID,
