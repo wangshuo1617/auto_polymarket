@@ -1098,6 +1098,108 @@ def api_balance():
         return jsonify({'error': str(e)}), 500
 
 
+# ---------------------------------------------------------------------------
+# 钱包充值/提现 (MetaMask EOA <-> Polymarket Proxy/Safe)
+# ---------------------------------------------------------------------------
+@app.route('/api/wallet/info', methods=['GET'])
+def api_wallet_info():
+    try:
+        from services.wallet_transfer import get_addresses, query_balances
+        info = get_addresses(profile=APP_PM_PROFILE)
+        info.update(query_balances(profile=APP_PM_PROFILE))
+        return jsonify(info)
+    except Exception as e:
+        logger.exception("api_wallet_info failed: %s", e)
+        return jsonify({'error': str(e)}), 500
+
+
+def _parse_wallet_amount(payload: dict) -> float:
+    raw = payload.get('amount')
+    if raw is None:
+        raise ValueError('缺少参数 amount')
+    try:
+        amount = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f'非法 amount: {raw!r}')
+    if amount <= 0:
+        raise ValueError('amount 必须大于 0')
+    return amount
+
+
+@app.route('/api/wallet/deposit', methods=['POST'])
+def api_wallet_deposit():
+    """从 MetaMask EOA 经 Bridge API 充值到 Polymarket proxy (自动 wrap pUSD)。"""
+    data = request.json or {}
+    try:
+        amount = _parse_wallet_amount(data)
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 400
+    source_token = (data.get('source_token') or 'USDC').strip()
+
+    operator = (session.get('operator_name') or 'dashboard') if session else 'dashboard'
+    logger.info("api_wallet_deposit requested: amount=%s src=%s operator=%s",
+                amount, source_token, operator)
+
+    try:
+        from services.wallet_transfer import deposit_via_bridge
+        result = deposit_via_bridge(amount, profile=APP_PM_PROFILE, source_token=source_token)
+        logger.info("api_wallet_deposit success: tx=%s amount=%s", result.tx_hash, amount)
+        return jsonify({
+            'tx_hash': result.tx_hash,
+            'amount_usdc': result.amount_usdc,
+            'from_address': result.from_address,
+            'bridge_address': result.bridge_address,
+            'proxy_address': result.proxy_address,
+            'source_token': result.source_token,
+            'explorer_url': f"https://polygonscan.com/tx/{result.tx_hash}",
+            'note': '资金已发往 Bridge, 通常 1-2 分钟后自动入账 Polymarket (pUSD)。',
+        })
+    except Exception as e:
+        logger.exception("api_wallet_deposit failed: amount=%s error=%s", amount, e)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/wallet/withdraw', methods=['POST'])
+def api_wallet_withdraw():
+    """从 Polymarket proxy 经 Bridge API 提现到 MetaMask (自动 swap 成原生 USDC)。"""
+    data = request.json or {}
+    try:
+        amount = _parse_wallet_amount(data)
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 400
+    dest_token = (data.get('dest_token') or 'USDC').strip()
+
+    operator = (session.get('operator_name') or 'dashboard') if session else 'dashboard'
+    logger.info("api_wallet_withdraw requested: amount=%s dest=%s operator=%s",
+                amount, dest_token, operator)
+
+    try:
+        from services.wallet_transfer import withdraw_via_bridge
+        result = withdraw_via_bridge(amount, profile=APP_PM_PROFILE, dest_token=dest_token)
+        logger.info(
+            "api_wallet_withdraw success: relayer_id=%s tx=%s amount=%s",
+            result.relayer_transaction_id, result.tx_hash, amount,
+        )
+        return jsonify({
+            'relayer_transaction_id': result.relayer_transaction_id,
+            'tx_hash': result.tx_hash,
+            'state': result.state,
+            'amount_usdc': result.amount_usdc,
+            'from_address': result.from_address,
+            'bridge_address': result.bridge_address,
+            'recipient_address': result.recipient_address,
+            'source_token': result.source_token,
+            'dest_token': result.dest_token,
+            'explorer_url': (
+                f"https://polygonscan.com/tx/{result.tx_hash}" if result.tx_hash else None
+            ),
+            'note': '资金已发往 Bridge, 通常 1-2 分钟后自动到账 MetaMask (原生 USDC)。',
+        })
+    except Exception as e:
+        logger.exception("api_wallet_withdraw failed: amount=%s error=%s", amount, e)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/btc_1h_kline')
 def api_btc_1h_kline():
     """Return current BTC price and latest 1h kline OHLC."""

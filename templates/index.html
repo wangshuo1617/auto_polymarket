@@ -102,6 +102,7 @@
             <div id="btc-price" class="balance-chip">BTC: Loading...</div>
             <button type="button" class="btn btn-outline-primary btn-sm" id="btnPositionAnalyze">Position Analyze</button>
             <a href="/report/latest" target="_blank" rel="noopener" class="btn btn-outline-secondary btn-sm">Latest Report</a>
+            <button type="button" class="btn btn-outline-success btn-sm" id="btnWalletTransfer" data-bs-toggle="modal" data-bs-target="#walletTransferModal">💰 充值/提现</button>
         </div>
         <div class="mb-3">
             <textarea id="operatorIntent" class="form-control form-control-sm" rows="2"
@@ -306,6 +307,80 @@
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- 钱包充值/提现 modal -->
+    <div class="modal fade" id="walletTransferModal" tabindex="-1" aria-labelledby="walletTransferModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="walletTransferModalLabel">💰 钱包充值 / 提现 (Polymarket Bridge)</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="alert alert-warning small mb-3">
+                        ⚠️ 链上不可逆操作。提现仅支持 .env 中固定的 MetaMask 地址。<br>
+                        所有充值/提现走 Polymarket Bridge API: 自动 swap, 即时, 免手续费 (但充值需要 MetaMask 持有少量 POL 付 gas)。
+                    </div>
+                    <div id="walletInfoBox" class="mb-3 small text-muted">加载钱包信息…</div>
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <div class="card">
+                                <div class="card-header bg-success-subtle">⬆️ 充值 (MetaMask USDC → Polymarket pUSD)</div>
+                                <div class="card-body">
+                                    <div class="mb-2">
+                                        <label class="form-label small">金额 (USDC)</label>
+                                        <input type="number" class="form-control" id="walletDepositAmount" min="2" step="0.01" placeholder="例如 100">
+                                    </div>
+                                    <div class="d-flex gap-1 mb-2 flex-wrap">
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setWalletAmount('walletDepositAmount',10)">10</button>
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setWalletAmount('walletDepositAmount',100)">100</button>
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setWalletAmount('walletDepositAmount',1000)">1000</button>
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" id="walletDepositAllBtn">All</button>
+                                    </div>
+                                    <div class="mb-2">
+                                        <label class="form-label small">源 token</label>
+                                        <select class="form-select form-select-sm" id="walletDepositToken">
+                                            <option value="USDC" selected>USDC (原生, 0x3c49…)</option>
+                                            <option value="USDC.e">USDC.e (桥接版, 0x2791…)</option>
+                                        </select>
+                                    </div>
+                                    <button type="button" class="btn btn-success w-100" id="walletDepositBtn">充值</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="card">
+                                <div class="card-header bg-warning-subtle">⬇️ 提现 (Polymarket pUSD → MetaMask USDC)</div>
+                                <div class="card-body">
+                                    <div class="mb-2">
+                                        <label class="form-label small">金额 (USDC)</label>
+                                        <input type="number" class="form-control" id="walletWithdrawAmount" min="2" step="0.01" placeholder="例如 100">
+                                    </div>
+                                    <div class="d-flex gap-1 mb-2 flex-wrap">
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setWalletAmount('walletWithdrawAmount',10)">10</button>
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setWalletAmount('walletWithdrawAmount',100)">100</button>
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setWalletAmount('walletWithdrawAmount',1000)">1000</button>
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" id="walletWithdrawAllBtn">All</button>
+                                    </div>
+                                    <div class="mb-2">
+                                        <label class="form-label small">目标 token</label>
+                                        <select class="form-select form-select-sm" id="walletWithdrawToken">
+                                            <option value="USDC" selected>USDC (原生, 0x3c49…)</option>
+                                            <option value="USDC.e">USDC.e (桥接版)</option>
+                                        </select>
+                                    </div>
+                                    <button type="button" class="btn btn-warning w-100" id="walletWithdrawBtn">提现</button>
+                                    <div class="small text-muted mt-2">通过 Gasless Relayer + Bridge, MetaMask 无需 POL。</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="walletResultBox" class="mt-3"></div>
                 </div>
             </div>
         </div>
@@ -2883,6 +2958,129 @@
                 });
             }
         });
+    </script>
+
+    <script>
+    // 钱包充值/提现
+    function setWalletAmount(inputId, val) {
+        const el = document.getElementById(inputId);
+        if (el) el.value = val;
+    }
+
+    let _walletInfoCache = null;
+
+    async function loadWalletInfo() {
+        const box = document.getElementById('walletInfoBox');
+        if (box) box.textContent = '加载钱包信息…';
+        try {
+            const r = await fetch('/api/wallet/info');
+            const data = await r.json();
+            if (!r.ok) throw new Error(data.error || '加载失败');
+            _walletInfoCache = data;
+            const fmt = (v) => Number(v ?? 0).toLocaleString(undefined, {maximumFractionDigits: 4});
+            const html = `
+                <div><b>MetaMask</b>: <code>${data.metamask_address}</code></div>
+                <div class="ms-3">USDC <b>${fmt(data.metamask_usdc_native)}</b> · USDC.e ${fmt(data.metamask_usdc_e)} · POL ${fmt(data.metamask_pol)}</div>
+                <div class="mt-1"><b>Polymarket Proxy</b> (${data.profile}): <code>${data.proxy_address}</code></div>
+                <div class="ms-3">pUSD <b>${fmt(data.proxy_pusd)}</b> · USDC.e ${fmt(data.proxy_usdc_e)}</div>
+                <div class="text-muted mt-1">单笔范围: ${fmt(data.min_amount_usdc)} ~ ${fmt(data.max_amount_usdc)} USDC</div>
+            `;
+            if (box) box.innerHTML = html;
+        } catch (e) {
+            if (box) box.innerHTML = '<span class="text-danger">钱包信息加载失败: ' + (e.message || e) + '</span>';
+        }
+    }
+
+    function _renderWalletResult(kind, data, isError) {
+        const box = document.getElementById('walletResultBox');
+        if (!box) return;
+        if (isError) {
+            box.innerHTML = `<div class="alert alert-danger small">${kind} 失败：${data.error || JSON.stringify(data)}</div>`;
+            return;
+        }
+        const txLink = data.explorer_url
+            ? `<a href="${data.explorer_url}" target="_blank" rel="noopener">${data.tx_hash || '查看交易'}</a>`
+            : (data.tx_hash || '');
+        const tokenLine = data.source_token && data.dest_token
+            ? `${data.source_token} → ${data.dest_token}`
+            : (data.source_token ? `源 token: ${data.source_token}` : '');
+        const flow = data.bridge_address
+            ? `${data.from_address} → bridge ${data.bridge_address}` +
+              (data.recipient_address ? ` → ${data.recipient_address}` : ` → proxy ${data.proxy_address}`)
+            : `${data.from_address} → ${data.to_address || ''}`;
+        box.innerHTML = `
+            <div class="alert alert-success small">
+                ✅ ${kind} 已提交。金额 ${data.amount_usdc} USDC。${tokenLine ? '<br>' + tokenLine : ''}<br>
+                ${flow}<br>
+                tx: ${txLink}
+                ${data.relayer_transaction_id ? '<br>relayer_id: ' + data.relayer_transaction_id : ''}
+                ${data.state ? '<br>state: ' + data.state : ''}
+                ${data.note ? '<br><span class="text-muted">' + data.note + '</span>' : ''}
+            </div>
+        `;
+    }
+
+    async function _doWalletAction(endpoint, kind, amountInputId, btn, extraPayload) {
+        const amount = parseFloat(document.getElementById(amountInputId).value);
+        if (!amount || amount <= 0) {
+            alert('请输入合法金额');
+            return;
+        }
+        const confirmMsg = `确认 ${kind} ${amount} USDC？此操作链上不可逆。`;
+        if (!confirm(confirmMsg)) return;
+        if (btn) { btn.disabled = true; btn.textContent = kind + '中…'; }
+        try {
+            const payload = Object.assign({amount: amount}, extraPayload || {});
+            const r = await fetch(endpoint, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload),
+            });
+            const data = await r.json();
+            _renderWalletResult(kind, data, !r.ok);
+            if (r.ok) loadWalletInfo();
+        } catch (e) {
+            _renderWalletResult(kind, {error: e.message || String(e)}, true);
+        } finally {
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = kind;
+            }
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        const modalEl = document.getElementById('walletTransferModal');
+        if (modalEl) {
+            modalEl.addEventListener('show.bs.modal', loadWalletInfo);
+        }
+        const dBtn = document.getElementById('walletDepositBtn');
+        if (dBtn) dBtn.addEventListener('click', () => {
+            const tokenSel = document.getElementById('walletDepositToken');
+            _doWalletAction('/api/wallet/deposit', '充值', 'walletDepositAmount', dBtn,
+                {source_token: tokenSel ? tokenSel.value : 'USDC'});
+        });
+        const wBtn = document.getElementById('walletWithdrawBtn');
+        if (wBtn) wBtn.addEventListener('click', () => {
+            const tokenSel = document.getElementById('walletWithdrawToken');
+            _doWalletAction('/api/wallet/withdraw', '提现', 'walletWithdrawAmount', wBtn,
+                {dest_token: tokenSel ? tokenSel.value : 'USDC'});
+        });
+        const dAll = document.getElementById('walletDepositAllBtn');
+        if (dAll) dAll.addEventListener('click', () => {
+            if (!_walletInfoCache) return;
+            const sel = document.getElementById('walletDepositToken');
+            const t = sel ? sel.value : 'USDC';
+            const v = (t === 'USDC.e') ? _walletInfoCache.metamask_usdc_e : _walletInfoCache.metamask_usdc_native;
+            document.getElementById('walletDepositAmount').value = v;
+        });
+        const wAll = document.getElementById('walletWithdrawAllBtn');
+        if (wAll) wAll.addEventListener('click', () => {
+            if (!_walletInfoCache) return;
+            const v = Math.max(_walletInfoCache.proxy_pusd || 0, _walletInfoCache.proxy_usdc_e || 0);
+            document.getElementById('walletWithdrawAmount').value = v;
+        });
+    });
     </script>
 </body>
 </html>

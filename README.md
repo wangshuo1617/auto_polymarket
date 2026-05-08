@@ -141,6 +141,16 @@ DASHBOARD_HOST=0.0.0.0
 DASHBOARD_PORT=5000
 # 仅在你已配置 HTTPS 时设为 true
 DASHBOARD_HTTPS_ONLY=false
+
+# Dashboard 钱包充值/提现 (USDC.e on Polygon, MetaMask <-> Polymarket Proxy)
+# 充值用 MetaMask EOA 直接发链上 USDC.e (需该地址有少量 POL 付 gas)；
+# 提现走 Polymarket Gasless Relayer，由 BUILDER_* 凭据驱动，无需 POL。
+METAMASK_WALLET_ADDRESS=0xYourMetamaskAddress
+METAMASK_PRIVATE_KEY=0xYourMetamaskPrivateKey
+# 可选: 自定义 Polygon RPC (默认 https://polygon-rpc.com)
+POLYGON_RPC_URL=
+# 可选: 单笔充值/提现金额上限 USDC (默认 10000)
+WALLET_TRANSFER_MAX_USDC=10000
 ```
 
 双账号部署建议：
