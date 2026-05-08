@@ -14,7 +14,7 @@ Environment=FOREGROUND=1
 Environment=LD_PRELOAD=
 Environment=ADVISORY_SETTLEMENT_MAX_STRIKES=12
 ExecStart=/bin/bash scripts/restart_advisory_settlement.sh
-Restart=on-failure
+Restart=always
 RestartSec=60
 KillMode=mixed
 KillSignal=SIGTERM
