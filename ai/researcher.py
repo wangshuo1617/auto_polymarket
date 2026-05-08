@@ -341,7 +341,7 @@ def analyze_pathview_for_advisory(
     tokens: list,
     baseline_fair_by_token: dict,
     temperature: float = 0.3,
-    max_output_tokens: int = 8192,
+    max_output_tokens: int = 16384,
 ) -> Dict[str, Any]:
     """B3: AI PathView shadow estimator. Returns parsed JSON dict matching
     PATHVIEW_AI_SCHEMA. Caller must validate via pathview_validator before
@@ -353,7 +353,6 @@ def analyze_pathview_for_advisory(
         response_schema=PATHVIEW_AI_SCHEMA,
         temperature=temperature,
         max_output_tokens=max_output_tokens,
-        thinking_config=types.ThinkingConfig(thinking_budget=2048),
     )
     user_prompt = get_pathview_ai_user_prompt(
         batch_id=batch_id,
