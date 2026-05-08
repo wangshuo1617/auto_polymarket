@@ -243,6 +243,15 @@ def record_baseline_replay(batch_id: int) -> Optional[int]:
         batch_id, run_id, validation.status,
         len(validation.errors), len(validation.warnings),
     )
+
+    try:
+        from services.advisory.shadow_intents import project_shadow_intents
+        n_intents = project_shadow_intents(run_id, batch_id)
+        logger.info("shadow intents projected: run_id=%s n=%d",
+                    run_id, n_intents)
+    except Exception as exc:
+        logger.warning("shadow intents projection failed: %s", exc)
+
     return run_id
 
 

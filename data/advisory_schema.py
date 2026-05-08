@@ -483,6 +483,44 @@ CREATE INDEX IF NOT EXISTS advisory_pathview_shadow_views_token_idx
 """
 
 
+PATHVIEW_SHADOW_INTENT_STATES = (
+    "waiting", "armed", "executable", "expired", "cancelled", "skipped",
+)
+
+_DDL_PATHVIEW_SHADOW_INTENTS = """
+CREATE TABLE IF NOT EXISTS advisory_pathview_shadow_intents (
+    id                       BIGSERIAL PRIMARY KEY,
+    run_id                   BIGINT NOT NULL REFERENCES advisory_pathview_shadow_runs(id) ON DELETE CASCADE,
+    batch_id                 BIGINT NOT NULL REFERENCES market_view_batches(id),
+    token_id                 TEXT NOT NULL,
+    generated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    state                    TEXT NOT NULL {state_check},
+    prev_state               TEXT {prev_state_check},
+    consecutive_above_arm    INTEGER NOT NULL DEFAULT 0,
+    edge_to_fair             DOUBLE PRECISION,
+    fair_event               DOUBLE PRECISION,
+    best_ask                 DOUBLE PRECISION,
+    best_bid                 DOUBLE PRECISION,
+    target_size_usdc_raw     DOUBLE PRECISION,
+    target_size_usdc_capped  DOUBLE PRECISION,
+    correlation_bucket       TEXT,
+    bucket_size_used_usdc    DOUBLE PRECISION,
+    transition_reason        TEXT,
+    components               JSONB,
+    UNIQUE (run_id, token_id)
+);
+CREATE INDEX IF NOT EXISTS advisory_pathview_shadow_intents_token_gen_idx
+    ON advisory_pathview_shadow_intents (token_id, generated_at DESC);
+CREATE INDEX IF NOT EXISTS advisory_pathview_shadow_intents_state_idx
+    ON advisory_pathview_shadow_intents (state, generated_at DESC);
+CREATE INDEX IF NOT EXISTS advisory_pathview_shadow_intents_batch_idx
+    ON advisory_pathview_shadow_intents (batch_id);
+""".format(
+    state_check=_enum_check("state", PATHVIEW_SHADOW_INTENT_STATES),
+    prev_state_check=_enum_check("prev_state", PATHVIEW_SHADOW_INTENT_STATES),
+)
+
+
 _DDL_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("path_observation_snapshots", _DDL_PATH_OBSERVATION_SNAPSHOTS),
     ("settlement_feed_versions", _DDL_SETTLEMENT_FEED_VERSIONS),
@@ -500,6 +538,7 @@ _DDL_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("advisory_chain_fills_poller_state", _DDL_ADVISORY_CHAIN_FILLS_POLLER_STATE),
     ("advisory_pathview_shadow_runs", _DDL_PATHVIEW_SHADOW_RUNS),
     ("advisory_pathview_shadow_views", _DDL_PATHVIEW_SHADOW_VIEWS),
+    ("advisory_pathview_shadow_intents", _DDL_PATHVIEW_SHADOW_INTENTS),
 )
 
 
