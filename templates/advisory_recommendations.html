@@ -275,7 +275,8 @@ async function load() {
       <th class="num">target $</th>
       <th class="num">current $</th>
       <th class="num">delta $</th>
-      <th class="num" title="AI PathView shadow fair (gemini-3.1-pro). 鼠标悬停查看理由; 仅最近 6 个 strike. 该列不参与下单决策.">AI fair</th>
+      <th class="num" title="AI PathView shadow fair (gemini-3.1-pro). 鼠标悬停查看理由; 仅最近 8 个未触发 strike. 该列不参与下单决策.">AI fair</th>
+      <th class="num" title="AI edge = AI fair − best_ask. 与左侧 edge 列同口径, 仅 AI focus 子集有数据.">AI edge</th>
     </tr></thead><tbody>`;
   for (const s of rows) {
     const cls = s.halt_reason ? 'halt' : (s.resolution_state === 'settled' ? 'settled' : '');
@@ -283,6 +284,7 @@ async function load() {
     const tokShort = (s.token_id || '').slice(0, 10) + '…';
     const ai = s.ai_shadow;
     let aiCell = '<span style="color:#bbb">—</span>';
+    let aiEdgeCell = '<span style="color:#bbb">—</span>';
     if (ai && ai.fair_event !== null && ai.fair_event !== undefined) {
       const baseFair = s.fair_value_for_edge;
       const diff = (typeof baseFair === 'number') ? (ai.fair_event - baseFair) : null;
@@ -291,6 +293,20 @@ async function load() {
       const tip = (ai.rationale_short || '(无理由文本)').replace(/"/g, '&quot;')
                  + `\n— status: ${ai.fair_value_status || '?'}; p_yes=${(ai.p_event_yes ?? 0).toFixed(3)}`;
       aiCell = `<div title="${tip}" style="cursor:help">${fmt(ai.fair_event, 3)}${diffTxt}</div>`;
+
+      const ask = (s.view_payload && typeof s.view_payload.best_ask === 'number') ? s.view_payload.best_ask : null;
+      if (ask !== null && ask > 0 && ask < 1) {
+        const aiEdge = ai.fair_event - ask;
+        const aiEdgeClr = aiEdge >= 0.05 ? '#2e7d32' : (aiEdge <= -0.05 ? '#c62828' : '#666');
+        const baseEdge = s.edge_buy_active;
+        const edgeDiffTxt = (typeof baseEdge === 'number')
+          ? `<div style="color:#888;font-size:11px">vs ${fmt(baseEdge, 3)}</div>`
+          : '';
+        aiEdgeCell = `<div title="ask=${fmt(ask, 3)}; AI fair − ask">
+          <span style="color:${aiEdgeClr}">${aiEdge >= 0 ? '+' : ''}${aiEdge.toFixed(3)}</span>
+          ${edgeDiffTxt}
+        </div>`;
+      }
     }
     html += `<tr class="${cls}">
       <td class="txt"><div title="${s.market_slug || ''}">${label}</div><div style="color:#999;font-size:11px" title="${s.token_id || ''}">${tokShort}</div></td>
@@ -302,6 +318,7 @@ async function load() {
       <td class="num">${fmt(s.current_position_usdc, 2)}</td>
       <td class="num">${fmt(s.delta_usdc, 2)}</td>
       <td class="num">${aiCell}</td>
+      <td class="num">${aiEdgeCell}</td>
     </tr>`;
   }
   html += '</tbody></table>';
