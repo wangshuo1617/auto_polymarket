@@ -1,0 +1,15 @@
+[Unit]
+Description=Auto Polymarket - Advisory Calibration Drift Monitor
+After=auto-poly-advisory-batch.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/auto_polymarket
+EnvironmentFile=-/root/auto_polymarket/.env
+Environment=LD_PRELOAD=
+# 默认 28 天回看, ECE>0.05 退出码 1 (供 alert 钩子捕获).
+# 持久化两种 mode (M1/M2) 到 advisory_calibration_runs.
+ExecStart=/usr/bin/env uv run scripts/advisory_calibration_monitor.py --mode both --since-days 28 --ece-threshold 0.05
+SuccessExitStatus=0
+# 退出码 1 = ECE 超阈值, 不算服务失败 (timer 仍正常)
+SuccessExitStatus=0 1

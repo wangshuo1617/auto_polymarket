@@ -23,6 +23,7 @@ EXTRA_UNITS=(
   auto-poly-advisory-fills-poller.service
   auto-poly-advisory-intent-filler.service
   auto-poly-advisory-edge-alerts.service
+  auto-poly-advisory-calibration.service
 )
 
 TIMERS=(
@@ -31,6 +32,7 @@ TIMERS=(
   auto-poly-advisory-fills-poller.timer
   auto-poly-advisory-intent-filler.timer
   auto-poly-advisory-edge-alerts.timer
+  auto-poly-advisory-calibration.timer
 )
 
 echo "=========================================="

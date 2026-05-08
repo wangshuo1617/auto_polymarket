@@ -1,0 +1,13 @@
+[Unit]
+Description=Auto Polymarket - Advisory Calibration Monitor Timer (daily)
+
+[Timer]
+# 每天凌晨 02:30 UTC 跑一次 (避开主 batch 高峰), boot 后 10 分钟也跑一次.
+OnBootSec=10min
+OnCalendar=*-*-* 02:30:00 UTC
+AccuracySec=5min
+Persistent=true
+Unit=auto-poly-advisory-calibration.service
+
+[Install]
+WantedBy=timers.target
