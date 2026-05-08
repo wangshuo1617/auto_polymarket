@@ -146,7 +146,54 @@ def _ai_model_version() -> str:
 
 
 def _ai_prompt_version() -> str:
-    return os.environ.get("ADVISORY_PATHVIEW_AI_PROMPT_VERSION", "b3_v4")
+    return os.environ.get("ADVISORY_PATHVIEW_AI_PROMPT_VERSION", "b3_v5")
+
+
+def _format_strike_short(strike: float | int | None) -> str:
+    if strike is None:
+        return "?"
+    try:
+        k = float(strike) / 1000.0
+    except Exception:
+        return "?"
+    if k.is_integer():
+        return f"{int(k)}k"
+    txt = f"{k:.1f}".rstrip("0").rstrip(".")
+    return f"{txt}k"
+
+
+def _month_from_slug(slug: str | None) -> str:
+    if not slug:
+        return "?"
+    import re
+    m = re.search(r"-in-([a-z]+)(?:-([0-9]{4}))?", slug, re.I)
+    if not m:
+        return "?"
+    mo = m.group(1).lower()
+    yr = m.group(2)
+    return f"{mo}{yr[-2:]}" if yr else mo
+
+
+def _build_token_label(slug: str | None, vp: dict, fair_meta: dict) -> str:
+    """与前端 formatTokenLabel 同口径: 'may26-↑85k-yes' / 'may26-↓75k-no'.
+
+    side_above ⊕ outcome_index 决定 token 实际 pay-off 方向; outcome_index=1 (no)
+    时 market 方向取反."""
+    strike = vp.get("strike_usd") or fair_meta.get("strike_usd")
+    side_above = vp.get("side_above")
+    if side_above is None:
+        side_above = fair_meta.get("side_above")
+    oi = vp.get("outcome_index")
+    if oi == 0:
+        market_above = bool(side_above)
+    elif oi == 1:
+        market_above = not bool(side_above)
+    else:
+        market_above = bool(side_above)
+    arrow = "↑" if market_above else "↓"
+    yn = "yes" if oi == 0 else ("no" if oi == 1 else "?")
+    month = _month_from_slug(slug)
+    return f"{month}-{arrow}{_format_strike_short(strike)}-{yn}"
 
 
 def _fetch_batch_context(batch_id: int) -> Optional[dict]:
@@ -187,14 +234,18 @@ def _fetch_batch_context(batch_id: int) -> Optional[dict]:
     for tok, slug, cid, vp in snaps:
         vp = vp or {}
         f = fair_map.get(tok, {})
+        strike = vp.get("strike_usd") or f.get("strike_usd")
+        side_above = vp.get("side_above") if vp.get("side_above") is not None else f.get("side_above")
+        # market_direction follows side_above only — outcome_index (yes/no) is handled
+        # by fair_event vs fair_non_event polarity in the AI output, not by direction grouping.
+        market_dir = "above" if side_above else "below"
         tokens.append({
             "token_id": tok,
+            "label": _build_token_label(slug, vp, f),
             "market_slug": slug,
-            "condition_id": cid,
-            "strike_usd": vp.get("strike_usd") or f.get("strike_usd"),
-            "side_above": vp.get("side_above") if vp.get("side_above") is not None
-                          else f.get("side_above"),
-            "outcome_index": vp.get("outcome_index"),
+            "strike_usd": strike,
+            "side_above": side_above,
+            "market_direction": market_dir,
             "fair_value_status": vp.get("fair_value_status") or "available",
         })
         if f.get("fair_calibrated") is not None:
