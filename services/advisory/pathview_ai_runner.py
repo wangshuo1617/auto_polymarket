@@ -146,7 +146,7 @@ def _ai_model_version() -> str:
 
 
 def _ai_prompt_version() -> str:
-    return os.environ.get("ADVISORY_PATHVIEW_AI_PROMPT_VERSION", "b3_v5")
+    return os.environ.get("ADVISORY_PATHVIEW_AI_PROMPT_VERSION", "b3_v6")
 
 
 def _format_strike_short(strike: float | int | None) -> str:
@@ -305,6 +305,24 @@ def run_ai_pathview_for_batch(batch_id: int) -> Optional[int]:
     focus_tokens = _select_focus_tokens(ctx["tokens"], spot, focus_n)
     focus_ids = {t["token_id"] for t in focus_tokens}
     focus_baseline = {k: v for k, v in ctx["baseline_fair"].items() if k in focus_ids}
+
+    # Compact tid mapping (e.g. t1..t8) to slash 8 × 78-char token_ids in the
+    # prompt. AI echoes back the short tid; we restore the full token_id
+    # before validation/persistence so downstream code is unaffected.
+    tid_to_token: dict[str, str] = {}
+    token_to_tid: dict[str, str] = {}
+    compact_focus_tokens: list[dict] = []
+    for idx, tok in enumerate(focus_tokens, start=1):
+        tid = f"t{idx}"
+        tid_to_token[tid] = tok["token_id"]
+        token_to_tid[tok["token_id"]] = tid
+        new_tok = dict(tok)
+        new_tok["token_id"] = tid
+        compact_focus_tokens.append(new_tok)
+    compact_focus_baseline = {
+        token_to_tid[t]: v for t, v in focus_baseline.items() if t in token_to_tid
+    }
+
     logger.info(
         "pathview_ai: focus %d/%d tokens (spot=%s)",
         len(focus_tokens), len(ctx["tokens"]), spot,
@@ -342,8 +360,8 @@ def run_ai_pathview_for_batch(batch_id: int) -> Optional[int]:
             gbm_drift_daily=ctx["drift_daily"] or 0.0,
             sigma_source=ctx.get("sigma_source") or "unknown",
             btc_panels=panels,
-            tokens=focus_tokens,
-            baseline_fair_by_token=focus_baseline,
+            tokens=compact_focus_tokens,
+            baseline_fair_by_token=compact_focus_baseline,
             market_context=market_ctx,
         )
     except Exception as exc:
@@ -356,6 +374,12 @@ def run_ai_pathview_for_batch(batch_id: int) -> Optional[int]:
         )
 
     latency = int((time.time() - t0) * 1000)
+
+    # Restore long token_ids: AI sees t1..tN, downstream expects full ids.
+    for item in (payload.get("per_token") or []):
+        short = item.get("token_id")
+        if isinstance(short, str) and short in tid_to_token:
+            item["token_id"] = tid_to_token[short]
 
     try:
         batch_as_of = datetime.fromisoformat(ctx["as_of_utc"].replace("Z", "+00:00"))
