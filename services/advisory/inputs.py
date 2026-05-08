@@ -326,7 +326,20 @@ def _estimate_volatility_and_drift() -> tuple[float, str, float, str, float, flo
     panel = compute_sigma_panel(returns, windows=(7, 14, 30, 60), ewma_lam=ewma_lam)
     panel["window_n_env"] = window_n
 
-    if sigma_ewma > 0:
+    # dyn-cal #2: regime-aware blending (vol-of-vol → 短/中/长窗口权重)
+    from services.advisory.sigma_blender import compute_regime_blend, regime_blend_enabled
+    blend = compute_regime_blend(panel, returns)
+    panel["regime_blend"] = blend
+
+    if regime_blend_enabled() and blend.get("sigma_blended", 0.0) > 0 \
+            and blend.get("regime") != "insufficient_data":
+        sigma_daily = float(blend["sigma_blended"])
+        sigma_source = (
+            f"regime_blend({blend['regime']},cv={blend['vov_cv']:.3f},"
+            f"σ={sigma_daily * 100:.2f}%,"
+            f"w=s{blend['weights']['short_7d']:.2f}/m{blend['weights']['mid_14d']:.2f}/l{blend['weights']['long_30d']:.2f})"
+        )
+    elif sigma_ewma > 0:
         sigma_daily = sigma_ewma
         sigma_source = ewma_src
     elif realized_pct > 0:
