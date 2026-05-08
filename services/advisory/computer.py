@@ -125,35 +125,45 @@ def _compute_one_view(
             apr = (fair_value / quote.best_ask - 1.0) * 365.0 / days_left
         ranking = edge_buy
 
-    # Kelly target (quarter-Kelly + 20% net-value cap).
-    # 仅当 fair / ask 都可用 + 未 halt + edge > 0 + total_net_value 可知时计算.
-    # 不会写到 position.target_usdc (避免污染 input dataclass), 直接进入 payload.
-    target_usdc: Optional[float] = position.target_usdc
+    # Target sizing 决策树:
+    #   1. 计算 kelly_target (filter: ask<=0.90, edge>=0.05, edge<0 时 = None)
+    #   2. 若有持仓:
+    #        bid > fair  → 锁利: target = kelly_target if exists else 0 (减仓 / 全清)
+    #        bid <= fair → 持有: 若 current 已达 kelly_target, target=None (不动);
+    #                            若 current < kelly_target, target=kelly_target (加仓)
+    #   3. 若无持仓: target = kelly_target (有信号才提示开仓)
+    # 微残留 (<$5) 不触发任何信号 (避免 dust 触发 CLEAR)
+    MIN_HELD_USDC = 5.0
+    kelly_target: Optional[float] = None
     if (
-        target_usdc is None
-        and total_net_value_usdc is not None and total_net_value_usdc > 0
+        total_net_value_usdc is not None and total_net_value_usdc > 0
         and fair_value is not None and 0.0 < fair_value < 1.0
-        and quote.best_ask is not None and 0.0 < quote.best_ask < 1.0
-        and edge_buy is not None and edge_buy > 0
+        and quote.best_ask is not None and 0.0 < quote.best_ask <= 0.90
+        and edge_buy is not None and edge_buy >= 0.05
     ):
-        # Kelly = (p − price) / (1 − price); quarter-Kelly + 20% cap
         kelly = max(0.0, (fair_value - quote.best_ask) / max(1e-6, 1.0 - quote.best_ask))
         fractional = 0.25 * kelly
-        target_usdc = round(min(total_net_value_usdc * 0.20,
-                                total_net_value_usdc * fractional), 2)
+        kelly_target = round(min(total_net_value_usdc * 0.20,
+                                 total_net_value_usdc * fractional), 2)
 
-    # 减仓 / 清仓: 持有 + 按 bid 重算 edge_bid<0 (卖出价已低于公允) → target=0 全清.
-    # 仅 ask-edge 翻负但 bid-edge 仍 >=0 时只是不该加仓, 不强制平.
-    # (锁利逻辑暂时去掉: bid >> fair 时人工判断, 避免过早出场)
-    if (
-        position.current_usdc is not None and position.current_usdc > 0
-        and fair_value is not None and 0.0 < fair_value < 1.0
-        and quote.best_bid is not None and quote.best_bid > 0
-        and halt is None
-    ):
-        edge_bid = (quote.best_bid - fair_value) / fair_value
-        if edge_bid < 0:
-            target_usdc = 0.0
+    target_usdc: Optional[float] = position.target_usdc
+    if target_usdc is None:
+        cur_usdc = position.current_usdc
+        held = (cur_usdc is not None and cur_usdc >= MIN_HELD_USDC)
+        bid_ok = (quote.best_bid is not None and quote.best_bid > 0
+                  and fair_value is not None and 0.0 < fair_value < 1.0
+                  and halt is None)
+        if held and bid_ok and quote.best_bid > fair_value:
+            # 锁利: 卖到 kelly_target (有 edge 时保留部分) 或全清
+            target_usdc = kelly_target if kelly_target is not None else 0.0
+        elif held:
+            # bid <= fair: 持有不动, 除非 kelly_target > current 时加仓
+            if kelly_target is not None and cur_usdc is not None and kelly_target > cur_usdc:
+                target_usdc = kelly_target
+            # else: target_usdc 保持 None (持有观望)
+        else:
+            # 无持仓 (或残留): kelly_target 是开仓建议
+            target_usdc = kelly_target
 
     delta_usdc = None
     if target_usdc is not None and position.current_usdc is not None:
