@@ -146,7 +146,7 @@ def _ai_model_version() -> str:
 
 
 def _ai_prompt_version() -> str:
-    return os.environ.get("ADVISORY_PATHVIEW_AI_PROMPT_VERSION", "b3_v3")
+    return os.environ.get("ADVISORY_PATHVIEW_AI_PROMPT_VERSION", "b3_v4")
 
 
 def _fetch_batch_context(batch_id: int) -> Optional[dict]:
@@ -195,8 +195,6 @@ def _fetch_batch_context(batch_id: int) -> Optional[dict]:
             "side_above": vp.get("side_above") if vp.get("side_above") is not None
                           else f.get("side_above"),
             "outcome_index": vp.get("outcome_index"),
-            "best_bid": vp.get("best_bid"),
-            "best_ask": vp.get("best_ask"),
             "fair_value_status": vp.get("fair_value_status") or "available",
         })
         if f.get("fair_calibrated") is not None:
