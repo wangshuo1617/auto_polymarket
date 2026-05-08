@@ -19,12 +19,66 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from data.database import get_conn
+from services.advisory.path_mc import mc_barrier_touch
 from services.advisory.pathview_validator import (
     ValidationResult,
     validate_pathview_payload,
 )
 
 logger = logging.getLogger(__name__)
+
+
+_MC_FAT_TAIL_MULT = 1.15  # match profit_optimizer realized σ scaling
+_MC_PATHS_DEFAULT = 4000  # per-token; cheap enough for 24 tokens/batch
+
+
+def _compute_mc_components(
+    spot: float, sigma_daily: float, mu_daily: float, days_left: float,
+    fair_map: dict,
+) -> dict[str, dict]:
+    """Per-token raw MC barrier-touch probability (Brownian-bridge corrected,
+    antithetic). Returns {token_id: {p_touch_mc, sample_se, n_paths, dt_days}}.
+
+    NOTE: p_touch_mc is *raw* P(barrier touched in market direction). It does
+    NOT apply the pays_on_event / no-token side flip — production
+    `fair_calibrated` already does. B4 reporting is responsible for mapping
+    p_touch_mc → fair_event_mc using the same convention as the comparison
+    target (AI payload or closed-form baseline) before computing diffs.
+    """
+    out: dict[str, dict] = {}
+    if spot is None or sigma_daily is None or days_left is None:
+        return out
+    for tok_id, f in (fair_map or {}).items():
+        strike = f.get("strike_usd")
+        side_above = f.get("side_above")
+        if strike is None or side_above is None:
+            continue
+        if f.get("p_touch_to_date"):
+            out[tok_id] = {
+                "p_touch_mc": 1.0, "sample_se": 0.0, "n_paths": 0,
+                "dt_days": None, "fat_tail_mult": _MC_FAT_TAIL_MULT,
+                "note": "path_locked",
+            }
+            continue
+        direction = "above" if side_above else "below"
+        try:
+            r = mc_barrier_touch(
+                current_price=float(spot), strike=float(strike),
+                direction=direction, mu_daily=float(mu_daily or 0.0),
+                sigma_daily=float(sigma_daily), days_left=float(days_left),
+                n_paths=_MC_PATHS_DEFAULT, fat_tail_mult=_MC_FAT_TAIL_MULT,
+            )
+        except Exception as e:
+            logger.warning("mc_barrier_touch failed for %s: %s", tok_id, e)
+            continue
+        out[tok_id] = {
+            "p_touch_mc": round(r.p_touch, 6),
+            "sample_se": round(r.p_touch_se, 6),
+            "n_paths": r.n_paths,
+            "dt_days": r.dt_days,
+            "fat_tail_mult": _MC_FAT_TAIL_MULT,
+        }
+    return out
 
 
 def _fetch_batch_baseline(batch_id: int) -> Optional[dict]:
@@ -34,7 +88,8 @@ def _fetch_batch_baseline(batch_id: int) -> Optional[dict]:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT b.as_of_utc, pv.sigma_daily, pv.per_token_fair
+            SELECT b.as_of_utc, pv.sigma_daily, pv.per_token_fair,
+                   pv.current_btc_price, pv.drift_daily, pv.days_left
             FROM market_view_batches b
             LEFT JOIN path_views pv ON pv.id = b.path_view_id
             WHERE b.id = %s
@@ -44,7 +99,7 @@ def _fetch_batch_baseline(batch_id: int) -> Optional[dict]:
         row = cur.fetchone()
         if not row:
             return None
-        as_of, sigma, per_token_fair_json = row
+        as_of, sigma, per_token_fair_json, spot, mu, days_left = row
 
         cur.execute(
             """
@@ -57,6 +112,7 @@ def _fetch_batch_baseline(batch_id: int) -> Optional[dict]:
         snaps = cur.fetchall()
 
     fair_map = per_token_fair_json or {}
+    mc_map = _compute_mc_components(spot, sigma, mu, days_left, fair_map)
     per_token: list[dict] = []
     for tok_id, vp in snaps:
         vp = vp or {}
@@ -65,7 +121,6 @@ def _fetch_batch_baseline(batch_id: int) -> Optional[dict]:
         if fair_event is None:
             fair_event = vp.get("fair_event")
         fair_non_event = (1.0 - fair_event) if isinstance(fair_event, (int, float)) else None
-        # baseline 用 fair_event 当 p_event_yes 的代理 (yes 视角已合并 no 翻转)
         p_event_yes = fair_event
         per_token.append({
             "token_id": tok_id,
@@ -75,6 +130,7 @@ def _fetch_batch_baseline(batch_id: int) -> Optional[dict]:
             "fair_value_status": vp.get("fair_value_status") or "available",
             "strike_usd": f.get("strike_usd"),
             "side_above": f.get("side_above"),
+            "path_mc": mc_map.get(tok_id),
         })
 
     return {
