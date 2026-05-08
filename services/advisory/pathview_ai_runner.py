@@ -1,0 +1,296 @@
+"""Phase B3 — AI PathView shadow runner (NEVER drives production).
+
+Pulls current batch context (path_views + per-token universe + baseline GBM
+fair) from PG, calls Gemini with PATHVIEW_AI_SCHEMA, validates the response,
+and persists into advisory_pathview_shadow_runs (source='ai') +
+advisory_pathview_shadow_views.
+
+Default DISABLED via env. Set ADVISORY_PATHVIEW_AI_ENABLED=1 to flip on.
+On any failure (timeout / validation_failed / quota), logs warning and
+records a 'failed'/'fatal' shadow row — production GBM advisory + email
+notification path is not affected.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+from data.database import get_conn
+from services.advisory.pathview_shadow import _persist_shadow_run
+from services.advisory.pathview_validator import validate_pathview_payload
+
+logger = logging.getLogger(__name__)
+
+
+def ai_enabled() -> bool:
+    raw = os.environ.get("ADVISORY_PATHVIEW_AI_ENABLED", "0").strip()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+def _ai_min_interval_hours() -> float:
+    """两次 AI shadow run 之间的最小间隔 (小时)。默认 6h。"""
+    try:
+        return float(os.environ.get("ADVISORY_PATHVIEW_AI_MIN_INTERVAL_HOURS", "6"))
+    except Exception:
+        return 6.0
+
+
+def _ai_focus_tokens() -> int:
+    """每次 AI 调用只分析最接近现价的 N 个 token, 默认 6。"""
+    try:
+        return max(1, int(os.environ.get("ADVISORY_PATHVIEW_AI_FOCUS_TOKENS", "6")))
+    except Exception:
+        return 6
+
+
+def _last_ai_run_at(batch_id: int) -> Optional[datetime]:
+    """返回上一次 AI shadow run 的 generated_at (任一状态, 含 failed)。"""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT max(generated_at)
+            FROM advisory_pathview_shadow_runs
+            WHERE source = 'ai'
+            """,
+        )
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    ts = row[0]
+    if isinstance(ts, datetime) and ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def _should_run_ai_now() -> tuple[bool, str]:
+    """节流: 距上次 AI 调用不足 min_interval 则跳过。"""
+    min_h = _ai_min_interval_hours()
+    if min_h <= 0:
+        return True, "no_throttle"
+    last = _last_ai_run_at(0)
+    if last is None:
+        return True, "first_run"
+    age_h = (datetime.now(timezone.utc) - last).total_seconds() / 3600.0
+    if age_h >= min_h:
+        return True, f"age={age_h:.2f}h>={min_h}h"
+    return False, f"throttled age={age_h:.2f}h<{min_h}h"
+
+
+def _select_focus_tokens(tokens: list, spot: Optional[float], n: int) -> list:
+    """挑选最接近现价的 n 个 token (按 |strike - spot|)。"""
+    if not tokens:
+        return []
+    if spot is None or spot <= 0 or n >= len(tokens):
+        return list(tokens)
+
+    def _dist(t):
+        s = t.get("strike_usd")
+        try:
+            return abs(float(s) - float(spot))
+        except Exception:
+            return float("inf")
+
+    return sorted(tokens, key=_dist)[:n]
+
+
+
+def _ai_model_version() -> str:
+    return os.environ.get("ADVISORY_PATHVIEW_AI_MODEL_VERSION", "gemini_v1")
+
+
+def _ai_prompt_version() -> str:
+    return os.environ.get("ADVISORY_PATHVIEW_AI_PROMPT_VERSION", "b3_v1")
+
+
+def _fetch_batch_context(batch_id: int) -> Optional[dict]:
+    """Pull everything needed to build the AI prompt."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT b.as_of_utc, pv.current_btc_price, pv.sigma_daily,
+                   pv.sigma_source, pv.drift_daily, pv.days_left,
+                   pv.per_token_fair
+            FROM market_view_batches b
+            LEFT JOIN path_views pv ON pv.id = b.path_view_id
+            WHERE b.id = %s
+            """,
+            (batch_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        as_of, spot, sigma, sigma_src, mu, days, per_token_fair = row
+
+        cur.execute(
+            """
+            SELECT s.token_id, s.market_slug, s.condition_id,
+                   s.view_payload
+            FROM market_view_snapshots s
+            WHERE s.batch_id = %s
+            ORDER BY s.token_id
+            """,
+            (batch_id,),
+        )
+        snaps = cur.fetchall()
+
+    tokens = []
+    baseline_fair = {}
+    fair_map = per_token_fair or {}
+    for tok, slug, cid, vp in snaps:
+        vp = vp or {}
+        f = fair_map.get(tok, {})
+        tokens.append({
+            "token_id": tok,
+            "market_slug": slug,
+            "condition_id": cid,
+            "strike_usd": vp.get("strike_usd") or f.get("strike_usd"),
+            "side_above": vp.get("side_above") if vp.get("side_above") is not None
+                          else f.get("side_above"),
+            "outcome_index": vp.get("outcome_index"),
+            "best_bid": vp.get("best_bid"),
+            "best_ask": vp.get("best_ask"),
+            "fair_value_status": vp.get("fair_value_status") or "available",
+        })
+        if f.get("fair_calibrated") is not None:
+            baseline_fair[tok] = float(f["fair_calibrated"])
+
+    return {
+        "as_of_utc": as_of.isoformat() if isinstance(as_of, datetime) else str(as_of),
+        "current_btc_price": float(spot) if spot is not None else None,
+        "sigma_daily": float(sigma) if sigma is not None else None,
+        "sigma_source": sigma_src,
+        "drift_daily": float(mu) if mu is not None else 0.0,
+        "days_left": float(days) if days is not None else None,
+        "tokens": tokens,
+        "baseline_fair": baseline_fair,
+    }
+
+
+def _record_shadow_failure(
+    batch_id: int, *, status: str, errors: list, notes: str,
+    latency_ms: Optional[int] = None,
+) -> int:
+    """Persist a shadow row representing a failed AI call so B4 metrics
+    can track AI availability without blowing up the batch."""
+    from services.advisory.pathview_validator import ValidationResult
+    res = ValidationResult(status=status, errors=errors, warnings=[])
+    return _persist_shadow_run(
+        batch_id, source="ai",
+        payload={"per_token": [], "ai_call_failed": True},
+        validation=res,
+        model_id="gemini",
+        model_version=_ai_model_version(),
+        prompt_version=_ai_prompt_version(),
+        request_latency_ms=latency_ms,
+        notes=notes,
+    )
+
+
+def run_ai_pathview_for_batch(batch_id: int) -> Optional[int]:
+    """Main B3 entry. Returns shadow_run_id or None when disabled/throttled."""
+    if not ai_enabled():
+        logger.debug("pathview_ai disabled (set ADVISORY_PATHVIEW_AI_ENABLED=1)")
+        return None
+
+    ok, reason = _should_run_ai_now()
+    if not ok:
+        logger.info("pathview_ai: skip batch=%s (%s)", batch_id, reason)
+        return None
+    logger.info("pathview_ai: proceed batch=%s (%s)", batch_id, reason)
+
+    ctx = _fetch_batch_context(batch_id)
+    if ctx is None:
+        logger.warning("pathview_ai: batch %s not found", batch_id)
+        return None
+
+    focus_n = _ai_focus_tokens()
+    spot = ctx.get("current_btc_price")
+    focus_tokens = _select_focus_tokens(ctx["tokens"], spot, focus_n)
+    focus_ids = {t["token_id"] for t in focus_tokens}
+    focus_baseline = {k: v for k, v in ctx["baseline_fair"].items() if k in focus_ids}
+    logger.info(
+        "pathview_ai: focus %d/%d tokens (spot=%s)",
+        len(focus_tokens), len(ctx["tokens"]), spot,
+    )
+
+    try:
+        from ai.researcher import analyze_pathview_for_advisory
+    except Exception as exc:
+        logger.warning("pathview_ai: cannot import researcher: %s", exc)
+        return _record_shadow_failure(
+            batch_id, status="fatal",
+            errors=[{"code": "import_failed", "detail": str(exc)}],
+            notes="researcher_unavailable",
+        )
+
+    panels = {
+        "sigma_source": ctx.get("sigma_source"),
+        "gbm_sigma_daily": ctx.get("sigma_daily"),
+        "gbm_drift_daily": ctx.get("drift_daily"),
+        "current_btc_price": ctx.get("current_btc_price"),
+        "days_left": ctx.get("days_left"),
+    }
+
+    t0 = time.time()
+    payload = None
+    try:
+        payload = analyze_pathview_for_advisory(
+            batch_id=batch_id,
+            batch_as_of_utc=ctx["as_of_utc"],
+            current_btc_price=ctx["current_btc_price"] or 0.0,
+            days_left=ctx["days_left"] or 0.0,
+            gbm_sigma_daily=ctx["sigma_daily"] or 0.0,
+            gbm_drift_daily=ctx["drift_daily"] or 0.0,
+            sigma_source=ctx.get("sigma_source") or "unknown",
+            btc_panels=panels,
+            tokens=focus_tokens,
+            baseline_fair_by_token=focus_baseline,
+        )
+    except Exception as exc:
+        latency = int((time.time() - t0) * 1000)
+        logger.warning("pathview_ai: API call failed batch=%s err=%s", batch_id, exc)
+        return _record_shadow_failure(
+            batch_id, status="failed",
+            errors=[{"code": "api_call_failed", "detail": str(exc)[:500]}],
+            notes="ai_api_exception", latency_ms=latency,
+        )
+
+    latency = int((time.time() - t0) * 1000)
+
+    try:
+        batch_as_of = datetime.fromisoformat(ctx["as_of_utc"].replace("Z", "+00:00"))
+        if batch_as_of.tzinfo is None:
+            batch_as_of = batch_as_of.replace(tzinfo=timezone.utc)
+    except Exception:
+        batch_as_of = datetime.now(timezone.utc)
+
+    validation = validate_pathview_payload(
+        payload,
+        batch_as_of_utc=batch_as_of,
+        baseline_fair_by_token=focus_baseline,
+    )
+
+    run_id = _persist_shadow_run(
+        batch_id, source="ai",
+        payload=payload, validation=validation,
+        model_id="gemini",
+        model_version=_ai_model_version(),
+        prompt_version=_ai_prompt_version(),
+        request_latency_ms=latency,
+        notes=("validation_passed" if validation.status == "passed"
+               else f"validation_{validation.status}"),
+    )
+    logger.info(
+        "pathview_ai: batch=%s run_id=%s status=%s errors=%d warnings=%d "
+        "latency=%dms n_tokens=%d",
+        batch_id, run_id, validation.status,
+        len(validation.errors), len(validation.warnings),
+        latency, len(payload.get("per_token") or []),
+    )
+    return run_id

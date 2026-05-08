@@ -252,6 +252,21 @@ def record_baseline_replay(batch_id: int) -> Optional[int]:
     except Exception as exc:
         logger.warning("shadow intents projection failed: %s", exc)
 
+    try:
+        from services.advisory.pathview_ai_runner import (
+            ai_enabled, run_ai_pathview_for_batch,
+        )
+        if ai_enabled():
+            ai_run_id = run_ai_pathview_for_batch(batch_id)
+            if ai_run_id is not None:
+                try:
+                    from services.advisory.shadow_intents import project_shadow_intents
+                    project_shadow_intents(ai_run_id, batch_id)
+                except Exception as exc:
+                    logger.warning("ai shadow intents failed: %s", exc)
+    except Exception as exc:
+        logger.warning("pathview_ai run failed: %s", exc)
+
     return run_id
 
 

@@ -20,6 +20,9 @@ from ai.prompts import (
     GOLD_RESPONSE_SCHEMA,
     get_gold_system_instruction,
     get_gold_user_prompt,
+    PATHVIEW_AI_SCHEMA,
+    get_pathview_ai_system_instruction,
+    get_pathview_ai_user_prompt,
 )
 
 ET_TIMEZONE = ZoneInfo("America/New_York")
@@ -323,3 +326,62 @@ def analyze_gold_market_with_grounding(
         return result
     except Exception as e:
         raise Exception(f"Error calling Gemini API (gold): {str(e)}") from e
+
+
+def analyze_pathview_for_advisory(
+    *,
+    batch_id: int,
+    batch_as_of_utc: str,
+    current_btc_price: float,
+    days_left: float,
+    gbm_sigma_daily: float,
+    gbm_drift_daily: float,
+    sigma_source: str,
+    btc_panels: dict,
+    tokens: list,
+    baseline_fair_by_token: dict,
+    temperature: float = 0.3,
+    max_output_tokens: int = 8192,
+) -> Dict[str, Any]:
+    """B3: AI PathView shadow estimator. Returns parsed JSON dict matching
+    PATHVIEW_AI_SCHEMA. Caller must validate via pathview_validator before
+    persisting. NEVER drives production trading."""
+    client = _get_client()
+    config = types.GenerateContentConfig(
+        system_instruction=get_pathview_ai_system_instruction(),
+        response_mime_type="application/json",
+        response_schema=PATHVIEW_AI_SCHEMA,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        thinking_config=types.ThinkingConfig(thinking_budget=2048),
+    )
+    user_prompt = get_pathview_ai_user_prompt(
+        batch_id=batch_id,
+        batch_as_of_utc=batch_as_of_utc,
+        current_btc_price=current_btc_price,
+        days_left=days_left,
+        gbm_sigma=gbm_sigma_daily,
+        gbm_drift=gbm_drift_daily,
+        sigma_source=sigma_source,
+        btc_panels=btc_panels,
+        tokens=tokens,
+        baseline_fair_by_token=baseline_fair_by_token,
+    )
+    response = client.models.generate_content(
+        model=GEMINI_MODEL_ID,
+        contents=user_prompt,
+        config=config,
+    )
+    text = response.text
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        if "```json" in text:
+            s = text.find("```json") + 7
+            e = text.find("```", s)
+            text = text[s:e].strip()
+        elif "```" in text:
+            s = text.find("```") + 3
+            e = text.find("```", s)
+            text = text[s:e].strip()
+        return json.loads(text)

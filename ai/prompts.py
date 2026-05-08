@@ -991,3 +991,141 @@ def get_gold_user_prompt(
         profit_optimization_context=json.dumps(profit_optimization_context, ensure_ascii=False, indent=2),
         previous_report=previous_report_str,
     )
+
+
+# =============================================================================
+# B3: PathView AI shadow schema + prompt (Phase B - shadow only, NEVER drives
+# production trading until B5 cutover gate).
+# =============================================================================
+
+PATHVIEW_AI_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "as_of_utc": {
+            "type": "string",
+            "description": "ISO-8601 UTC 时间戳, 必须等于 batch_as_of_utc (容差 600s)。"
+        },
+        "sigma_daily": {
+            "type": "number",
+            "description": "日 σ (相对). 允许范围 [0.001, 0.30]. 应基于 batch 提供的近期实现波动 + 当前事件冲击调整。"
+        },
+        "drift_daily": {
+            "type": "number",
+            "description": "日 μ (相对). 通常接近 0; 若有强趋势可适度偏移 (建议绝对值 < 0.005)。"
+        },
+        "market_view_summary": {
+            "type": "string",
+            "description": "中文简述: 当前 BTC 多空格局、关键阻力/支撑、近期催化剂。"
+        },
+        "key_levels": {
+            "type": "array",
+            "description": "关键价位 (阻力/支撑/事件预期). 用于 path_mc 偏置 + 人审可读。",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "price_usd": {"type": "number"},
+                    "kind": {"type": "string", "enum": ["resistance", "support", "expected_target", "stop_zone"]},
+                    "rationale": {"type": "string"}
+                },
+                "required": ["price_usd", "kind", "rationale"]
+            }
+        },
+        "per_token": {
+            "type": "array",
+            "description": "每个 token 一项, 必须覆盖 batch 提供的全部 token_id。",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "token_id": {"type": "string"},
+                    "market_slug": {"type": "string"},
+                    "strike_usd": {"type": "number"},
+                    "side_above": {"type": "boolean", "description": "true=touch-above 类 token, false=touch-below"},
+                    "market_direction": {"type": "string", "enum": ["above", "below"]},
+                    "p_event_yes": {"type": "number", "description": "AI 估计该 token 命中事件的概率 [0, 1]"},
+                    "fair_event": {"type": "number", "description": "fair (本 token 命中支付侧). 通常 = p_event_yes"},
+                    "fair_non_event": {"type": "number", "description": "fair (互补侧). 通常 = 1 - fair_event"},
+                    "fair_value_status": {"type": "string", "enum": ["available", "unavailable", "locked_event_occurred", "locked_event_missed", "settled"]},
+                    "rationale_short": {"type": "string", "description": "一句话理由 (≤ 60 字)"}
+                },
+                "required": [
+                    "token_id", "strike_usd", "side_above", "market_direction",
+                    "p_event_yes", "fair_event", "fair_non_event", "fair_value_status"
+                ]
+            }
+        },
+        "ai_notes": {
+            "type": "string",
+            "description": "自由文本: 当前批次特殊情况、AI 不确定性、对 GBM baseline 的不同意点。供人审, 不参与机器决策。"
+        }
+    },
+    "required": ["as_of_utc", "sigma_daily", "per_token", "key_levels", "ai_notes"]
+}
+
+
+PATHVIEW_AI_SYSTEM_INSTRUCTION = """你是 BTC Polymarket 月度市场的 PathView 估值专家。
+
+你的任务: 基于本 batch 提供的 BTC 实时上下文 (现价 / 近期实现 σ / IV 参考 / days_left / 关键 K 线) +
+本 batch 全部 token 的 strike + side, 给出每个 token 的 fair value (后验事件概率)。
+
+硬性约束:
+1. 输出 JSON 必须严格符合 PATHVIEW_AI_SCHEMA, 否则会被回滚 GBM baseline。
+2. as_of_utc 必须等于上下文给出的 batch_as_of_utc (允许 600s 内)。
+3. sigma_daily ∈ [0.001, 0.30], 通常落在 [0.005, 0.05]。
+4. 同一 market 内的 yes/no token: fair_event + 互补 token 的 fair_event ≈ 1 (容差 0.5%)。
+5. 单调性: 在同一方向上, strike 越远 fair_event 越低 (touch-above) 或越高 (touch-below)。
+6. 你必须为每一个 token_id 输出一项, 不可遗漏。
+7. 不要给出交易建议或仓位 — 只回答 fair value。
+8. ai_notes 用中文, 自由表达对 GBM baseline 的不同意见或当前批次特殊情况。
+
+风格:
+- rationale_short ≤ 60 字, 中文。
+- 不要 hallucinate 不存在的 token_id。
+- 你的 fair 会与 GBM baseline 在 shadow 层对照打分; 偏差超过 40% 会被标记 R10。
+"""
+
+
+PATHVIEW_AI_USER_PROMPT_TEMPLATE = """=== Batch context ===
+batch_id: {batch_id}
+batch_as_of_utc: {batch_as_of_utc}
+current_btc_price_usd: {current_btc_price}
+days_left: {days_left}
+gbm_baseline_sigma_daily: {gbm_sigma}
+gbm_baseline_drift_daily: {gbm_drift}
+sigma_source: {sigma_source}
+
+=== Recent BTC realized vol (panels, 1d) ===
+{btc_panels}
+
+=== Focus tokens (本次仅需分析这 {n_tokens} 个最接近现价的 token) ===
+{tokens_json}
+
+=== GBM baseline fair (per token, 仅供对比, 你可以同意或不同意) ===
+{baseline_fair_json}
+
+=== Output ===
+按 PATHVIEW_AI_SCHEMA 严格输出 JSON。per_token 数组只需覆盖上述 focus tokens 即可 (不要补其他 token)。
+"""
+
+
+def get_pathview_ai_system_instruction() -> str:
+    return PATHVIEW_AI_SYSTEM_INSTRUCTION
+
+
+def get_pathview_ai_user_prompt(
+    *, batch_id: int, batch_as_of_utc: str, current_btc_price: float,
+    days_left: float, gbm_sigma: float, gbm_drift: float, sigma_source: str,
+    btc_panels: dict, tokens: list[dict], baseline_fair_by_token: dict,
+) -> str:
+    return PATHVIEW_AI_USER_PROMPT_TEMPLATE.format(
+        batch_id=batch_id,
+        batch_as_of_utc=batch_as_of_utc,
+        current_btc_price=current_btc_price,
+        days_left=round(days_left, 4),
+        gbm_sigma=gbm_sigma,
+        gbm_drift=gbm_drift,
+        sigma_source=sigma_source,
+        btc_panels=json.dumps(btc_panels, ensure_ascii=False, indent=2),
+        n_tokens=len(tokens),
+        tokens_json=json.dumps(tokens, ensure_ascii=False, indent=2),
+        baseline_fair_json=json.dumps(baseline_fair_by_token, ensure_ascii=False, indent=2),
+    )
