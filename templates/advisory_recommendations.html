@@ -332,7 +332,7 @@ async function load() {
                 : aiRun.validation_status === 'passed_with_warnings' ? '#ef6c00' : '#c62828';
     const aiBanner = `<div style="background:#f3f7ff;border:1px solid #cfe0ff;padding:8px 12px;border-radius:6px;margin-bottom:10px;font-size:12px;">
       <b>AI PathView shadow</b> (${aiRun.model_id || '?'} / ${aiRun.prompt_version || '?'})
-      · run #${aiRun.id} · ${aiRun.generated_at || ''}
+      · run #${aiRun.id} (batch #${aiRun.batch_id || '?'}) · ${aiRun.generated_at || ''}
       · status=<span style="color:${stClr}">${aiRun.validation_status}</span>
       · latency ${aiRun.latency_ms}ms
       <div style="margin-top:4px;color:#333;cursor:help" title="${sumTip}"><b>summary:</b> ${(aiRun.summary || '').slice(0, 180)}${(aiRun.summary || '').length > 180 ? '…' : ''}</div>

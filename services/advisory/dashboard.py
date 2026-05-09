@@ -66,8 +66,9 @@ def _serialize_snapshot(s: dict) -> dict:
     return out
 
 
-def _fetch_latest_ai_shadow_for_batch(batch_id: int) -> dict:
-    """返回最新一次 source='ai' 的 PathView shadow run 数据.
+def _fetch_latest_ai_shadow() -> dict:
+    """返回最近一次 source='ai' (任意 batch) 的 PathView shadow run 数据.
+    不与当前 batch 绑定 —— AI 每 6h 跑一次, 非 AI batch 不应清空显示.
     结构: {"run": {...}, "by_token": {token_id: {fair_event, p_event_yes, fair_value_status, rationale_short}}}
     若无任何 AI run, 返回 {"run": None, "by_token": {}}.
     """
@@ -77,19 +78,18 @@ def _fetch_latest_ai_shadow_for_batch(batch_id: int) -> dict:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT id, generated_at, model_id, prompt_version, validation_status,
-                       request_latency_ms, raw_payload
+                SELECT id, batch_id, generated_at, model_id, prompt_version,
+                       validation_status, request_latency_ms, raw_payload
                 FROM advisory_pathview_shadow_runs
-                WHERE batch_id = %s AND source = 'ai'
+                WHERE source = 'ai'
                 ORDER BY generated_at DESC
                 LIMIT 1
                 """,
-                (batch_id,),
             )
             row = cur.fetchone()
             if not row:
                 return out
-            run_id, gen_at, model_id, prompt_v, status, latency, payload = row
+            run_id, batch_id, gen_at, model_id, prompt_v, status, latency, payload = row
             if isinstance(payload, str):
                 import json
                 try:
@@ -99,6 +99,7 @@ def _fetch_latest_ai_shadow_for_batch(batch_id: int) -> dict:
             payload = payload or {}
             out["run"] = {
                 "id": run_id,
+                "batch_id": batch_id,
                 "generated_at": gen_at.astimezone(timezone.utc).isoformat() if isinstance(gen_at, datetime) else None,
                 "model_id": model_id,
                 "prompt_version": prompt_v,
@@ -132,7 +133,7 @@ def _fetch_latest_ai_shadow_for_batch(batch_id: int) -> dict:
                     "rationale_short": comp.get("rationale_short"),
                 }
     except Exception:
-        logger.exception("_fetch_latest_ai_shadow_for_batch failed")
+        logger.exception("_fetch_latest_ai_shadow failed")
     return out
 
 
@@ -170,7 +171,7 @@ def api_recommendations():
     snapshots_out = []
     ai_shadow = {"run": None, "by_token": {}}
     if not is_stale:
-        ai_shadow = _fetch_latest_ai_shadow_for_batch(batch.get("id"))
+        ai_shadow = _fetch_latest_ai_shadow()
         ai_by_token = ai_shadow.get("by_token") or {}
         for s in snapshots:
             row = _serialize_snapshot(s)
