@@ -12,7 +12,7 @@ EnvironmentFile=-/root/auto_polymarket/.env
 Environment=POLYMARKET_PROFILE=analyze
 Environment=FOREGROUND=1
 Environment=LD_PRELOAD=
-Environment=ADVISORY_BATCH_INTERVAL=3600
+Environment=ADVISORY_BATCH_INTERVAL=300
 Environment=ADVISORY_BATCH_MAX_STRIKES=12
 # Phase B3: enable AI PathView shadow (6h throttle inside runner).
 # Production GBM advisory + email path remain authoritative; AI rows
