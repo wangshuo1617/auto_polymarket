@@ -285,6 +285,7 @@ async function load() {
     const ai = s.ai_shadow;
     let aiCell = '<span style="color:#bbb">—</span>';
     let aiEdgeCell = '<span style="color:#bbb">—</span>';
+    let aiBuyBadge = '';
     if (ai && ai.fair_event !== null && ai.fair_event !== undefined) {
       const baseFair = s.fair_value_for_edge;
       const diff = (typeof baseFair === 'number') ? (ai.fair_event - baseFair) : null;
@@ -306,10 +307,14 @@ async function load() {
           <span style="color:${aiEdgeClr}">${aiEdge >= 0 ? '+' : ''}${aiEdge.toFixed(3)}</span>
           ${edgeDiffTxt}
         </div>`;
+        if (aiEdge >= 0.05 && ai.fair_value_status === 'available') {
+          const badgeTip = (ai.rationale_short || '').replace(/"/g, '&quot;');
+          aiBuyBadge = ` <span title="AI edge +${aiEdge.toFixed(2)} (fair ${fmt(ai.fair_event,3)} vs ask ${fmt(ask,3)})\n${badgeTip}" style="display:inline-block;background:#1b5e20;color:#fff;font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;vertical-align:middle;cursor:help">BUY</span>`;
+        }
       }
     }
     html += `<tr class="${cls}">
-      <td class="txt"><div title="${s.market_slug || ''}">${label}</div><div style="color:#999;font-size:11px" title="${s.token_id || ''}">${tokShort}</div></td>
+      <td class="txt"><div title="${s.market_slug || ''}">${label}${aiBuyBadge}</div><div style="color:#999;font-size:11px" title="${s.token_id || ''}">${tokShort}</div></td>
       <td class="txt">${pillFor(s)}</td>
       <td class="num">${fmt(s.fair_value_for_edge, 3)}</td>
       <td class="num">${fmt(s.edge_buy_active, 3)}</td>
