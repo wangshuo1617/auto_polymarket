@@ -1,6 +1,255 @@
 # Auto Polymarket
 
-一个自动化 Polymarket 交易分析系统，集成 AI 市场研究、实时价格监控和持仓分析功能。
+Polymarket 月度市场分析与 AI 顾问系统。系统自动分析持仓、生成 AI 交易建议（advisory），并通过 WebHook/邮件通知，由自动执行器按触发条件下单。
+
+## 功能概述
+
+### 📊 持仓分析与月度策略
+- 自动获取 Polymarket 持仓和挂单，结合 BTC K 线、ETF 流入、稳定币流动性等宏观数据
+- 使用 Google Gemini AI 生成结构化分析报告（市场快照、仓位建议、预警信号）
+- 月初自动生成 BTC 价格市场建仓方案，通过邮件发送
+
+### 🤖 AI Advisory 推荐系统
+- 批量计算每个 Polymarket 市场的公平价值与边缘（fair value / edge）
+- AI（Gemini）对高优先级市场给出 BUY / SELL / HOLD 建议，写入 PostgreSQL
+- 自动执行器（recommendation_auto_executor）监听价格触发条件，按建议自动下单
+- 支持校准、结算刷新、意图填充等完整交易生命周期管理
+
+### 🌐 Web Dashboard
+- Flask 实时看板：持仓、挂单、余额、BTC 价格、Advisory 建议一览
+- 支持手动下单/撤单
+- 基于 session 的登录鉴权，支持公网访问
+
+### 📧 通知
+- HTML 格式邮件：持仓分析报告、月度建仓建议
+- 支持 SMTP 配置
+
+---
+
+## 项目结构
+
+```
+auto_polymarket/
+├── position_analyze.py          # 持仓分析主程序（入口）
+├── monthly_btc_strategy.py      # 月初建仓建议（入口）
+├── recommendation_auto_executor.py  # Advisory 自动执行器（长跑进程）
+├── app.py                       # Flask Dashboard（入口）
+├── config.py                    # 统一配置（读取 .env）
+│
+├── data/                        # 数据源层（纯拉取，无业务逻辑）
+│   ├── polymarket.py            # Polymarket CLOB：持仓、挂单、下单
+│   ├── binance.py               # Binance：BTC 价格、K 线、衍生品
+│   ├── advisory_schema.py       # Advisory PostgreSQL schema 定义
+│   ├── database.py              # PostgreSQL 连接池与 DDL 初始化
+│   ├── deribit.py               # Deribit 期权数据
+│   ├── defillama.py             # DefiLlama 稳定币流动性
+│   ├── etf.py                   # SoSoValue ETF 净流入
+│   └── rsi.py                   # RSI 指标
+│
+├── services/                    # 业务逻辑层
+│   ├── advisory/                # Advisory 核心领域模块
+│   │   ├── computer.py          # 公平价值计算（fair value）
+│   │   ├── inputs.py            # 数据聚合与输入准备
+│   │   ├── path_view.py         # AI PathView 推理
+│   │   ├── intent_filler.py     # 意图填充（intent fill）
+│   │   ├── settlement_adapter.py # 结算适配
+│   │   ├── reconcile_v2.py      # 对账 v2
+│   │   └── ...（其他 advisory 子模块）
+│   ├── recommendation_db.py     # Advisory 推荐数据库操作
+│   ├── recommendation_trigger/  # 价格触发引擎
+│   │   ├── engine.py            # TriggerEngine：消费价格事件队列
+│   │   └── parser.py            # 触发条件解析
+│   ├── shared/
+│   │   └── watchers.py          # ChainlinkBTCPriceWatcher（WebSocket）
+│   ├── position.py              # 持仓与挂单匹配、格式化
+│   ├── market_sentiment.py      # 市场情绪聚合
+│   └── wallet_transfer.py       # 钱包划转
+│
+├── ai/
+│   ├── researcher.py            # Gemini API 调用
+│   └── prompts.py               # 提示词与结构化输出 Schema
+│
+├── notifications/
+│   ├── email.py                 # SMTP 邮件发送
+│   └── html.py                  # HTML 报告模板
+│
+├── scripts/
+│   ├── advisory_batch_runner.py       # Advisory 批量计算（主循环）
+│   ├── advisory_settlement_refresher.py # 结算价格刷新
+│   ├── advisory_calibration_monitor.py  # 校准监控
+│   ├── advisory_edge_alerts.py          # 边缘预警
+│   ├── advisory_fills_backfill.py       # 成交回填
+│   ├── advisory_intent_filler.py        # 意图填充守护
+│   ├── advisory_metrics.py              # 指标统计
+│   ├── etf_volume_monitor.py            # ETF 成交量监控
+│   ├── usdc_balance_monitor.py          # USDC 余额快照（月度账号）
+│   ├── auto_polymarket.sh               # 触发持仓分析的快捷脚本
+│   ├── restart_all.sh                   # 重启 app + usdc-monitor
+│   ├── restart_advisory_batch.sh        # 重启 advisory batch 服务
+│   ├── restart_advisory_settlement.sh   # 重启 advisory settlement 服务
+│   ├── restart_recommendation_auto_executor.sh
+│   ├── install_systemd.sh               # 安装/更新所有 systemd 单元
+│   └── systemd/                         # systemd unit 文件
+│       ├── auto-poly-app.service
+│       ├── auto-poly-usdc-monitor.service
+│       ├── auto-poly-advisory-batch.service
+│       ├── auto-poly-advisory-settlement.service
+│       ├── auto-poly-recommendation-executor.service
+│       ├── auto-poly-etf-volume-monitor.service
+│       ├── auto-poly-advisory-calibration.{service,timer}
+│       ├── auto-poly-advisory-edge-alerts.{service,timer}
+│       ├── auto-poly-advisory-fills-poller.{service,timer}
+│       ├── auto-poly-advisory-intent-filler.{service,timer}
+│       └── auto-poly-advisory-metrics.{service,timer}
+│
+└── pyproject.toml
+```
+
+---
+
+## 环境要求
+
+- Python ≥ 3.13
+- [uv](https://github.com/astral-sh/uv) 包管理器
+- PostgreSQL（advisory、recommendation、usdc_balance_snapshots 等表）
+
+---
+
+## 安装
+
+```bash
+git clone <repository-url>
+cd auto_polymarket
+uv sync
+```
+
+---
+
+## 配置（.env）
+
+所有配置通过 `.env` 文件注入，由 `config.py` 统一读取：
+
+```env
+# Google Gemini API
+GOOGLE_API_KEY=your_google_api_key
+
+# Polymarket 月度账号（advisory、position analyze、executor 使用）
+MONTHLY_ACCOUNT_KEY=your_monthly_private_key
+MONTHLY_ACCOUNT_WALLET_ADDRESS=your_monthly_wallet_address
+# 默认 profile（应设为 analyze）
+POLYMARKET_PROFILE=analyze
+
+# PostgreSQL（advisory 系统使用）
+PG_DSN=postgresql://user:pass@localhost:5432/dbname
+
+# 邮件
+TO_EMAIL=recipient@example.com
+SMTP_SERVER=smtp.example.com
+SMTP_PORT=465
+FROM_EMAIL=sender@example.com
+FROM_EMAIL_PASSWORD=your_email_password
+
+# Flask Dashboard
+DASHBOARD_PASSWORD=your_strong_password
+DASHBOARD_SECRET_KEY=your_long_random_secret
+DASHBOARD_HOST=0.0.0.0
+DASHBOARD_PORT=5000
+DASHBOARD_HTTPS_ONLY=false
+```
+
+---
+
+## 使用方法
+
+### 持仓分析（一次性）
+
+```bash
+uv run position_analyze.py
+```
+
+获取持仓 → AI 分析 → 发送 HTML 邮件报告。
+
+### 月初建仓建议
+
+```bash
+uv run monthly_btc_strategy.py
+```
+
+### Web Dashboard
+
+```bash
+uv run app.py
+# 或通过 systemd：
+systemctl start auto-poly-app
+```
+
+访问 `http://<IP>:5000`，用 `DASHBOARD_PASSWORD` 登录。
+
+### 初始化数据库
+
+```bash
+python -c "from data.database import init_db; init_db()"
+```
+
+---
+
+## 服务运维（systemd）
+
+所有长跑进程通过 systemd 管理，**不要手动 `nohup` 启动**。
+
+### 安装/更新所有服务
+
+```bash
+sudo bash scripts/install_systemd.sh
+```
+
+### 常用命令
+
+```bash
+# 查看所有服务状态
+systemctl status auto-poly-*
+
+# 重启服务
+systemctl restart auto-poly-app
+systemctl restart auto-poly-advisory-batch
+systemctl restart auto-poly-recommendation-executor
+
+# 查看日志
+journalctl -u auto-poly-app -f
+journalctl -u auto-poly-advisory-batch -f
+```
+
+### 服务列表
+
+| 服务 | 说明 |
+|------|------|
+| `auto-poly-app` | Flask Dashboard |
+| `auto-poly-usdc-monitor` | USDC 余额快照（每分钟，月度账号） |
+| `auto-poly-advisory-batch` | Advisory 批量公平价值计算 |
+| `auto-poly-advisory-settlement` | 结算价格刷新 |
+| `auto-poly-recommendation-executor` | 自动执行器（价格触发下单） |
+| `auto-poly-etf-volume-monitor` | ETF 成交量监控 |
+| `auto-poly-advisory-calibration` | 校准监控（timer 定时触发） |
+| `auto-poly-advisory-edge-alerts` | 边缘预警（timer） |
+| `auto-poly-advisory-fills-poller` | 成交回填（timer） |
+| `auto-poly-advisory-intent-filler` | 意图填充守护（timer） |
+| `auto-poly-advisory-metrics` | 指标统计（timer） |
+
+---
+
+## 注意事项
+
+- `.env` 文件不要提交到版本控制
+- 确保 `POLYMARKET_PROFILE=analyze` 使用月度账号
+- 公网访问 Dashboard 建议配合 Nginx + HTTPS
+- Advisory 系统依赖 PostgreSQL，启动前确保数据库可连接
+
+---
+
+## 归档说明
+
+5m 交易策略、BTC 实时监控、双向做市商等历史功能已归档至 `archive` 分支，master 分支不再包含这些模块。
+
 
 ## 功能特性
 
