@@ -5,7 +5,7 @@ Uses Google Gemini API with Google Search Grounding for market research.
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from google import genai
 from google.genai import types
 
@@ -20,9 +20,67 @@ from ai.prompts import (
     GOLD_RESPONSE_SCHEMA,
     get_gold_system_instruction,
     get_gold_user_prompt,
+    PATHVIEW_AI_SCHEMA,
+    get_pathview_ai_system_instruction,
+    get_pathview_ai_user_prompt,
 )
 
 ET_TIMEZONE = ZoneInfo("America/New_York")
+
+
+def _dedupe_grounding_sources(sources: list[dict]) -> list[dict]:
+    """按 URL 去重，保留前序来源。"""
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for src in sources:
+        url = str(src.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        deduped.append(src)
+    return deduped
+
+
+def _ensure_news_factors_from_grounding(result: Dict[str, Any], sources: list[dict]) -> None:
+    """
+    保证 BTC短期预测.新闻驱动因子 引用外部检索来源。
+    若模型未给出来源URL，则基于 grounding sources 进行兜底填充。
+    """
+    btc_prediction = result.get("BTC短期预测")
+    if not isinstance(btc_prediction, dict):
+        return
+
+    news_factors = btc_prediction.get("新闻驱动因子")
+    if not isinstance(news_factors, list):
+        news_factors = []
+
+    deduped_sources = _dedupe_grounding_sources(sources)
+    if not deduped_sources:
+        return
+    grounded_urls = {str(src.get("url") or "").strip() for src in deduped_sources}
+    news_urls = {
+        str(item.get("来源") or "").strip()
+        for item in news_factors
+        if isinstance(item, dict)
+    }
+    if grounded_urls.intersection(news_urls):
+        return
+
+    fallback_items = []
+    for src in deduped_sources[:3]:
+        title = str(src.get("title") or "").strip() or "外部检索新闻"
+        url = str(src.get("url") or "").strip()
+        fallback_items.append(
+            {
+                "事件": title,
+                "方向偏置": "偏震荡",
+                "影响说明": "该条目来自外部检索来源，请结合K线与成交量确认其方向强度。",
+                "发布时间": "未知",
+                "来源": url,
+            }
+        )
+    if fallback_items:
+        btc_prediction["新闻驱动因子"] = fallback_items
 
 
 # Initialize the Gemini client
@@ -46,11 +104,16 @@ def analyze_market_with_grounding(
     market_sentiment_and_funding: dict,
     polymarket_event_situation: dict,
     usdc_balance: str,
+    recommendation_memory_context: dict | None = None,
     previous_report: dict | None = None,
+    operator_intent: str | None = None,
+    monthly_target: str = "月度净值翻倍（+100%）",
 ) -> Dict[str, Any]:
     """
     Analyze the polymarket positions, orders, event situation, USDC balance, and btc 4h k data.
     previous_report: 上一时间段的报告内容，供本次输出参考与延续。
+    operator_intent: 本次分析的操作员意图，如持仓偏好、当前判断等，优先于默认策略。
+    monthly_target: 本月收益目标，用于调整策略激进度。
     """
     
     # Get current date for temporal context
@@ -67,10 +130,11 @@ def analyze_market_with_grounding(
     grounding_tool = types.Tool(google_search=types.GoogleSearch())
     
     config = types.GenerateContentConfig(
-        system_instruction=get_system_instruction(current_date),
+        system_instruction=get_system_instruction(current_date, monthly_target=monthly_target),
         tools=[grounding_tool],  # Enable Google Search Grounding
         response_schema=RESPONSE_SCHEMA,  # Structured output
-        temperature=0.7,  # Balanced creativity and consistency
+        temperature=0.4,  # 金融分析需要一致性，低温优于高温
+        max_output_tokens=16384,
     )
     
     user_prompt = get_user_prompt(
@@ -84,7 +148,9 @@ def analyze_market_with_grounding(
         market_sentiment_and_funding,
         polymarket_event_situation,
         usdc_balance,
+        recommendation_memory_context=recommendation_memory_context,
         previous_report=previous_report,
+        operator_intent=operator_intent,
     )
 
     try:        
@@ -134,6 +200,7 @@ def analyze_market_with_grounding(
             
             result = json.loads(response_text)
         
+        _ensure_news_factors_from_grounding(result, sources)
         return result
         
     except Exception as e:
@@ -160,7 +227,8 @@ def analyze_monthly_strategy_with_grounding(
         system_instruction=get_monthly_system_instruction(current_date, target_month),
         tools=[grounding_tool],
         response_schema=MONTHLY_STRATEGY_SCHEMA,
-        temperature=0.6,
+        temperature=0.5,
+        max_output_tokens=8192,
     )
 
     user_prompt = get_monthly_user_prompt(
@@ -221,7 +289,8 @@ def analyze_gold_market_with_grounding(
         system_instruction=get_gold_system_instruction(current_date),
         tools=[grounding_tool],
         response_schema=GOLD_RESPONSE_SCHEMA,
-        temperature=0.7,
+        temperature=0.4,
+        max_output_tokens=8192,
     )
     user_prompt = get_gold_user_prompt(
         polymarket_status,
@@ -257,3 +326,63 @@ def analyze_gold_market_with_grounding(
         return result
     except Exception as e:
         raise Exception(f"Error calling Gemini API (gold): {str(e)}") from e
+
+
+def analyze_pathview_for_advisory(
+    *,
+    batch_id: int,
+    batch_as_of_utc: str,
+    current_btc_price: float,
+    days_left: float,
+    gbm_sigma_daily: float,
+    gbm_drift_daily: float,
+    sigma_source: str,
+    btc_panels: dict,
+    tokens: list,
+    baseline_fair_by_token: dict,
+    market_context: Optional[dict] = None,
+    temperature: float = 0.3,
+    max_output_tokens: int = 32768,
+) -> Dict[str, Any]:
+    """B3: AI PathView shadow estimator. Returns parsed JSON dict matching
+    PATHVIEW_AI_SCHEMA. Caller must validate via pathview_validator before
+    persisting. NEVER drives production trading."""
+    client = _get_client()
+    config = types.GenerateContentConfig(
+        system_instruction=get_pathview_ai_system_instruction(),
+        response_mime_type="application/json",
+        response_schema=PATHVIEW_AI_SCHEMA,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+    )
+    user_prompt = get_pathview_ai_user_prompt(
+        batch_id=batch_id,
+        batch_as_of_utc=batch_as_of_utc,
+        current_btc_price=current_btc_price,
+        days_left=days_left,
+        gbm_sigma=gbm_sigma_daily,
+        gbm_drift=gbm_drift_daily,
+        sigma_source=sigma_source,
+        btc_panels=btc_panels,
+        tokens=tokens,
+        baseline_fair_by_token=baseline_fair_by_token,
+        market_context=market_context or {},
+    )
+    response = client.models.generate_content(
+        model=GEMINI_MODEL_ID,
+        contents=user_prompt,
+        config=config,
+    )
+    text = response.text
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        if "```json" in text:
+            s = text.find("```json") + 7
+            e = text.find("```", s)
+            text = text[s:e].strip()
+        elif "```" in text:
+            s = text.find("```") + 3
+            e = text.find("```", s)
+            text = text[s:e].strip()
+        return json.loads(text)
