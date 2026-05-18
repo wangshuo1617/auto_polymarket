@@ -13,6 +13,45 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+# 线程本地存储：用于 buy_order/sell_order 在返回 None 时把底层错误信息暴露给上层调用方
+# (例如 dashboard 需要把 'service not ready' / 'not enough balance' 等真实原因展示给用户)
+_last_order_error = threading.local()
+
+
+def _set_last_order_error(msg: Optional[str]) -> None:
+    _last_order_error.value = msg
+
+
+def get_last_order_error() -> Optional[str]:
+    return getattr(_last_order_error, "value", None)
+
+
+def clear_last_order_error() -> None:
+    _last_order_error.value = None
+
+
+def _friendly_clob_error(exc: BaseException) -> str:
+    """把 PolyApiException / 普通 Exception 转成更适合给前端展示的中文友好提示。
+    保留底层原始信息以便排查。
+    """
+    raw = str(exc) if exc is not None else ""
+    low = raw.lower()
+    # 常见错误模式 -> 友好提示
+    if "service not ready" in low or "status_code=425" in low:
+        return f"Polymarket 服务暂时不可用 (HTTP 425),请稍后重试。原始: {raw}"
+    if "not enough balance / allowance" in low:
+        return f"余额或授权不足,无法成交。原始: {raw}"
+    if "order_version_mismatch" in low:
+        return f"订单版本不匹配,可能 SDK 与 CLOB 协议版本不一致。原始: {raw}"
+    if "minimum_tick_size" in low or "tick size" in low:
+        return f"价格未对齐到最小 tick size。原始: {raw}"
+    if "status_code=429" in low or "rate limit" in low:
+        return f"请求过于频繁 (HTTP 429),请稍后重试。原始: {raw}"
+    if "status_code=502" in low or "status_code=503" in low or "status_code=504" in low:
+        return f"Polymarket 网关临时错误,请稍后重试。原始: {raw}"
+    return raw or exc.__class__.__name__
+
+
 # 添加项目根目录到 sys.path，以便可以导入 config
 _project_root = Path(__file__).resolve().parent.parent
 if str(_project_root) not in sys.path:
@@ -20,9 +59,9 @@ if str(_project_root) not in sys.path:
 
 import requests
 import httpx
-import py_clob_client.http_helpers.helpers as clob_http_helpers
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
+import py_clob_client_v2.http_helpers.helpers as clob_http_helpers
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
     OrderArgs,
     CreateOrderOptions,
     BalanceAllowanceParams,
@@ -31,10 +70,11 @@ from py_clob_client.clob_types import (
     PartialCreateOrderOptions,
     OrderType,
     PostOrdersArgs,
+    BookParams,
 )
-from py_clob_client.order_builder.builder import ROUNDING_CONFIG
-from py_clob_client.order_builder.helpers import round_down
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
+from py_clob_client_v2.order_builder.helpers import round_down
+from py_clob_client_v2.order_builder.constants import BUY, SELL
 from datetime import datetime, timezone
 from config import (
     POLYMARKET_KEY,
@@ -44,6 +84,8 @@ from config import (
     PM_ANALYZE_KEY,
     PM_ANALYZE_WALLET_ADDRESS,
     POLYMARKET_PROFILE,
+    POLYMARKET_BUILDER_CODE,
+    _BUILDER_CODE_ZERO,
 )
 
 
@@ -107,7 +149,7 @@ def get_polymarket_context(profile: Optional[str] = None) -> PolymarketContext:
             signature_type=2,
             funder=wallet,
         )
-        creds = temp_client.create_or_derive_api_creds()
+        creds = temp_client.create_or_derive_api_key()
         profile_client = ClobClient(
             host,
             key=private_key,
@@ -425,6 +467,9 @@ def prefetch_order_metadata_for_tokens(
                 fee_rate_bps = _get_cached_fee_rate_bps(clob_client, token)
         else:
             fee_rate_bps = _get_cached_fee_rate_bps(clob_client, token)
+            # 缓存未命中返回 0 时不写入，避免污染 ClobClient 内部缓存
+            if fee_rate_bps == 0:
+                fee_rate_bps = None
 
         meta = _cache_token_order_metadata(
             clob_client=clob_client,
@@ -488,7 +533,7 @@ def get_open_orders(profile: Optional[str] = None) -> list:
     clob_client = get_client(profile)
     logger.info("get_open_orders called")
     try:
-        response = clob_client.get_orders()
+        response = clob_client.get_open_orders()
         count = len(response) if isinstance(response, list) else "non-list"
         logger.info("get_open_orders success: count=%s", count)
         return response
@@ -547,11 +592,13 @@ def buy_order(
     profile: Optional[str] = None,
     market_meta: Optional[Dict[str, Any]] = None,
 ):
+    clear_last_order_error()
     clob_client = get_client(profile)
     logger.info("buy_order called: market_id=%s token_id=%s price=%s size=%s", market_id, _token_id_short(token_id), price, size)
     meta = market_meta or get_market_metadata(market_id, profile=profile)
     if not meta or meta.get("minimum_tick_size") is None:
         logger.error("buy_order missing market metadata: market_id=%s", market_id)
+        _set_last_order_error("无法获取市场元数据 (minimum_tick_size)")
         return None
     normalized_size = normalize_order_size(size=size, tick_size=meta["minimum_tick_size"])
     if normalized_size <= 0:
@@ -561,6 +608,7 @@ def buy_order(
             _token_id_short(token_id),
             size,
         )
+        _set_last_order_error(f"size 归一化后 <= 0 (原始 size={size}, tick_size={meta['minimum_tick_size']})")
         return None
     if abs(normalized_size - float(size)) > 1e-12:
         logger.info(
@@ -577,6 +625,15 @@ def buy_order(
         refresh_fee_rate=False,
     )
     fee_rate_bps = _get_cached_fee_rate_bps(clob_client, token_id)
+    # 缓存未命中时主动查询 fee_rate，避免传 0 被 API 拒绝
+    if fee_rate_bps == 0:
+        try:
+            fee_rate_bps = int(clob_client.get_fee_rate_bps(token_id) or 0)
+            if fee_rate_bps > 0:
+                _cache_token_order_metadata(clob_client, token_id, fee_rate_bps=fee_rate_bps)
+                logger.info("buy_order fee_rate_bps fetched on cache miss: token_id=%s fee_rate_bps=%d", _token_id_short(token_id), fee_rate_bps)
+        except Exception as e:
+            logger.warning("buy_order get_fee_rate_bps failed: token_id=%s error=%s", _token_id_short(token_id), e)
     submit_t0 = time.perf_counter()
     try:
         response = clob_client.create_and_post_order(
@@ -585,7 +642,7 @@ def buy_order(
                 price=price,
                 size=normalized_size,
                 side=BUY,
-                fee_rate_bps=fee_rate_bps,
+                builder_code=POLYMARKET_BUILDER_CODE or _BUILDER_CODE_ZERO,
             ),
             options=CreateOrderOptions(
                 tick_size=str(meta["minimum_tick_size"]),
@@ -598,6 +655,7 @@ def buy_order(
         return order_id
     except Exception as e:
         logger.exception("buy_order create_and_post_order failed: market_id=%s token_id=%s price=%s size=%s error=%s", market_id, _token_id_short(token_id), price, size, e)
+        _set_last_order_error(_friendly_clob_error(e))
         return None
 
 
@@ -610,14 +668,17 @@ def sell_order(
     market_meta: Optional[Dict[str, Any]] = None,
     order_type: OrderType = OrderType.FAK,  # <--- 核心新增：默认使用 FAK 拒绝挂单被套
 ):
+    clear_last_order_error()
     clob_client = get_client(profile)
     logger.info("sell_order called: market_id=%s token_id=%s price=%s size=%s type=%s", market_id, _token_id_short(token_id), price, size, order_type)
     meta = market_meta or get_market_metadata(market_id, profile=profile)
     if not meta or meta.get("minimum_tick_size") is None:
+        _set_last_order_error("无法获取市场元数据 (minimum_tick_size)")
         return None
 
     normalized_size = normalize_order_size(size=size, tick_size=meta["minimum_tick_size"])
     if normalized_size <= 0:
+        _set_last_order_error(f"size 归一化后 <= 0 (原始 size={size}, tick_size={meta['minimum_tick_size']})")
         return None
 
     normalized_price = _clamp_order_price(price=float(price), tick_size=meta["minimum_tick_size"])
@@ -633,51 +694,86 @@ def sell_order(
                 price=normalized_price,
                 size=submit_size,
                 side=SELL,
-                fee_rate_bps=fee_rate_bps,
+                builder_code=POLYMARKET_BUILDER_CODE or _BUILDER_CODE_ZERO,
             ),
             options=PartialCreateOrderOptions(
                 tick_size=str(meta["minimum_tick_size"]),
                 neg_risk=bool(meta.get("neg_risk", False)),
             ),
         )
-        return clob_client.post_order(signed_order, orderType=order_type)
+        return clob_client.post_order(signed_order, order_type=order_type)
+
+    def _is_retryable_server_error(err_msg: str) -> bool:
+        text = str(err_msg or "").lower()
+        return (
+            "status_code=500" in text
+            or "status_code=502" in text
+            or "status_code=503" in text
+            or "status_code=504" in text
+            or "could not run the execution" in text
+            or "internal server error" in text
+            or "bad gateway" in text
+            or "service unavailable" in text
+            or "gateway timeout" in text
+        )
 
     submit_t0 = time.perf_counter()
-    try:
-        response = _submit_once(normalized_size)
-        order_id = response.get("orderID") if isinstance(response, dict) else None
-        submit_ms = (time.perf_counter() - submit_t0) * 1000
-        logger.info("sell_order success: order_id=%s submit_latency=%.2fms", order_id, submit_ms)
-        return order_id
-    except Exception as e:
-        err_msg = str(e).lower()
-        if "not enough balance / allowance" not in err_msg:
-            logger.exception("sell_order failed: %s", e)
-            return None
-
-        # --- 救回那段死代码：自动降量重试机制 ---
-        logger.warning("sell_order 触发余额不足，尝试去链上核实真实余额并重试...")
-        available_balance = get_conditional_token_balance(token_id, profile=profile)
-        retry_size = normalize_order_size(
-            size=min(normalized_size, available_balance),
-            tick_size=meta["minimum_tick_size"],
-        )
-        
-        if retry_size <= 0 or retry_size + 1e-12 >= normalized_size:
-            logger.warning("sell_order 真实余额验证失败: 目标=%.6f, 实际=%.6f", normalized_size, available_balance)
-            return None
-
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
         try:
-            logger.info("sell_order 使用真实余额重试: size=%.6f", retry_size)
-            retry_resp = _submit_once(retry_size)
-            return retry_resp.get("orderID") if isinstance(retry_resp, dict) else None
-        except Exception as retry_err:
-            logger.exception("sell_order 降量重试依然失败: %s", retry_err)
-            return None
+            response = _submit_once(normalized_size)
+            order_id = response.get("orderID") if isinstance(response, dict) else None
+            submit_ms = (time.perf_counter() - submit_t0) * 1000
+            logger.info("sell_order success: order_id=%s submit_latency=%.2fms", order_id, submit_ms)
+            return order_id
+        except Exception as e:
+            err_msg = str(e).lower()
+            is_balance_err = "not enough balance / allowance" in err_msg
+            if _is_retryable_server_error(err_msg) and attempt < max_attempts:
+                backoff_sec = 0.15 * attempt
+                logger.warning(
+                    "sell_order 交易所临时错误，准备重试: attempt=%d/%d wait=%.2fs error=%s",
+                    attempt,
+                    max_attempts,
+                    backoff_sec,
+                    e,
+                )
+                time.sleep(backoff_sec)
+                continue
+            if not is_balance_err:
+                logger.exception("sell_order failed: %s", e)
+                _set_last_order_error(_friendly_clob_error(e))
+                return None
+
+            # --- 救回那段死代码：自动降量重试机制 ---
+            logger.warning("sell_order 触发余额不足，尝试去链上核实真实余额并重试...")
+            available_balance = get_conditional_token_balance(token_id, profile=profile)
+            retry_size = normalize_order_size(
+                size=min(normalized_size, available_balance),
+                tick_size=meta["minimum_tick_size"],
+            )
+            
+            if retry_size <= 0 or retry_size + 1e-12 >= normalized_size:
+                logger.warning("sell_order 真实余额验证失败: 目标=%.6f, 实际=%.6f", normalized_size, available_balance)
+                _set_last_order_error(
+                    f"余额不足且无法降量重试: 目标 size={normalized_size:.6f}, 链上可用={available_balance:.6f}"
+                )
+                return None
+
+            try:
+                logger.info("sell_order 使用真实余额重试: size=%.6f", retry_size)
+                retry_resp = _submit_once(retry_size)
+                return retry_resp.get("orderID") if isinstance(retry_resp, dict) else None
+            except Exception as retry_err:
+                logger.exception("sell_order 降量重试依然失败: %s", retry_err)
+                _set_last_order_error(_friendly_clob_error(retry_err))
+                return None
+    return None
 
 def cancel_order(order_id: str, profile: Optional[str] = None):
     clob_client = get_client(profile)
-    return clob_client.cancel(order_id)
+    from py_clob_client_v2.clob_types import OrderPayload
+    return clob_client.cancel_order(OrderPayload(orderID=order_id))
 
 
 def get_order_detail(order_id: str, profile: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -758,6 +854,42 @@ def get_order_book(token_id: str, profile: Optional[str] = None):
     clob_client = get_client(profile)
     return clob_client.get_order_book(token_id)
 
+
+def get_best_prices(token_ids: List[str], profile: Optional[str] = None) -> Dict[str, Dict[str, Optional[float]]]:
+    """批量获取一组 token 的 best bid / best ask。
+
+    返回 {token_id: {"best_bid": float|None, "best_ask": float|None}}。
+    Polymarket /prices 接口约定：side=BUY 返回 best bid（买方愿付最高价），
+    side=SELL 返回 best ask（卖方愿收最低价）。失败的 token 用 None 占位，避免拖垮整体。
+    """
+    result: Dict[str, Dict[str, Optional[float]]] = {tid: {"best_bid": None, "best_ask": None} for tid in token_ids}
+    if not token_ids:
+        return result
+    try:
+        clob_client = get_client(profile)
+        params = []
+        for tid in token_ids:
+            params.append({"token_id": str(tid), "side": "BUY"})
+            params.append({"token_id": str(tid), "side": "SELL"})
+        prices = clob_client.get_prices(params)  # {token_id: {"BUY": "0.12", "SELL": "0.13"}}
+    except Exception as exc:
+        logger.warning("get_best_prices batch failed: error=%s", exc)
+        return result
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    for tid in token_ids:
+        entry = prices.get(str(tid)) or {}
+        result[tid] = {
+            "best_bid": _f(entry.get("BUY")),
+            "best_ask": _f(entry.get("SELL")),
+        }
+    return result
+
 def get_balance_allowance(profile: Optional[str] = None) -> str:
     """返回当前可用 USDC 余额，如 $123.45"""
     clob_client = get_client(profile)
@@ -779,200 +911,3 @@ def get_activity_history(market_id: str, profile: Optional[str] = None) -> List[
         logger.warning("get_activity_history failed: market_id=%s error=%s", market_id, e)
         return []
 
-def get_5m_updown_activity_history(
-    since_ts: Optional[int] = None,
-    until_ts: Optional[int] = None,
-    profile: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    wallet_address = get_polymarket_context(profile).wallet_address
-    url = "https://data-api.polymarket.com/activity"
-    params = {"user": wallet_address, "limit": 1000, "start": since_ts, "end": until_ts}
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        result = response.json()
-        if isinstance(result, list):
-            filtered = []
-            for item in result:
-                slug = str(item.get("eventSlug") or "").lower()
-                if "btc-updown-5m" in slug:
-                    filtered.append(item)
-            return filtered
-        return []
-    except Exception as e:
-        logger.warning("get_5m_updown_activity_history failed: error=%s", e)
-    return []
-
-def _event_time_to_epoch(event_time: str) -> int:
-    raw = str(event_time or "").strip()
-    if not raw:
-        return 0
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    except Exception:
-        return 0
-
-
-def _safe_float(value: Any) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return 0.0
-
-
-def _round2(value: float) -> float:
-    return round(float(value), 2)
-
-
-def calculate_activity_pnl_from_trade_events(
-    since_ts: int,
-    until_ts: Optional[int] = None,
-    profile: Optional[str] = None,
-) -> Dict[str, Any]:
-    """统计给定时间区间内 5m up/down activity 的 USDC 收益。
-
-    规则：
-    - 收入: type=TRADE 且 side=SELL，以及 type=REDEEM
-    - 支出: type=TRADE 且 side=BUY
-    - 仅统计 usdcSize
-
-    说明：
-    - 直接使用 get_5m_updown_activity_history 的返回数据，不再依赖 SQLite 中的 market_id。
-    - db_path/sleep_sec 参数保留用于兼容旧调用。
-    - 新增 slug 维度聚合：返回每个 slug 的净盈亏，以及盈利/亏损/持平次数统计。
-    """
-    since_ts = int(since_ts)
-    until_ts_int = int(until_ts) if until_ts is not None else None
-    batch = get_5m_updown_activity_history(
-        since_ts=since_ts,
-        until_ts=until_ts_int,
-        profile=profile,
-    )
-    if not isinstance(batch, list):
-        batch = []
-
-    income_trade_sell = 0.0
-    income_redeem = 0.0
-    expense_trade_buy = 0.0
-    count_trade_sell = 0
-    count_redeem = 0
-    count_trade_buy = 0
-    activity_count = 0
-    slug_stats: Dict[str, Dict[str, Any]] = {}
-
-    def _get_slug_stats(slug_value: str) -> Dict[str, Any]:
-        if slug_value not in slug_stats:
-            slug_stats[slug_value] = {
-                "slug": slug_value,
-                "activity_count": 0,
-                "income_trade_sell": 0.0,
-                "income_redeem": 0.0,
-                "expense_trade_buy": 0.0,
-                "count_trade_sell": 0,
-                "count_redeem": 0,
-                "count_trade_buy": 0,
-            }
-        return slug_stats[slug_value]
-
-    for item in batch:
-        if not isinstance(item, dict):
-            continue
-
-        ts = int(item.get("timestamp") or 0)
-        if ts < since_ts:
-            continue
-        if until_ts_int is not None and ts > until_ts_int:
-            continue
-
-        usdc_size = _safe_float(item.get("usdcSize"))
-        if usdc_size <= 0:
-            continue
-
-        event_type = str(item.get("type") or "").upper()
-        side = str(item.get("side") or "").upper()
-        event_slug = str(item.get("eventSlug") or item.get("slug") or "unknown").strip().lower() or "unknown"
-        slug_bucket = _get_slug_stats(event_slug)
-
-        if event_type == "TRADE" and side == "SELL":
-            income_trade_sell += usdc_size
-            count_trade_sell += 1
-            activity_count += 1
-            slug_bucket["income_trade_sell"] += usdc_size
-            slug_bucket["count_trade_sell"] += 1
-            slug_bucket["activity_count"] += 1
-        elif event_type == "REDEEM":
-            income_redeem += usdc_size
-            count_redeem += 1
-            activity_count += 1
-            slug_bucket["income_redeem"] += usdc_size
-            slug_bucket["count_redeem"] += 1
-            slug_bucket["activity_count"] += 1
-        elif event_type == "TRADE" and side == "BUY":
-            expense_trade_buy += usdc_size
-            count_trade_buy += 1
-            activity_count += 1
-            slug_bucket["expense_trade_buy"] += usdc_size
-            slug_bucket["count_trade_buy"] += 1
-            slug_bucket["activity_count"] += 1
-
-    total_income = income_trade_sell + income_redeem
-    net_pnl = total_income - expense_trade_buy
-
-    slug_pnl_summary: List[Dict[str, Any]] = []
-    slug_profit_count = 0
-    slug_loss_count = 0
-    slug_flat_count = 0
-
-    for stats in slug_stats.values():
-        slug_total_income = float(stats["income_trade_sell"]) + float(stats["income_redeem"])
-        slug_net_pnl = slug_total_income - float(stats["expense_trade_buy"])
-
-        if slug_net_pnl > 0:
-            slug_profit_count += 1
-        elif slug_net_pnl < 0:
-            slug_loss_count += 1
-        else:
-            slug_flat_count += 1
-
-        slug_pnl_summary.append(
-            {
-                "slug": stats["slug"],
-                "activity_count": int(stats["activity_count"]),
-                "income_trade_sell": _round2(stats["income_trade_sell"]),
-                "income_redeem": _round2(stats["income_redeem"]),
-                "expense_trade_buy": _round2(stats["expense_trade_buy"]),
-                "total_income": _round2(slug_total_income),
-                "net_pnl": _round2(slug_net_pnl),
-                "count_trade_sell": int(stats["count_trade_sell"]),
-                "count_redeem": int(stats["count_redeem"]),
-                "count_trade_buy": int(stats["count_trade_buy"]),
-            }
-        )
-
-    slug_pnl_summary.sort(key=lambda x: (x["net_pnl"], x["slug"]), reverse=True)
-
-    return {
-        "since_ts": since_ts,
-        "until_ts": until_ts_int,
-        "activity_count": activity_count,
-        "income_trade_sell": _round2(income_trade_sell),
-        "income_redeem": _round2(income_redeem),
-        "expense_trade_buy": _round2(expense_trade_buy),
-        "total_income": _round2(total_income),
-        "net_pnl": _round2(net_pnl),
-        "count_trade_sell": count_trade_sell,
-        "count_redeem": count_redeem,
-        "count_trade_buy": count_trade_buy,
-        "slug_summary": slug_pnl_summary,
-        "slug_profit_count": slug_profit_count,
-        "slug_loss_count": slug_loss_count,
-        "slug_flat_count": slug_flat_count,
-        "slug_total_count": len(slug_pnl_summary),
-    }
-
-if __name__ == "__main__":
-    result = calculate_activity_pnl_from_trade_events(since_ts=1773390285)
-    print(result)
