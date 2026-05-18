@@ -5,12 +5,153 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
-from math import erf, sqrt
+from math import erf, exp, log, sqrt
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 ET_TIMEZONE = ZoneInfo("America/New_York")
+_BASELINE_FILE = Path("data/monthly_baseline.json")
+logger = logging.getLogger(__name__)
+
+# 肥尾修正乘数: GBM 假设正态分布，BTC 实际收益分布肥尾显著。
+# 回测 Nov'25-Mar'26 共 84 个月度市场的校准分析:
+#   - 使用历史已实现波动率时，σ×1.35 最优 (Brier 0.1161, 中远距离校准误差 <5pp)
+#   - 使用 Deribit IV 时，IV 已含 vol risk premium (≈ realized × 1.12)，
+#     等效目标 σ 不变 → IV 模式乘数 ≈ 1.35/1.12 ≈ 1.20
+_FAT_TAIL_MULT_REALIZED = 1.15
+_FAT_TAIL_MULT_IV = 1.05
+
+# 重新校准 (P1b+P2+P3, 2026-05-07): 636 个样本 (Nov'25-Apr'26, 缺 Dec'25).
+# 配套模型: dynamic drift + EWMA σ + 1s path-to-date + fat_tail=1.15 + wick=0.002.
+# 残余 bias 已显著降低 (peak 8-15% bucket: P1b 13.4pp → P2/P3 后 4.3pp);
+# 整体仍微高估 p_yes, 用以下分段线性插值最后修正.
+_CALIBRATION_CONTROL_POINTS: list[tuple[float, float, int]] = [
+    (0.0,    0.0,   0),   # at-the-money: 无修正
+    (1.5,    3.2,  34),   # 0-3% 桶中点
+    (5.5,    7.1,  57),   # 3-8% 桶中点
+    (11.5,   4.3,  81),   # 8-15% 桶中点
+    (22.5,   3.6, 149),   # 15-30% 桶中点
+    (50.0,   0.6, 297),   # 30%+ 桶中点 (回归至接近零)
+    (80.0,   0.0,   0),   # 极远距离: 衰减至零
+]
+_CALIBRATION_BIAS_CAP_PP = 15.0  # 最大校正幅度上限
+
+
+def _shrinkage_weight(n: int) -> float:
+    """小样本收缩: 样本量越小，校正越保守。"""
+    if n >= 15:
+        return 1.0
+    if n >= 10:
+        return 0.85
+    if n >= 5:
+        return 0.6
+    return 0.0
+
+
+def _calibration_bias_pp(distance_pct: float) -> float:
+    """
+    返回模型在给定行权距离上的校准偏差 (pp)。
+
+    正值 = 模型高估 p_yes，应下调；负值 = 模型低估，应上调。
+    使用分段线性插值 + 小样本收缩，避免桶边界处的突变。
+    """
+    pts = _CALIBRATION_CONTROL_POINTS
+    d = max(0.0, distance_pct)
+
+    if d <= pts[0][0]:
+        return 0.0
+    if d >= pts[-1][0]:
+        return 0.0
+
+    for i in range(len(pts) - 1):
+        d0, b0, n0 = pts[i]
+        d1, b1, n1 = pts[i + 1]
+        if d0 <= d <= d1:
+            t = (d - d0) / (d1 - d0) if d1 > d0 else 0.0
+            bias0 = b0 * _shrinkage_weight(n0)
+            bias1 = b1 * _shrinkage_weight(n1)
+            raw = bias0 + t * (bias1 - bias0)
+            return max(-_CALIBRATION_BIAS_CAP_PP, min(_CALIBRATION_BIAS_CAP_PP, raw))
+
+    return 0.0
+
+
+def _calibration_confidence(distance_pct: float) -> str:
+    """根据行权距离返回校准置信度标签。"""
+    if distance_pct < 3:
+        return "low"
+    if distance_pct < 8:
+        return "low"
+    if distance_pct < 15:
+        return "medium"
+    if distance_pct < 30:
+        return "high"
+    return "medium"
+
+
+def _calibrate_p_yes(p_yes_raw: float, distance_pct: float) -> float:
+    """对 p_yes 施加校准偏差修正，返回校准后概率。"""
+    bias = _calibration_bias_pp(distance_pct) / 100.0
+    return max(0.001, min(0.999, p_yes_raw - bias))
+
+
+
+def _load_monthly_baseline() -> dict:
+    """加载月度基准净值记录文件。"""
+    if _BASELINE_FILE.exists():
+        try:
+            return json.loads(_BASELINE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_monthly_baseline(data: dict) -> None:
+    """保存月度基准净值记录文件。"""
+    try:
+        _BASELINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _BASELINE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning("保存月度基准净值失败: %s", e)
+
+
+def get_or_set_monthly_baseline(total_net_value: float) -> dict:
+    """
+    获取或初始化当月基准净值。
+    若当月尚无记录，则以当前净值作为基准自动写入。
+    返回包含基准净值和进度信息的字典。
+    """
+    now = datetime.now(ET_TIMEZONE)
+    month_key = now.strftime("%Y-%m")
+
+    baselines = _load_monthly_baseline()
+
+    if month_key not in baselines:
+        # 月初首次运行，自动记录基准
+        baselines[month_key] = {
+            "baseline_net_value": round(total_net_value, 2),
+            "recorded_at": now.isoformat(),
+        }
+        _save_monthly_baseline(baselines)
+        logger.info("月度基准净值已记录: %s = %.2f USDC", month_key, total_net_value)
+
+    baseline = baselines[month_key]
+    baseline_value = baseline["baseline_net_value"]
+    pnl = total_net_value - baseline_value
+    pnl_pct = (pnl / baseline_value * 100) if baseline_value > 0 else 0.0
+
+    return {
+        "month": month_key,
+        "baseline_net_value": baseline_value,
+        "current_net_value": round(total_net_value, 2),
+        "monthly_pnl_usdc": round(pnl, 2),
+        "monthly_pnl_pct": round(pnl_pct, 2),
+        "recorded_at": baseline["recorded_at"],
+    }
 
 
 def _to_float(value, default: float = 0.0) -> float:
@@ -83,7 +224,7 @@ def _extract_strike_and_direction(question: str) -> tuple[float | None, str]:
 
     ql = q.lower()
     above_keys = ["above", "over", "greater", "at least", "reach", "hit", "higher than"]
-    below_keys = ["below", "under", "less", "at most", "lower than"]
+    below_keys = ["below", "under", "less", "at most", "lower than", "dip", "drop", "fall"]
 
     direction = "unknown"
     if any(k in ql for k in above_keys):
@@ -94,12 +235,100 @@ def _extract_strike_and_direction(question: str) -> tuple[float | None, str]:
     return strike, direction
 
 
+def _barrier_touch_prob(
+    current_price: float,
+    strike: float,
+    direction: str,
+    mu_daily: float,
+    sigma_daily: float,
+    days_left: float,
+    *,
+    sigma_is_iv: bool = False,
+    fat_tail_mult: Optional[float] = None,
+) -> float:
+    """
+    首次触及概率（反射原理 / reflection principle）。
+
+    Polymarket 月度价格事件的结算规则: 月内**任何时刻**触及 strike 即算 Yes,
+    因此必须使用路径依赖的 barrier touch 概率，而非到期分布 P(S_T ≥ K)。
+
+    direction="above": P(max_{0..T} S_t >= strike)  — "reach / hit" 类问题
+    direction="below": P(min_{0..T} S_t <= strike)  — "dip / drop / fall" 类问题
+
+    基于 GBM 反射原理:
+      X_t = ln(S_t/S_0) = μ_log·t + σ·W_t
+      P(max X_t >= a) = Φ((μT-a)/(σ√T)) + exp(2μa/σ²)·Φ((-μT-a)/(σ√T))
+
+    肥尾修正 (fat-tail correction):
+      GBM 假设对数收益服从正态分布，但 BTC 实际分布具有显著肥尾（kurtosis >> 3）。
+      回测 4 个月 84 个市场的校准分析显示:
+        - 行权距离 8-15%: 原始模型预测 37%，实际 54%（低估 +17pp）
+        - 行权距离 15-30%: 原始模型预测 11%，实际 21%（低估 +10pp）
+
+      σ 来源不同，乘数不同 (P2 重新校准, 2026-05-07, 636 样本):
+        - 已实现波动率: ×1.15 (Brier 0.0623→0.0572, wabs_bias 5.21pp→2.55pp,
+          配合 wick_buffer=0.002; 旧 1.35 与 1s path-to-date + EWMA σ 后
+          系统性高估 p_yes 5pp+)
+        - Deribit IV: ×1.05 (按 IV/realized ≈1.10 比例缩放)
+
+    sigma_is_iv: True 表示 sigma_daily 来自 Deribit IV，使用较小乘数。
+    """
+    if days_left <= 0 or sigma_daily <= 1e-9:
+        if direction == "above":
+            return 1.0 if current_price >= strike else 0.0
+        else:
+            return 1.0 if current_price <= strike else 0.0
+
+    fat_tail_mult = (
+        fat_tail_mult if fat_tail_mult is not None
+        else (_FAT_TAIL_MULT_IV if sigma_is_iv else _FAT_TAIL_MULT_REALIZED)
+    )
+    sigma_adj = sigma_daily * fat_tail_mult
+
+    # log-drift: μ_log = μ_simple - σ²/2 (Itō 修正)
+    mu_log = mu_daily - 0.5 * sigma_adj ** 2
+    T = float(days_left)
+    mu_T = mu_log * T
+    sigma_T = sigma_adj * sqrt(T)
+
+    if direction == "above":
+        if current_price >= strike:
+            return 1.0
+        # a = ln(K/S) > 0
+        a = log(strike / current_price)
+    else:
+        if current_price <= strike:
+            return 1.0
+        # 转化为上界问题: P(min X_t <= -b) = P(max(-X_t) >= b)
+        # -X_t 的 drift = -μ_log
+        a = log(current_price / strike)  # b = ln(S/K) > 0
+        mu_log = -mu_log
+        mu_T = mu_log * T
+
+    d_plus = (mu_T - a) / sigma_T
+    d_minus = (-mu_T - a) / sigma_T
+
+    if abs(mu_log) < 1e-12:
+        # 零漂移: P = 2·Φ(-a / σ√T)
+        p = 2.0 * _norm_cdf(-a / sigma_T)
+    else:
+        exp_arg = 2.0 * mu_log * a / (sigma_adj ** 2)
+        if exp_arg > 500:
+            p = 1.0
+        elif exp_arg < -500:
+            p = _norm_cdf(d_plus)
+        else:
+            p = _norm_cdf(d_plus) + exp(exp_arg) * _norm_cdf(d_minus)
+
+    return max(0.001, min(0.999, p))
+
+
 def _build_scenario_probs(
     future_possibility_context: dict,
     daily_volatility_profile: dict,
 ) -> dict:
     drawdown = _to_float(future_possibility_context.get("drawdown_from_month_high_pct"), 0.0)
-    days_left = int(_to_float(future_possibility_context.get("days_left_in_month"), 0.0))
+    days_left = _to_float(future_possibility_context.get("days_left_in_month"), 0.0)
     regime = str(daily_volatility_profile.get("market_regime") or "unknown")
     atr_pct = max(0.2, _to_float(daily_volatility_profile.get("atr_pct"), 1.5))
     tr_percentile = _to_float(daily_volatility_profile.get("tr_percentile_30d"), 50.0)
@@ -167,7 +396,7 @@ def _build_scenario_probs(
         "range_then_reclaim": round(p_reclaim / total, 4),
         "fast_rebound": round(p_fast_rebound / total, 4),
         "time_compression_note": (
-            f"剩余{days_left}天，TR分位{tr_percentile}%"
+            f"剩余{days_left:.1f}天，TR分位{tr_percentile}%"
             + ("，时间不足已大幅压缩极端路径概率" if days_left <= 7 else "")
         ),
     }
@@ -215,10 +444,14 @@ def _build_position_safety_assessment(
     future_possibility_context: dict,
     daily_volatility_profile: dict,
     asset: str = "btc",
+    drift_daily: float = 0.0,
+    sigma_daily: float = 0.018,
+    *,
+    sigma_is_iv: bool = False,
 ) -> list:
-    """对每个持仓评估安全度: safe_to_hold / monitor / at_risk。"""
+    """对每个持仓评估安全度: safe_to_hold / monitor / at_risk，并用 barrier 模型计算胜率。"""
     current_price = _get_current_price(future_possibility_context, asset)
-    days_left = max(0, int(_to_float(future_possibility_context.get("days_left_in_month"), 0)))
+    days_left = max(0.0, _to_float(future_possibility_context.get("days_left_in_month"), 0))
     atr_pct = _to_float(daily_volatility_profile.get("atr_pct"), 2.0)
 
     assessments = []
@@ -255,7 +488,7 @@ def _build_position_safety_assessment(
 
         if buffer_favorable > 0 and buffer_favorable > max_expected_move_pct * 1.5 and days_left <= 10:
             safety_level = "safe_to_hold"
-            reason = f"安全垫{buffer_favorable:.1f}%远超剩余{days_left}天最大预期波动{max_expected_move_pct:.1f}%，持有到期胜率极高"
+            reason = f"安全垫{buffer_favorable:.1f}%远超剩余{days_left:.0f}天最大预期波动{max_expected_move_pct:.1f}%，持有到期胜率极高"
         elif buffer_favorable > 0 and buffer_favorable > max_expected_move_pct * 0.8:
             safety_level = "monitor"
             reason = f"安全垫{buffer_favorable:.1f}%尚可，与预期波动{max_expected_move_pct:.1f}%接近，需持续监控"
@@ -276,6 +509,18 @@ def _build_position_safety_assessment(
         if cur_price_contract > 0 and cur_price_contract < 1.0:
             hold_to_expiry_return_pct = round((1.0 - cur_price_contract) / cur_price_contract * 100.0, 2)
 
+        # 用 barrier 模型计算持仓胜率
+        model_win_prob = None
+        dist_pct = safety_margin_pct  # already computed above
+        cal_conf = _calibration_confidence(dist_pct)
+        if direction in ("above", "below") and days_left > 0:
+            p_yes = _barrier_touch_prob(
+                current_price, strike, direction, drift_daily, sigma_daily, days_left,
+                sigma_is_iv=sigma_is_iv,
+            )
+            p_yes_cal = _calibrate_p_yes(p_yes, dist_pct)
+            model_win_prob = round(1.0 - p_yes_cal if is_no else p_yes_cal, 4)
+
         assessments.append({
             "title": title,
             "outcome": p.get("outcome", ""),
@@ -283,6 +528,8 @@ def _build_position_safety_assessment(
             "cur_price": cur_price_contract,
             "strike": strike,
             "direction": direction,
+            "distance_pct": round(dist_pct, 1),
+            "calibration_confidence": cal_conf,
             "safety_margin_pct": round(safety_margin_pct, 2),
             "atr_distance": round(atr_distance, 2),
             "within_one_atr_warning": near_atr_warning,
@@ -292,13 +539,14 @@ def _build_position_safety_assessment(
             "safety_level": safety_level,
             "reason": reason,
             "hold_to_expiry_return_pct": hold_to_expiry_return_pct,
+            "model_win_prob": model_win_prob,
         })
 
     return assessments
 
 
-def _build_theta_income(position_assessments: list, days_left: int) -> list:
-    """计算每个持仓的 Theta 日收益。"""
+def _build_theta_income(position_assessments: list, days_left: float) -> list:
+    """计算每个持仓的 Theta 日收益（按 barrier 模型胜率折现）。"""
     theta_data = []
     for pa in position_assessments:
         size = _to_float(pa.get("size"), 0.0)
@@ -308,15 +556,19 @@ def _build_theta_income(position_assessments: list, days_left: int) -> list:
         if size <= 0 or cur_price <= 0 or cur_price >= 1.0:
             continue
 
-        theta_to_expiry = size * (1.0 - cur_price)
-        daily_theta = theta_to_expiry / max(days_left, 1)
+        theta_if_win = size * (1.0 - cur_price)
+        win_prob = _to_float(pa.get("model_win_prob"), 0.5)
+        theta_expected = theta_if_win * win_prob
+        daily_theta = theta_expected / max(days_left, 1)
 
         theta_data.append({
             "title": pa.get("title", ""),
             "outcome": pa.get("outcome", ""),
             "size": size,
             "cur_price": cur_price,
-            "theta_to_expiry_usdc": round(theta_to_expiry, 2),
+            "theta_if_win_usdc": round(theta_if_win, 2),
+            "win_probability": round(win_prob, 4),
+            "theta_to_expiry_usdc": round(theta_expected, 2),
             "daily_theta_income_usdc": round(daily_theta, 2),
             "safety_level": safety_level,
             "hold_to_expiry_return_pct": pa.get("hold_to_expiry_return_pct"),
@@ -407,13 +659,186 @@ def _build_rotation_opportunities(
     return rotation_opps[:5]
 
 
+def _build_swing_opportunities(
+    markets: list,
+    current_asset_price: float,
+    drift_daily: float,
+    sigma_daily: float,
+    days_left: float,
+    held_questions: set | None = None,
+    asset: str = "btc",
+    *,
+    sigma_is_iv: bool = False,
+) -> list:
+    """
+    波段交易机会分析：计算每个市场 token 对 BTC 短期波动的价格敏感度 (Delta)。
+
+    不同于 hold-to-expiry 的 Edge 分析，这里关注的是：
+    - BTC 涨/跌 1-3% 时，token 价格变动多少（Delta 杠杆）
+    - 哪些 token 在短期波动中提供最大的价差收益机会
+    """
+    if current_asset_price <= 0 or days_left <= 0:
+        return []
+
+    held_questions = held_questions or set()
+    opportunities = []
+
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        question = str(market.get("question") or "")
+        strike, direction = _extract_strike_and_direction(question)
+        yes_price, no_price = _parse_market_prices(market)
+
+        if strike is None or direction == "unknown" or yes_price is None or no_price is None:
+            continue
+        if current_asset_price <= 0 or strike <= 0:
+            continue
+
+        # 基准 barrier 概率
+        p_yes_base = _barrier_touch_prob(
+            current_asset_price, strike, direction, drift_daily, sigma_daily, days_left,
+            sigma_is_iv=sigma_is_iv,
+        )
+
+        # BTC ±1% / ±3% 时的 token 理论价变化
+        deltas = {}
+        for move_pct in [-3, -1, 1, 3]:
+            scenario_price = current_asset_price * (1.0 + move_pct / 100.0)
+            p_yes_scenario = _barrier_touch_prob(
+                scenario_price, strike, direction, drift_daily, sigma_daily, days_left,
+                sigma_is_iv=sigma_is_iv,
+            )
+            # Yes token 价格变化
+            yes_change = p_yes_scenario - p_yes_base
+            no_change = -yes_change
+
+            deltas[f"btc_{move_pct:+d}pct"] = {
+                "yes_price_change": round(yes_change, 4),
+                "no_price_change": round(no_change, 4),
+                "yes_new_price": round(p_yes_scenario, 4),
+                "no_new_price": round(1 - p_yes_scenario, 4),
+            }
+
+        # Delta 杠杆 = token 变化% / BTC 变化%
+        # 用 ±1% 来计算标准 delta
+        yes_delta_1pct = deltas["btc_+1pct"]["yes_price_change"]
+        no_delta_1pct = deltas["btc_+1pct"]["no_price_change"]
+
+        # Delta 杠杆 = token 收益率% / BTC 收益率%
+        # BTC +1% 时 token 收益率 = delta / price，除以 BTC 的 0.01 得杠杆倍数
+        yes_leverage = abs(yes_delta_1pct / yes_price) / 0.01 if yes_price > 0.01 else 0.0
+        no_leverage = abs(no_delta_1pct / no_price) / 0.01 if no_price > 0.01 else 0.0
+
+        # 波段评分: 杠杆归一化 × sqrt(剩余天数) × 流动性因子
+        # 便宜的 token 杠杆高但流动性差，用 token 价格做平衡
+        def _swing_score(leverage: float, token_price: float) -> float:
+            if token_price < 0.04 or token_price > 0.96:
+                liquidity_penalty = 0.5
+            elif token_price < 0.08 or token_price > 0.92:
+                liquidity_penalty = 0.75
+            else:
+                liquidity_penalty = 1.0
+            time_factor = min(sqrt(days_left) / sqrt(15), 1.5)
+            # 归一化杠杆: 10x 为基准
+            normalized_leverage = min(leverage / 10.0, 5.0)
+            return round(normalized_leverage * time_factor * liquidity_penalty, 3)
+
+        yes_score = _swing_score(yes_leverage, yes_price)
+        no_score = _swing_score(no_leverage, no_price)
+
+        # 确定哪边更适合波段
+        if yes_score >= no_score:
+            best_swing_side = "Yes"
+            best_leverage = yes_leverage
+            best_score = yes_score
+            best_token_price = yes_price
+        else:
+            best_swing_side = "No"
+            best_leverage = no_leverage
+            best_score = no_score
+            best_token_price = no_price
+
+        # 方向性提示：BTC 涨时买什么，跌时买什么
+        if direction == "above":
+            btc_up_buy = "Yes"
+            btc_down_buy = "No"
+        else:
+            btc_up_buy = "No"
+            btc_down_buy = "Yes"
+
+        is_held = (strike, direction) in held_questions
+
+        dist_pct = abs(strike - current_asset_price) / current_asset_price * 100.0
+        cal_conf = _calibration_confidence(dist_pct)
+        p_yes_cal = _calibrate_p_yes(p_yes_base, dist_pct)
+
+        opportunities.append({
+            "question": question,
+            "strike": round(strike, 2),
+            "direction": direction,
+            "distance_pct": round(dist_pct, 1),
+            "calibration_confidence": cal_conf,
+            "is_held": is_held,
+            "current_yes_price": round(yes_price, 4),
+            "current_no_price": round(no_price, 4),
+            "model_yes_prob": round(p_yes_base, 4),
+            "prob_yes_calibrated": round(p_yes_cal, 4),
+            "delta_matrix": deltas,
+            "yes_leverage_per_1pct": round(yes_leverage, 1),
+            "no_leverage_per_1pct": round(no_leverage, 1),
+            "best_swing_side": best_swing_side,
+            "best_swing_leverage": round(best_leverage, 1),
+            "swing_score": best_score,
+            "btc_up_action": f"买入 {btc_up_buy}",
+            "btc_down_action": f"买入 {btc_down_buy}",
+            "swing_note": _swing_note(direction, strike, current_asset_price, best_leverage, days_left),
+        })
+
+    opportunities.sort(key=lambda x: x.get("swing_score", 0), reverse=True)
+    return opportunities[:10]
+
+
+def _swing_note(direction: str, strike: float, current_price: float, leverage: float, days_left: float) -> str:
+    """生成简洁的波段策略提示。"""
+    distance_pct = abs(strike - current_price) / current_price * 100
+    if distance_pct < 3:
+        proximity = "极近"
+    elif distance_pct < 8:
+        proximity = "中等"
+    else:
+        proximity = "较远"
+
+    notes = []
+    if leverage >= 20:
+        notes.append(f"超高杠杆({leverage:.0f}x)")
+    elif leverage >= 10:
+        notes.append(f"高杠杆({leverage:.0f}x)")
+    elif leverage >= 5:
+        notes.append(f"中等杠杆({leverage:.0f}x)")
+
+    notes.append(f"距行权价{distance_pct:.1f}%({proximity})")
+
+    if days_left <= 5:
+        notes.append("临近到期Theta加速衰减")
+    elif days_left <= 10:
+        notes.append("注意时间衰减")
+
+    return "；".join(notes)
+
+
 def _build_portfolio_analysis(
     position_assessments: list,
     current_asset_price: float,
     usdc_balance: float,
     asset: str = "btc",
+    drift_daily: float = 0.0,
+    sigma_daily: float = 0.018,
+    days_left: float = 15,
+    *,
+    sigma_is_iv: bool = False,
 ) -> dict:
-    """组合级关联风险分析：情景矩阵、对冲结构识别。"""
+    """组合级关联风险分析：用 barrier 模型做情景矩阵、对冲结构识别。"""
     if current_asset_price <= 0:
         return {"note": f"{asset}价格无效，无法计算组合分析"}
 
@@ -435,35 +860,19 @@ def _build_portfolio_analysis(
             size = _to_float(pa.get("size"), 0.0)
             cur_price = _to_float(pa.get("cur_price"), 0.0)
 
-            if strike <= 0 or size <= 0:
+            if strike <= 0 or size <= 0 or direction not in ("above", "below"):
                 continue
 
             is_no = outcome == "no"
 
-            if direction == "above":
-                if scenario_asset >= strike:
-                    new_price = 0.01 if is_no else 0.99
-                else:
-                    dist_now = max(strike - current_asset_price, 1.0)
-                    dist_new = max(strike - scenario_asset, 0.0)
-                    ratio = min(dist_new / dist_now, 2.0)
-                    if is_no:
-                        new_price = min(0.99, cur_price + (1.0 - cur_price) * max(0, 1.0 - 1.0 / max(ratio, 0.01)) * 0.4)
-                    else:
-                        new_price = max(0.01, cur_price * ratio)
-            elif direction == "below":
-                if scenario_asset <= strike:
-                    new_price = 0.01 if is_no else 0.99
-                else:
-                    dist_now = max(current_asset_price - strike, 1.0)
-                    dist_new = max(scenario_asset - strike, 0.0)
-                    ratio = min(dist_new / dist_now, 2.0)
-                    if is_no:
-                        new_price = min(0.99, cur_price + (1.0 - cur_price) * max(0, 1.0 - 1.0 / max(ratio, 0.01)) * 0.4)
-                    else:
-                        new_price = max(0.01, cur_price * ratio)
-            else:
-                new_price = cur_price
+            # 用 barrier 模型从 scenario 价格重新算 touch 概率
+            p_yes = _barrier_touch_prob(
+                scenario_asset, strike, direction, drift_daily, sigma_daily, days_left,
+                sigma_is_iv=sigma_is_iv,
+            )
+            # 合约价格 ≈ 胜率
+            new_yes_price = max(0.01, min(0.99, p_yes))
+            new_price = (1.0 - new_yes_price) if is_no else new_yes_price
 
             scenario_pnl += size * (new_price - cur_price)
 
@@ -517,7 +926,7 @@ def _build_prediction_review(
 
     overall = previous_report.get("整体分析", "")
     if overall:
-        review["previous_overall_summary"] = overall[:300] + "..." if len(overall) > 300 else overall
+        review["previous_overall_summary"] = overall
 
     warnings = previous_report.get("预警信号", [])
     if warnings and current_asset_price > 0:
@@ -593,18 +1002,25 @@ def build_profit_optimization_context(
 
     scenario_probs = _build_scenario_probs(future_possibility_context, daily_volatility_profile)
 
-    drift_daily = _to_float(future_possibility_context.get("drawdown_from_month_high_pct"), 0.0) / 100.0 / 14.0
-    drift_daily = max(-0.01, min(0.01, -drift_daily * 0.25))
+    # 漂移: 默认 0（随机游走）。短期价格漂移无法可靠估计，
+    # 人为引入 mean-reversion / momentum 偏差反而增大误差。
+    # AI 可根据自身趋势判断在建议中做方向性调整。
+    drift_daily = 0.0
 
-    sigma_daily = _to_float(daily_volatility_profile.get("realized_vol_daily_pct"), 0.0) / 100.0
-    if sigma_daily <= 0:
-        sigma_daily = max(0.008, _to_float(daily_volatility_profile.get("atr_pct"), 1.8) / 100.0 * 0.6)
+    # σ_daily 优先级: Deribit IV > realized vol > ATR fallback
+    iv_daily = _to_float(daily_volatility_profile.get("iv_daily"), 0.0)
+    if iv_daily > 0:
+        sigma_daily = iv_daily
+        sigma_is_iv = True
+    else:
+        sigma_daily = _to_float(daily_volatility_profile.get("realized_vol_daily_pct"), 0.0) / 100.0
+        if sigma_daily <= 0:
+            # fallback: ATR → σ 转换; 正态分布下 E[|X|] ≈ 0.8σ
+            sigma_daily = max(0.008, _to_float(daily_volatility_profile.get("atr_pct"), 1.8) / 100.0 * 0.8)
+        sigma_is_iv = False
 
-    days_left = max(0, int(_to_float(future_possibility_context.get("days_left_in_month"), 0)))
+    days_left = max(0.0, _to_float(future_possibility_context.get("days_left_in_month"), 0))
     current_price = _get_current_price(future_possibility_context, asset)
-
-    mu_ret = drift_daily * days_left
-    sigma_ret = max(0.01, sigma_daily * sqrt(days_left))
 
     balance = _parse_usdc_balance(usdc_balance)
 
@@ -615,15 +1031,20 @@ def build_profit_optimization_context(
     risk_budget_ratio = 0.35
     total_risk_budget = total_net_value * risk_budget_ratio
 
-    # --- Position safety assessment ---
+    # --- Monthly progress tracking ---
+    monthly_progress = get_or_set_monthly_baseline(total_net_value)
+
+    # --- Position safety assessment (含 barrier 模型胜率) ---
     position_assessments = _build_position_safety_assessment(
-        positions, future_possibility_context, daily_volatility_profile, asset=asset,
+        positions, future_possibility_context, daily_volatility_profile,
+        asset=asset, drift_daily=drift_daily, sigma_daily=sigma_daily,
+        sigma_is_iv=sigma_is_iv,
     )
 
     # --- Theta daily income ---
     theta_income = _build_theta_income(position_assessments, days_left)
 
-    # --- Edge calculation ---
+    # --- Edge calculation (barrier touch probability + calibration) ---
     edges = []
     markets = polymarket_event_situation.get("markets", []) if isinstance(polymarket_event_situation, dict) else []
     for market in markets:
@@ -636,31 +1057,44 @@ def build_profit_optimization_context(
         if current_price <= 0 or strike is None or direction == "unknown" or yes_price is None or no_price is None:
             continue
 
-        threshold_ret = strike / current_price - 1.0
-        z = (threshold_ret - mu_ret) / sigma_ret
-        p_above = max(0.001, min(0.999, 1.0 - _norm_cdf(z)))
+        distance_pct = abs(strike - current_price) / current_price * 100.0
+        cal_conf = _calibration_confidence(distance_pct)
 
-        p_yes = p_above if direction == "above" else (1.0 - p_above)
+        # 首次触及概率（barrier model）
+        p_yes = _barrier_touch_prob(
+            current_price, strike, direction, drift_daily, sigma_daily, days_left,
+            sigma_is_iv=sigma_is_iv,
+        )
         p_no = 1.0 - p_yes
 
-        ev_yes = p_yes - yes_price
-        ev_no = p_no - no_price
+        # 校准后概率 (用于决策和 Kelly sizing)
+        p_yes_cal = _calibrate_p_yes(p_yes, distance_pct)
+        p_no_cal = 1.0 - p_yes_cal
 
-        if ev_yes >= ev_no:
+        # 原始 edge (供参考)
+        ev_yes_raw = p_yes - yes_price
+        ev_no_raw = p_no - no_price
+
+        # 校准后 edge (用于决策)
+        ev_yes_cal = p_yes_cal - yes_price
+        ev_no_cal = p_no_cal - no_price
+
+        if ev_yes_cal >= ev_no_cal:
             chosen_side = "Yes"
             chosen_price = yes_price
-            chosen_prob = p_yes
-            edge = ev_yes
+            chosen_prob_cal = p_yes_cal
+            edge_cal = ev_yes_cal
         else:
             chosen_side = "No"
             chosen_price = no_price
-            chosen_prob = p_no
-            edge = ev_no
+            chosen_prob_cal = p_no_cal
+            edge_cal = ev_no_cal
 
+        # Kelly sizing 使用校准后概率
         if chosen_price >= 0.999:
             kelly = 0.0
         else:
-            kelly = max(0.0, (chosen_prob - chosen_price) / max(1e-6, 1.0 - chosen_price))
+            kelly = max(0.0, (chosen_prob_cal - chosen_price) / max(1e-6, 1.0 - chosen_price))
 
         fractional_kelly = 0.25 * kelly
         suggested_alloc = min(
@@ -669,17 +1103,28 @@ def build_profit_optimization_context(
             total_net_value * fractional_kelly,
         )
 
+        # 相关性分组: 同方向标的高度相关（同月 above/below BTC 共享驱动因素）
+        corr_group = f"{asset}_{direction}"
+
         edges.append({
             "question": question,
             "direction_in_question": direction,
             "strike": round(strike, 2),
+            "distance_pct": round(distance_pct, 1),
+            "calibration_confidence": cal_conf,
+            "correlation_group": corr_group,
+            # 原始模型输出 (透明度)
             "model_prob_yes": round(p_yes, 4),
             "implied_prob_yes": round(yes_price, 4),
-            "edge_yes": round(ev_yes, 4),
-            "edge_no": round(ev_no, 4),
+            "edge_yes_raw": round(ev_yes_raw, 4),
+            "edge_no_raw": round(ev_no_raw, 4),
+            # 校准后输出 (用于决策)
+            "prob_yes_calibrated": round(p_yes_cal, 4),
+            "edge_yes_calibrated": round(ev_yes_cal, 4),
+            "edge_no_calibrated": round(ev_no_cal, 4),
             "best_side": chosen_side,
             "best_side_price": round(chosen_price, 4),
-            "best_side_edge": round(edge, 4),
+            "best_side_edge": round(edge_cal, 4),
             "fractional_kelly": round(fractional_kelly, 4),
             "suggested_max_alloc_usdc": round(max(0.0, suggested_alloc), 2),
         })
@@ -690,9 +1135,24 @@ def build_profit_optimization_context(
     # --- Rotation opportunities ---
     rotation_opportunities = _build_rotation_opportunities(position_assessments, edges)
 
+    # --- Swing trading opportunities (波段交易机会) ---
+    held_questions = set()
+    for pa in position_assessments:
+        s = pa.get("strike")
+        d = pa.get("direction", "")
+        if s:
+            held_questions.add((s, d))
+    swing_opportunities = _build_swing_opportunities(
+        markets, current_price, drift_daily, sigma_daily, days_left,
+        held_questions=held_questions, asset=asset,
+        sigma_is_iv=sigma_is_iv,
+    )
+
     # --- Portfolio-level analysis ---
     portfolio_analysis = _build_portfolio_analysis(
-        position_assessments, current_price, balance, asset=asset,
+        position_assessments, current_price, balance,
+        asset=asset, drift_daily=drift_daily, sigma_daily=sigma_daily, days_left=days_left,
+        sigma_is_iv=sigma_is_iv,
     )
 
     # --- Prediction review ---
@@ -701,6 +1161,7 @@ def build_profit_optimization_context(
     return {
         "objective": "maximize_expected_profit_under_risk_budget",
         "portfolio_summary": portfolio,
+        "monthly_progress": monthly_progress,
         "risk_budget": {
             "basis": "total_net_value",
             "total_net_value": round(total_net_value, 2),
@@ -712,16 +1173,22 @@ def build_profit_optimization_context(
         },
         "scenario_probabilities": scenario_probs,
         "distribution_assumption": {
+            "model_type": "barrier_touch_GBM_reflection_fat_tail",
+            "note": f"使用首次触及概率（反射原理）+ 肥尾修正σ×{_FAT_TAIL_MULT_IV if sigma_is_iv else _FAT_TAIL_MULT_REALIZED}",
             "asset": asset,
             "days_left": days_left,
-            "mu_return": round(mu_ret, 4),
-            "sigma_return": round(sigma_ret, 4),
+            "drift_daily": round(drift_daily, 6),
+            "sigma_daily_raw": round(sigma_daily, 6),
+            "sigma_daily_adjusted": round(sigma_daily * (_FAT_TAIL_MULT_IV if sigma_is_iv else _FAT_TAIL_MULT_REALIZED), 6),
+            "fat_tail_multiplier": _FAT_TAIL_MULT_IV if sigma_is_iv else _FAT_TAIL_MULT_REALIZED,
+            "sigma_source": "deribit_iv" if sigma_is_iv else "realized_vol" if _to_float(daily_volatility_profile.get("realized_vol_daily_pct"), 0.0) > 0 else "atr_fallback",
             "current_price": round(current_price, 2),
         },
         "position_safety_assessment": position_assessments,
         "theta_income": theta_income,
         "portfolio_analysis": portfolio_analysis,
         "rotation_opportunities": rotation_opportunities,
+        "swing_opportunities": swing_opportunities,
         "prediction_review": prediction_review,
         "top_edge_opportunities": top_edges,
         "all_edge_count": len(edges),
