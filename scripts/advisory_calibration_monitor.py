@@ -115,14 +115,24 @@ def _fetch_settled_labels(since: datetime) -> list[tuple[float, float]]:
     """M1 terminal labels: snapshots where condition_id is in settled records.
 
     label = 1 if snapshot.token_id == settlement.winning_token_id else 0
+
+    settlement_feed_records 同一 condition_id 可能有多条历史记录（每次
+    ingest 都新增 settlement_feed_version），所以先用 DISTINCT ON 取最新
+    一条，避免 join 出笛卡尔。
     """
     sql = """
+        WITH latest_settled AS (
+            SELECT DISTINCT ON (condition_id)
+                   condition_id, winning_token_id
+              FROM settlement_feed_records
+             WHERE settlement_state = 'settled'
+             ORDER BY condition_id, settlement_feed_version DESC
+        )
         SELECT s.fair_value_for_edge AS p,
                (s.token_id = sf.winning_token_id)::int AS y
           FROM market_view_snapshots s
-          JOIN settlement_feed_records sf
+          JOIN latest_settled sf
             ON sf.condition_id = s.condition_id
-           AND sf.settlement_state = 'settled'
          WHERE s.generated_at >= %s
            AND s.fair_value_for_edge IS NOT NULL
     """
@@ -158,13 +168,14 @@ def _fetch_path_locked_labels(since: datetime) -> list[tuple[float, float]]:
                (s.view_payload->>'outcome_index') AS outcome_index,
                (s.view_payload->>'side_above')::bool AS side_above
           FROM market_view_snapshots s
-     LEFT JOIN settlement_feed_records sf
-            ON sf.condition_id = s.condition_id
-           AND sf.settlement_state = 'settled'
          WHERE s.generated_at >= %s
            AND s.fair_value_for_edge IS NOT NULL
-           AND sf.condition_id IS NULL
            AND (s.view_payload->>'strike_usd') IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM settlement_feed_records sf
+                WHERE sf.condition_id = s.condition_id
+                  AND sf.settlement_state = 'settled'
+           )
     """
     rows: list[dict] = []
     with get_cursor() as cur:
