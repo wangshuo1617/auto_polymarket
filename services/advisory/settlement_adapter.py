@@ -213,24 +213,40 @@ def refresh_settlement_feed(
 
     with get_conn() as conn:
         cur = conn.cursor()
+        # 与上一次成功 version 的 effect_hash 对比, 相同则跳过 records 写入。
+        # 月度 BTC 市场月内 settled 状态稳定, refresher 每 10min 重复 ingest
+        # 同一份内容会让 settlement_feed_records 线性增长, calibration 等
+        # 下游 JOIN 时容易膨胀成笛卡尔。
+        cur.execute(
+            """
+            SELECT effect_hash FROM settlement_feed_versions
+             WHERE refresh_status IN ('ok','partial') AND effect_hash IS NOT NULL
+             ORDER BY settlement_feed_version DESC LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        prev_hash = row[0] if row else None
+        skip_records = bool(records) and prev_hash == effect_hash
+
         cur.execute(
             """
             INSERT INTO settlement_feed_versions
-              (refresh_status, rows_upserted, refreshed_condition_ids, missing_condition_ids, source_etag)
-            VALUES (%s, %s, %s::jsonb, %s::jsonb, %s)
+              (refresh_status, rows_upserted, refreshed_condition_ids, missing_condition_ids, source_etag, effect_hash)
+            VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s)
             RETURNING settlement_feed_version, refreshed_at_utc
             """,
             (
                 status,
-                len(records),
+                0 if skip_records else len(records),
                 json.dumps(refreshed_ids),
                 json.dumps(missing),
                 SOURCE_NAME,
+                effect_hash,
             ),
         )
         version, _refreshed_at = cur.fetchone()
 
-        if records:
+        if records and not skip_records:
             cur.executemany(
                 """
                 INSERT INTO settlement_feed_records
@@ -258,12 +274,13 @@ def refresh_settlement_feed(
         conn.commit()
 
     logger.info(
-        "settlement_adapter: version=%s status=%s refreshed=%d missing=%d effect_hash=%s",
+        "settlement_adapter: version=%s status=%s refreshed=%d missing=%d effect_hash=%s records_written=%s",
         version,
         status,
         len(refreshed_ids),
         len(missing),
         effect_hash[:12],
+        "skipped(unchanged)" if skip_records else len(records),
     )
     return RefreshResult(
         settlement_feed_version=version,
