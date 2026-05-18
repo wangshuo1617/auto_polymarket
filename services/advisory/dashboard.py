@@ -76,17 +76,35 @@ def _fetch_latest_ai_shadow() -> dict:
     try:
         with get_conn() as conn:
             cur = conn.cursor()
+            # 优先找有 views 的成功 run；若全部失败则回退到最新 run（仅展示 meta）
             cur.execute(
                 """
-                SELECT id, batch_id, generated_at, model_id, prompt_version,
-                       validation_status, request_latency_ms, raw_payload
-                FROM advisory_pathview_shadow_runs
-                WHERE source = 'ai'
-                ORDER BY generated_at DESC
+                SELECT r.id, r.batch_id, r.generated_at, r.model_id, r.prompt_version,
+                       r.validation_status, r.request_latency_ms, r.raw_payload
+                FROM advisory_pathview_shadow_runs r
+                WHERE r.source = 'ai'
+                  AND r.validation_status != 'fatal'
+                  AND EXISTS (
+                      SELECT 1 FROM advisory_pathview_shadow_views v WHERE v.run_id = r.id
+                  )
+                ORDER BY r.generated_at DESC
                 LIMIT 1
                 """,
             )
             row = cur.fetchone()
+            if not row:
+                # 全部 fatal 或无 views，回退到最新 run（at least show meta）
+                cur.execute(
+                    """
+                    SELECT id, batch_id, generated_at, model_id, prompt_version,
+                           validation_status, request_latency_ms, raw_payload
+                    FROM advisory_pathview_shadow_runs
+                    WHERE source = 'ai'
+                    ORDER BY generated_at DESC
+                    LIMIT 1
+                    """,
+                )
+                row = cur.fetchone()
             if not row:
                 return out
             run_id, batch_id, gen_at, model_id, prompt_v, status, latency, payload = row
