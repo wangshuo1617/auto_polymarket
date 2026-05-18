@@ -1,0 +1,11 @@
+[Unit]
+Description=Auto Polymarket - Advisory Chain Fills Poller Timer (every 60s)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=auto-poly-advisory-fills-poller.service
+
+[Install]
+WantedBy=timers.target

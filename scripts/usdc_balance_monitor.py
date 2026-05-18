@@ -70,7 +70,7 @@ def main() -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     _init_table(conn)
-    profile = "trade"
+    profile = "analyze"
     logger.info("USDC监控已启动: profile=%s db=%s", profile, db_path)
 
     while True:

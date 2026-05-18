@@ -1,0 +1,24 @@
+[Unit]
+Description=Auto Polymarket - Recommendation Auto Executor
+After=network-online.target
+Wants=network-online.target
+
+StartLimitIntervalSec=300
+StartLimitBurst=5
+[Service]
+Type=exec
+WorkingDirectory=/root/auto_polymarket
+Environment=FOREGROUND=1
+# AI 推荐 (position_analyze.py) 基于 analyze 账号,executor 必须用同一账号下单,
+# 否则 size 估算与实际可用资金错配 (.env 默认是 trade,会被这里 override)。
+Environment=POLYMARKET_PROFILE=analyze
+Environment=AUTO_EXECUTOR_PM_PROFILE=analyze
+ExecStart=/bin/bash scripts/restart_recommendation_auto_executor.sh
+Restart=always
+RestartSec=15
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,30 @@
+[Unit]
+Description=Auto Polymarket - Advisory Batch Runner (R1)
+After=network-online.target
+Wants=network-online.target
+
+StartLimitIntervalSec=300
+StartLimitBurst=5
+[Service]
+Type=exec
+WorkingDirectory=/root/auto_polymarket
+EnvironmentFile=-/root/auto_polymarket/.env
+Environment=POLYMARKET_PROFILE=analyze
+Environment=FOREGROUND=1
+Environment=LD_PRELOAD=
+Environment=ADVISORY_BATCH_INTERVAL=300
+Environment=ADVISORY_BATCH_MAX_STRIKES=12
+# Phase B3: enable AI PathView shadow (6h throttle inside runner).
+# Production GBM advisory + email path remain authoritative; AI rows
+# are written to advisory_pathview_shadow_runs (source='ai') only.
+Environment=ADVISORY_PATHVIEW_AI_ENABLED=1
+Environment=ADVISORY_PATHVIEW_AI_MIN_INTERVAL_HOURS=6
+ExecStart=/bin/bash scripts/restart_advisory_batch.sh
+Restart=always
+RestartSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

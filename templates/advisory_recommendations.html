@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <title>Advisory Recommendations</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 24px; color: #222; }
+    h1 { margin: 0 0 12px; font-size: 20px; }
+    .meta { color: #666; font-size: 13px; margin-bottom: 16px; }
+    .stale-banner { background: #fff3cd; border: 1px solid #ffeeba; color: #856404;
+                    padding: 12px 16px; border-radius: 6px; margin-bottom: 16px; font-weight: bold; }
+    .empty { color: #999; padding: 24px; text-align: center; border: 1px dashed #ccc; border-radius: 6px; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { padding: 6px 8px; border-bottom: 1px solid #eee; text-align: right; vertical-align: middle; }
+    th { background: #f7f7f7; text-align: left; position: sticky; top: 0; }
+    th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    th.txt, td.txt { text-align: left; }
+    tr.halt { background: #fafafa; color: #888; }
+    tr.settled { background: #e8f5e9; }
+    .pill { display: inline-block; padding: 2px 6px; border-radius: 10px; font-size: 11px; }
+    .pill-open { background: #e3f2fd; color: #1565c0; }
+    .pill-settled { background: #c8e6c9; color: #2e7d32; }
+    .pill-locked { background: #fff8e1; color: #ef6c00; }
+    .pill-halt { background: #ffebee; color: #c62828; }
+    button.record { background: #1976d2; color: white; border: 0; padding: 4px 10px;
+                    border-radius: 4px; cursor: pointer; font-size: 12px; }
+    button.record:hover { background: #1565c0; }
+    button.record:disabled { background: #ccc; cursor: not-allowed; }
+    .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: none;
+                align-items: center; justify-content: center; z-index: 1000; }
+    .modal-bg.show { display: flex; }
+    .modal { background: white; padding: 20px 24px; border-radius: 8px; min-width: 360px;
+             box-shadow: 0 6px 30px rgba(0,0,0,0.2); }
+    .modal h3 { margin: 0 0 12px; }
+    .modal label { display: block; margin: 8px 0 4px; font-size: 13px; color: #555; }
+    .modal input, .modal select, .modal textarea {
+      width: 100%; padding: 6px 8px; box-sizing: border-box;
+      border: 1px solid #ccc; border-radius: 4px; font-size: 13px;
+    }
+    .modal textarea { resize: vertical; min-height: 60px; }
+    .modal-actions { margin-top: 16px; text-align: right; }
+    .modal-actions button { margin-left: 8px; padding: 6px 14px; border-radius: 4px;
+                            border: 0; cursor: pointer; font-size: 13px; }
+    .btn-cancel { background: #eee; color: #333; }
+    .btn-submit { background: #1976d2; color: white; }
+    .err { color: #c62828; font-size: 12px; margin-top: 8px; }
+    .ok { color: #2e7d32; font-size: 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Advisory Recommendations</h1>
+  <div class="meta" id="meta">加载中…</div>
+  <div style="margin-bottom: 12px;">
+    <button id="btn-rerun-batch" onclick="rerunBatchNow()"
+            style="background: #1976d2; color: white; border: 0; padding: 6px 14px;
+                   border-radius: 4px; cursor: pointer; font-size: 13px;">
+      ▶ 立即重跑 batch
+    </button>
+    <span id="rerun-msg" style="margin-left: 12px; font-size: 12px; color: #555;"></span>
+  </div>
+
+  <div id="stale-banner" class="stale-banner" style="display: none;"></div>
+
+  <div id="content"></div>
+
+  <h1 style="margin-top: 32px;">Reconcile v2 (intents ⇄ chain_fills)</h1>
+  <div class="meta">
+    时间窗口:
+    <select id="recon-hours" onchange="loadReconcile()">
+      <option value="24">24h</option>
+      <option value="72" selected>72h</option>
+      <option value="168">7d</option>
+      <option value="720">30d</option>
+    </select>
+    <span id="recon-meta" style="margin-left:12px;"></span>
+  </div>
+  <div id="recon-summary" style="margin-top:8px;"></div>
+
+  <h1 style="margin-top: 32px;">Calibration (per 6h job)</h1>
+  <div class="meta" id="calib-meta">加载中…</div>
+  <div id="calib-latest" style="margin-bottom: 12px;"></div>
+  <table id="calib-table" style="width:100%;border-collapse:collapse;font-size:12px;">
+    <thead><tr style="background:#f5f5f5;">
+      <th style="padding:6px;border:1px solid #ddd;text-align:left;">run_at (UTC)</th>
+      <th style="padding:6px;border:1px solid #ddd;">N snapshots</th>
+      <th style="padding:6px;border:1px solid #ddd;">Brier</th>
+      <th style="padding:6px;border:1px solid #ddd;">N trades</th>
+      <th style="padding:6px;border:1px solid #ddd;">PnL (USDC)</th>
+    </tr></thead>
+    <tbody id="calib-body"></tbody>
+  </table>
+
+  <h1 style="margin-top: 32px;">My Thesis (BTC 走势自由文本判断)</h1>
+  <div class="meta" id="thesis-meta">加载中…</div>
+  <div id="thesis-current" style="margin-bottom: 12px;"></div>
+  <textarea id="thesis-input" rows="3" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px;"
+            placeholder="例如: 我认为接下来 24h BTC 大概率冲 90k, 之后回踩 85k. 影响下一 batch 的 inputs_hash. (留空 = 不修改)"></textarea>
+  <div style="margin-top: 8px;">
+    <label style="font-size: 12px; color: #666;">TTL 小时:</label>
+    <input type="number" id="thesis-ttl" value="6" min="0.5" max="72" step="0.5"
+           style="width: 60px; padding: 4px; border: 1px solid #ccc; border-radius: 4px;" />
+    <button onclick="submitThesis()" style="background: #1976d2; color: white; border: 0; padding: 6px 14px; border-radius: 4px; cursor: pointer;">保存 (替换 active)</button>
+    <button onclick="clearThesis()" style="background: #eee; color: #333; border: 0; padding: 6px 14px; border-radius: 4px; cursor: pointer; margin-left: 8px;">清除 active</button>
+    <span id="thesis-msg" style="margin-left: 12px; font-size: 12px;"></span>
+  </div>
+  <div class="meta" style="margin-top: 6px; font-size: 11px; color: #888;">
+    注: 写入 advisory_user_theses 表; 通过 inputs_hash 让下一 batch 失效旧缓存. 当前未连入 AI 调用 (advisory pipeline 还无 AI).
+  </div>
+
+  <h1 style="margin-top: 32px;">Portfolio (advisory_chain_fills 派生)</h1>
+  <div class="meta" id="portfolio-meta">加载中…</div>
+  <div id="portfolio-content"></div>
+
+<script>
+let CURRENT_SNAPSHOTS = {};   // snapshot_id -> snapshot row
+
+function fmt(v, digits) {
+  if (v === null || v === undefined) return '—';
+  if (typeof v === 'number') return v.toFixed(digits ?? 4);
+  return String(v);
+}
+
+// 把 market_slug + view_payload 组装为 "month-up to/down to TARGET-yes/no" 友好标签
+// 兼容两种 slug:
+//   per-condition (旧 chain_fills): "will-bitcoin-reach-90k-in-may-2026"  → 直接从 slug 解析
+//   parent event (snapshots/portfolio): "what-price-will-bitcoin-hit-in-may-2026"
+//     → 月份从 slug 解析, target/direction 从 view_payload (strike_usd, side_above, outcome_index)
+function _formatTarget(strike) {
+  if (strike == null || isNaN(strike)) return '?';
+  const k = strike / 1000;
+  return (Number.isInteger(k) ? k.toString() : k.toFixed(1).replace(/\.0$/, '')) + 'k';
+}
+function _ynLabel(outcome_index) {
+  if (outcome_index === 0) return 'yes';
+  if (outcome_index === 1) return 'no';
+  return '?';
+}
+function _monthFromSlug(slug) {
+  const m = slug && slug.match(/-in-([a-z]+)/i);
+  return m ? m[1].toLowerCase() : '?';
+}
+function formatTokenLabel(slug, vpOrIdx) {
+  if (!slug) return '—';
+  // 兼容旧调用 (传 outcome_index 数字 / null)
+  let vp = null, oi = null;
+  if (typeof vpOrIdx === 'number' || vpOrIdx === null || vpOrIdx === undefined) {
+    oi = (typeof vpOrIdx === 'number') ? vpOrIdx : null;
+  } else {
+    vp = vpOrIdx;
+    oi = (vp.outcome_index !== undefined) ? vp.outcome_index : null;
+  }
+
+  // path 1: per-condition slug
+  const m = slug.match(/^will-bitcoin-(reach|dip-to)-([0-9]+k?)-in-([a-z]+)/i);
+  if (m) {
+    const dir = (m[1].toLowerCase() === 'reach') ? 'up to' : 'down to';
+    let target = m[2].toLowerCase();
+    if (!target.endsWith('k')) {
+      const n = parseInt(target, 10);
+      if (!isNaN(n)) target = _formatTarget(n);
+    }
+    return `${m[3].toLowerCase()}-${dir} ${target}-${_ynLabel(oi)}`;
+  }
+
+  // path 2: parent event slug + view_payload
+  if (vp && vp.strike_usd != null) {
+    const month = _monthFromSlug(slug);
+    // direction by token: side_above XOR (outcome_index===1)
+    // 简化: 若 outcome_index=0 (yes), market 方向就是 token 方向; 用 side_above 直读
+    // 若 outcome_index=1 (no), market 方向 = !side_above
+    let marketAbove;
+    if (oi === 0) marketAbove = !!vp.side_above;
+    else if (oi === 1) marketAbove = !vp.side_above;
+    else marketAbove = !!vp.side_above;
+    const dir = marketAbove ? 'up to' : 'down to';
+    return `${month}-${dir} ${_formatTarget(vp.strike_usd)}-${_ynLabel(oi)}`;
+  }
+
+  // fallback: truncated slug
+  return slug.length > 40 ? slug.slice(0, 40) + '…' : slug;
+}
+
+function pillFor(s) {
+  if (s.halt_reason) {
+    return `<span class="pill pill-halt" title="${s.halt_reason}">halt</span>`;
+  }
+  if (s.resolution_state === 'settled') return '<span class="pill pill-settled">settled</span>';
+  if (s.resolution_state === 'locked_event_occurred') return '<span class="pill pill-locked">locked-hit</span>';
+  if (s.resolution_state === 'locked_event_missed') return '<span class="pill pill-locked">locked-miss</span>';
+  return '<span class="pill pill-open">open</span>';
+}
+
+async function rerunBatchNow() {
+  const btn = document.getElementById('btn-rerun-batch');
+  const msg = document.getElementById('rerun-msg');
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = '⏳ 跑批中…';
+  msg.style.color = '#555';
+  msg.textContent = '后台执行 advisory_batch_runner --once (~5s)…';
+  try {
+    const r = await fetch('/api/advisory/run_batch_now', { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) {
+      msg.style.color = '#c62828';
+      msg.textContent = '失败: ' + (data.error || ('HTTP ' + r.status));
+      return;
+    }
+    msg.style.color = '#2e7d32';
+    msg.textContent = `✓ 写入 batch #${data.batch_id} (tokens=${data.token_count}, ${data.elapsed_seconds}s) — 刷新数据中…`;
+    await load();
+    await loadPortfolio();
+  } catch (e) {
+    msg.style.color = '#c62828';
+    msg.textContent = '失败: ' + e;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
+async function load() {
+  const r = await fetch('/api/advisory/recommendations');
+  const meta = document.getElementById('meta');
+  const banner = document.getElementById('stale-banner');
+  const content = document.getElementById('content');
+
+  if (!r.ok) {
+    meta.textContent = '加载失败: HTTP ' + r.status;
+    return;
+  }
+  const data = await r.json();
+
+  if (data.status === 'no_batch') {
+    meta.textContent = '当前无 complete batch';
+    content.innerHTML = '<div class="empty">尚无可展示的推荐数据</div>';
+    return;
+  }
+
+  const b = data.batch;
+  meta.textContent = `Batch #${b.id} (seq=${b.batch_sequence}) completed_at=${b.batch_completed_at} tokens=${b.token_count}`;
+
+  if (data.stale) {
+    banner.textContent = `⚠️ 数据陈旧 (超过 ${data.staleness_threshold_seconds}s 阈值), 已暂停推荐展示。请检查 batch worker 是否在运行。`;
+    banner.style.display = 'block';
+    content.innerHTML = '';
+    return;
+  }
+  banner.style.display = 'none';
+
+  CURRENT_SNAPSHOTS = {};
+  data.snapshots.forEach(s => { CURRENT_SNAPSHOTS[s.id] = s; });
+
+  if (data.snapshots.length === 0) {
+    content.innerHTML = '<div class="empty">该 batch 无 snapshot</div>';
+    return;
+  }
+
+  // 按 ranking_score DESC 排序 (NULL 在最后)
+  const rows = data.snapshots.slice().sort((a, b) => {
+    const av = a.ranking_score, bv = b.ranking_score;
+    if (av === null && bv === null) return 0;
+    if (av === null) return 1;
+    if (bv === null) return -1;
+    return bv - av;
+  });
+
+  let html = `<table>
+    <thead><tr>
+      <th class="txt">market / outcome</th>
+      <th class="txt">state</th>
+      <th class="num">fair</th>
+      <th class="num">edge</th>
+      <th class="num">APR</th>
+      <th class="num">target $</th>
+      <th class="num">current $</th>
+      <th class="num">delta $</th>
+      <th class="num" title="AI PathView shadow fair (gemini-3.1-pro). 鼠标悬停查看理由; 仅最近 8 个未触发 strike. 该列不参与下单决策.">AI fair</th>
+      <th class="num" title="AI edge = AI fair − best_ask. 与左侧 edge 列同口径, 仅 AI focus 子集有数据.">AI edge</th>
+    </tr></thead><tbody>`;
+  for (const s of rows) {
+    const cls = s.halt_reason ? 'halt' : (s.resolution_state === 'settled' ? 'settled' : '');
+    const label = formatTokenLabel(s.market_slug, s.view_payload || null);
+    const tokShort = (s.token_id || '').slice(0, 10) + '…';
+    const ai = s.ai_shadow;
+    let aiCell = '<span style="color:#bbb">—</span>';
+    let aiEdgeCell = '<span style="color:#bbb">—</span>';
+    let aiBuyBadge = '';
+    if (ai && ai.fair_event !== null && ai.fair_event !== undefined) {
+      const baseFair = s.fair_value_for_edge;
+      const diff = (typeof baseFair === 'number') ? (ai.fair_event - baseFair) : null;
+      const diffClr = diff === null ? '#888' : (Math.abs(diff) >= 0.20 ? '#c62828' : (Math.abs(diff) >= 0.05 ? '#ef6c00' : '#2e7d32'));
+      const diffTxt = diff === null ? '' : `<div style="color:${diffClr};font-size:11px">${diff >= 0 ? '+' : ''}${diff.toFixed(3)}</div>`;
+      const tip = (ai.rationale_short || '(无理由文本)').replace(/"/g, '&quot;')
+                 + `\n— status: ${ai.fair_value_status || '?'}; p_yes=${(ai.p_event_yes ?? 0).toFixed(3)}`;
+      aiCell = `<div title="${tip}" style="cursor:help">${fmt(ai.fair_event, 3)}${diffTxt}</div>`;
+
+      const ask = (s.view_payload && typeof s.view_payload.best_ask === 'number') ? s.view_payload.best_ask : null;
+      if (ask !== null && ask > 0 && ask < 1) {
+        const aiEdge = ai.fair_event - ask;
+        const aiEdgeClr = aiEdge >= 0.05 ? '#2e7d32' : (aiEdge <= -0.05 ? '#c62828' : '#666');
+        const baseEdge = s.edge_buy_active;
+        const edgeDiffTxt = (typeof baseEdge === 'number')
+          ? `<div style="color:#888;font-size:11px">vs ${fmt(baseEdge, 3)}</div>`
+          : '';
+        aiEdgeCell = `<div title="ask=${fmt(ask, 3)}; AI fair − ask">
+          <span style="color:${aiEdgeClr}">${aiEdge >= 0 ? '+' : ''}${aiEdge.toFixed(3)}</span>
+          ${edgeDiffTxt}
+        </div>`;
+        if (aiEdge >= 0.05 && ai.fair_value_status === 'available') {
+          const badgeTip = (ai.rationale_short || '').replace(/"/g, '&quot;');
+          aiBuyBadge = ` <span title="AI edge +${aiEdge.toFixed(2)} (fair ${fmt(ai.fair_event,3)} vs ask ${fmt(ask,3)})\n${badgeTip}" style="display:inline-block;background:#1b5e20;color:#fff;font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;vertical-align:middle;cursor:help">BUY</span>`;
+        }
+      }
+    }
+    html += `<tr class="${cls}">
+      <td class="txt"><div title="${s.market_slug || ''}">${label}${aiBuyBadge}</div><div style="color:#999;font-size:11px" title="${s.token_id || ''}">${tokShort}</div></td>
+      <td class="txt">${pillFor(s)}</td>
+      <td class="num">${fmt(s.fair_value_for_edge, 3)}</td>
+      <td class="num">${fmt(s.edge_buy_active, 3)}</td>
+      <td class="num">${fmt(s.expected_apr_by_intent, 2)}</td>
+      <td class="num">${fmt(s.target_position_usdc, 2)}</td>
+      <td class="num">${fmt(s.current_position_usdc, 2)}</td>
+      <td class="num">${fmt(s.delta_usdc, 2)}</td>
+      <td class="num">${aiCell}</td>
+      <td class="num">${aiEdgeCell}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+
+  // AI shadow run 元信息 banner (放在表上方)
+  const aiRun = data.ai_shadow_run;
+  if (aiRun) {
+    const sumTip = (aiRun.summary || '').replace(/"/g, '&quot;');
+    const notesTip = (aiRun.ai_notes || '').replace(/"/g, '&quot;');
+    const stClr = aiRun.validation_status === 'passed' ? '#2e7d32'
+                : aiRun.validation_status === 'passed_with_warnings' ? '#ef6c00' : '#c62828';
+    const aiBanner = `<div style="background:#f3f7ff;border:1px solid #cfe0ff;padding:8px 12px;border-radius:6px;margin-bottom:10px;font-size:12px;">
+      <b>AI PathView shadow</b> (${aiRun.model_id || '?'} / ${aiRun.prompt_version || '?'})
+      · run #${aiRun.id} (batch #${aiRun.batch_id || '?'}) · ${aiRun.generated_at || ''}
+      · status=<span style="color:${stClr}">${aiRun.validation_status}</span>
+      · latency ${aiRun.latency_ms}ms
+      <div style="margin-top:4px;color:#333;cursor:help" title="${sumTip}"><b>summary:</b> ${(aiRun.summary || '').slice(0, 180)}${(aiRun.summary || '').length > 180 ? '…' : ''}</div>
+      <div style="margin-top:2px;color:#555;cursor:help" title="${notesTip}"><b>notes:</b> ${(aiRun.ai_notes || '').slice(0, 180)}${(aiRun.ai_notes || '').length > 180 ? '…' : ''}</div>
+    </div>`;
+    html = aiBanner + html;
+  }
+  content.innerHTML = html;
+}
+
+function openModal() { /* removed: manual_trades 已退役 (advisory v2) */ }
+function closeModal() { /* removed */ }
+async function submitTrade() { /* removed */ }
+
+load();
+setInterval(load, 30000);  // 30s 自动刷新
+
+// --- Portfolio (P1) ---
+async function loadPortfolio() {
+  try {
+    const r = await fetch('/api/advisory/portfolio');
+    const data = await r.json();
+    if (!r.ok) {
+      document.getElementById('portfolio-meta').textContent = '错误: ' + (data.error || r.status);
+      return;
+    }
+    renderPortfolio(data);
+  } catch (e) {
+    document.getElementById('portfolio-meta').textContent = '网络错误: ' + e;
+  }
+}
+
+function renderPortfolio(data) {
+  const meta = document.getElementById('portfolio-meta');
+  const content = document.getElementById('portfolio-content');
+  const t = data.totals || {};
+  meta.innerHTML =
+    `as_of: ${data.as_of} · open_positions: ${t.open_position_count} · ` +
+    `净投入: ${fmt(t.net_invested_usdc, 2)} USDC · ` +
+    `市值(@bid): ${fmt(t.mark_value_usdc, 2)} · ` +
+    `未实现 PnL: <strong>${fmt(t.unrealized_pnl_usdc, 2)}</strong> USDC`;
+
+  const positions = data.positions || [];
+  if (positions.length === 0) {
+    content.innerHTML = '<div class="empty">暂无 advisory 持仓 (链上)</div>';
+    return;
+  }
+  let html = `<table>
+    <thead><tr>
+      <th class="txt">market / outcome</th>
+      <th class="num">shares</th>
+      <th class="num">avg entry</th>
+      <th class="num">净投入 $</th>
+      <th class="num">fair</th>
+      <th class="num">bid / ask</th>
+      <th class="num">市值 $</th>
+      <th class="num">unrealized PnL $</th>
+      <th class="txt">advisory</th>
+      <th class="num">trades (B/S)</th>
+      <th class="txt">last trade</th>
+    </tr></thead><tbody>`;
+  for (const p of positions) {
+    const label = formatTokenLabel(p.market_slug, p);
+    const tok = (p.token_id || '').slice(0, 10) + '…';
+    const pnl = p.unrealized_pnl_usdc;
+    const pnlColor = (pnl == null) ? '' :
+                     (pnl > 0 ? 'color:#2e7d32' : (pnl < 0 ? 'color:#c62828' : ''));
+    let advisoryPill = '—';
+    if (p.halt_reason) {
+      advisoryPill = `<span class="pill pill-halt" title="${p.halt_reason}">halt</span>`;
+    } else if (p.edge_buy_active === true) {
+      advisoryPill = `<span class="pill pill-open">edge BUY</span>`;
+    } else if (p.edge_buy_active === false) {
+      advisoryPill = `<span class="pill pill-locked">no edge</span>`;
+    }
+    const lastTrade = p.last_trade_at
+      ? new Date(p.last_trade_at).toISOString().replace('T', ' ').slice(0, 16) + 'Z'
+      : '—';
+    html += `<tr>
+      <td class="txt"><div title="${p.market_slug || ''}">${label}</div><div style="color:#999;font-size:11px" title="${p.token_id || ''}">${tok}</div></td>
+      <td class="num">${fmt(p.shares, 2)}</td>
+      <td class="num">${fmt(p.avg_entry_price, 3)}</td>
+      <td class="num">${fmt(p.net_invested_usdc, 2)}</td>
+      <td class="num">${fmt(p.fair_value_for_edge, 3)}</td>
+      <td class="num">${fmt(p.best_bid, 3)} / ${fmt(p.best_ask, 3)}</td>
+      <td class="num">${fmt(p.mark_value_usdc, 2)}</td>
+      <td class="num" style="${pnlColor}"><strong>${fmt(pnl, 2)}</strong></td>
+      <td class="txt">${advisoryPill}</td>
+      <td class="num">${p.buy_count}/${p.sell_count}</td>
+      <td class="txt" style="font-size:11px;color:#666">${lastTrade}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  content.innerHTML = html;
+}
+
+loadPortfolio();
+setInterval(loadPortfolio, 30000);
+
+// --- User Thesis (P2) ---
+async function loadThesis() {
+  try {
+    const r = await fetch('/api/advisory/user_thesis');
+    const j = await r.json();
+    const meta = document.getElementById('thesis-meta');
+    const cur = document.getElementById('thesis-current');
+    if (!r.ok) { meta.textContent = '错误: ' + (j.error || r.status); return; }
+    if (!j.active) {
+      meta.textContent = '当前无 active thesis';
+      cur.innerHTML = '';
+      return;
+    }
+    meta.textContent = `active id=${j.active.id} · 创建 ${j.active.created_at} · 过期 ${j.active.expires_at}`;
+    cur.innerHTML = `<div style="background:#f5f5f5;padding:10px 12px;border-left:3px solid #1976d2;font-size:13px;white-space:pre-wrap;">${escapeHtml(j.active.thesis_text)}</div>`;
+  } catch (e) {
+    document.getElementById('thesis-meta').textContent = '网络错误: ' + e;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function submitThesis() {
+  const text = document.getElementById('thesis-input').value.trim();
+  const ttl = parseFloat(document.getElementById('thesis-ttl').value) || 6;
+  const msg = document.getElementById('thesis-msg');
+  if (!text) { msg.textContent = '空文本; 不修改'; msg.style.color = '#c62828'; return; }
+  msg.textContent = '提交中…';
+  try {
+    const r = await fetch('/api/advisory/user_thesis', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({thesis_text: text, ttl_hours: ttl}),
+    });
+    const j = await r.json();
+    if (r.ok) {
+      msg.textContent = `✓ 已设置 id=${j.active.id}`; msg.style.color = '#2e7d32';
+      document.getElementById('thesis-input').value = '';
+      loadThesis();
+    } else {
+      msg.textContent = `失败: ${j.error}`; msg.style.color = '#c62828';
+    }
+  } catch (e) {
+    msg.textContent = '网络错误: ' + e; msg.style.color = '#c62828';
+  }
+}
+
+async function clearThesis() {
+  const msg = document.getElementById('thesis-msg');
+  if (!confirm('确认清除当前 active thesis?')) return;
+  try {
+    const r = await fetch('/api/advisory/user_thesis', {method: 'DELETE'});
+    const j = await r.json();
+    if (r.ok) {
+      msg.textContent = `✓ 已清除 ${j.cleared} 条`; msg.style.color = '#2e7d32';
+      loadThesis();
+    } else {
+      msg.textContent = `失败: ${j.error}`; msg.style.color = '#c62828';
+    }
+  } catch (e) {
+    msg.textContent = '网络错误: ' + e; msg.style.color = '#c62828';
+  }
+}
+
+loadThesis();
+setInterval(loadThesis, 60000);
+
+// --- Calibration history (P3) ---
+async function loadCalibration() {
+  try {
+    const r = await fetch('/api/advisory/calibration?limit=20');
+    const j = await r.json();
+    const meta = document.getElementById('calib-meta');
+    const latest = document.getElementById('calib-latest');
+    const body = document.getElementById('calib-body');
+    if (!r.ok) { meta.textContent = '错误: ' + (j.error || r.status); return; }
+    meta.textContent = `共 ${j.count} 次 run (timer 每 6h)`;
+    if (j.runs.length === 0) {
+      latest.innerHTML = '<em>暂无 calibration run; timer 启动后 ~10min 出现首条</em>';
+      body.innerHTML = '';
+      return;
+    }
+    const head = j.runs[0];
+    const buckets = (head.calibration && head.calibration.buckets) || [];
+    const bucketRows = buckets.map(b => `<tr><td style="padding:3px 6px;border:1px solid #eee;">${b.bucket}</td><td style="padding:3px 6px;border:1px solid #eee;text-align:right;">${b.n}</td><td style="padding:3px 6px;border:1px solid #eee;text-align:right;">${b.mean_predicted}</td><td style="padding:3px 6px;border:1px solid #eee;text-align:right;">${b.mean_realized}</td><td style="padding:3px 6px;border:1px solid #eee;text-align:right;color:${b.calibration_gap >= 0 ? '#2e7d32' : '#c62828'};">${b.calibration_gap >= 0 ? '+' : ''}${b.calibration_gap}</td></tr>`).join('');
+    latest.innerHTML = `<div style="background:#f5f5f5;padding:10px 12px;border-left:3px solid #1976d2;">
+      <strong>最新 run #${head.id}</strong> @ ${head.run_at}<br>
+      Brier=${head.brier !== null ? head.brier.toFixed(4) : '—'} · N=${head.n_snapshots} · Trades=${head.n_trades_settled}/${head.n_trades} settled · PnL=${head.total_pnl_usdc !== null ? head.total_pnl_usdc.toFixed(2) : '—'}
+      <table style="width:100%;margin-top:8px;border-collapse:collapse;font-size:11px;">
+        <thead><tr style="background:#eee;"><th style="padding:3px 6px;border:1px solid #ddd;">bucket</th><th>N</th><th>predicted</th><th>realized</th><th>gap</th></tr></thead>
+        <tbody>${bucketRows || '<tr><td colspan=5><em>无桶数据</em></td></tr>'}</tbody>
+      </table></div>`;
+    body.innerHTML = j.runs.map(run => `<tr>
+      <td style="padding:4px 6px;border:1px solid #eee;">${run.run_at}</td>
+      <td style="padding:4px 6px;border:1px solid #eee;text-align:right;">${run.n_snapshots}</td>
+      <td style="padding:4px 6px;border:1px solid #eee;text-align:right;">${run.brier !== null ? run.brier.toFixed(4) : '—'}</td>
+      <td style="padding:4px 6px;border:1px solid #eee;text-align:right;">${run.n_trades_settled}/${run.n_trades}</td>
+      <td style="padding:4px 6px;border:1px solid #eee;text-align:right;color:${(run.total_pnl_usdc || 0) >= 0 ? '#2e7d32' : '#c62828'};">${run.total_pnl_usdc !== null ? run.total_pnl_usdc.toFixed(2) : '—'}</td>
+    </tr>`).join('');
+  } catch (e) {
+    document.getElementById('calib-meta').textContent = '网络错误: ' + e;
+  }
+}
+
+loadCalibration();
+setInterval(loadCalibration, 300000);  // 5min
+
+// --- Reconcile v2 (C3) — 6 类视图 ---
+async function loadReconcile() {
+  const hours = document.getElementById('recon-hours').value;
+  const meta = document.getElementById('recon-meta');
+  const sum = document.getElementById('recon-summary');
+  meta.textContent = '加载中…';
+  try {
+    const r = await fetch(`/api/advisory/reconcile_v2?hours=${hours}&limit=50`);
+    const j = await r.json();
+    if (!r.ok) { meta.textContent = '错误: ' + (j.error || r.status); return; }
+    const c = j.counts || {};
+    meta.textContent = `as_of=${j.as_of} · window=${j.window_hours}h`;
+    const cell = (label, val, bg) =>
+      `<div style="background:${bg};padding:10px;border-radius:4px;">
+         <strong>${val}</strong><br><span style="font-size:11px;color:#666;">${label}</span></div>`;
+    sum.innerHTML = `
+      <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px;font-size:13px;">
+        ${cell('matched', c.matched || 0, '#e8f5e9')}
+        ${cell('partial', c.partial || 0, '#fff8e1')}
+        ${cell('orphan', c.orphan || 0, '#ffebee')}
+        ${cell('cancelled_clean', c.cancelled_clean || 0, '#eceff1')}
+        ${cell('cancelled_with_fills', c.cancelled_with_fills || 0, '#fce4ec')}
+        ${cell('chain_fills_no_intent', c.chain_fills_no_intent || 0, '#e3f2fd')}
+      </div>
+      ${renderIntentList('matched (前 20)', j.matched.slice(0, 20))}
+      ${renderIntentList('partial (前 20)', j.partial.slice(0, 20))}
+      ${renderIntentList('orphan (前 20)', j.orphan.slice(0, 20))}
+      ${renderIntentList('cancelled_with_fills (前 20)', j.cancelled_with_fills.slice(0, 20))}
+      ${renderIntentList('cancelled_clean (前 20)', j.cancelled_clean.slice(0, 20))}
+      ${renderChainFillsNoIntent(j.chain_fills_no_intent.slice(0, 20))}
+    `;
+  } catch (e) {
+    meta.textContent = '网络错误: ' + e;
+  }
+}
+
+function renderIntentList(title, items) {
+  if (!items || !items.length) return '';
+  const rows = items.map(x => {
+    const slip = x.slippage_cents;
+    const slipColor = (slip !== null && slip !== undefined && Math.abs(slip) > 1) ? '#c62828' : '#666';
+    const slipDisp = (slip === null || slip === undefined) ? '—'
+      : `${slip >= 0 ? '+' : ''}${slip.toFixed(2)}¢`;
+    return `<tr>
+      <td>${x.created_at ? x.created_at.slice(0,19).replace('T',' ') : ''}</td>
+      <td>${x.intended_side || ''}</td>
+      <td>${(x.token_id || '').slice(0,8)}…</td>
+      <td>${x.intended_price !== null ? Number(x.intended_price).toFixed(4) : '—'}</td>
+      <td>${x.fill_avg_price !== null && x.fill_avg_price !== undefined ? Number(x.fill_avg_price).toFixed(4) : '—'}</td>
+      <td style="color:${slipColor};">${slipDisp}</td>
+      <td>${Number(x.intended_size_shares || 0).toFixed(0)}</td>
+      <td>${Number(x.fill_total_shares || 0).toFixed(0)}</td>
+      <td>${x.fill_count || 0}</td>
+      <td>${x.polymarket_order_id ? x.polymarket_order_id.slice(0,10) + '…' : '—'}</td>
+    </tr>`;
+  }).join('');
+  return `<details style="margin-top:12px;"><summary style="cursor:pointer;font-weight:bold;">${title}</summary>
+    <table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:6px;">
+      <thead><tr style="background:#f5f5f5;">
+        <th>created_at</th><th>side</th><th>token</th><th>intended</th><th>fill_avg</th>
+        <th>slip</th><th>intended_sh</th><th>filled_sh</th><th>fills</th><th>order_id</th>
+      </tr></thead><tbody>${rows}</tbody></table></details>`;
+}
+
+function renderChainFillsNoIntent(items) {
+  if (!items || !items.length) return '';
+  const rows = items.map(x => `<tr>
+    <td>${x.fill_timestamp ? x.fill_timestamp.slice(0,19).replace('T',' ') : ''}</td>
+    <td>${x.side}</td>
+    <td>${(x.token_id || '').slice(0,8)}…</td>
+    <td>${Number(x.price || 0).toFixed(4)}</td>
+    <td>${Number(x.size_shares || 0).toFixed(0)}</td>
+    <td>$${Number(x.size_usdc || 0).toFixed(2)}</td>
+    <td title="${x.market_slug || ''}">${formatTokenLabel(x.market_slug, x.outcome_index !== undefined ? x.outcome_index : null)}</td>
+    <td>${x.profile}</td>
+  </tr>`).join('');
+  return `<details style="margin-top:12px;" open><summary style="cursor:pointer;font-weight:bold;color:#1565c0;">chain_fills_no_intent (前 20) — 链上有 fill 但 dashboard 无意图记录</summary>
+    <table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:6px;">
+      <thead><tr style="background:#f5f5f5;">
+        <th>fill_ts</th><th>side</th><th>token</th><th>price</th><th>shares</th><th>usdc</th><th>market</th><th>profile</th>
+      </tr></thead><tbody>${rows}</tbody></table></details>`;
+}
+
+loadReconcile();
+setInterval(loadReconcile, 600000);  // 10min
+</script>
+</body>
+</html>

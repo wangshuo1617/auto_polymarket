@@ -1,0 +1,25 @@
+[Unit]
+Description=Auto Polymarket - BTC ETF 量能异常监控
+After=network-online.target
+Wants=network-online.target
+
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+WorkingDirectory=/root/auto_polymarket
+EnvironmentFile=/root/auto_polymarket/.env
+Environment=ETF_MONITOR_INTERVAL=1800
+Environment=ETF_MONITOR_MAX_ALERTS=3
+Environment=ETF_SINGLE_THRESHOLD=1.8
+Environment=ETF_COMBINED_THRESHOLD=1.5
+ExecStart=/bin/bash -c 'exec /snap/astral-uv/current/bin/uv run scripts/etf_volume_monitor.py'
+Restart=on-failure
+RestartSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

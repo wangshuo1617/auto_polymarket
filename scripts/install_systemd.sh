@@ -9,18 +9,28 @@ SYSTEMD_DIR="$SCRIPT_DIR/systemd"
 TARGET_DIR="/etc/systemd/system"
 
 SERVICES=(
-  auto-poly-btc-monitor
-  auto-poly-5m-trade
   auto-poly-app
   auto-poly-usdc-monitor
+  auto-poly-advisory-batch
+  auto-poly-advisory-settlement
+  auto-poly-etf-volume-monitor
+  auto-poly-recommendation-executor
 )
 
 EXTRA_UNITS=(
-  auto-poly-btc-monitor-freshness.service
+  auto-poly-advisory-calibration.service
+  auto-poly-advisory-edge-alerts.service
+  auto-poly-advisory-fills-poller.service
+  auto-poly-advisory-intent-filler.service
+  auto-poly-advisory-metrics.service
 )
 
 TIMERS=(
-  auto-poly-btc-monitor-freshness.timer
+  auto-poly-advisory-calibration.timer
+  auto-poly-advisory-edge-alerts.timer
+  auto-poly-advisory-fills-poller.timer
+  auto-poly-advisory-intent-filler.timer
+  auto-poly-advisory-metrics.timer
 )
 
 echo "=========================================="
@@ -30,9 +40,7 @@ echo "=========================================="
 
 # 先停止通过 nohup 启动的旧进程
 echo "[1/4] 停止旧的 nohup 进程..."
-pkill -f "5m_trade.py" 2>/dev/null || true
 pkill -f "app.py" 2>/dev/null || true
-pkill -f "btc_1s_market_monitor.py" 2>/dev/null || true
 pkill -f "usdc_balance_monitor.py" 2>/dev/null || true
 sleep 2
 
@@ -79,9 +87,9 @@ done
 echo ""
 echo "=========================================="
 echo "安装完成！常用命令："
-echo "  systemctl status auto-poly-*          # 查看所有服务状态"
-echo "  systemctl restart auto-poly-5m-trade  # 重启某个服务"
-echo "  journalctl -u auto-poly-5m-trade -f   # 查看日志"
-echo "  systemctl stop auto-poly-5m-trade     # 停止某个服务"
-echo "  systemctl status auto-poly-btc-monitor-freshness.timer  # 查看看门狗状态"
+echo "  systemctl status auto-poly-*                       # 查看所有服务状态"
+echo "  systemctl restart auto-poly-app                    # 重启 Dashboard"
+echo "  systemctl restart auto-poly-recommendation-executor  # 重启自动执行器"
+echo "  journalctl -u auto-poly-app -f                     # 查看日志"
+echo "  systemctl stop auto-poly-app                       # 停止某个服务"
 echo "=========================================="
