@@ -69,23 +69,22 @@ def market_settle_yes(conn, mk: ParsedMarket, t_start: datetime, t_end: datetime
     """
     Returns True if Yes side wins (barrier touched in [t_start, t_end]),
     False if not touched and t_end is past, None if window still open.
+
+    数据源: Binance 现货 5m kline 的 high/low（与 Polymarket 月度结算一致）。
+    `conn` 参数保留以兼容旧调用方但不再使用。
     """
+    from data.binance import get_path_extrema  # local import to avoid module-load cost
+
     now = datetime.now(timezone.utc)
     end_for_query = min(t_end, now)
     if end_for_query <= t_start:
         return None
-    op = ">=" if mk.direction == "reach" else "<="
-    agg = "MAX" if mk.direction == "reach" else "MIN"
-    q = f"""
-        SELECT {agg}(price) AS extreme FROM btc_aggtrades
-        WHERE ts >= %s AND ts <= %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(q, (t_start, end_for_query))
-        row = cur.fetchone()
-    if not row or row["extreme"] is None:
+    pmax, pmin, _cov, n = get_path_extrema(t_start, end_for_query, interval="5m")
+    if n == 0:
         return None
-    extreme = row["extreme"]
+    extreme = pmax if mk.direction == "reach" else pmin
+    if extreme <= 0:
+        return None
     touched = (extreme >= mk.barrier) if mk.direction == "reach" else (extreme <= mk.barrier)
     if touched:
         return True

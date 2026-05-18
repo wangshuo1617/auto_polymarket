@@ -949,13 +949,23 @@ def _build_prediction_review(
                 "note": f"{asset_label} {'已触及' if triggered else '未触及'}该预警位（当前${current_asset_price:,.0f}）",
             })
 
-    appendix = previous_report.get("报告解读附录", [])
+    # 兼容旧版报告(报告解读附录) 和新版报告(操作清单 - 立即执行项)
     immediate_actions = []
+    appendix = previous_report.get("报告解读附录", [])
     for item in appendix:
         if item.get("执行优先级") == "立即执行":
             conclusion = item.get("一句话结论", "")
             if conclusion:
                 immediate_actions.append(conclusion)
+    for item in previous_report.get("操作清单", []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("优先级") == "立即执行":
+            op = item.get("操作") or ""
+            target = item.get("标的") or ""
+            reason = item.get("理由") or ""
+            if target or reason:
+                immediate_actions.append(f"{op} {target}：{reason}".strip())
     if immediate_actions:
         review["previous_immediate_actions"] = immediate_actions
         review["findings"].append({

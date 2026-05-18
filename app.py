@@ -592,9 +592,13 @@ def api_chat():
 # ============================================================================
 from services.manual_pending_orders import (
     insert_pending_order as _mpo_insert,
+    insert_plan as _mpo_insert_plan,
     list_pending_orders as _mpo_list,
     cancel_pending_order as _mpo_cancel,
     VALID_OPS as _MPO_VALID_OPS,
+    VALID_TRIGGER_KINDS as _MPO_VALID_KINDS,
+    VALID_SIZE_TYPES as _MPO_VALID_SIZE_TYPES,
+    VALID_PRICE_TYPES as _MPO_VALID_PRICE_TYPES,
 )
 
 
@@ -674,6 +678,38 @@ def api_manual_pending_list():
     try:
         include_finished = (request.args.get('include_finished') or '').lower() in ('1', 'true', 'yes')
         rows = _mpo_list(include_finished=include_finished)
+        # Enrich with event_name + outcome label for UI display
+        try:
+            market_client = get_client(APP_PM_PROFILE)
+        except Exception:
+            market_client = None
+        market_cache: dict[str, dict] = {}
+        for r in rows:
+            mid = r.get('market_id')
+            tid = str(r.get('token_id') or '')
+            if not mid:
+                continue
+            if mid not in market_cache:
+                try:
+                    m = market_client.get_market(mid) if market_client else {}
+                    market_cache[mid] = m or {}
+                except Exception:
+                    market_cache[mid] = {}
+            m = market_cache[mid]
+            r['event_name'] = m.get('question') or m.get('title') or ''
+            outcome_label = ''
+            for tk in (m.get('tokens') or []):
+                if str(tk.get('token_id') or '') == tid:
+                    outcome_label = str(tk.get('outcome') or '')
+                    break
+            if not outcome_label:
+                outcomes = m.get('outcomes') or []
+                token_ids = m.get('token_id') or m.get('clobTokenIds') or []
+                for idx, t in enumerate(token_ids):
+                    if str(t) == tid and idx < len(outcomes):
+                        outcome_label = str(outcomes[idx])
+                        break
+            r['outcome'] = outcome_label
         return jsonify({'orders': rows})
     except Exception as e:
         logger.exception("api_manual_pending_list error")
@@ -690,6 +726,77 @@ def api_manual_pending_cancel(order_id: int):
     except Exception as e:
         logger.exception("api_manual_pending_cancel error")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/manual_pending/plan', methods=['POST'])
+def api_manual_pending_plan():
+    """提交联动计划: { items: [...] }
+
+    每个 item 字段:
+      action               buy / sell
+      market_id, token_id  必填
+      trigger_kind         btc_abs | share_abs | share_cost_pct
+      trigger_op           >= / <=
+      trigger_threshold    btc_abs/share_abs 用 (BTC 价 或 share 价)
+      trigger_pct          share_cost_pct 用 (-100~+1000)
+      size_spec            {type, value} type ∈ shares/usdc/pct_balance/pct_position
+      price_spec           {type, value?/offset?} type ∈ absolute/market/cost_pct
+      expires_hours        可选 (默认 24)
+      parent_index         可选 (引用 items 前序索引;首项不能有)
+      notes                可选
+    """
+    data = request.get_json(silent=True) or {}
+    items = data.get('items')
+    if not isinstance(items, list) or not items:
+        return jsonify({'error': 'items 必须是非空数组'}), 400
+    if len(items) > 10:
+        return jsonify({'error': 'items 单次最多 10 项'}), 400
+
+    now = datetime.now(timezone.utc)
+    parsed_items: list[dict] = []
+    for idx, raw in enumerate(items):
+        if not isinstance(raw, dict):
+            return jsonify({'error': f'items[{idx}] 必须是对象'}), 400
+        try:
+            hours = float(raw.get('expires_hours') or 24)
+            if hours <= 0 or hours > 720:
+                raise ValueError('hours out of range')
+        except (TypeError, ValueError):
+            return jsonify({'error': f'items[{idx}].expires_hours 必须在 (0, 720]'}), 400
+        item = {
+            'action': str(raw.get('action') or '').strip().lower(),
+            'market_id': str(raw.get('market_id') or '').strip(),
+            'token_id': str(raw.get('token_id') or '').strip(),
+            'trigger_kind': str(raw.get('trigger_kind') or 'btc_abs').strip().lower(),
+            'trigger_op': str(raw.get('trigger_op') or '>=').strip(),
+            'trigger_threshold': raw.get('trigger_threshold'),
+            'trigger_pct': raw.get('trigger_pct'),
+            'size_spec': raw.get('size_spec') or {},
+            'price_spec': raw.get('price_spec') or {},
+            'expires_at': now + timedelta(hours=hours),
+            'notes': raw.get('notes'),
+            'extra': {'profile': APP_PM_PROFILE},
+            'parent_index': raw.get('parent_index'),
+        }
+        parsed_items.append(item)
+    try:
+        rows = _mpo_insert_plan(
+            parsed_items,
+            requested_by=session.get('user') or 'dashboard',
+        )
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 400
+    except Exception as e:
+        logger.exception("create manual pending plan failed")
+        return jsonify({'error': f'写入失败: {e}'}), 500
+    logger.info("manual pending plan created: plan_id=%s items=%s",
+                rows[0].get('plan_id'), len(rows))
+    return jsonify({
+        'queued': True,
+        'plan_id': rows[0].get('plan_id'),
+        'items': rows,
+        'message': f'已排队联动计划 plan_id={rows[0].get("plan_id")}, 共 {len(rows)} 档',
+    })
 
 
 @app.route('/api/positions')
@@ -2307,6 +2414,9 @@ def api_recommendations_latest():
                     else None
                 ),
                 "action_plans": item.get("plans") or [],
+                "take_profit": (item.get("raw_payload") or {}).get("止盈目标") or (item.get("raw_payload") or {}).get("止盈阈值"),
+                "stop_loss": (item.get("raw_payload") or {}).get("止损规则") or (item.get("raw_payload") or {}).get("止损阈值") or (item.get("raw_payload") or {}).get("认错止损价"),
+                "max_hold": (item.get("raw_payload") or {}).get("最长持仓"),
             }
             for item in items
         ]

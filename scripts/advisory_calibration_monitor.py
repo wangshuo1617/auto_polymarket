@@ -135,7 +135,7 @@ def _fetch_settled_labels(since: datetime) -> list[tuple[float, float]]:
 
 
 def _fetch_path_locked_labels(since: datetime) -> list[tuple[float, float]]:
-    """M2 partial labels: snapshots where strike has been touched in BTC 1s
+    """M2 partial labels: snapshots where strike has been touched in BTC kline
     history between snapshot time and NOW. Excludes already-settled (handled by M1).
 
     A "touch" is determined by:
@@ -146,51 +146,55 @@ def _fetch_path_locked_labels(since: datetime) -> list[tuple[float, float]]:
 
     NOTE: we only label the PROVEN side (touched markets); markets that have
     NOT yet touched are still uncertain at "now" and excluded.
+
+    数据源已从本地 btc_poly_1s_ticks 切到 Binance 5m kline。
     """
+    from datetime import timezone as _tz
+    from data.binance import get_path_extrema
+
     sql = """
-        WITH s AS (
-          SELECT s.id, s.token_id, s.market_slug, s.fair_value_for_edge AS p,
-                 (s.view_payload->>'strike_usd')::float AS strike,
-                 (s.view_payload->>'outcome_index') AS outcome_index,
-                 (s.view_payload->>'side_above')::bool AS side_above,
-                 s.generated_at
-            FROM market_view_snapshots s
-       LEFT JOIN settlement_feed_records sf
-              ON sf.condition_id = s.condition_id
-             AND sf.settlement_state = 'settled'
-           WHERE s.generated_at >= %s
-             AND s.fair_value_for_edge IS NOT NULL
-             AND sf.condition_id IS NULL
-             AND (s.view_payload->>'strike_usd') IS NOT NULL
-        ),
-        path AS (
-          SELECT market_slug,
-                 MAX(btc_price) AS px_max,
-                 MIN(NULLIF(btc_price, 0)) AS px_min
-            FROM btc_poly_1s_ticks
-           WHERE ts_sec >= %s
-           GROUP BY market_slug
-        )
-        SELECT s.p,
-               CASE
-                 WHEN s.side_above AND p.px_max >= s.strike THEN 1
-                 WHEN NOT s.side_above AND p.px_min <= s.strike THEN 1
-                 ELSE 0
-               END AS touched,
-               s.outcome_index
-          FROM s LEFT JOIN path p ON p.market_slug = s.market_slug
-         WHERE p.market_slug IS NOT NULL
-           AND ((s.side_above AND p.px_max >= s.strike)
-                OR (NOT s.side_above AND p.px_min <= s.strike))
+        SELECT s.id, s.market_slug, s.fair_value_for_edge AS p,
+               (s.view_payload->>'strike_usd')::float AS strike,
+               (s.view_payload->>'outcome_index') AS outcome_index,
+               (s.view_payload->>'side_above')::bool AS side_above
+          FROM market_view_snapshots s
+     LEFT JOIN settlement_feed_records sf
+            ON sf.condition_id = s.condition_id
+           AND sf.settlement_state = 'settled'
+         WHERE s.generated_at >= %s
+           AND s.fair_value_for_edge IS NOT NULL
+           AND sf.condition_id IS NULL
+           AND (s.view_payload->>'strike_usd') IS NOT NULL
     """
-    out: list[tuple[float, float]] = []
+    rows: list[dict] = []
     with get_cursor() as cur:
-        cur.execute(sql, (since, int(since.timestamp())))
+        cur.execute(sql, (since,))
         for r in cur.fetchall():
-            # touched=1 means yes-side wins, no-side loses.
-            # outcome_index '0' = yes, '1' = no
-            y = 1.0 if r["outcome_index"] == "0" else 0.0
-            out.append((float(r["p"]), y))
+            rows.append(dict(r))
+
+    if not rows:
+        return []
+
+    # BTC price is global, so one path-extrema fetch covers all snapshots.
+    now = datetime.now(_tz.utc)
+    try:
+        pmax, pmin, _cov, n = get_path_extrema(since, now, interval="5m")
+    except Exception:
+        logger.exception("get_path_extrema failed")
+        return []
+    if n == 0 or pmax <= 0:
+        return []
+
+    out: list[tuple[float, float]] = []
+    for r in rows:
+        strike = float(r["strike"])
+        side_above = bool(r["side_above"])
+        touched = (pmax >= strike) if side_above else (pmin > 0 and pmin <= strike)
+        if not touched:
+            continue
+        # outcome_index '0' = yes (wins on touch), '1' = no (loses on touch)
+        y = 1.0 if r["outcome_index"] == "0" else 0.0
+        out.append((float(r["p"]), y))
     return out
 
 

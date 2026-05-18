@@ -384,14 +384,6 @@ def build_recommendation_items(
     output = analysis_output if isinstance(analysis_output, dict) else {}
     profit_ctx = profit_optimization_context if isinstance(profit_optimization_context, dict) else {}
 
-    appendix_map: dict[str, str] = {}
-    for item in output.get("报告解读附录", []):
-        if not isinstance(item, dict):
-            continue
-        appendix_key = _normalize_text_key(item.get("标的") or "")
-        if appendix_key:
-            appendix_map[appendix_key] = str(item.get("执行优先级") or "").strip() or None
-
     edge_map: dict[str, dict] = {}
     for item in profit_ctx.get("top_edge_opportunities", []):
         if not isinstance(item, dict):
@@ -435,223 +427,48 @@ def build_recommendation_items(
             )
         return None, _infer_correlation_group(question)
 
-    for item in output.get("建仓建议", []):
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get("事件或问题") or "").strip()
-        confidence_text, correlation_group = _meta_for_question(title)
-        low_cents, high_cents = _parse_price_range_cents(item.get("建议价格区间"))
-        items.append({
-            "source_section": "建仓建议",
-            "item_kind": "entry",
-            "title": title,
-            "subject_key": _normalize_text_key(title),
-            "action_type": "buy",
-            "direction": str(item.get("建议方向") or "").strip() or None,
-            "strategy_type": "hold_to_expiry",
-            "suggested_price_text": str(item.get("建议价格区间") or "").strip() or None,
-            "suggested_price_low_cents": low_cents,
-            "suggested_price_high_cents": high_cents,
-            "size_text": str(item.get("建议投入金额或比例") or "").strip() or None,
-            "trigger_condition": None,
-            "reason": str(item.get("理由") or "").strip() or None,
-            "edge_text": str(item.get("预估优势") or "").strip() or None,
-            "confidence_text": confidence_text,
-            "correlation_group": correlation_group,
-            "priority_hint": appendix_map.get(_normalize_text_key(title)),
-            "raw_payload": item,
-        })
+    # 注: 旧版"预警信号"item 用到的 btc_price_question_map / _resolve_warning_target 已随
+    # "预警信号" schema 一并移除 (操作清单 已统一表达 BTC 触发位的操作)。
 
-    for item in output.get("波段交易建议", []):
+    _ACTION_MAP = {
+        "买入": "buy",
+        "卖出": "sell",
+        "撤单": "cancel",
+        "持有观察": "review",
+    }
+    for item in output.get("操作清单", []):
         if not isinstance(item, dict):
             continue
-        title = str(item.get("标的") or "").strip()
-        confidence_text, correlation_group = _meta_for_question(title)
-        low_cents, high_cents = _parse_price_range_cents(item.get("建议价格"))
+        op_text = str(item.get("操作") or "").strip()
+        action_type = _ACTION_MAP.get(op_text, "review")
+        if action_type == "review":
+            continue
+        title = str(item.get("标的") or "").strip() or op_text or "操作清单条目"
+        base_title, fallback_direction = _extract_title_direction(title)
+        direction = str(item.get("方向") or "").strip() or fallback_direction
+        priority = str(item.get("优先级") or "").strip() or None
+        confidence_text, correlation_group = _meta_for_question(base_title)
+        low_cents, high_cents = _parse_price_range_cents(item.get("价格"))
+        item_kind = "entry" if action_type == "buy" else ("position_order_cancel" if action_type == "cancel" else "exit")
         items.append({
-            "source_section": "波段交易建议",
-            "item_kind": "swing",
+            "source_section": "操作清单",
+            "item_kind": item_kind,
             "title": title,
-            "subject_key": _normalize_text_key(title),
-            "action_type": "buy",
-            "direction": str(item.get("方向") or "").strip() or None,
+            "subject_key": _normalize_text_key(base_title),
+            "action_type": action_type,
+            "direction": direction,
             "strategy_type": str(item.get("策略类型") or "").strip() or None,
-            "suggested_price_text": str(item.get("建议价格") or "").strip() or None,
+            "suggested_price_text": str(item.get("价格") or "").strip() or None,
             "suggested_price_low_cents": low_cents,
             "suggested_price_high_cents": high_cents,
-            "size_text": str(item.get("建议仓位") or "").strip() or None,
+            "size_text": str(item.get("金额或数量") or "").strip() or None,
             "trigger_condition": str(item.get("触发条件") or "").strip() or None,
             "reason": str(item.get("理由") or "").strip() or None,
             "edge_text": None,
             "confidence_text": confidence_text,
             "correlation_group": correlation_group,
-            "priority_hint": appendix_map.get(_normalize_text_key(title)),
+            "priority_hint": priority,
             "raw_payload": item,
-        })
-
-    for item in output.get("当前持仓与挂单分析与建议", []):
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get("事件或合约") or "").strip()
-        base_title, direction = _extract_title_direction(title)
-        title_key = _normalize_text_key(base_title)
-        position_meta = position_map.get(title_key, {})
-        confidence_text = str(position_meta.get("calibration_confidence") or "").strip() or None
-        correlation_group = _infer_correlation_group(base_title)
-
-        # 不再为持仓生成纯叙述的 position_review item;
-        # 若 AI 给了具体的挂单建议(挂买/挂卖/撤单), 下面会单独生成 position_order item。
-        # 这样未给出动作的"保持挂单即可"持仓不会进入 inbox。
-
-        for order_suggestion in item.get("挂单建议", []):
-            if not isinstance(order_suggestion, dict):
-                continue
-            low_cents, high_cents = _parse_price_range_cents(order_suggestion.get("建议价格"))
-            operation = str(order_suggestion.get("操作类型") or "").strip()
-            action_type = (
-                "buy" if operation == "挂买单"
-                else "sell" if operation == "挂卖单"
-                else "cancel" if operation == "撤单"
-                else "review"
-            )
-            # 仅生成可执行 item; AI 偶尔会输出 "保持挂单"/未知操作类型, 直接跳过避免污染 inbox。
-            if action_type not in {"buy", "sell", "cancel"}:
-                continue
-            reason_text = str(order_suggestion.get("理由") or "").strip() or None
-            # 兜底: AI 仍把"维持/保持现有/不变"类无变化建议挂在 buy/sell 下时, 也跳过。
-            if reason_text and re.search(r"维持|保持现有|已存在|既有|不变|继续挂", reason_text):
-                continue
-            items.append({
-                "source_section": "当前持仓与挂单分析与建议",
-                "item_kind": "position_order_cancel" if action_type == "cancel" else "position_order",
-                "title": title,
-                "subject_key": title_key,
-                "action_type": action_type,
-                "direction": str(order_suggestion.get("方向") or "").strip() or direction,
-                "strategy_type": "position_order",
-                "suggested_price_text": (
-                    None if action_type == "cancel"
-                    else str(order_suggestion.get("建议价格") or "").strip() or None
-                ),
-                "suggested_price_low_cents": None if action_type == "cancel" else low_cents,
-                "suggested_price_high_cents": None if action_type == "cancel" else high_cents,
-                "size_text": str(order_suggestion.get("建议数量或比例") or "").strip() or None,
-                "trigger_condition": str(order_suggestion.get("触发条件") or "").strip() or None,
-                "reason": reason_text,
-                "edge_text": None,
-                "confidence_text": confidence_text,
-                "correlation_group": correlation_group,
-                "priority_hint": appendix_map.get(title_key),
-                "raw_payload": order_suggestion,
-            })
-
-    # 为 warning items 预先解析 target_question:
-    # warning item 的 title 是 "up_to:79220" 这种合成 key, 不是真实 market question。
-    # 但 AI 给的 关联止盈止损 字段(如 "止盈 80k Yes")带有 BTC 阈值 + 方向。
-    # 候选市场列表(top_edge / swing / position)里有 "Will Bitcoin reach $80,000 in April?"
-    # 这种带具体价位的 question, 可以建立 阈值→question 映射, 让 plan 启用时无需 AI 单独提供。
-    btc_price_question_map: dict[int, str] = {}
-    for question in list(edge_map.keys()) + list(swing_map.keys()) + list(position_map.keys()):
-        # 候选市场原文 (edge_map keys 是 normalized text key, 拿不到原 question)
-        pass
-    # 重新从原始结构里提取带价位的 BTC question:
-    _all_questions: list[str] = []
-    for src in (
-        profit_ctx.get("top_edge_opportunities") or [],
-        profit_ctx.get("swing_opportunities") or [],
-    ):
-        for it in src:
-            if isinstance(it, dict):
-                q = str(it.get("question") or "").strip()
-                if q:
-                    _all_questions.append(q)
-    for it in profit_ctx.get("position_safety_assessment") or []:
-        if isinstance(it, dict):
-            q = str(it.get("title") or "").strip()
-            if q:
-                _all_questions.append(q)
-    _btc_price_re = re.compile(r"\$?([0-9][0-9,]{2,7})", re.IGNORECASE)
-    for q in _all_questions:
-        if "bitcoin" not in q.lower() and "btc" not in q.lower():
-            continue
-        for m in _btc_price_re.finditer(q):
-            try:
-                v = int(m.group(1).replace(",", ""))
-            except ValueError:
-                continue
-            if 10_000 <= v <= 1_000_000:
-                btc_price_question_map.setdefault(v, q)
-
-    def _resolve_warning_target(raw: dict) -> tuple[str | None, str | None]:
-        """根据 warning item 的 价格 / 关联止盈止损 推断 target_question + side。返回 (question, side)。"""
-        related = str(raw.get("关联止盈止损") or "")
-        # 方向: 优先看 "Yes"/"No"
-        side = None
-        if re.search(r"\bYes\b", related, re.IGNORECASE):
-            side = "Yes"
-        elif re.search(r"\bNo\b", related, re.IGNORECASE):
-            side = "No"
-        # 阈值: ① 关联文本里的 "80k"/"80,000"/"$80000"  ② warning 自己的 价格
-        candidates: list[int] = []
-        for token in re.finditer(r"(\d+(?:\.\d+)?)\s*[kK]\b", related):
-            try:
-                candidates.append(int(float(token.group(1)) * 1000))
-            except ValueError:
-                pass
-        for token in _btc_price_re.finditer(related):
-            try:
-                v = int(token.group(1).replace(",", ""))
-                if v >= 10_000:
-                    candidates.append(v)
-            except ValueError:
-                pass
-        # warning 价格自身(如 79220)只用作"找最接近的整千 reach 市场"
-        warn_price_raw = str(raw.get("价格") or "")
-        warn_price = None
-        m = _btc_price_re.search(warn_price_raw)
-        if m:
-            try:
-                warn_price = int(m.group(1).replace(",", ""))
-            except ValueError:
-                warn_price = None
-        # 选最匹配的 question
-        for thr in candidates:
-            if thr in btc_price_question_map:
-                return btc_price_question_map[thr], side
-        if warn_price and btc_price_question_map:
-            # 找最接近且 ≥ warn_price 的市场 (向上 reach 市场更可能是预警目标)
-            up_options = sorted(p for p in btc_price_question_map if p >= warn_price)
-            if up_options:
-                return btc_price_question_map[up_options[0]], side
-        return None, side
-
-    for item in output.get("预警信号", []):
-        if not isinstance(item, dict):
-            continue
-        title = f"{item.get('预警方向')}:{item.get('价格')}"
-        default_q, default_side = _resolve_warning_target(item)
-        items.append({
-            "source_section": "预警信号",
-            "item_kind": "warning",
-            "title": title,
-            "subject_key": _normalize_text_key(title),
-            "action_type": "alert",
-            "direction": str(item.get("预警方向") or "").strip() or None,
-            "strategy_type": "warning",
-            "suggested_price_text": str(item.get("价格") or "").strip() or None,
-            "suggested_price_low_cents": None,
-            "suggested_price_high_cents": None,
-            "size_text": None,
-            "trigger_condition": str(item.get("关联止盈止损") or "").strip() or None,
-            "reason": str(item.get("操作建议") or "").strip() or None,
-            "edge_text": None,
-            "confidence_text": None,
-            "correlation_group": None,
-            "priority_hint": "立即执行",
-            "raw_payload": item,
-            # warning 类 item 专用:plan 启用时 target_question 缺失则回退到这里
-            "default_target_question": default_q,
-            "default_target_side": default_side,
         })
 
     return items

@@ -1,8 +1,8 @@
 """Path-to-date extrema + dynamic drift/EWMA σ helpers (Fair-Value P0+P1).
 
-All functions are pure / side-effect free except `compute_path_extrema_from_1s`
-which queries Postgres `btc_poly_1s_ticks`. They are extracted so that
-`scripts/advisory_recalibrate.py` can replay them on historical windows
+All functions are pure / side-effect free except `compute_path_extrema_from_binance`
+which hits Binance kline REST API (with a small TTL cache). They are extracted so
+that `scripts/advisory_recalibrate.py` can replay them on historical windows
 without going through the live batch runner.
 """
 
@@ -12,10 +12,12 @@ import calendar
 import logging
 import math
 import re
+import time
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
-from data.database import get_conn
+from data.binance import get_path_extrema
 
 logger = logging.getLogger(__name__)
 
@@ -48,21 +50,30 @@ def parse_slug_to_month_window(slug: str) -> Optional[tuple[datetime, datetime]]
 
 # --- path-to-date extrema ---------------------------------------------------
 
-# If 1s data covers < this fraction of the elapsed window we fall back to
-# daily klines (gaps from monitor restarts could understate path-min).
+# If 1m data covers < this fraction of the elapsed window we fall back to
+# daily klines (Binance API failure could leave gaps).
 _MIN_1S_COVERAGE = 0.5
 
+# TTL cache：advisory batch 每 5min 跑一次，60s 缓存可让同一批次内多次调用复用，
+# 但不会让陈旧结果延续到下一批次。Key=(start_sec, end_sec_floor_60s)。
+_CACHE_TTL_SEC = 60
+_CACHE: dict[tuple[int, int], tuple[float, tuple[float, float, float, str]]] = {}
+_CACHE_LOCK = threading.Lock()
 
-def compute_path_extrema_from_1s(
+
+def compute_path_extrema_from_binance(
     start_utc: datetime,
     end_utc: datetime,
+    interval: str = "5m",
 ) -> tuple[float, float, float, str]:
     """Return (path_max, path_min, coverage_ratio, source).
 
-    Queries `btc_poly_1s_ticks` for max/min btc_price between
-    [start_utc, end_utc] (clamped to now if end is in the future).
-    coverage_ratio = distinct_seconds / window_seconds.
-    Returns (0, 0, 0, "no_data") on empty / error.
+    用 Binance kline 在 [start_utc, end_utc] (end 截到 now) 算 path 最高/最低。
+    Polymarket 月度 BTC barrier 用 Binance 现货 OHLC 结算，与此处源一致。
+    barrier touch 用 high/low 即可，1m 与 5m 结果一致（5m.high = max of 5×1m.high），
+    默认 5m 在精度无损的前提下减少 5× 请求量与延迟。
+    coverage = 实际拿到的 bar 数 / 期望 bar 数。
+    空窗口/拉取异常 → (0, 0, 0, error_source)。
     """
     now = datetime.now(timezone.utc)
     effective_end = min(end_utc, now)
@@ -70,34 +81,43 @@ def compute_path_extrema_from_1s(
         return 0.0, 0.0, 0.0, "empty_window"
 
     start_sec = int(start_utc.timestamp())
-    end_sec = int(effective_end.timestamp())
-    window_sec = max(1, end_sec - start_sec)
+    # 把 end 向下取整到 5min，对齐 advisory_batch 5min 节奏，确保同批次内 cache 命中
+    end_sec = int(effective_end.timestamp()) // 300 * 300
+
+    key = (start_sec, end_sec, interval)
+    now_t = time.time()
+    with _CACHE_LOCK:
+        cached = _CACHE.get(key)
+        if cached and now_t - cached[0] <= _CACHE_TTL_SEC:
+            return cached[1]
 
     try:
-        with get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT MAX(btc_price), MIN(btc_price), COUNT(DISTINCT ts_sec)
-                FROM btc_poly_1s_ticks
-                WHERE ts_sec BETWEEN %s AND %s
-                  AND btc_price IS NOT NULL
-                """,
-                (start_sec, end_sec),
-            )
-            row = cur.fetchone()
+        pmax, pmin, coverage, n = get_path_extrema(
+            start_utc, effective_end, interval=interval
+        )
     except Exception:
-        logger.exception("btc_poly_1s_ticks query failed")
+        logger.exception("Binance get_path_extrema failed")
         return 0.0, 0.0, 0.0, "query_error"
 
-    if not row or row[0] is None:
-        return 0.0, 0.0, 0.0, "no_data"
+    if pmax <= 0 or n == 0:
+        result = (0.0, 0.0, 0.0, "no_data")
+    else:
+        source = (
+            f"binance_{interval}_kline({start_utc.date()}..{effective_end.date()},"
+            f"bars={n},cov={coverage:.2%})"
+        )
+        result = (pmax, pmin, coverage, source)
 
-    pmax = float(row[0])
-    pmin = float(row[1])
-    coverage = float(row[2] or 0) / window_sec
-    source = f"btc_poly_1s({start_utc.date()}..{effective_end.date()},cov={coverage:.2%})"
-    return pmax, pmin, coverage, source
+    with _CACHE_LOCK:
+        _CACHE[key] = (now_t, result)
+        if len(_CACHE) > 32:
+            oldest = min(_CACHE.items(), key=lambda kv: kv[1][0])[0]
+            _CACHE.pop(oldest, None)
+    return result
+
+
+# 兼容别名（原 1s 实现已迁出到 Binance）
+compute_path_extrema_from_1s = compute_path_extrema_from_binance
 
 
 def compute_path_extrema_with_fallback(
@@ -112,9 +132,9 @@ def compute_path_extrema_with_fallback(
     Fallback triggers on: empty window, no rows, query error, or
     coverage < _MIN_1S_COVERAGE.
     """
-    pmax, pmin, cov, src = compute_path_extrema_from_1s(start_utc, end_utc)
+    pmax, pmin, cov, src = compute_path_extrema_from_binance(start_utc, end_utc)
     if pmax <= 0 or cov < _MIN_1S_COVERAGE:
-        return fallback_high, fallback_low, f"kline_fallback({fallback_source};1s_cov={cov:.2%})"
+        return fallback_high, fallback_low, f"kline_fallback({fallback_source};1m_cov={cov:.2%})"
     return pmax, pmin, src
 
 

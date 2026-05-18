@@ -3,7 +3,7 @@
 
 启动顺序:
   1. 拿 PG advisory lock,确保整个集群只有一个 executor 在跑
-  2. 启动 ChainlinkBTCPriceWatcher,把价格事件 enqueue 进 TriggerEngine
+  2. 启动 BinanceBTCPriceWatcher,把价格事件 enqueue 进 TriggerEngine
   3. TriggerEngine.start() — worker thread 从 queue 消费 + refresh thread 每 30s 刷 DB
   4. SIGTERM/SIGINT 优雅退出
 
@@ -23,7 +23,7 @@ import socket
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # 项目根加入 sys.path,与其他 root entry 对齐
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -32,8 +32,8 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from py_clob_client_v2.clob_types import OrderType  # noqa: E402
 
-from data.polymarket import buy_order, sell_order, get_best_prices  # noqa: E402
-from services.shared.watchers import ChainlinkBTCPriceWatcher  # noqa: E402
+from data.polymarket import buy_order, sell_order, get_best_prices, get_balance_allowance, get_positions  # noqa: E402
+from services.shared.watchers import BinanceBTCPriceWatcher  # noqa: E402
 from services.recommendation_db import RecommendationDB  # noqa: E402
 from services.recommendation_trigger import auto_trigger_db as atdb  # noqa: E402
 from services.recommendation_trigger.engine import TriggerEngine, _PlanEntry  # noqa: E402
@@ -250,9 +250,93 @@ def main() -> int:
 
     _last_expiry_sweep = [0.0]
 
-    def _process_manual_pending(price: float) -> None:
+    def _resolve_size_at_fire(
+        *,
+        action: str,
+        token_id: str,
+        size_spec: dict,
+        limit_price: float,
+    ) -> tuple[float, str]:
+        """根据 size_spec 在 fire 瞬间计算实际下单 shares,返回 (size, debug_info)。
+        失败抛 ValueError(error_message)。
+        """
+        st = (size_spec or {}).get("type") or "shares"
+        sv = float(size_spec.get("value") or 0)
+        if sv <= 0:
+            raise ValueError(f"size_spec.value={sv} 非法")
+        if st == "shares":
+            return round(sv, 2), f"shares={sv}"
+        if st == "usdc":
+            if limit_price <= 0:
+                raise ValueError("usdc sizing 需要正 limit_price")
+            return round(sv / limit_price, 2), f"usdc={sv}/price={limit_price}"
+        if st == "pct_balance":
+            try:
+                bal_str = get_balance_allowance(profile=AUTO_EXECUTOR_PM_PROFILE)
+                balance = float(bal_str.lstrip("$"))
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"取 USDC 余额失败: {exc}") from exc
+            usdc_to_use = balance * sv / 100.0
+            if usdc_to_use <= 0 or limit_price <= 0:
+                raise ValueError(f"pct_balance 计算结果非法: balance={balance} pct={sv} price={limit_price}")
+            return round(usdc_to_use / limit_price, 2), f"balance={balance}*{sv}%/price={limit_price}"
+        if st == "pct_position":
+            try:
+                positions = get_positions(profile=AUTO_EXECUTOR_PM_PROFILE)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"取持仓失败: {exc}") from exc
+            pos_shares = 0.0
+            for p in positions or []:
+                if str(p.get("asset") or p.get("token_id") or "") == token_id:
+                    try:
+                        pos_shares = float(p.get("size") or 0)
+                    except (TypeError, ValueError):
+                        pos_shares = 0.0
+                    break
+            if pos_shares <= 0:
+                raise ValueError(f"无可卖持仓 (token_id={token_id[:10]}...)")
+            return round(pos_shares * sv / 100.0, 2), f"position={pos_shares}*{sv}%"
+        raise ValueError(f"未知 size_spec.type={st}")
+
+    def _resolve_price_at_fire(
+        *,
+        action: str,
+        token_id: str,
+        price_spec: dict,
+        parent_fill_price: Optional[float] = None,
+        fallback_price: float = 0.5,
+    ) -> tuple[float, str]:
+        """根据 price_spec 在 fire 瞬间计算 limit price,返回 (price, debug_info)。"""
+        pt = (price_spec or {}).get("type") or "absolute"
+        if pt == "absolute":
+            v = float(price_spec.get("value") or fallback_price)
+            return round(max(0.01, min(0.99, v)), 3), f"abs={v}"
+        if pt == "market":
+            offset = float(price_spec.get("offset") or 0.0)
+            try:
+                quotes = get_best_prices([token_id], profile=AUTO_EXECUTOR_PM_PROFILE)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"取 best_prices 失败: {exc}") from exc
+            q = quotes.get(token_id) or {}
+            ref = q.get("best_ask") if action == "buy" else q.get("best_bid")
+            if not ref or ref <= 0:
+                raise ValueError(f"market mode 无法取到 best_{'ask' if action=='buy' else 'bid'}")
+            computed = round(float(ref) + offset, 3)
+            return max(0.01, min(0.99, computed)), f"market:{'ask' if action=='buy' else 'bid'}={ref}+{offset}"
+        if pt == "cost_pct":
+            if parent_fill_price is None or parent_fill_price <= 0:
+                raise ValueError("cost_pct price 需要 parent_fill_price")
+            pct = float(price_spec.get("value") or 0)
+            computed = round(parent_fill_price * (1.0 + pct / 100.0), 3)
+            return max(0.01, min(0.99, computed)), f"cost={parent_fill_price}*(1+{pct}%)"
+        raise ValueError(f"未知 price_spec.type={pt}")
+
+    def _process_manual_pending(
+        btc_price: Optional[float] = None,
+        share_prices: Optional[dict[str, float]] = None,
+    ) -> None:
         try:
-            triggered = _mpo.fetch_triggered_orders(price)
+            triggered = _mpo.fetch_triggered_orders(btc_price, share_prices=share_prices)
         except Exception:  # noqa: BLE001
             logger.exception("manual_pending fetch_triggered 失败")
             return
@@ -265,29 +349,61 @@ def main() -> int:
                 continue
             if not claimed:
                 continue  # 已被别人/前一次 tick claim
-            action = claimed['action']
-            limit_price = float(claimed['price'])
-            extra = claimed.get('extra') or {}
-            offset = extra.get('trigger_market_offset') if isinstance(extra, dict) else None
-            if offset is not None:
-                try:
-                    quotes = get_best_prices([claimed['token_id']], profile=AUTO_EXECUTOR_PM_PROFILE)
-                    best_bid = (quotes.get(claimed['token_id']) or {}).get('best_bid')
-                except Exception:  # noqa: BLE001
-                    logger.exception("[manual_pending %s] 获取 best_bid 失败", order_id)
-                    best_bid = None
-                if not best_bid or best_bid <= 0:
-                    _mpo.mark_order_failed(order_id, error_message="无法获取 best_bid,放弃市价挂单")
-                    continue
-                computed = round(best_bid + float(offset), 3)
-                computed = max(0.01, min(0.99, computed))
-                logger.info("[manual_pending %s] market mode: best_bid=%s offset=%s -> price=%s",
-                            order_id, best_bid, offset, computed)
-                limit_price = computed
 
-            logger.info("[manual_pending %s] FIRE action=%s op=%s thr=%s btc=%s market=%s price=%s size=%s",
-                        order_id, action, claimed['trigger_op'], claimed['trigger_btc_price'],
-                        price, claimed['market_id'], limit_price, claimed['size'])
+            action = claimed['action']
+            token_id = claimed['token_id']
+            market_id = claimed['market_id']
+            size_spec = claimed.get('size_spec') or {"type": "shares", "value": claimed.get('size') or 0}
+            price_spec = claimed.get('price_spec')
+            if not price_spec:
+                # 兼容老路径:trigger_market_offset 走 sell 市价;否则用 absolute price
+                extra = claimed.get('extra') or {}
+                legacy_offset = extra.get('trigger_market_offset') if isinstance(extra, dict) else None
+                if legacy_offset is not None:
+                    price_spec = {"type": "market", "offset": float(legacy_offset)}
+                else:
+                    price_spec = {"type": "absolute", "value": float(claimed.get('price') or 0.5)}
+
+            parent_fill_price = order.get('_parent_fill_price')
+
+            # 1. 先算 limit price (usdc/pct_balance sizing 需要)
+            try:
+                limit_price, price_dbg = _resolve_price_at_fire(
+                    action=action,
+                    token_id=token_id,
+                    price_spec=price_spec,
+                    parent_fill_price=parent_fill_price,
+                    fallback_price=float(claimed.get('price') or 0.5),
+                )
+            except ValueError as ve:
+                logger.warning("[manual_pending %s] price 解析失败: %s", order_id, ve)
+                _mpo.mark_order_failed(order_id, error_message=f"price spec: {ve}")
+                continue
+
+            # 2. 再算 size
+            try:
+                size, size_dbg = _resolve_size_at_fire(
+                    action=action,
+                    token_id=token_id,
+                    size_spec=size_spec,
+                    limit_price=limit_price,
+                )
+            except ValueError as ve:
+                logger.warning("[manual_pending %s] size 解析失败: %s", order_id, ve)
+                _mpo.mark_order_failed(order_id, error_message=f"size spec: {ve}")
+                continue
+
+            if size <= 0:
+                _mpo.mark_order_failed(order_id, error_message=f"resolved size={size}")
+                continue
+
+            logger.info(
+                "[manual_pending %s] FIRE action=%s kind=%s btc=%s plan=%s parent=%s price=%s (%s) size=%s (%s)",
+                order_id, action, claimed.get('trigger_kind'), btc_price,
+                claimed.get('plan_id'), claimed.get('parent_pending_id'),
+                limit_price, price_dbg, size, size_dbg,
+            )
+
             if DRY_RUN:
                 logger.info("[manual_pending %s] DRY-RUN 不真实下单", order_id)
                 _mpo.mark_order_failed(order_id, error_message="dry-run, not executed")
@@ -295,18 +411,18 @@ def main() -> int:
             try:
                 if action == 'buy':
                     fired_id = buy_order(
-                        market_id=claimed['market_id'],
-                        token_id=claimed['token_id'],
+                        market_id=market_id,
+                        token_id=token_id,
                         price=limit_price,
-                        size=float(claimed['size']),
+                        size=size,
                         profile=AUTO_EXECUTOR_PM_PROFILE,
                     )
                 else:
                     fired_id = sell_order(
-                        market_id=claimed['market_id'],
-                        token_id=claimed['token_id'],
+                        market_id=market_id,
+                        token_id=token_id,
                         price=limit_price,
-                        size=float(claimed['size']),
+                        size=size,
                         profile=AUTO_EXECUTOR_PM_PROFILE,
                     )
             except Exception as exc:  # noqa: BLE001
@@ -316,8 +432,9 @@ def main() -> int:
             if not fired_id:
                 _mpo.mark_order_failed(order_id, error_message=f"{action}_order returned empty id")
                 continue
-            _mpo.mark_order_fired(order_id, fired_order_id=str(fired_id))
-            logger.info("[manual_pending %s] DONE order_id=%s", order_id, fired_id)
+            # fill_price = limit price (Polymarket limit 单成交不会差于限价,作为子档 cost basis)
+            _mpo.mark_order_fired(order_id, fired_order_id=str(fired_id), fill_price=limit_price)
+            logger.info("[manual_pending %s] DONE order_id=%s fill_price=%s", order_id, fired_id, limit_price)
 
     def _on_btc(payload: dict[str, Any]) -> None:
         try:
@@ -328,8 +445,8 @@ def main() -> int:
             engine.enqueue_btc_price(price, payload.get("update_time"))
         except (TypeError, ValueError):
             pass
-        _process_manual_pending(price)
-        # 每 60s 扫一次过期 pending
+        _process_manual_pending(btc_price=price)
+        # 每 60s 扫一次过期 pending + 卡死 executing
         now_ts = time.time()
         if now_ts - _last_expiry_sweep[0] > 60:
             _last_expiry_sweep[0] = now_ts
@@ -339,11 +456,62 @@ def main() -> int:
                     logger.info("manual_pending 过期清理: %s", n)
             except Exception:  # noqa: BLE001
                 logger.exception("manual_pending expire_overdue_orders 失败")
+            try:
+                stale_report = _mpo.repair_stale_executing_orders(
+                    timeout_minutes=int(os.getenv("MANUAL_PENDING_STALE_EXECUTING_MIN", "10"))
+                )
+                if stale_report.get("marked_failed"):
+                    logger.warning(
+                        "manual_pending stale-executing 告警: scanned=%s marked_failed=%s ids=%s",
+                        stale_report.get("scanned"),
+                        stale_report.get("marked_failed"),
+                        stale_report.get("ids"),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception("manual_pending repair_stale_executing_orders 失败")
 
-    watcher = ChainlinkBTCPriceWatcher(symbol="btcusdt", callback=_on_btc)
+    # ============ share 价轮询线程 ============
+    # 5s 一轮:收集 share_abs / share_cost_pct 类挂单的 token_id,批量取 best_bid/ask,
+    # 取中间价作为 share price 输入,触发后走与 BTC 相同的 _process_manual_pending 路径。
+    SHARE_POLL_INTERVAL = float(os.getenv("MANUAL_PENDING_SHARE_POLL_SEC", "5"))
+
+    def _share_poll_loop() -> None:
+        logger.info("manual_pending share-price 轮询启动 interval=%ss", SHARE_POLL_INTERVAL)
+        while not stop["flag"]:
+            try:
+                token_ids = _mpo.collect_active_share_token_ids()
+                share_prices: dict[str, float] = {}
+                if token_ids:
+                    quotes = get_best_prices(token_ids, profile=AUTO_EXECUTOR_PM_PROFILE)
+                    for tid, q in (quotes or {}).items():
+                        bid = (q or {}).get("best_bid")
+                        ask = (q or {}).get("best_ask")
+                        if bid and ask and bid > 0 and ask > 0:
+                            share_prices[tid] = (float(bid) + float(ask)) / 2.0
+                        elif bid:
+                            share_prices[tid] = float(bid)
+                        elif ask:
+                            share_prices[tid] = float(ask)
+                # 始终调用 _process_manual_pending:
+                #  - 有 share_prices: 评估 share_abs / share_cost_pct
+                #  - 无 share_prices: 仍可触发 time_after_parent_fill (纯时间,不依赖价格)
+                _process_manual_pending(share_prices=share_prices if share_prices else None)
+            except Exception:  # noqa: BLE001
+                logger.exception("share-price 轮询异常")
+            # 用 sleep 而不是 Event.wait 简化(stop 时最多多等 SHARE_POLL_INTERVAL)
+            for _ in range(int(max(1, SHARE_POLL_INTERVAL))):
+                if stop["flag"]:
+                    break
+                time.sleep(1)
+        logger.info("manual_pending share-price 轮询退出")
+
+    watcher = BinanceBTCPriceWatcher(symbol="btcusdt", callback=_on_btc)
     watcher.start()
 
     stop = {"flag": False}
+
+    share_thread = __import__("threading").Thread(target=_share_poll_loop, name="mpo-share-poll", daemon=True)
+    share_thread.start()
 
     def _handle_signal(signum, frame):  # noqa: ARG001
         logger.info("收到信号 %s,准备退出", signum)

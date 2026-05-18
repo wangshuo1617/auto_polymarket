@@ -60,7 +60,7 @@ auto_polymarket/
 │   │   ├── engine.py            # TriggerEngine：消费价格事件队列
 │   │   └── parser.py            # 触发条件解析
 │   ├── shared/
-│   │   └── watchers.py          # ChainlinkBTCPriceWatcher（WebSocket）
+│   │   └── watchers.py          # BinanceBTCPriceWatcher（WebSocket aggTrade）
 │   ├── position.py              # 持仓与挂单匹配、格式化
 │   ├── market_sentiment.py      # 市场情绪聚合
 │   └── wallet_transfer.py       # 钱包划转

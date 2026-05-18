@@ -14,173 +14,174 @@ def generate_overview_section(text: str) -> str:
     """
 
 
-def generate_position_and_orders_section(items: list) -> str:
-    """Part 2: 当前持仓、当前挂单分析与建议（已参与的 event）"""
-    if not items:
-        return '<div class="card"><div class="card-body muted">暂无已参与仓位</div></div>'
-    html = ""
-    for block in items:
-        event_name = block.get("事件或合约", "")
-        summary = block.get("仓位简述", "")
-        hold_condition = block.get("持有条件", "")
-        layered_exit_plan = block.get("分层离场计划", "")
-        orders = block.get("挂单建议", [])
-        exit_risk = block.get("离场风控", {})
-        order_rows = ""
-        for o in orders:
-            op_type = o.get("操作类型", "")
-            icon = "🟢" if op_type == "挂买单" else "🔴"
-            price = o.get("建议价格")
-            price_str = f" <strong>{price}¢</strong>" if price is not None else ""
-            direction = o.get("方向", "")
-            size = o.get("建议数量或比例", "")
-            reason = o.get("理由", "")
-            order_rows += f"""
-            <div class="ladder-step">
-                <div class="step-price">{icon} {op_type} {direction}{price_str} · {size or '-'}</div>
-                <div class="step-logic">触发条件：{o.get('触发条件', '-')}</div>
-                <div class="step-logic">{reason}</div>
+def generate_btc_forecast_section(forecast: dict) -> str:
+    """Part 2: BTC 短期预测 (24-48h + 月底 + 新闻驱动因子)"""
+    if not isinstance(forecast, dict) or not forecast:
+        return ""
+
+    direction = forecast.get("方向判断", "")
+    confidence = forecast.get("置信度", "")
+    current_price = forecast.get("当前价格", "")
+    target_range = forecast.get("24h目标区间", "")
+    eom_direction = forecast.get("月底方向判断", "")
+    eom_range = forecast.get("月底目标区间", "")
+    support = forecast.get("关键支撑位", "")
+    resistance = forecast.get("关键阻力位", "")
+    paths = forecast.get("路径概率", []) or []
+    news = forecast.get("新闻驱动因子", []) or []
+    logic = forecast.get("核心逻辑", "")
+    risk = forecast.get("风险提示", "")
+
+    dir_colors = {
+        "看涨": ("#10b981", "#10b98120", "📈"),
+        "看跌": ("#ef4444", "#ef444420", "📉"),
+        "震荡": ("#f59e0b", "#f59e0b20", "↔️"),
+    }
+    color, bg, icon = dir_colors.get(direction, ("#64748b", "#64748b20", "❓"))
+    eom_color, eom_bg, eom_icon = dir_colors.get(eom_direction, ("#64748b", "#64748b20", "❓"))
+
+    conf_colors = {"高": "#10b981", "中": "#f59e0b", "低": "#ef4444"}
+    conf_color = conf_colors.get(confidence, "#64748b")
+
+    path_rows = ""
+    for p in paths:
+        if not isinstance(p, dict):
+            continue
+        path_rows += f"""
+            <div style="display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #1e293b;">
+                <span style="color: #e2e8f0;">{p.get('路径', '')}</span>
+                <span style="color: #94a3b8; flex: 1; margin: 0 12px; font-size: 13px;">{p.get('描述', '')}</span>
+                <span style="color: {color}; font-weight: 600; white-space: nowrap;">{p.get('概率', '')}</span>
+            </div>"""
+
+    news_bias_colors = {"偏多": "#10b981", "偏空": "#ef4444", "偏震荡": "#f59e0b"}
+    news_rows = ""
+    for n in news:
+        if not isinstance(n, dict):
+            continue
+        bias = n.get("方向偏置", "")
+        nb_color = news_bias_colors.get(bias, "#64748b")
+        src = n.get("来源", "")
+        src_link = (
+            f'<a href="{src}" style="color:#60a5fa; text-decoration: none;">🔗 来源</a>'
+            if src else ""
+        )
+        when = n.get("发布时间", "")
+        when_block = f"<span style='color:#64748b; font-size:12px; margin-left:8px;'>{when}</span>" if when else ""
+        news_rows += f"""
+            <div style="padding: 8px 0; border-bottom: 1px solid #1e293b;">
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+                    <span class="status-badge" style="background: {nb_color}20; color: {nb_color};">{bias or '-'}</span>
+                    <strong style="color:#e2e8f0;">{n.get('事件','')}</strong>
+                    {when_block}
+                </div>
+                <div style="color:#94a3b8; font-size:13px; margin-left:4px;">{n.get('影响说明','')} {src_link}</div>
+            </div>"""
+
+    return f"""
+        <h2 style="color: {color};">{icon} 二、BTC 短期预测</h2>
+        <div class="card" style="border-left: 4px solid {color};">
+            <div class="card-body">
+                <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap;">
+                    <div class="status-badge" style="background: {bg}; color: {color}; font-size: 16px; padding: 6px 16px;">24-48h {direction}</div>
+                    <div class="status-badge" style="background: #334155; color: {conf_color};">置信度：{confidence}</div>
+                    <div class="status-badge" style="background: {eom_bg}; color: {eom_color};">{eom_icon} 月底：{eom_direction}</div>
+                    <span style="color: #94a3b8;">当前 {current_price}</span>
+                </div>
+                <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 12px;">
+                    <div style="flex: 1; min-width: 140px; background: #1e293b; border-radius: 6px; padding: 10px;">
+                        <div style="color: #64748b; font-size: 12px;">24h 目标区间</div>
+                        <div style="color: #e2e8f0; font-weight: 600;">{target_range}</div>
+                    </div>
+                    <div style="flex: 1; min-width: 140px; background: #1e293b; border-radius: 6px; padding: 10px;">
+                        <div style="color: #64748b; font-size: 12px;">月底目标区间</div>
+                        <div style="color: {eom_color}; font-weight: 600;">{eom_range}</div>
+                    </div>
+                    <div style="flex: 1; min-width: 140px; background: #1e293b; border-radius: 6px; padding: 10px;">
+                        <div style="color: #64748b; font-size: 12px;">关键支撑</div>
+                        <div style="color: #10b981; font-weight: 600;">{support}</div>
+                    </div>
+                    <div style="flex: 1; min-width: 140px; background: #1e293b; border-radius: 6px; padding: 10px;">
+                        <div style="color: #64748b; font-size: 12px;">关键阻力</div>
+                        <div style="color: #ef4444; font-weight: 600;">{resistance}</div>
+                    </div>
+                </div>
+                <div style="margin-bottom: 12px;">
+                    <div style="color: #94a3b8; font-size: 13px; margin-bottom: 6px;">📊 路径概率</div>
+                    {path_rows}
+                </div>
+                {'<div style="margin-bottom: 12px;"><div style="color: #94a3b8; font-size: 13px; margin-bottom: 6px;">📰 新闻驱动因子</div>' + news_rows + '</div>' if news_rows else ''}
+                {'<div class="logic-text" style="margin-bottom: 8px;">📌 核心逻辑：' + logic + '</div>' if logic else ''}
+                {'<div class="logic-text" style="color: #f59e0b;">⚠️ 风险提示：' + risk + '</div>' if risk else ''}
             </div>
-            """
+        </div>
+    """
 
-        exit_risk_html = ""
-        if exit_risk:
-            exit_risk_html = f"""
-                <div class="action-box" style="margin-top: 10px; border-left: 3px solid #f59e0b;">
-                    🛡️ 离场风控：状态={exit_risk.get('市场状态', '-')}, ATR={exit_risk.get('ATR百分比', '-') }%,
-                    波动分位={exit_risk.get('波动分位', '-')},
-                    止盈={exit_risk.get('止盈阈值', '-')}, 止损={exit_risk.get('止损阈值', '-')}
-                </div>
-            """
 
-        hold_plan_html = ""
-        if hold_condition or layered_exit_plan:
-            hold_plan_html = f"""
-                <div class="action-box" style="margin-top: 10px; border-left: 3px solid #3b82f6;">
-                    ⏳ 持有条件：{hold_condition or '-'}<br>
-                    📚 分层离场计划：{layered_exit_plan or '-'}
-                </div>
-            """
+def generate_action_list_section(items: list) -> str:
+    """Part 5.5: 操作清单（聚合可执行动作 + 止盈止损）"""
+    if not items:
+        return '<div class="card"><div class="card-body muted">暂无操作清单</div></div>'
+
+    _PRIORITY_RANK = {"立即执行": 0, "挂单等待": 1, "仅观察": 2}
+    _OP_COLOR = {"买入": "#10b981", "卖出": "#ef4444", "撤单": "#6b7280", "持有观察": "#3b82f6"}
+
+    def _sort_key(it):
+        return _PRIORITY_RANK.get(str(it.get("优先级") or "").strip(), 99)
+
+    html = ""
+    for item in sorted([i for i in items if isinstance(i, dict)], key=_sort_key):
+        op = str(item.get("操作") or "").strip() or "操作"
+        title = item.get("标的") or ""
+        direction = item.get("方向") or ""
+        price = item.get("价格") or ""
+        size = item.get("金额或数量") or ""
+        trigger = item.get("触发条件") or ""
+        take_profit = item.get("止盈目标") or ""
+        stop_loss = item.get("止损规则") or ""
+        max_hold = item.get("最长持仓") or ""
+        priority = item.get("优先级") or ""
+        reason = item.get("理由") or ""
+        color = _OP_COLOR.get(op, "#6366f1")
+
+        meta_lines = ""
+        if price:
+            meta_lines += f"<div class='logic-text'>价格：<strong>{price}</strong></div>"
+        if size:
+            meta_lines += f"<div class='logic-text'>金额/数量：{size}</div>"
+        if trigger:
+            meta_lines += f"<div class='logic-text'>触发条件：{trigger}</div>"
+        if take_profit:
+            meta_lines += f"<div class='logic-text'>🎯 止盈目标：{take_profit}</div>"
+        if stop_loss:
+            meta_lines += f"<div class='logic-text'>🛑 止损规则：{stop_loss}</div>"
+        if max_hold:
+            meta_lines += f"<div class='logic-text'>⏱️ 最长持仓：{max_hold}</div>"
+        if reason:
+            meta_lines += f"<div class='logic-text'>理由：{reason}</div>"
+
+        direction_badge = f" · {direction}" if direction else ""
+        priority_badge = f"<div class='status-badge' style='background: {color}20; color: {color};'>{priority or op}</div>"
+
         html += f"""
         <div class="card action-card">
-            <div class="card-header" style="border-left: 4px solid #10b981;">
-                <div class="contract-title">{event_name}</div>
+            <div class="card-header" style="border-left: 4px solid {color};">
+                <div class="contract-title">{op}：{title}{direction_badge}</div>
+                {priority_badge}
             </div>
             <div class="card-body">
-                <div class="action-box" style="margin-bottom: 10px;">📋 仓位简述：{summary}</div>
-                <div class="muted" style="margin-bottom: 6px;">挂单建议：</div>
-                <div class="ladder-container">{order_rows}</div>
-                {exit_risk_html}
-                {hold_plan_html}
+                {meta_lines}
             </div>
         </div>
         """
     return html
 
-
-def generate_new_position_section(items: list) -> str:
-    """Part 3: 建仓建议（未参与的 event）"""
-    if not items:
-        return '<div class="card"><div class="card-body muted">暂无建仓建议</div></div>'
-    html = ""
-    for item in items:
-        event_or_question = item.get("事件或问题", "")
-        direction = item.get("建议方向", "")
-        price_range = item.get("建议价格区间", "")
-        amount = item.get("建议投入金额或比例", "")
-        edge_hint = item.get("预估优势", "")
-        cap_hint = item.get("建议仓位上限", "")
-        reason = item.get("理由", "")
-
-        extra_lines = ""
-        if edge_hint:
-            extra_lines += f"<div class='logic-text'>预估优势：{edge_hint}</div>"
-        if cap_hint:
-            extra_lines += f"<div class='logic-text'>建议仓位上限：{cap_hint}</div>"
-
-        html += f"""
-        <div class="card action-card">
-            <div class="card-header" style="border-left: 4px solid #f59e0b;">
-                <div class="contract-title">{event_or_question}</div>
-                <div class="status-badge" style="background: #f59e0b20; color: #f59e0b;">{direction}</div>
-            </div>
-            <div class="card-body">
-                <div class="action-box">建议价格区间：<strong>{price_range}</strong> · 建议投入：{amount}</div>
-                {extra_lines}
-                <div class="logic-text">理由：{reason}</div>
-            </div>
-        </div>
-        """
-    return html
-
-def generate_alert_rows(items):
-    rows = ""
-    for item in items:
-        # 判断方向颜色
-        is_up = item['预警方向'] == 'up_to'
-        color = "#10b981" if is_up else "#ef4444"
-        icon = "📈" if is_up else "📉"
-        direction_text = "向上突破" if is_up else "向下触及"
-        
-        rows += f"""
-        <div class="alert-item" style="border-color: {color};">
-            <div class="alert-price" style="color: {color};">
-                {icon} BTC {direction_text} <strong>${item['价格']}</strong>
-            </div>
-            <div class="alert-action">
-                {item['操作建议']}
-            </div>
-            <div class="alert-action muted" style="margin-top: 4px;">
-                {item.get('关联止盈止损', '')}
-            </div>
-        </div>
-        """
-    return rows
 
 def generate_market_snapshot(snapshot_text):
     """生成市场快照部分的 HTML（兼容旧 key 市场与持仓快照）"""
     if not snapshot_text:
         return ""
     return generate_overview_section(snapshot_text)
-
-
-def generate_interpretation_appendix(items: list) -> str:
-    """Part 5: 报告解读附录（快速执行版）"""
-    if not items:
-        return ""
-
-    rows = ""
-    for item in items:
-        target = item.get("标的", "")
-        priority = item.get("执行优先级", "")
-        summary = item.get("一句话结论", "")
-        action = item.get("执行要点", "")
-
-        priority_bg = "#334155"
-        priority_color = "#e2e8f0"
-        if priority == "立即执行":
-            priority_bg = "#ef444420"
-            priority_color = "#f87171"
-        elif priority == "挂单等待":
-            priority_bg = "#f59e0b20"
-            priority_color = "#fbbf24"
-        elif priority == "仅观察":
-            priority_bg = "#3b82f620"
-            priority_color = "#60a5fa"
-
-        rows += f"""
-        <div class="card action-card">
-            <div class="card-header" style="border-left: 4px solid #3b82f6;">
-                <div class="contract-title">{target}</div>
-                <div class="status-badge" style="background: {priority_bg}; color: {priority_color};">{priority or '未分类'}</div>
-            </div>
-            <div class="card-body">
-                <div class="action-box">{summary}</div>
-                <div class="logic-text">执行要点：{action}</div>
-            </div>
-        </div>
-        """
-    return rows
 
 
 def generate_monthly_strategy_html(data: dict) -> str:
@@ -466,17 +467,10 @@ def generate_html_template(data):
 
         {generate_overview_section(data.get("整体分析", "") or data.get("市场与持仓快照", ""))}
 
-        <h2 style="color: #10b981;">📋 二、当前持仓、当前挂单分析与建议</h2>
-        {generate_position_and_orders_section(data.get('当前持仓与挂单分析与建议', []))}
+        {generate_btc_forecast_section(data.get("BTC短期预测", {}))}
 
-        <h2 style="color: #f59e0b;">🆕 三、建仓建议</h2>
-        {generate_new_position_section(data.get('建仓建议', []))}
-
-        <h2 style="color: var(--accent-red);">🚨 四、预警价格及操作</h2>
-        {generate_alert_rows(data.get('预警信号', []))}
-
-        <h2 style="color: #3b82f6;">🧠 五、报告解读附录</h2>
-        {generate_interpretation_appendix(data.get('报告解读附录', []))}
+        <h2 style="color: #6366f1;">🎯 三、操作清单（含止盈止损）</h2>
+        {generate_action_list_section(data.get('操作清单', []))}
         
         <div style="text-align: center; margin-top: 40px; color: #475569; font-size: 12px;">
             Generated by AI Agent Strategy Analysis

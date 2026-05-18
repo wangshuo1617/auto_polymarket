@@ -6,7 +6,7 @@
 设计原则:
   - 解析失败一律不自动触发(`unparseable`),只走人工执行路径,fail-closed。
   - 不接受任何"无阈值/无方向"的兜底,避免误触发。
-  - 所有阈值类型必须能映射到现有 watcher 的实时数据源(BTC chainlink / Polymarket bid/ask)。
+  - 所有阈值类型必须能映射到现有 watcher 的实时数据源(BTC Binance aggTrade / Polymarket bid/ask)。
 """
 
 from __future__ import annotations

@@ -1,16 +1,35 @@
-"""手动挂单的"BTC 价格触达"延迟触发机制。
+"""手动挂单的延迟触发机制（支持联动多档计划）。
 
-dashboard 提交 /api/buy 或 /api/sell 时，若指定了 trigger_op + trigger_btc_price，
-不再立即下单，而是写入 manual_pending_orders 表。
+dashboard 提交 /api/buy /api/sell /api/manual_pending/plan 时,
+带触发条件的订单写入 manual_pending_orders 表，
+recommendation_auto_executor 进程订阅 BTC + Polymarket share 价，
+扫描表中已触发(且未过期)的订单 → 原子 claim → 解析 spec → 下单 → 写回结果。
 
-recommendation_auto_executor 进程订阅 Chainlink BTC tick，定期扫描该表，
-把已触发(且未过期)的订单原子 claim → 下单 → 写回结果。
+触发种类 (trigger_kind):
+  - btc_abs                : BTC 价 op threshold (原 v1 行为)
+  - share_abs              : token (share) 价 op threshold
+  - share_cost_pct         : token 价相对父档 fill_price 的 ±% 偏移 (链式联动)
+  - time_after_parent_fill : 父档成交 N 小时后到期平仓 (与 TP/SL 同档独立 fire,
+                              其中任何一条 fire 后系统不会自动撤销其他几条,
+                              需要人工取消多余子档)
 
-设计要点:
-- 只支持 BTC 价格触发，operator ∈ {">=", "<="}
-- 默认 24h 过期，可由调用方覆盖
-- claim 用 `UPDATE ... WHERE status='pending' RETURNING *` 保证单次 fire
-- 失败不重试(避免重复下单),手工取消用 cancel_pending_order
+size 表达 (size_spec):
+  - {"type":"shares",        "value": N}     固定张数
+  - {"type":"usdc",          "value": N}     固定金额, fire 时 / price 换算
+  - {"type":"pct_balance",   "value": pct}   触发瞬间可用 USDC 余额 × pct%
+  - {"type":"pct_position",  "value": pct}   触发瞬间该 token 持仓张数 × pct%
+
+价格表达 (price_spec):
+  - {"type":"absolute", "value": p}                   原 limit
+  - {"type":"market",   "offset": o}                  fire 时 buy=best_ask+o / sell=best_bid+o
+  - {"type":"cost_pct", "value": pct}                 仅 sell 子档,limit = parent.fill_price*(1+pct/100)
+
+约束:
+  - share_cost_pct trigger 必须挂 parent_pending_id, 且 parent.action='buy'
+  - 子档在 parent.status != 'fired' OR parent.fill_price IS NULL 时不会被 fetch_triggered_orders 选中
+  - 父档 cancel / expired / failed → 子档级联标 cancelled
+  - claim 用 `UPDATE ... WHERE status='pending' RETURNING *` 保证单次 fire
+  - 失败不重试(避免重复下单),手工取消用 cancel_pending_order
 """
 
 from __future__ import annotations
@@ -29,11 +48,16 @@ logger = logging.getLogger(__name__)
 
 VALID_OPS = (">=", "<=")
 VALID_ACTIONS = ("buy", "sell")
+VALID_TRIGGER_KINDS = ("btc_abs", "share_abs", "share_cost_pct", "time_after_parent_fill")
+VALID_SIZE_TYPES = ("shares", "usdc", "pct_balance", "pct_position")
+VALID_PRICE_TYPES = ("absolute", "market", "cost_pct")
 DEFAULT_EXPIRY_HOURS = 24
 
 _table_ready = False
 _table_lock = threading.Lock()
 
+# 旧表 trigger_btc_price 是 NOT NULL；新 share_* 触发不需要 BTC 价，需要放宽。
+# 新增列均 NULL-able，以兼容历史行。
 _DDL = """
 CREATE TABLE IF NOT EXISTS manual_pending_orders (
     id              BIGSERIAL PRIMARY KEY,
@@ -43,7 +67,7 @@ CREATE TABLE IF NOT EXISTS manual_pending_orders (
     price           DOUBLE PRECISION NOT NULL,
     size            DOUBLE PRECISION NOT NULL,
     trigger_op      TEXT NOT NULL CHECK (trigger_op IN ('>=','<=')),
-    trigger_btc_price DOUBLE PRECISION NOT NULL,
+    trigger_btc_price DOUBLE PRECISION,
     notes           TEXT,
     requested_by    TEXT,
     extra           JSONB,
@@ -54,12 +78,42 @@ CREATE TABLE IF NOT EXISTS manual_pending_orders (
     fired_at        TIMESTAMPTZ,
     fired_order_id  TEXT,
     error_message   TEXT,
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- 联动 plan 字段 (v2)
+    plan_id           BIGINT,
+    parent_pending_id BIGINT REFERENCES manual_pending_orders(id),
+    trigger_kind      TEXT NOT NULL DEFAULT 'btc_abs',
+    trigger_threshold DOUBLE PRECISION,
+    trigger_pct       DOUBLE PRECISION,
+    size_spec         JSONB,
+    price_spec        JSONB,
+    fill_price        DOUBLE PRECISION
 );
 CREATE INDEX IF NOT EXISTS idx_manual_pending_status_op
     ON manual_pending_orders (status, trigger_op);
 CREATE INDEX IF NOT EXISTS idx_manual_pending_status_expires
     ON manual_pending_orders (status, expires_at);
+-- 兼容旧表:列 / 约束补齐 (必须在依赖新列的 CREATE INDEX 之前)
+ALTER TABLE manual_pending_orders ALTER COLUMN trigger_btc_price DROP NOT NULL;
+ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS plan_id BIGINT;
+ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS parent_pending_id BIGINT REFERENCES manual_pending_orders(id);
+ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS trigger_kind TEXT NOT NULL DEFAULT 'btc_abs';
+ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS trigger_threshold DOUBLE PRECISION;
+ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS trigger_pct DOUBLE PRECISION;
+ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS size_spec JSONB;
+ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS price_spec JSONB;
+ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS fill_price DOUBLE PRECISION;
+CREATE INDEX IF NOT EXISTS idx_manual_pending_plan
+    ON manual_pending_orders (plan_id);
+CREATE INDEX IF NOT EXISTS idx_manual_pending_parent_status
+    ON manual_pending_orders (parent_pending_id, status);
+CREATE INDEX IF NOT EXISTS idx_manual_pending_kind_status
+    ON manual_pending_orders (trigger_kind, status);
+-- 旧行 plan_id 回填 = id (单独 plan)
+UPDATE manual_pending_orders SET plan_id = id WHERE plan_id IS NULL;
+-- 旧行 trigger_threshold 回填 = trigger_btc_price
+UPDATE manual_pending_orders SET trigger_threshold = trigger_btc_price
+ WHERE trigger_threshold IS NULL AND trigger_btc_price IS NOT NULL;
 """
 
 
@@ -73,6 +127,212 @@ def ensure_table() -> None:
         with get_conn(autocommit=True) as conn, conn.cursor() as cur:
             cur.execute(_DDL)
         _table_ready = True
+
+
+def _validate_spec(
+    *,
+    action: str,
+    trigger_kind: str,
+    trigger_op: str,
+    trigger_threshold: Optional[float],
+    trigger_pct: Optional[float],
+    size_spec: dict,
+    price_spec: dict,
+    has_parent: bool,
+) -> None:
+    if action not in VALID_ACTIONS:
+        raise ValueError(f"action 必须是 {VALID_ACTIONS}")
+    if trigger_op not in VALID_OPS:
+        raise ValueError(f"trigger_op 必须是 {VALID_OPS}")
+    if trigger_kind not in VALID_TRIGGER_KINDS:
+        raise ValueError(f"trigger_kind 必须是 {VALID_TRIGGER_KINDS}")
+
+    if trigger_kind in ("btc_abs", "share_abs"):
+        if trigger_threshold is None or trigger_threshold <= 0:
+            raise ValueError(f"{trigger_kind} 触发需要 trigger_threshold > 0")
+    elif trigger_kind == "share_cost_pct":
+        if trigger_pct is None:
+            raise ValueError("share_cost_pct 触发需要 trigger_pct")
+        if not has_parent:
+            raise ValueError("share_cost_pct 触发必须有 parent_pending_id")
+        if abs(trigger_pct) > 1000:
+            raise ValueError("trigger_pct 必须在 ±1000 范围内")
+    elif trigger_kind == "time_after_parent_fill":
+        if trigger_threshold is None or trigger_threshold <= 0:
+            raise ValueError("time_after_parent_fill 触发需要 trigger_threshold > 0 (小时)")
+        if trigger_threshold > 720:
+            raise ValueError("time_after_parent_fill 持有时长不能超过 720 小时 (30 天)")
+        if not has_parent:
+            raise ValueError("time_after_parent_fill 必须有 parent_pending_id")
+        if action != "sell":
+            raise ValueError("time_after_parent_fill 仅支持 sell (用于父档买入后的超时平仓)")
+
+    st = (size_spec or {}).get("type")
+    if st not in VALID_SIZE_TYPES:
+        raise ValueError(f"size_spec.type 必须是 {VALID_SIZE_TYPES}")
+    sv = size_spec.get("value")
+    if sv is None or float(sv) <= 0:
+        raise ValueError("size_spec.value 必须 > 0")
+    if st == "pct_balance":
+        if action != "buy":
+            raise ValueError("pct_balance 仅支持 buy")
+        if float(sv) > 100:
+            raise ValueError("pct_balance 不能超过 100")
+    if st == "pct_position":
+        if action != "sell":
+            raise ValueError("pct_position 仅支持 sell")
+        if float(sv) > 100:
+            raise ValueError("pct_position 不能超过 100")
+
+    pt = (price_spec or {}).get("type")
+    if pt not in VALID_PRICE_TYPES:
+        raise ValueError(f"price_spec.type 必须是 {VALID_PRICE_TYPES}")
+    if pt == "absolute":
+        pv = price_spec.get("value")
+        if pv is None or not (0 < float(pv) < 1):
+            raise ValueError("price_spec.value 必须在 (0,1)")
+    elif pt == "market":
+        off = price_spec.get("offset", 0.0)
+        if abs(float(off)) > 0.5:
+            raise ValueError("price_spec.offset 必须在 ±0.5")
+    elif pt == "cost_pct":
+        if action != "sell":
+            raise ValueError("price_spec=cost_pct 仅支持 sell")
+        if not has_parent:
+            raise ValueError("price_spec=cost_pct 必须有 parent_pending_id")
+        pv = price_spec.get("value")
+        if pv is None:
+            raise ValueError("price_spec.value 必填")
+
+
+def _derive_snapshot_price_size(
+    *, price_spec: dict, size_spec: dict, default_price: float = 0.5
+) -> tuple[float, float]:
+    """为旧 price/size 列提供占位/展示快照（fire 时会按 spec 重算）。
+
+    - absolute 用 price_spec.value;否则用 default_price 占位
+    - shares/usdc 用 size_spec.value(usdc 时换算成 shares);pct_* 用 0 占位
+    """
+    pt = price_spec.get("type")
+    if pt == "absolute":
+        price = float(price_spec["value"])
+    else:
+        price = float(default_price)
+
+    st = size_spec.get("type")
+    sv = float(size_spec["value"])
+    if st == "shares":
+        size = sv
+    elif st == "usdc":
+        size = round(sv / max(price, 0.01), 2)
+    else:
+        size = 0.0  # 触发时再算
+    return round(price, 4), round(size, 4)
+
+
+def insert_plan(
+    items: list[dict],
+    *,
+    requested_by: Optional[str] = None,
+) -> list[dict]:
+    """事务性写入一个 plan(1 主 + N 从)。
+
+    每个 item dict 至少含:
+      action, market_id, token_id,
+      trigger_kind, trigger_op, trigger_threshold?, trigger_pct?,
+      size_spec, price_spec,
+      expires_at? (datetime), notes?, extra?,
+      parent_index? (int, 引用 items 列表中已写入的索引;首项不能有)
+    返回写入后的 row 列表(顺序与输入一致)。
+    """
+    if not items:
+        raise ValueError("plan 至少 1 项")
+    ensure_table()
+    now = datetime.now(timezone.utc)
+    written: list[dict] = []
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            plan_id: Optional[int] = None
+            for idx, item in enumerate(items):
+                action = str(item.get("action") or "").strip().lower()
+                trigger_kind = str(item.get("trigger_kind") or "btc_abs").strip().lower()
+                trigger_op = str(item.get("trigger_op") or ">=").strip()
+                trigger_threshold = item.get("trigger_threshold")
+                trigger_pct = item.get("trigger_pct")
+                size_spec = item.get("size_spec") or {}
+                price_spec = item.get("price_spec") or {}
+                parent_index = item.get("parent_index")
+                parent_id: Optional[int] = None
+                if parent_index is not None:
+                    if not isinstance(parent_index, int) or parent_index < 0 or parent_index >= idx:
+                        raise ValueError(f"item[{idx}].parent_index 非法: {parent_index}")
+                    parent_id = int(written[parent_index]["id"])
+                elif idx > 0 and trigger_kind in ("share_cost_pct", "time_after_parent_fill"):
+                    # 默认链到上一项
+                    parent_id = int(written[idx - 1]["id"])
+
+                _validate_spec(
+                    action=action,
+                    trigger_kind=trigger_kind,
+                    trigger_op=trigger_op,
+                    trigger_threshold=float(trigger_threshold) if trigger_threshold is not None else None,
+                    trigger_pct=float(trigger_pct) if trigger_pct is not None else None,
+                    size_spec=size_spec,
+                    price_spec=price_spec,
+                    has_parent=parent_id is not None,
+                )
+                price, size = _derive_snapshot_price_size(
+                    price_spec=price_spec, size_spec=size_spec
+                )
+                expires_at = item.get("expires_at")
+                if expires_at is None:
+                    expires_at = now + timedelta(hours=DEFAULT_EXPIRY_HOURS)
+                if expires_at <= now:
+                    raise ValueError(f"item[{idx}].expires_at 必须在未来")
+
+                market_id = str(item.get("market_id") or "").strip()
+                token_id = str(item.get("token_id") or "").strip()
+                if not market_id or not token_id:
+                    raise ValueError(f"item[{idx}] market_id/token_id 必填")
+
+                # btc_abs 触发时同时写 trigger_btc_price 兼容旧列展示
+                trigger_btc_price = None
+                if trigger_kind == "btc_abs" and trigger_threshold is not None:
+                    trigger_btc_price = float(trigger_threshold)
+
+                cur.execute(
+                    """
+                    INSERT INTO manual_pending_orders
+                      (action, market_id, token_id, price, size,
+                       trigger_op, trigger_btc_price, expires_at, notes, requested_by, extra,
+                       plan_id, parent_pending_id, trigger_kind,
+                       trigger_threshold, trigger_pct, size_spec, price_spec)
+                    VALUES (%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s,%s)
+                    RETURNING *
+                    """,
+                    (
+                        action, market_id, token_id, price, size,
+                        trigger_op, trigger_btc_price, expires_at,
+                        (str(item.get("notes") or "")[:500] or None),
+                        requested_by,
+                        psycopg2.extras.Json(item.get("extra")) if item.get("extra") else None,
+                        plan_id, parent_id, trigger_kind,
+                        (float(trigger_threshold) if trigger_threshold is not None else None),
+                        (float(trigger_pct) if trigger_pct is not None else None),
+                        psycopg2.extras.Json(size_spec),
+                        psycopg2.extras.Json(price_spec),
+                    ),
+                )
+                row = cur.fetchone()
+                if plan_id is None:
+                    plan_id = int(row["id"])
+                    cur.execute(
+                        "UPDATE manual_pending_orders SET plan_id=%s WHERE id=%s RETURNING *",
+                        (plan_id, row["id"]),
+                    )
+                    row = cur.fetchone()
+                written.append(_row_to_dict(row))
+    return written
 
 
 def insert_pending_order(
@@ -89,42 +349,25 @@ def insert_pending_order(
     requested_by: Optional[str] = None,
     extra: Optional[dict] = None,
 ) -> dict:
-    if action not in VALID_ACTIONS:
-        raise ValueError(f"action 必须是 {VALID_ACTIONS}")
-    if trigger_op not in VALID_OPS:
-        raise ValueError(f"trigger_op 必须是 {VALID_OPS}")
-    if not market_id or not token_id:
-        raise ValueError("market_id / token_id 必填")
-    if price <= 0 or price >= 1:
-        raise ValueError("price 必须在 (0,1) 区间")
-    if size <= 0:
-        raise ValueError("size 必须 > 0")
-    if trigger_btc_price <= 0:
-        raise ValueError("trigger_btc_price 必须 > 0")
-    if expires_at is None:
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=DEFAULT_EXPIRY_HOURS)
-    if expires_at <= datetime.now(timezone.utc):
-        raise ValueError("expires_at 必须在未来")
+    """兼容旧路径:单独的 btc_abs 触发挂单(absolute price + shares size)。
 
-    ensure_table()
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                INSERT INTO manual_pending_orders
-                  (action, market_id, token_id, price, size, trigger_op, trigger_btc_price,
-                   expires_at, notes, requested_by, extra)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                RETURNING *
-                """,
-                (
-                    action, market_id, token_id, price, size, trigger_op, trigger_btc_price,
-                    expires_at, notes, requested_by,
-                    psycopg2.extras.Json(extra) if extra else None,
-                ),
-            )
-            row = cur.fetchone()
-    return _row_to_dict(row)
+    内部转成 insert_plan 单 item 调用。
+    """
+    items = [{
+        "action": action,
+        "market_id": market_id,
+        "token_id": token_id,
+        "trigger_kind": "btc_abs",
+        "trigger_op": trigger_op,
+        "trigger_threshold": trigger_btc_price,
+        "size_spec": {"type": "shares", "value": float(size)},
+        "price_spec": {"type": "absolute", "value": float(price)},
+        "expires_at": expires_at,
+        "notes": notes,
+        "extra": extra,
+    }]
+    rows = insert_plan(items, requested_by=requested_by)
+    return rows[0]
 
 
 def list_pending_orders(*, include_finished: bool = False, limit: int = 200) -> list[dict]:
@@ -145,6 +388,7 @@ def list_pending_orders(*, include_finished: bool = False, limit: int = 200) -> 
 
 
 def cancel_pending_order(order_id: int) -> Optional[dict]:
+    """取消一档,若是父档则级联取消同 plan 所有未 fire 子档。"""
     ensure_table()
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -158,11 +402,69 @@ def cancel_pending_order(order_id: int) -> Optional[dict]:
                 (order_id,),
             )
             row = cur.fetchone()
-    return _row_to_dict(row) if row else None
+            if not row:
+                return None
+            plan_id = row.get("plan_id") or row["id"]
+            # 级联:同 plan 下所有 pending 子档全部取消(父档已被上一句改过)
+            cur.execute(
+                """
+                UPDATE manual_pending_orders
+                SET status='cancelled',
+                    error_message='cascaded from cancelled parent',
+                    updated_at=NOW()
+                WHERE plan_id=%s AND status='pending' AND id <> %s
+                """,
+                (plan_id, order_id),
+            )
+    return _row_to_dict(row)
+
+
+def repair_stale_executing_orders(*, timeout_minutes: int = 10) -> dict[str, int]:
+    """巡检卡死的 executing 单。
+
+    超过 timeout_minutes 仍未推到终态(fired/failed/cancelled/expired)的 executing 单,
+    认为 worker 在 try_claim_order 之后 crash 或 hang, 此处把它标成 failed,
+    error_message='stale-executing auto-failed (timeout=Xmin)' 让用户能在 dashboard 看到。
+
+    注意: 这是单向的安全网, 不尝试重新 fire (避免双下风险)。
+
+    返回 {scanned, marked_failed}。
+    """
+    ensure_table()
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, plan_id, parent_pending_id, trigger_kind,
+                   EXTRACT(EPOCH FROM (NOW() - updated_at)) AS stale_seconds
+            FROM manual_pending_orders
+            WHERE status='executing'
+              AND updated_at <= NOW() - make_interval(mins => %s)
+            ORDER BY id ASC
+            """,
+            (timeout_minutes,),
+        )
+        stale_rows = cur.fetchall() or []
+        if not stale_rows:
+            return {"scanned": 0, "marked_failed": 0}
+        ids = [r[0] for r in stale_rows]
+        cur.execute(
+            """
+            UPDATE manual_pending_orders
+            SET status='failed',
+                error_message=%s,
+                updated_at=NOW()
+            WHERE id = ANY(%s) AND status='executing'
+            """,
+            (f"stale-executing auto-failed (timeout={timeout_minutes}min)", ids),
+        )
+        marked = cur.rowcount
+    return {"scanned": len(stale_rows), "marked_failed": marked, "ids": ids}
 
 
 def expire_overdue_orders() -> int:
-    """把已过期的 pending 标成 expired,返回受影响行数。"""
+    """把已过期的 pending 标成 expired,返回受影响行数。
+    同时把"父档已 cancelled/failed/expired 而仍 pending 的子档"级联标 expired。
+    """
     ensure_table()
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -172,31 +474,161 @@ def expire_overdue_orders() -> int:
             WHERE status='pending' AND expires_at <= NOW()
             """
         )
-        return cur.rowcount
+        n_time = cur.rowcount
+        cur.execute(
+            """
+            UPDATE manual_pending_orders c
+            SET status='expired',
+                error_message='cascaded from parent terminal status',
+                updated_at=NOW()
+            FROM manual_pending_orders p
+            WHERE c.status='pending'
+              AND c.parent_pending_id = p.id
+              AND p.status IN ('cancelled','failed','expired')
+            """
+        )
+        n_orphan = cur.rowcount
+    return n_time + n_orphan
 
 
-def fetch_triggered_orders(btc_price: float) -> list[dict]:
-    """返回当前 BTC 价格已满足触发条件、未过期、未 claim 的 pending 订单。
+def fetch_triggered_orders(
+    btc_price: Optional[float] = None,
+    *,
+    share_prices: Optional[dict[str, float]] = None,
+) -> list[dict]:
+    """返回当前满足触发条件、未过期、未 claim 的 pending 订单。
+
+    - btc_abs                : 用 btc_price 与 trigger_threshold 比较
+    - share_abs              : 用 share_prices[token_id] 与 trigger_threshold 比较
+    - share_cost_pct         : 父档必须 fired 且 fill_price 已写,阈值 = parent.fill_price*(1+trigger_pct/100)
+    - time_after_parent_fill : 父档 fired_at 起 trigger_threshold (小时) 后到期
 
     只读;真正的 claim 在 try_claim_order 里做。
     """
     ensure_table()
+    share_prices = share_prices or {}
+    results: list[dict] = []
     with get_cursor() as cur:
+        # btc_abs
+        if btc_price is not None:
+            cur.execute(
+                """
+                SELECT * FROM manual_pending_orders
+                WHERE status='pending'
+                  AND expires_at > NOW()
+                  AND trigger_kind='btc_abs'
+                  AND trigger_threshold IS NOT NULL
+                  AND (
+                       (trigger_op='>=' AND %s >= trigger_threshold)
+                    OR (trigger_op='<=' AND %s <= trigger_threshold)
+                  )
+                ORDER BY id ASC
+                """,
+                (btc_price, btc_price),
+            )
+            results.extend(_row_to_dict(r) for r in cur.fetchall())
+
+        # time_after_parent_fill: 父档 fired_at 起 N 小时后到期。无需任何价格输入。
+        cur.execute(
+            """
+            SELECT c.*, p.fired_at AS parent_fired_at, p.fill_price AS parent_fill_price
+            FROM manual_pending_orders c
+            JOIN manual_pending_orders p ON p.id = c.parent_pending_id
+            WHERE c.status='pending'
+              AND c.expires_at > NOW()
+              AND c.trigger_kind='time_after_parent_fill'
+              AND c.trigger_threshold IS NOT NULL
+              AND p.status='fired'
+              AND p.fired_at IS NOT NULL
+              AND NOW() >= p.fired_at + make_interval(secs => c.trigger_threshold * 3600)
+            ORDER BY c.id ASC
+            """
+        )
+        for r in cur.fetchall():
+            d = _row_to_dict(r)
+            d["_parent_fired_at"] = d.pop("parent_fired_at", None)
+            parent_fp = d.pop("parent_fill_price", None)
+            if parent_fp is not None:
+                d["_parent_fill_price"] = float(parent_fp)
+            results.append(d)
+
+        if not share_prices:
+            return results
+
+        token_ids = list(share_prices.keys())
+        # share_abs
         cur.execute(
             """
             SELECT * FROM manual_pending_orders
             WHERE status='pending'
               AND expires_at > NOW()
-              AND (
-                   (trigger_op='>=' AND %s >= trigger_btc_price)
-                OR (trigger_op='<=' AND %s <= trigger_btc_price)
-              )
+              AND trigger_kind='share_abs'
+              AND trigger_threshold IS NOT NULL
+              AND token_id = ANY(%s)
             ORDER BY id ASC
             """,
-            (btc_price, btc_price),
+            (token_ids,),
         )
-        rows = cur.fetchall()
-    return [_row_to_dict(r) for r in rows]
+        for r in cur.fetchall():
+            d = _row_to_dict(r)
+            sp = share_prices.get(d["token_id"])
+            if sp is None:
+                continue
+            thr = d["trigger_threshold"]
+            op = d["trigger_op"]
+            if (op == ">=" and sp >= thr) or (op == "<=" and sp <= thr):
+                results.append(d)
+
+        # share_cost_pct: 必须 parent fired + fill_price 已写
+        cur.execute(
+            """
+            SELECT c.*, p.fill_price AS parent_fill_price, p.status AS parent_status
+            FROM manual_pending_orders c
+            JOIN manual_pending_orders p ON p.id = c.parent_pending_id
+            WHERE c.status='pending'
+              AND c.expires_at > NOW()
+              AND c.trigger_kind='share_cost_pct'
+              AND c.trigger_pct IS NOT NULL
+              AND p.status='fired'
+              AND p.fill_price IS NOT NULL
+              AND c.token_id = ANY(%s)
+            ORDER BY c.id ASC
+            """,
+            (token_ids,),
+        )
+        for r in cur.fetchall():
+            d = _row_to_dict(r)
+            sp = share_prices.get(d["token_id"])
+            if sp is None:
+                continue
+            cost = float(d.pop("parent_fill_price"))
+            d.pop("parent_status", None)
+            thr = cost * (1.0 + float(d["trigger_pct"]) / 100.0)
+            op = d["trigger_op"]
+            if (op == ">=" and sp >= thr) or (op == "<=" and sp <= thr):
+                d["_resolved_threshold"] = thr
+                d["_parent_fill_price"] = cost
+                results.append(d)
+    return results
+
+
+def collect_active_share_token_ids() -> list[str]:
+    """返回当前需要 share 价订阅/轮询的 token_id 列表。
+
+    条件:status='pending' AND trigger_kind IN ('share_abs','share_cost_pct')
+         (cost_pct 类即使父档未 fired 也包含,提前预热,逻辑层会忽略未激活的)
+    """
+    ensure_table()
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT token_id FROM manual_pending_orders
+            WHERE status='pending'
+              AND expires_at > NOW()
+              AND trigger_kind IN ('share_abs','share_cost_pct')
+            """
+        )
+        return [r["token_id"] for r in cur.fetchall()]
 
 
 def try_claim_order(order_id: int) -> Optional[dict]:
@@ -217,16 +649,26 @@ def try_claim_order(order_id: int) -> Optional[dict]:
     return _row_to_dict(row) if row else None
 
 
-def mark_order_fired(order_id: int, *, fired_order_id: str) -> None:
+def mark_order_fired(
+    order_id: int,
+    *,
+    fired_order_id: str,
+    fill_price: Optional[float] = None,
+) -> None:
+    """fire 成功:写 status=fired + 实际成交参考价 fill_price(给链上子档当 cost basis)。"""
     ensure_table()
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
             UPDATE manual_pending_orders
-            SET status='fired', fired_at=NOW(), fired_order_id=%s, updated_at=NOW()
+            SET status='fired',
+                fired_at=NOW(),
+                fired_order_id=%s,
+                fill_price=COALESCE(%s, fill_price),
+                updated_at=NOW()
             WHERE id=%s
             """,
-            (fired_order_id, order_id),
+            (fired_order_id, fill_price, order_id),
         )
 
 
