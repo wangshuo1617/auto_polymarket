@@ -289,6 +289,18 @@ def insert_plan(
                     expires_at = now + timedelta(hours=DEFAULT_EXPIRY_HOURS)
                 if expires_at <= now:
                     raise ValueError(f"item[{idx}].expires_at 必须在未来")
+                # 子档(parent_id 不为空)的 TTL 含义是 "父档 fill 后还可挂多久"。
+                # 父档 fill 时点未知,但不可能晚于 parent.expires_at,
+                # 所以把子档 expires_at 平移到 parent.expires_at + 原请求窗口,
+                # 保证父档在其窗口内任意时刻 fire,子档都有完整 hold 时长可以等待触发。
+                if parent_id is not None:
+                    parent_row = written[
+                        parent_index if parent_index is not None else idx - 1
+                    ]
+                    parent_expiry = parent_row.get("expires_at")
+                    if isinstance(parent_expiry, datetime) and parent_expiry > now:
+                        child_window = expires_at - now
+                        expires_at = parent_expiry + child_window
 
                 market_id = str(item.get("market_id") or "").strip()
                 token_id = str(item.get("token_id") or "").strip()
