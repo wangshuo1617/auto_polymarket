@@ -8,6 +8,7 @@ import secrets
 import subprocess
 import sys
 import time
+import calendar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, List
@@ -16,6 +17,8 @@ from zoneinfo import ZoneInfo
 import psycopg2.extras
 from data.database import get_conn, get_cursor
 from services.recommendation_db import RecommendationDB, RecommendationGateError
+from services.profit_optimizer import get_or_set_monthly_baseline
+from services.profit_optimizer import _extract_strike_and_direction, _parse_market_prices
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
 from py_clob_client_v2.clob_types import (
@@ -140,6 +143,156 @@ def _login_redirect():
     return redirect(url_for("login", next=request.path))
 
 
+def _make_zone_badge(label: str, tone: str, tooltip: str) -> dict:
+    return {"label": label, "tone": tone, "tooltip": tooltip}
+
+
+def _classify_time_phase(days_left_in_month: float) -> tuple[str, str]:
+    if days_left_in_month <= 7.0:
+        return "month_end", "月末"
+    if days_left_in_month <= 16.0:
+        return "month_mid", "月中"
+    return "month_start", "月初"
+
+
+def _market_zone_badges(
+    yes_price: float | None,
+    no_price: float | None,
+    *,
+    distance_pct: float | None,
+    days_left_in_month: float,
+) -> list[dict]:
+    badges: list[dict] = []
+    d = distance_pct or 0.0
+    phase_key, phase_label = _classify_time_phase(days_left_in_month)
+
+    if phase_key == "month_start":
+        comfy_high_no = no_price is not None and no_price >= 0.90 and d >= 12.0
+        high_no = no_price is not None and no_price >= 0.82 and d >= 10.0
+        mid_no = no_price is not None and 0.65 <= no_price < 0.82 and 5.0 <= d <= 12.0
+        low_yes = yes_price is not None and 0.10 <= yes_price <= 0.25 and 5.0 <= d <= 10.0
+    elif phase_key == "month_mid":
+        comfy_high_no = no_price is not None and no_price >= 0.88 and d >= 10.0
+        high_no = no_price is not None and no_price >= 0.82 and d >= 8.0
+        mid_no = no_price is not None and 0.62 <= no_price < 0.82 and 4.0 <= d <= 10.0
+        low_yes = yes_price is not None and 0.10 <= yes_price <= 0.30 and 3.0 <= d <= 8.0
+    else:
+        comfy_high_no = no_price is not None and no_price >= 0.85 and d >= 8.0
+        high_no = no_price is not None and no_price >= 0.75 and d >= 6.0
+        mid_no = no_price is not None and 0.58 <= no_price < 0.78 and 3.0 <= d <= 8.0
+        low_yes = yes_price is not None and 0.08 <= yes_price <= 0.22 and 2.0 <= d <= 5.0
+
+    if phase_key == "month_mid":
+        mid_no_tip = (
+            f"{phase_label}谨慎收益区：结合你的历史，月中 No 不是自动主战区。"
+            "只有在第一次试探 barrier 失败后的确认位，或出现明确错配时才参与。"
+        )
+        low_yes_tip = (
+            f"{phase_label}弹性机会区：结合你的历史，月中 Yes 的弹性更值得关注。"
+            "但仍只在突破/催化确认后小仓位参与，不能无信号抄底。"
+        )
+    elif phase_key == "month_end":
+        mid_no_tip = (
+            f"{phase_label}近端收益区：月末盈利更偏向 No，"
+            "可接受更近的中价 No，但仍应优先做更确定的 No 收割。"
+        )
+        low_yes_tip = (
+            f"{phase_label}克制进攻区：只有非常近、非常明确的催化/错配才参与 Yes，"
+            "默认应把注意力放回 No。"
+        )
+    else:
+        mid_no_tip = (
+            f"{phase_label}收益候选区：月初不要预设没 edge。"
+            "中价 No 可做，但依然优先等第一次试探 barrier 失败后再进。"
+        )
+        low_yes_tip = (
+            f"{phase_label}进攻弹性仓：月初允许更积极寻找低价 Yes，"
+            "但仍需突破/催化确认，不能因为便宜就直接买。"
+        )
+
+    if comfy_high_no:
+        badges.append(
+            _make_zone_badge(
+                "舒服高价No",
+                "danger",
+                f"{phase_label}舒服防守仓：当前按剩余 {days_left_in_month:.1f} 天判断，需同时满足更舒服的 No 价格与更远的 barrier 距离。适合稳定收 Theta、做组合底盘，但仍不是主利润引擎。",
+            )
+        )
+    elif high_no:
+        badges.append(
+            _make_zone_badge(
+                "高价No",
+                "danger",
+                f"{phase_label}防守仓：已进入高价No区，但舒适度弱于更远 barrier 的舒服高价No。适合偏防守生息，避免把它当主收益仓追大仓。",
+            )
+        )
+    elif mid_no:
+        badges.append(
+            _make_zone_badge(
+                "中价No",
+                "warning",
+                mid_no_tip,
+            )
+        )
+    else:
+        badges.append(
+            _make_zone_badge(
+                "No观察",
+                "secondary",
+                f"{phase_label}当前 No 不在舒服高价No / 高价No / 中价No主战区，优先观察，避免硬做或追不舒服的价格结构。",
+            )
+        )
+
+    if low_yes:
+        badges.append(
+            _make_zone_badge(
+                "低价Yes",
+                "success",
+                low_yes_tip,
+            )
+        )
+    else:
+        badges.append(
+            _make_zone_badge(
+                "Yes观察",
+                "secondary",
+                f"{phase_label}当前 Yes 不属于低价Yes进攻区；若没有趋势突破或明确催化，保持观察，不主动抄底。",
+            )
+        )
+
+    return badges
+
+
+def _build_market_badges(market: dict, current_btc_price: float, days_left_in_month: float) -> dict:
+    strike, direction = _extract_strike_and_direction(market.get("question") or "")
+    yes_price, no_price = _parse_market_prices(market)
+    phase_label = _classify_time_phase(days_left_in_month)[1]
+    if current_btc_price <= 0 or strike is None or direction == "unknown":
+        return {
+            "distance_pct": None,
+            "distance_label": "距 barrier —",
+            "phase_label": phase_label,
+            "zone_badges": [
+                _make_zone_badge("No观察", "secondary", "当前无法可靠识别 No 分类，先观察。"),
+                _make_zone_badge("Yes观察", "secondary", "当前无法可靠识别 Yes 分类，先观察。"),
+            ],
+        }
+
+    distance_pct = round(abs(strike - current_btc_price) / current_btc_price * 100.0, 1)
+    action_word = "上破" if direction == "above" else "下破"
+    return {
+        "distance_pct": distance_pct,
+        "distance_label": f"距{action_word} barrier {distance_pct:.1f}%",
+        "phase_label": phase_label,
+        "zone_badges": _market_zone_badges(
+            yes_price,
+            no_price,
+            distance_pct=distance_pct,
+            days_left_in_month=days_left_in_month,
+        ),
+    }
+
+
 @app.before_request
 def require_authentication():
     if request.endpoint in {"login", "logout", "static"}:
@@ -204,6 +357,11 @@ def index():
 def api_events():
     try:
         data = get_event_token_id()
+        current_btc_price = float(get_btc_price())
+        now_et = datetime.now(ET_TIMEZONE)
+        days_in_month = calendar.monthrange(now_et.year, now_et.month)[1]
+        days_left_in_month = max(0, days_in_month - now_et.day) + (24 - now_et.hour) / 24.0
+        phase_label = _classify_time_phase(days_left_in_month)[1]
         token_ids: List[str] = []
         for market in data.get("markets") or []:
             for tid in (market.get("token_id") or []):
@@ -220,6 +378,13 @@ def api_events():
                 best_asks.append(entry.get("best_ask"))
             market["bestBids"] = best_bids
             market["bestAsks"] = best_asks
+            market["barrierMeta"] = _build_market_badges(
+                market=market,
+                current_btc_price=current_btc_price,
+                days_left_in_month=days_left_in_month,
+            )
+        data["current_btc_price"] = current_btc_price
+        data["phase_label"] = phase_label
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -2200,10 +2365,14 @@ def api_balance_summary():
         except Exception:
             logger.warning("balance_summary: get_open_orders failed", exc_info=True)
         available = max(0.0, cash - buy_locked)
+        monthly_progress = get_or_set_monthly_baseline(profile_value)
         return jsonify({
             "cash_balance": balance_str,
             "position_value": round(position_value, 2),
             "profile_value": round(profile_value, 2),
+            "month_start_profile_value": monthly_progress.get("baseline_net_value"),
+            "monthly_return_pct": monthly_progress.get("monthly_pnl_pct"),
+            "monthly_pnl_usdc": monthly_progress.get("monthly_pnl_usdc"),
             "buy_locked": round(buy_locked, 2),
             "available_balance": round(available, 2),
         })

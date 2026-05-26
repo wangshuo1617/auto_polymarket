@@ -134,6 +134,7 @@ def generate_action_list_section(items: list) -> str:
         op = str(item.get("操作") or "").strip() or "操作"
         title = item.get("标的") or ""
         direction = item.get("方向") or ""
+        strategy_type = item.get("策略类型") or ""
         price = item.get("价格") or ""
         size = item.get("金额或数量") or ""
         trigger = item.get("触发条件") or ""
@@ -145,6 +146,8 @@ def generate_action_list_section(items: list) -> str:
         color = _OP_COLOR.get(op, "#6366f1")
 
         meta_lines = ""
+        if strategy_type:
+            meta_lines += f"<div class='logic-text'>策略类型：{strategy_type}</div>"
         if price:
             meta_lines += f"<div class='logic-text'>价格：<strong>{price}</strong></div>"
         if size:
@@ -182,160 +185,6 @@ def generate_market_snapshot(snapshot_text):
     if not snapshot_text:
         return ""
     return generate_overview_section(snapshot_text)
-
-
-def generate_monthly_strategy_html(data: dict) -> str:
-    """生成月初建仓建议的 HTML 邮件内容"""
-    strategy = data.get("策略方案", {})
-    ladder = strategy.get("分批建仓", [])
-    risk_tips = data.get("风险提示", [])
-    risk_controls = strategy.get("风险控制", [])
-    indicators = strategy.get("关键观察指标", [])
-    summary = data.get("参考数据摘要", {})
-
-    ladder_rows = ""
-    for step in ladder:
-        ladder_rows += f"""
-        <div class="ladder-step">
-            <div class="step-price">触发条件: <strong>{step.get('触发条件','')}</strong></div>
-            <div class="step-logic">建议价格区间: {step.get('建议价格区间','')} | 仓位比例: {step.get('仓位比例','')}</div>
-            <div class="step-logic">逻辑: {step.get('逻辑','')}</div>
-        </div>
-        """
-
-    risk_items = "".join([f"<li>{item}</li>" for item in risk_tips])
-    control_items = "".join([f"<li>{item}</li>" for item in risk_controls])
-    indicator_items = "".join([f"<li>{item}</li>" for item in indicators])
-
-    return f"""
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        :root {{
-            --bg-color: #0f172a;
-            --card-bg: #1e293b;
-            --text-main: #e2e8f0;
-            --text-muted: #94a3b8;
-            --accent-green: #10b981;
-            --accent-orange: #f59e0b;
-            --accent-blue: #3b82f6;
-        }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-main);
-            margin: 0;
-            padding: 20px;
-            line-height: 1.6;
-        }}
-        .container {{ max-width: 800px; margin: 0 auto; }}
-        h1 {{ text-align: center; color: #fff; margin-bottom: 30px; font-size: 24px; }}
-        h2 {{
-            font-size: 18px;
-            border-bottom: 2px solid #334155;
-            padding-bottom: 10px;
-            margin-top: 30px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }}
-        .card {{
-            background-color: var(--card-bg);
-            border-radius: 8px;
-            margin-bottom: 16px;
-            padding: 16px;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-        }}
-        .muted {{ color: var(--text-muted); font-size: 14px; }}
-        .ladder-container {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 10px;
-            margin-top: 10px;
-        }}
-        .ladder-step {{
-            background: #0f172a;
-            border: 1px solid #334155;
-            padding: 10px;
-            border-radius: 6px;
-        }}
-        ul {{ margin: 0; padding-left: 20px; }}
-        .summary-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 10px;
-        }}
-        .summary-item {{ background: #0f172a; border: 1px solid #334155; padding: 10px; border-radius: 6px; }}
-        .summary-item strong {{ color: var(--accent-blue); }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>📅 月初 BTC 建仓建议 (Polymarket)</h1>
-
-        <div class="card">
-            <h2 style="color: var(--accent-blue);">🧭 月份趋势判断</h2>
-            <div>{data.get("月份趋势判断", "")}</div>
-        </div>
-
-        <div class="card">
-            <h2 style="color: var(--accent-blue);">📏 月内BTC变动区间</h2>
-            <div><strong>下限：</strong>{data.get("月内BTC变动区间", {}).get("下限", "")}</div>
-            <div><strong>上限：</strong>{data.get("月内BTC变动区间", {}).get("上限", "")}</div>
-            <div class="muted" style="margin-top: 6px;">{data.get("月内BTC变动区间", {}).get("逻辑", "")}</div>
-        </div>
-
-        <div class="card">
-            <h2 style="color: var(--accent-green);">🎯 策略方案</h2>
-            <div><strong>总体建议：</strong>{strategy.get("总体建议", "")}</div>
-            <div><strong>建仓方向：</strong>{strategy.get("建仓方向", "")}</div>
-            <div><strong>仓位建议：</strong>{strategy.get("仓位建议", "")}</div>
-            <div class="muted" style="margin-top: 8px;">分批建仓：</div>
-            <div class="ladder-container">
-                {ladder_rows}
-            </div>
-        </div>
-
-        <div class="card">
-            <h2 style="color: var(--accent-orange);">🛡️ 风险控制</h2>
-            <ul>{control_items}</ul>
-        </div>
-
-        <div class="card">
-            <h2 style="color: var(--accent-blue);">👀 关键观察指标</h2>
-            <ul>{indicator_items}</ul>
-        </div>
-
-        <div class="card">
-            <h2 style="color: var(--accent-blue);">📌 参考数据摘要</h2>
-            <div class="summary-grid">
-                <div class="summary-item"><strong>BTC现价</strong><br>{summary.get("btc现价", "")}</div>
-                <div class="summary-item"><strong>4h趋势</strong><br>{summary.get("4h趋势", "")}</div>
-                <div class="summary-item"><strong>24h RSI</strong><br>{summary.get("24h RSI", "")}</div>
-                <div class="summary-item"><strong>资金费率</strong><br>{summary.get("资金费率", "")}</div>
-                <div class="summary-item"><strong>OI</strong><br>{summary.get("OI", "")}</div>
-                <div class="summary-item"><strong>ETF净流入</strong><br>{summary.get("ETF净流入", "")}</div>
-                <div class="summary-item"><strong>稳定币流动性</strong><br>{summary.get("稳定币流动性", "")}</div>
-                <div class="summary-item"><strong>恐惧贪婪</strong><br>{summary.get("恐惧贪婪", "")}</div>
-                <div class="summary-item"><strong>多空比</strong><br>{summary.get("多空比", "")}</div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2 style="color: var(--accent-orange);">⚠️ 风险提示</h2>
-            <ul>{risk_items}</ul>
-        </div>
-
-        <div style="text-align: center; margin-top: 30px; color: #475569; font-size: 12px;">
-            Generated by AI Monthly Strategy Engine
-        </div>
-    </div>
-</body>
-</html>
-"""
 
 # --- 2. 主 HTML 模板 (使用 f-string) ---
 def generate_html_template(data):

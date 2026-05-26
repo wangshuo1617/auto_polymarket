@@ -17,6 +17,34 @@
             font-size: clamp(1.8rem, 4vw, 3rem);
             margin-bottom: 0.75rem;
         }
+        .dashboard-title-tip {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 1.55rem;
+            height: 1.55rem;
+            padding: 0 0.45rem;
+            margin-left: 0.5rem;
+            border-radius: 999px;
+            font-size: 0.9rem;
+            line-height: 1;
+            cursor: help;
+            vertical-align: middle;
+        }
+        .dashboard-help-popover {
+            --bs-popover-max-width: 560px;
+        }
+        .dashboard-help-popover .popover-header {
+            font-weight: 600;
+        }
+        .dashboard-help-popover .popover-body {
+            font-size: 0.86rem;
+            line-height: 1.45;
+        }
+        .dashboard-help-popover .popover-body ul {
+            margin-bottom: 0.5rem;
+            padding-left: 1.1rem;
+        }
         .balance-chip {
             display: inline-block;
             background: #fff;
@@ -30,6 +58,12 @@
         }
         .event-card h3 {
             font-size: 1rem;
+            margin-bottom: 0.75rem;
+        }
+        .event-badge-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.35rem;
             margin-bottom: 0.75rem;
         }
         .table td, .table th {
@@ -94,7 +128,21 @@
 <body>
     <div class="container-fluid px-3 px-md-4 py-3 py-md-4 dashboard-shell">
         <div class="d-flex justify-content-between align-items-start gap-2">
-            <h1 class="dashboard-title">Polymarket Dashboard</h1>
+            <h1 class="dashboard-title">
+                Polymarket Dashboard
+                <span id="phaseBadge" class="badge text-bg-info ms-2 align-middle" style="font-size:0.85rem;">月中</span>
+                <span
+                    id="dashboardHelpTrigger"
+                    class="badge text-bg-dark dashboard-title-tip"
+                    data-bs-toggle="popover"
+                    data-bs-placement="right"
+                    data-bs-trigger="hover focus"
+                    data-bs-html="true"
+                    data-bs-custom-class="dashboard-help-popover"
+                    title="快速反思 / 策略速查"
+                    aria-label="查看快速反思与策略速查"
+                >?</span>
+            </h1>
             <a href="/logout" class="btn btn-outline-secondary btn-sm mt-1">Logout</a>
         </div>
         <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
@@ -247,7 +295,7 @@
                             <button type="button" class="btn btn-outline-primary btn-sm" id="addChainedBtn">
                                 + 添加联动卖出 (绑定主档 cost basis)
                             </button>
-                            <small class="text-muted small mt-1">仅在主档为 <strong>buy</strong> 时可用;子档触发条件 = "share 价相对主档实际成交价 ±X%"</small>
+                            <small class="text-muted small mt-1">仅在主档为 <strong>buy</strong> 时可用；子档可按 <strong>BTC 价触达</strong>、<strong>share 相对 cost ±%</strong> 或 <strong>持有超时</strong> 触发卖出。</small>
                         </div>
                     </form>
                 </div>
@@ -394,10 +442,89 @@
         let currentAction = null;
         let currentData = null;
         let recommendationFeedbackModal = null;
+        let dashboardTargetBaseValue = null;
+        let dashboardPhaseLabel = '月中';
 
         function formatMoneyNum(num) {
             if (num == null || isNaN(num)) return '—';
             return '$' + Number(num).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        function _bucketTargetRow(label, allocPct, returnPct, profileValue) {
+            const contributionPct = allocPct * returnPct / 100;
+            const positionAmount = profileValue != null && !isNaN(profileValue)
+                ? profileValue * allocPct / 100
+                : null;
+            const profitAmount = profileValue != null && !isNaN(profileValue)
+                ? profileValue * contributionPct / 100
+                : null;
+            return '<li><strong>' + label + '</strong>：'
+                + allocPct.toFixed(0) + '% 仓位'
+                + (positionAmount != null ? '（约 ' + formatMoneyNum(positionAmount) + '）' : '')
+                + ' × ' + returnPct.toFixed(0) + '% = '
+                + contributionPct.toFixed(1) + '%'
+                + (profitAmount != null ? '（约 ' + formatMoneyNum(profitAmount) + '）' : '')
+                + '</li>';
+        }
+
+        function buildDashboardHelpContent(profileValue, phaseLabel) {
+            const phase = phaseLabel || '月中';
+            const profileLine = profileValue != null && !isNaN(profileValue)
+                ? '<div class="mb-2"><strong>月度目标基数（按月初净值）</strong>：' + formatMoneyNum(profileValue) + '</div>'
+                : '<div class="mb-2"><strong>月度目标基数（按月初净值）</strong>：载入中…</div>';
+
+            const stableRows = [
+                _bucketTargetRow('舒服高价No', 20, 5, profileValue),
+                _bucketTargetRow('标准高价No', 20, 10, profileValue),
+                _bucketTargetRow('中价No', 60, 20, profileValue),
+                _bucketTargetRow('低价Yes', 0, 40, profileValue),
+            ].join('');
+            const balancedRows = [
+                _bucketTargetRow('舒服高价No', 20, 5, profileValue),
+                _bucketTargetRow('标准高价No', 30, 10, profileValue),
+                _bucketTargetRow('中价No', 45, 20, profileValue),
+                _bucketTargetRow('低价Yes', 5, 40, profileValue),
+            ].join('');
+            const exampleAmount = profileValue != null && !isNaN(profileValue)
+                ? formatMoneyNum(profileValue * 0.40 * 0.10)
+                : '载入中…';
+
+            return "<div class='text-start'>"
+                + profileLine
+                + "<div class='mb-2'><strong>标签定义（含数值）</strong><ul>"
+                + "<li><strong>舒服高价No</strong>：月初 <code>No ≥ 0.90 &amp; distance ≥ 12%</code>；月中 <code>No ≥ 0.88 &amp; distance ≥ 10%</code>；月末 <code>No ≥ 0.85 &amp; distance ≥ 8%</code>。</li>"
+                + "<li><strong>标准高价No</strong>：月初 <code>No ≥ 0.82 &amp; distance ≥ 10%</code>；月中 <code>No ≥ 0.82 &amp; distance ≥ 8%</code>；月末 <code>No ≥ 0.75 &amp; distance ≥ 6%</code>。</li>"
+                + "<li><strong>中价No</strong>：月初 <code>0.65≤No&lt;0.82</code> 且 <code>5%~12%</code>；月中 <code>0.62≤No&lt;0.82</code> 且 <code>4%~10%</code>；月末 <code>0.58≤No&lt;0.78</code> 且 <code>3%~8%</code>。</li>"
+                + "<li><strong>低价Yes</strong>：月初 <code>0.10≤Yes≤0.25</code> 且 <code>5%~10%</code>；月中 <code>0.10≤Yes≤0.30</code> 且 <code>3%~8%</code>；月末 <code>0.08≤Yes≤0.22</code> 且 <code>2%~5%</code>。</li>"
+                + "<li><strong>No观察 / Yes观察</strong>：不落在以上区间，先列入 watchlist，不代表永远不做，只代表现在不急着做。</li>"
+                + "</ul></div>"
+                + "<div class='mb-2'><strong>阶段提醒（按你的历史）</strong><ul>"
+                + "<li><strong>当前阶段：" + phase + "</strong></li>"
+                + "<li><strong>月初</strong>：不要预设没 edge，可正常找机会。</li>"
+                + "<li><strong>月中</strong>：No 不再默认主战区；只有确认后的中价No才做，Yes 的弹性机会更值得关注。</li>"
+                + "<li><strong>月末</strong>：盈利更偏向 No，继续以防守型 No 为主。</li>"
+                + "</ul></div>"
+                + "<div class='mb-2'><strong>分层盈利目标（公式）</strong><br>仓位目标 × 该类收益目标 = 对总净值的月度贡献目标。<br>例如：<code>标准高价No 40% × 10%</code> = <strong>4.0%</strong>，"
+                + (profileValue != null && !isNaN(profileValue) ? "按月初净值约为 <strong>" + exampleAmount + "</strong>。" : "")
+                + "</div>"
+                + "<div class='mb-2'><strong>15% 目标拆分（更稳版）</strong><ul>" + stableRows + "</ul></div>"
+                + "<div class='mb-2'><strong>15% 目标拆分（稳中带弹性）</strong><ul>" + balancedRows + "</ul></div>"
+                + "<div><strong>你常犯的错误</strong><ul>"
+                + "<li>把高价No当主利润引擎去追价 → 改成只把它当防守底盘</li>"
+                + "<li>第一次逼近 barrier 就抄中价No → 改成等试探失败确认后再进</li>"
+                + "<li>没有催化就买低价Yes → 改成只在突破/催化确认后小仓位做</li>"
+                + "<li>因月度进度落后拖延止损 → 改成先保本金，再谈追目标</li>"
+                + "<li>把核心No轮动到高风险Yes → 改成核心防守仓默认不轮动</li>"
+                + "</ul></div></div>";
+        }
+
+        function updateDashboardHelpPopover() {
+            const el = document.getElementById('dashboardHelpTrigger');
+            if (!el) return;
+            el.setAttribute('data-bs-content', buildDashboardHelpContent(dashboardTargetBaseValue, dashboardPhaseLabel));
+            const instance = bootstrap.Popover.getInstance(el);
+            if (instance) instance.dispose();
+            bootstrap.Popover.getOrCreateInstance(el);
         }
 
         function loadBalance() {
@@ -408,11 +535,22 @@
                         return;
                     }
                     const profileStr = formatMoneyNum(data.profile_value);
+                    const monthStartStr = formatMoneyNum(data.month_start_profile_value);
+                    const monthlyReturnStr = formatPct(data.monthly_return_pct);
+                    dashboardTargetBaseValue = Number(
+                        data.month_start_profile_value != null ? data.month_start_profile_value : data.profile_value
+                    );
                     let availStr = '';
                     if (data.available_balance != null) {
                         availStr = ' &nbsp;|&nbsp; 可用: <strong>' + formatMoneyNum(data.available_balance) + '</strong>';
                     }
-                    document.getElementById('balance').innerHTML = 'Cash: <strong>' + (data.cash_balance || '—') + '</strong>' + availStr + ' &nbsp;|&nbsp; Profile: <strong>' + profileStr + '</strong>';
+                    document.getElementById('balance').innerHTML =
+                        'Cash: <strong>' + (data.cash_balance || '—') + '</strong>'
+                        + availStr
+                        + ' &nbsp;|&nbsp; Profile: <strong>' + profileStr + '</strong>'
+                        + ' &nbsp;|&nbsp; 月初收益率: <strong>' + monthlyReturnStr + '</strong>'
+                        + ' &nbsp;|&nbsp; 月初净值: <strong>' + monthStartStr + '</strong>';
+                    updateDashboardHelpPopover();
                 })
                 .catch(error => {
                     document.getElementById('balance').innerText = 'Error loading balance';
@@ -474,7 +612,15 @@
                         document.getElementById('events-content').innerHTML = 'Error: ' + data.error;
                         return;
                     }
+                    const escapeAttr = value => String(value ?? '')
+                        .replace(/&/g, '&amp;')
+                        .replace(/"/g, '&quot;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;');
                     let content = '<h2 class="h4 mb-3 text-wrap-mobile">' + data.event_name + '</h2>';
+                    dashboardPhaseLabel = (data.phase_label || '月中');
+                    document.getElementById('phaseBadge').textContent = dashboardPhaseLabel;
+                    updateDashboardHelpPopover();
                     // 按 question 中的 BTC 目标价格由高到低排列
                     const markets = (data.markets || []).slice().sort((a, b) => {
                         const extract = q => { const m = q.match(/\$([\d,]+)/); return m ? parseInt(m[1].replace(/,/g, ''), 10) : 0; };
@@ -485,9 +631,20 @@
                         if (hasSettledPrice) {
                             return;
                         }
+                        const barrierMeta = market.barrierMeta || {};
+                        const zoneBadges = Array.isArray(barrierMeta.zone_badges) ? barrierMeta.zone_badges : [];
 
                         content += '<div class="card event-card shadow-sm mb-3"><div class="card-body p-2 p-md-3">';
                         content += '<h3 class="text-wrap-mobile">' + market.question + '</h3>';
+                        content += '<div class="event-badge-row">';
+                        content += '<span class="badge text-bg-primary">' + (barrierMeta.distance_label || '距 barrier —') + '</span>';
+                        zoneBadges.forEach(badge => {
+                            const tone = badge && badge.tone ? badge.tone : 'secondary';
+                            const label = badge && badge.label ? badge.label : '观察区';
+                            const tooltip = badge && badge.tooltip ? escapeAttr(badge.tooltip) : '';
+                            content += '<span class="badge text-bg-' + tone + '" data-bs-toggle="tooltip" data-bs-placement="top" title="' + tooltip + '">' + label + '</span>';
+                        });
+                        content += '</div>';
                         content += '<div class="table-responsive">';
                         content += '<table class="table table-sm align-middle mb-0"><thead><tr><th>Outcome</th><th>Mid</th><th>Best Bid</th><th>Best Ask</th><th>Actions</th></tr></thead><tbody>';
                         market.outcomes.forEach((outcome, index) => {
@@ -509,7 +666,10 @@
                         });
                         content += '</tbody></table></div></div></div>';
                     });
-                    document.getElementById('events-content').innerHTML = content;
+                    const container = document.getElementById('events-content');
+                    disposeTooltips(container);
+                    container.innerHTML = content;
+                    initTooltips(container);
                 })
                 .catch(error => {
                     document.getElementById('events-content').innerHTML = 'Error loading events: ' + error;
@@ -1687,9 +1847,10 @@
             if (header) header.textContent = '联动子档 (sell)';
             const badge = clone.querySelector('#orderMainActionBadge');
             if (badge) badge.remove();
-            // 触发模式: share_cost_pct (相对父档 cost) + time_after_parent_fill (持有超时)
+            // 触发模式: btc_abs / share_cost_pct (相对父档 cost) / time_after_parent_fill (持有超时)
             const trigSel = clone.querySelector('.row-trigger-kind');
-            trigSel.innerHTML = '<option value="share_cost_pct" selected>share 触达 cost ±% (止盈/止损)</option>'
+            trigSel.innerHTML = '<option value="btc_abs">BTC 价触达</option>'
+                + '<option value="share_cost_pct" selected>share 触达 cost ±% (止盈/止损)</option>'
                 + '<option value="time_after_parent_fill">持有 N 小时后平仓 (超时退出)</option>';
             // size 默认 pct_position
             const sizeSel = clone.querySelector('.row-size-type');
@@ -1738,7 +1899,7 @@
             mainRow.querySelector('.row-price-value').value = '';
             mainRow.querySelector('.row-notes').value = '';
             _row_setupListeners(mainRow, false);
-            // chained 按钮:推荐执行不允许;sell 时也不允许(子档只能是 sell-on-cost,父档必须 buy)
+            // chained 按钮: 推荐执行不允许；sell 时也不允许（联动子档仅支持父档为 buy 后的卖出）
             const isRec = !!(currentData && currentData.recommendation_item_id);
             const allowChain = !isRec && currentAction === 'buy';
             const wrap = document.getElementById('addChainedWrap');
@@ -1905,6 +2066,32 @@
                 .catch(error => alert('取消失败: ' + error.message));
             }
         }
+
+        function disposeTooltips(root = document) {
+            if (!root) return;
+            root.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => {
+                const instance = bootstrap.Tooltip.getInstance(el);
+                if (instance) instance.dispose();
+            });
+            document.querySelectorAll('.tooltip').forEach(el => el.remove());
+        }
+
+        function initTooltips(root = document) {
+            if (!root) return;
+            root.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => {
+                bootstrap.Tooltip.getOrCreateInstance(el);
+            });
+        }
+
+        function initPopovers(root = document) {
+            if (!root) return;
+            root.querySelectorAll('[data-bs-toggle="popover"]').forEach(el => {
+                bootstrap.Popover.getOrCreateInstance(el);
+            });
+        }
+
+        initTooltips(document);
+        initPopovers(document);
 
         // Load data on page load
         loadBalance();

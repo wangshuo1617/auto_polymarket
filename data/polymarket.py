@@ -149,7 +149,11 @@ def get_polymarket_context(profile: Optional[str] = None) -> PolymarketContext:
             signature_type=2,
             funder=wallet,
         )
-        creds = temp_client.create_or_derive_api_key()
+        try:
+            # 对已存在 API key 的账户，优先 derive 可避免每次启动都先打一次 create 再输出 400 噪声。
+            creds = temp_client.derive_api_key()
+        except Exception:
+            creds = temp_client.create_api_key()
         profile_client = ClobClient(
             host,
             key=private_key,
@@ -172,11 +176,15 @@ def get_client(profile: Optional[str] = None) -> ClobClient:
     return get_polymarket_context(profile).client
 
 
-# Backward-compatible default client/wallet for legacy call sites
-_default_ctx = get_polymarket_context()
-client = _default_ctx.client
-funder_address = _default_ctx.wallet_address
-private_key = _default_ctx.private_key
+def __getattr__(name: str):
+    """兼容历史 `from data.polymarket import client` 等写法，按需懒初始化默认 profile。"""
+    if name == "client":
+        return get_client()
+    if name == "funder_address":
+        return get_polymarket_context().wallet_address
+    if name == "private_key":
+        return get_polymarket_context().private_key
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _market_meta_cache: Dict[str, Dict[str, Any]] = {}
 _token_order_meta_cache: Dict[str, Dict[str, Any]] = {}
@@ -488,7 +496,7 @@ def _http_keepalive_loop(interval_sec: int) -> None:
     while True:
         try:
             ping_t0 = time.perf_counter()
-            client.get_server_time()
+            get_client().get_server_time()
             ping_ms = (time.perf_counter() - ping_t0) * 1000
             ping_count += 1
             if ping_count % 30 == 1:
@@ -910,4 +918,3 @@ def get_activity_history(market_id: str, profile: Optional[str] = None) -> List[
     except Exception as e:
         logger.warning("get_activity_history failed: market_id=%s error=%s", market_id, e)
         return []
-
