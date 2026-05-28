@@ -7,18 +7,18 @@ import json
 # 结构化触发条件 schema(供"操作清单"等可选填充)
 # Dashboard 自动触发执行器(recommendation_auto_executor)只会在该字段解析成功时
 # 才允许人工开启"自动触发"。若条件无法用以下机器可读格式描述,请置空,
-# 仍可在「触发条件」自然语言字段说明,但只能由人工执行。v1 仅支持 BTC 价格触发。
+# 仍可在「触发条件」自然语言字段说明,但只能由人工执行。v1 仅支持 BTC 1m K 线收盘价触发。
 _TRIGGER_SPEC_SCHEMA = {
     "type": "object",
     "description": (
-        "可选。仅当触发条件可被机器化判定时填写,目前 v1 仅支持 BTC 价格阈值触发。"
+        "可选。仅当触发条件可被机器化判定时填写,目前 v1 仅支持 BTC 1m K 线收盘价阈值触发。"
         "无法机器化的复合/主观条件请留空。"
     ),
     "properties": {
         "type": {
             "type": "string",
             "enum": ["btc_price_threshold", "immediate"],
-            "description": "btc_price_threshold=BTC 价格越过阈值触发; immediate=立即可执行(无需等待)",
+            "description": "btc_price_threshold=BTC 1m K 线收盘价越过阈值触发; immediate=立即可执行(无需等待)",
         },
         "operator": {
             "type": "string",
@@ -32,7 +32,7 @@ _TRIGGER_SPEC_SCHEMA = {
         },
         "min_dwell_seconds": {
             "type": "integer",
-            "description": "命中条件后必须连续保持的秒数,默认 5,防毛刺",
+            "description": "命中条件后必须连续保持的秒数,默认 5；自动执行已先用 1m K 线收盘确认防插针",
         },
         "cooldown_seconds": {
             "type": "integer",
@@ -430,7 +430,7 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 
 **关于 `action_plans`（**强烈推荐**对每条建议尽量填写）**：在「操作清单」中，把建议拆成 0~N 条机器可执行的动作计划，每条动作含 `action_type`(buy/sell/cancel)、`side`、`price_cents`、`size_text`、可选 `trigger_spec`、`reason`。
 - 一条建议常包含多步：例如预警 "BTC≥80k 时止损 Yes / 急跌时入场 No" 应拆成 2 个 plan；波段建议 "入场 / 止盈 / 止损" 应拆成 3 个 plan（trigger_spec 各不相同）。
-- 若 `trigger_spec` 可机器化（BTC 价格越过某阈值或立即执行），请填上 type=btc_price_threshold/operator/value 或 type=immediate。无法机器化（成交量/IV/资金面/多重信号）就**省略 trigger_spec**，仍把 plan 写出来，由人工执行。
+- 若 `trigger_spec` 可机器化（BTC 1m K 线收盘价越过某阈值或立即执行），请填上 type=btc_price_threshold/operator/value 或 type=immediate。无法机器化（成交量/IV/资金面/多重信号）就**省略 trigger_spec**，仍把 plan 写出来，由人工执行。
 - `expires_at`（ISO8601 时间戳或日期，例如 `2026-05-31T23:59:59Z` 或 `2026-05-31`）的硬上限是该 polymarket 市场的到期日（通常本月底），但**默认要按 plan 性质设置，不要无脑填月底**：
   - `immediate` 立即执行类：可省略，或填 24h 内（防极端延迟下单）
   - 短期突破/止损类（btc_price_threshold，且阈值距现价 <5%）：**1-3 天**，因为价格走过阈值后市场结构会变，老阈值失效

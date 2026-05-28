@@ -753,7 +753,7 @@ def api_chat():
 
 
 # ============================================================================
-# 手动挂单的"BTC 价格触达"延迟触发
+# 手动挂单的"BTC 1m K 线收盘触达"延迟触发
 # ============================================================================
 from services.manual_pending_orders import (
     insert_pending_order as _mpo_insert,
@@ -769,6 +769,7 @@ from services.manual_pending_orders import (
 
 def _maybe_queue_manual_pending(action: str, data: dict, recommendation_item_id):
     """若 request 带 trigger_op + trigger_btc_price,把订单写入 manual_pending_orders 并返回 jsonify 响应。
+    实际触发用 BTC 1m K 线收盘价确认,避免 tick 插针误触发。
     否则返回 None,让上层走立即下单路径。
     """
     op = (data.get('trigger_op') or '').strip()
@@ -834,7 +835,7 @@ def _maybe_queue_manual_pending(action: str, data: dict, recommendation_item_id)
         'queued': True,
         'pending_id': row.get('id'),
         'pending': row,
-        'message': f"已排队: BTC {op} {trigger_btc_price} 时下 {action} 单 (有效期至 {row.get('expires_at')})",
+        'message': f"已排队: BTC 1m收盘 {op} {trigger_btc_price} 时下 {action} 单 (有效期至 {row.get('expires_at')})",
     })
 
 
@@ -902,7 +903,7 @@ def api_manual_pending_plan():
       market_id, token_id  必填
       trigger_kind         btc_abs | share_abs | share_cost_pct
       trigger_op           >= / <=
-      trigger_threshold    btc_abs/share_abs 用 (BTC 价 或 share 价)
+      trigger_threshold    btc_abs/share_abs 用 (BTC 1m收盘价 或 share 价)
       trigger_pct          share_cost_pct 用 (-100~+1000)
       size_spec            {type, value} type ∈ shares/usdc/pct_balance/pct_position
       price_spec           {type, value?/offset?} type ∈ absolute/market/cost_pct
@@ -975,28 +976,55 @@ def api_positions():
             except (TypeError, ValueError):
                 return default
 
+        def _to_float_or_none(v):
+            try:
+                if v is None:
+                    return None
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        token_ids = [str(p.get("asset")) for p in positions if p.get("asset")]
+        best_prices = {}
+        if token_ids:
+            try:
+                best_prices = get_best_prices(token_ids, profile=APP_PM_PROFILE)
+            except Exception as exc:
+                logger.warning("api_positions get_best_prices failed: %s", exc)
+
         result = []
         for p in positions:
+            asset = p.get("asset")
+            px = best_prices.get(str(asset)) if asset else None
+            best_bid = _to_float_or_none((px or {}).get("best_bid"))
+            best_ask = _to_float_or_none((px or {}).get("best_ask"))
             size = _to_float(p.get("size"))
-            cur_price = _to_float(p.get("curPrice"))
-            avg_price = _to_float(p.get("avgPrice"))
-            current_value = p.get("currentValue")
-            if current_value is None and size and cur_price is not None:
-                current_value = size * cur_price
+            source_cur_price = _to_float_or_none(p.get("curPrice"))
+            valuation_price = best_bid if best_bid is not None else source_cur_price
+            valuation_source = "best_bid" if best_bid is not None else "polymarket"
+            avg_price = _to_float_or_none(p.get("avgPrice"))
+            current_value = size * valuation_price if valuation_price is not None else p.get("currentValue")
             initial_value = p.get("initialValue")
             if initial_value is None and size and avg_price is not None:
                 initial_value = size * avg_price
+            percent_pnl = p.get("percentPnl")
+            if best_bid is not None and avg_price and avg_price > 0:
+                percent_pnl = ((best_bid / avg_price) - 1.0) * 100
             result.append({
-                "asset": p.get("asset"),
+                "asset": asset,
                 "conditionId": p.get("conditionId"),
                 "title": p.get("title") or "—",
                 "outcome": p.get("outcome") or "—",
                 "size": size,
                 "avgPrice": avg_price,
-                "curPrice": cur_price,
+                "curPrice": valuation_price,
+                "curPriceSource": valuation_source,
+                "sourceCurPrice": source_cur_price,
+                "bestBid": best_bid,
+                "bestAsk": best_ask,
                 "initialValue": initial_value,
                 "currentValue": current_value,
-                "percentPnl": p.get("percentPnl"),
+                "percentPnl": percent_pnl,
                 "endDate": p.get("endDate"),
             })
         return jsonify(result)

@@ -6,7 +6,7 @@ recommendation_auto_executor 进程订阅 BTC + Polymarket share 价，
 扫描表中已触发(且未过期)的订单 → 原子 claim → 解析 spec → 下单 → 写回结果。
 
 触发种类 (trigger_kind):
-  - btc_abs                : BTC 价 op threshold (原 v1 行为)
+  - btc_abs                : BTC 1m K 线收盘价 op threshold (防插针)
   - share_abs              : token (share) 价 op threshold
   - share_cost_pct         : token 价相对父档 fill_price 的 ±% 偏移 (链式联动)
   - time_after_parent_fill : 父档成交 N 小时后到期平仓 (与 TP/SL 同档独立 fire,
@@ -510,7 +510,7 @@ def fetch_triggered_orders(
 ) -> list[dict]:
     """返回当前满足触发条件、未过期、未 claim 的 pending 订单。
 
-    - btc_abs                : 用 btc_price 与 trigger_threshold 比较
+    - btc_abs                : 用 BTC 1m K 线收盘价与 trigger_threshold 比较
     - share_abs              : 用 share_prices[token_id] 与 trigger_threshold 比较
     - share_cost_pct         : 父档必须 fired 且 fill_price 已写,阈值 = parent.fill_price*(1+trigger_pct/100)
     - time_after_parent_fill : 父档 fired_at 起 trigger_threshold (小时) 后到期
@@ -521,7 +521,7 @@ def fetch_triggered_orders(
     share_prices = share_prices or {}
     results: list[dict] = []
     with get_cursor() as cur:
-        # btc_abs
+        # btc_abs: 调用方传入的是已收盘的 1m K 线 close,不是 tick 价。
         if btc_price is not None:
             cur.execute(
                 """

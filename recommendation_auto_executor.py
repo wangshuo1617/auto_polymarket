@@ -58,6 +58,47 @@ KILLSWITCH = os.getenv("AUTO_EXECUTE_KILLSWITCH", "0").strip() in {"1", "true", 
 _db = RecommendationDB()
 
 
+class _BTCOneMinuteCloseBuilder:
+    """用 aggTrade tick 聚合出已收盘的 1m BTC K 线 close。"""
+
+    def __init__(self) -> None:
+        self._minute_start_ms: Optional[int] = None
+        self._open: Optional[float] = None
+        self._high: Optional[float] = None
+        self._low: Optional[float] = None
+        self._close: Optional[float] = None
+
+    def update(self, *, price: float, event_ms: int) -> Optional[dict[str, Any]]:
+        minute_start_ms = int(event_ms // 60_000 * 60_000)
+        if self._minute_start_ms is None:
+            self._start_new(minute_start_ms, price)
+            return None
+
+        if minute_start_ms == self._minute_start_ms:
+            self._high = max(float(self._high or price), price)
+            self._low = min(float(self._low or price), price)
+            self._close = price
+            return None
+
+        closed = {
+            "open_time_ms": self._minute_start_ms,
+            "close_time_ms": self._minute_start_ms + 60_000,
+            "open": float(self._open or price),
+            "high": float(self._high or price),
+            "low": float(self._low or price),
+            "close": float(self._close or price),
+        }
+        self._start_new(minute_start_ms, price)
+        return closed
+
+    def _start_new(self, minute_start_ms: int, price: float) -> None:
+        self._minute_start_ms = minute_start_ms
+        self._open = price
+        self._high = price
+        self._low = price
+        self._close = price
+
+
 def _executor_label() -> str:
     try:
         host = socket.gethostname() or "executor"
@@ -241,6 +282,7 @@ def main() -> int:
 
     engine = TriggerEngine(execute_fn=_execute, rate_capacity_per_minute=RATE_LIMIT_PER_MINUTE)
     engine.start()
+    btc_1m_builder = _BTCOneMinuteCloseBuilder()
 
     # 手动延迟挂单表幂等建表
     try:
@@ -442,10 +484,27 @@ def main() -> int:
         except (TypeError, ValueError):
             return
         try:
-            engine.enqueue_btc_price(price, payload.get("update_time"))
+            event_ms = int(payload.get("timestamp") or int(time.time() * 1000))
+        except (TypeError, ValueError):
+            event_ms = int(time.time() * 1000)
+        try:
+            # tick 只用于 executor 健康度与 immediate 计划；BTC 阈值单改用 1m close 确认。
+            engine.enqueue_btc_tick(price, payload.get("update_time"))
         except (TypeError, ValueError):
             pass
-        _process_manual_pending(btc_price=price)
+        closed = btc_1m_builder.update(price=price, event_ms=event_ms)
+        if closed:
+            close_price = float(closed["close"])
+            closed_at = float(closed["close_time_ms"]) / 1000.0
+            engine.enqueue_btc_1m_close(close_price, closed_at)
+            logger.info(
+                "BTC 1m close 确认: close=%s high=%s low=%s close_time=%s",
+                close_price,
+                closed["high"],
+                closed["low"],
+                int(closed["close_time_ms"]),
+            )
+            _process_manual_pending(btc_price=close_price)
         # 每 60s 扫一次过期 pending + 卡死 executing
         now_ts = time.time()
         if now_ts - _last_expiry_sweep[0] > 60:

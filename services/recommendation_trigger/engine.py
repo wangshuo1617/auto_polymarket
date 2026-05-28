@@ -78,7 +78,7 @@ _ItemEntry = _PlanEntry
 
 @dataclass
 class _PriceEvent:
-    source: str        # "btc"
+    source: str        # "btc_tick" / "btc_1m_close"
     price: float
     received_at: float
 
@@ -116,7 +116,8 @@ class TriggerEngine:
       engine = TriggerEngine(execute_callback=..., refresh_callback=atdb.list_active_auto_plans, ...)
       engine.start()
       # 在 watcher callback 里:
-      engine.enqueue_btc_price(price, received_at)
+      engine.enqueue_btc_tick(price, received_at)
+      engine.enqueue_btc_1m_close(close_price, close_time)
       engine.stop()
     """
 
@@ -139,6 +140,7 @@ class TriggerEngine:
         self._worker: Optional[threading.Thread] = None
         self._refresher: Optional[threading.Thread] = None
         self._last_btc_update_at: float = 0.0
+        self._last_btc_1m_close_at: float = 0.0
         self._fire_count = 0
         self._skip_count = 0
         self._last_refresh_at: float = 0.0
@@ -170,14 +172,28 @@ class TriggerEngine:
     # ---------- 外部接口(线程安全) ----------
 
     def enqueue_btc_price(self, price: float, received_at: Optional[float] = None) -> None:
+        """兼容旧调用名：现在表示 BTC tick，仅用于健康度与 immediate 计划。"""
+        self.enqueue_btc_tick(price, received_at)
+
+    def enqueue_btc_tick(self, price: float, received_at: Optional[float] = None) -> None:
         try:
-            evt = _PriceEvent(source="btc", price=float(price), received_at=received_at or time.time())
+            evt = _PriceEvent(source="btc_tick", price=float(price), received_at=received_at or time.time())
         except (TypeError, ValueError):
             return
         try:
             self._queue.put_nowait(evt)
         except queue.Full:
-            logger.warning("TriggerEngine queue full,丢弃一个 BTC 价格事件 (price=%s)", price)
+            logger.warning("TriggerEngine queue full,丢弃一个 BTC tick 事件 (price=%s)", price)
+
+    def enqueue_btc_1m_close(self, price: float, closed_at: Optional[float] = None) -> None:
+        try:
+            evt = _PriceEvent(source="btc_1m_close", price=float(price), received_at=closed_at or time.time())
+        except (TypeError, ValueError):
+            return
+        try:
+            self._queue.put_nowait(evt)
+        except queue.Full:
+            logger.warning("TriggerEngine queue full,丢弃一个 BTC 1m close 事件 (price=%s)", price)
 
     def stats(self) -> dict[str, Any]:
         with self._items_lock:
@@ -188,6 +204,7 @@ class TriggerEngine:
             "skipped": self._skip_count,
             "queue_size": self._queue.qsize(),
             "last_btc_update_at": self._last_btc_update_at,
+            "last_btc_1m_close_at": self._last_btc_1m_close_at,
             "last_refresh_at": self._last_refresh_at,
             "killswitch": _killswitch_enabled(),
         }
@@ -296,7 +313,7 @@ class TriggerEngine:
                 continue
             if evt.source == "__stop__":
                 break
-            if evt.source == "btc":
+            if evt.source == "btc_tick":
                 # 价格源中断保护:若上一次 tick 距今超过 SOURCE_STALE_SECONDS,
                 # 在更新 _last_btc_update_at 前把所有正在累计 dwell 的 entry 重置,
                 # 避免离线期间被算进 dwell 而触发误 fire。
@@ -306,7 +323,10 @@ class TriggerEngine:
                 ):
                     self._reset_all_dwell(reason="btc source stale")
                 self._last_btc_update_at = evt.received_at
-                self._handle_btc_price(evt.price, evt.received_at)
+                self._handle_btc_tick(evt.price)
+            elif evt.source == "btc_1m_close":
+                self._last_btc_1m_close_at = evt.received_at
+                self._handle_btc_1m_close(evt.price, evt.received_at)
 
     def _reset_all_dwell(self, *, reason: str) -> None:
         with self._items_lock:
@@ -320,27 +340,33 @@ class TriggerEngine:
             return False
         return (now - self._last_btc_update_at) <= self.SOURCE_STALE_SECONDS
 
-    def _handle_btc_price(self, price: float, now: float) -> None:
+    def _handle_btc_tick(self, price: float) -> None:
         if _killswitch_enabled():
             return
         with self._items_lock:
-            entries = [e for e in self._plans.values() if e.trigger.type == TRIGGER_TYPE_BTC_PRICE]
             immediate = [e for e in self._plans.values() if e.trigger.type == TRIGGER_TYPE_IMMEDIATE]
 
         for entry in immediate:
             self._try_fire(entry, reason="immediate", price=price)
+
+    def _handle_btc_1m_close(self, price: float, now: float) -> None:
+        if _killswitch_enabled():
+            return
+        with self._items_lock:
+            entries = [e for e in self._plans.values() if e.trigger.type == TRIGGER_TYPE_BTC_PRICE]
 
         for entry in entries:
             hit = self._evaluate(price, entry.trigger.operator, entry.trigger.value)
             dwell = entry.dwell
             if hit:
                 if dwell.in_window_since is None:
-                    dwell.in_window_since = now
+                    # 1m close 已完成一次收盘确认；默认 5s dwell 不应再额外等一根。
+                    dwell.in_window_since = now - 60.0
                 elapsed = now - dwell.in_window_since
                 if elapsed >= entry.trigger.min_dwell_seconds:
                     self._try_fire(
                         entry,
-                        reason=f"btc {entry.trigger.operator} {entry.trigger.value} dwell={elapsed:.1f}s",
+                        reason=f"btc_1m_close {entry.trigger.operator} {entry.trigger.value} dwell={elapsed:.1f}s",
                         price=price,
                     )
                     dwell.in_window_since = None

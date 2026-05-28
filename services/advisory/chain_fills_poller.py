@@ -1,6 +1,6 @@
 """Advisory chain_fills poller (v2 B1).
 
-每次跑：拉 analyze + trade 两个 profile 的 Polymarket activity (TRADE 类型),
+每次跑：拉 active advisory profile 的 Polymarket activity (TRADE 类型),
 按 advisory universe (eventSlug startswith 'what-price-will-bitcoin-hit-in')
 过滤后写 advisory_chain_fills (UNIQUE 去重)。增量游标存
 advisory_chain_fills_poller_state.
@@ -25,6 +25,7 @@ from typing import Optional
 
 import requests
 
+from data.advisory_schema import CHAIN_FILL_PROFILES
 from data.database import get_conn
 from data.polymarket import get_polymarket_context
 
@@ -35,7 +36,7 @@ ADVISORY_SLUG_PREFIX = "what-price-will-bitcoin-hit-in"
 PAGE_LIMIT = 500
 OVERLAP_SECONDS = 120
 INITIAL_LOOKBACK_SECONDS = 3600
-PROFILES = ("analyze", "trade")
+PROFILES = CHAIN_FILL_PROFILES
 
 
 @dataclass

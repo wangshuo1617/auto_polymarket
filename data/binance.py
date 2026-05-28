@@ -3,6 +3,8 @@ Binance 现货与衍生品数据
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import requests
 
 
@@ -183,4 +185,240 @@ def get_binance_derivatives_data() -> dict:
         "open_interest_usdt": float(oi_data["openInterest"]) * float(fr_data["markPrice"]),
         "long_short_ratio": float(ls_data[0]["longShortRatio"]),
         "next_funding_time": fr_data["nextFundingTime"],
+    }
+
+
+def _to_ms(value) -> int:
+    if isinstance(value, datetime):
+        return int(value.astimezone(timezone.utc).timestamp() * 1000)
+    return int(value)
+
+
+def _fetch_klines_range(
+    base_url: str,
+    endpoint: str,
+    *,
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    timeout: int = 15,
+) -> list:
+    out: list = []
+    cursor = int(start_ms)
+    interval_ms = {
+        "1m": 60_000,
+        "3m": 180_000,
+        "5m": 300_000,
+        "15m": 900_000,
+        "30m": 1_800_000,
+        "1h": 3_600_000,
+    }.get(interval)
+    if interval_ms is None:
+        raise ValueError(f"unsupported interval: {interval}")
+
+    while cursor < end_ms:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cursor,
+            "endTime": end_ms,
+            "limit": 1000,
+        }
+        response = requests.get(base_url + endpoint, params=params, timeout=timeout)
+        response.raise_for_status()
+        chunk = response.json()
+        if not chunk:
+            break
+        out.extend(chunk)
+        last_open = int(chunk[-1][0])
+        next_cursor = last_open + interval_ms
+        if next_cursor <= cursor:
+            break
+        cursor = next_cursor
+        if len(chunk) < 1000:
+            break
+    return out
+
+
+def _kline_pressure(klines: list) -> dict:
+    if not klines:
+        return {
+            "open_price": 0.0,
+            "close_price": 0.0,
+            "ret_pct": 0.0,
+            "quote_volume_usd_m": 0.0,
+            "taker_buy_quote_usd_m": 0.0,
+            "taker_sell_quote_usd_m": 0.0,
+            "net_taker_quote_usd_m": 0.0,
+            "taker_buy_ratio": 0.0,
+            "net_taker_ratio": 0.0,
+            "trade_count": 0,
+            "kline_count": 0,
+        }
+
+    open_price = float(klines[0][1])
+    close_price = float(klines[-1][4])
+    quote_volume = 0.0
+    taker_buy_quote = 0.0
+    trade_count = 0
+    for k in klines:
+        quote_volume += float(k[7])
+        trade_count += int(k[8])
+        taker_buy_quote += float(k[10])
+    taker_sell_quote = max(quote_volume - taker_buy_quote, 0.0)
+    net_taker_quote = taker_buy_quote - taker_sell_quote
+    taker_buy_ratio = taker_buy_quote / quote_volume if quote_volume > 0 else 0.0
+    net_taker_ratio = net_taker_quote / quote_volume if quote_volume > 0 else 0.0
+    ret_pct = ((close_price / open_price) - 1.0) * 100 if open_price > 0 else 0.0
+
+    return {
+        "open_price": round(open_price, 2),
+        "close_price": round(close_price, 2),
+        "ret_pct": round(ret_pct, 3),
+        "quote_volume_usd_m": round(quote_volume / 1_000_000, 2),
+        "taker_buy_quote_usd_m": round(taker_buy_quote / 1_000_000, 2),
+        "taker_sell_quote_usd_m": round(taker_sell_quote / 1_000_000, 2),
+        "net_taker_quote_usd_m": round(net_taker_quote / 1_000_000, 2),
+        "taker_buy_ratio": round(taker_buy_ratio, 4),
+        "net_taker_ratio": round(net_taker_ratio, 4),
+        "trade_count": trade_count,
+        "kline_count": len(klines),
+    }
+
+
+def _classify_spot_pressure(spot: dict) -> tuple[str, str]:
+    ratio = float(spot.get("net_taker_ratio") or 0.0)
+    net_usd_m = abs(float(spot.get("net_taker_quote_usd_m") or 0.0))
+    ret_pct = float(spot.get("ret_pct") or 0.0)
+
+    direction = "NEUTRAL"
+    if ratio >= 0.08:
+        direction = "BUY_PRESSURE"
+    elif ratio <= -0.08:
+        direction = "SELL_PRESSURE"
+
+    confidence = "LOW"
+    if direction != "NEUTRAL":
+        if abs(ratio) >= 0.15 and net_usd_m >= 100:
+            confidence = "HIGH"
+        elif abs(ratio) >= 0.10 and net_usd_m >= 50:
+            confidence = "MEDIUM"
+        else:
+            confidence = "LOW"
+        # 价格和主动成交同向时，置信度上调；背离时不判 high。
+        if direction == "BUY_PRESSURE" and ret_pct > 0.15 and confidence == "MEDIUM":
+            confidence = "HIGH"
+        elif direction == "SELL_PRESSURE" and ret_pct < -0.15 and confidence == "MEDIUM":
+            confidence = "HIGH"
+        elif direction == "BUY_PRESSURE" and ret_pct < -0.20 and confidence == "HIGH":
+            confidence = "MEDIUM"
+        elif direction == "SELL_PRESSURE" and ret_pct > 0.20 and confidence == "HIGH":
+            confidence = "MEDIUM"
+    return direction, confidence
+
+
+def _fetch_open_interest_change(start_ms: int, end_ms: int) -> dict:
+    params = {
+        "symbol": "BTCUSDT",
+        "period": "5m",
+        "startTime": start_ms,
+        "endTime": end_ms,
+        "limit": 500,
+    }
+    response = requests.get(
+        "https://fapi.binance.com/futures/data/openInterestHist",
+        params=params,
+        timeout=15,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not rows:
+        return {"oi_value_change_pct": None, "start_oi_value": None, "end_oi_value": None}
+    start_val = float(rows[0].get("sumOpenInterestValue") or 0.0)
+    end_val = float(rows[-1].get("sumOpenInterestValue") or 0.0)
+    change_pct = ((end_val / start_val) - 1.0) * 100 if start_val > 0 else None
+    return {
+        "oi_value_change_pct": round(change_pct, 3) if change_pct is not None else None,
+        "start_oi_value": round(start_val, 2),
+        "end_oi_value": round(end_val, 2),
+    }
+
+
+def get_btc_session_market_pressure(start_utc, end_utc, interval: str = "5m") -> dict:
+    """获取同一时间窗内 Binance BTC 现货/期货资金压力。
+
+    主要用于验证 ETF 盘中异常是否传导到 BTC 市场:
+    - spot taker net quote > 0: 现货主动买盘占优
+    - spot taker net quote < 0: 现货主动卖盘占优
+    - futures/OI 用于判断是否更像杠杆驱动而非现货驱动
+    """
+    start_ms = _to_ms(start_utc)
+    end_ms = min(_to_ms(end_utc), int(datetime.now(timezone.utc).timestamp() * 1000))
+    if end_ms <= start_ms:
+        raise ValueError("end_utc must be later than start_utc")
+
+    spot_klines = _fetch_klines_range(
+        "https://data-api.binance.vision",
+        "/api/v3/klines",
+        symbol="BTCUSDT",
+        interval=interval,
+        start_ms=start_ms,
+        end_ms=end_ms,
+    )
+    spot = _kline_pressure(spot_klines)
+    spot_direction, spot_confidence = _classify_spot_pressure(spot)
+
+    futures = {"available": False}
+    try:
+        futures_klines = _fetch_klines_range(
+            "https://fapi.binance.com",
+            "/fapi/v1/klines",
+            symbol="BTCUSDT",
+            interval=interval,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+        futures = _kline_pressure(futures_klines)
+        futures["available"] = True
+        futures["open_interest"] = _fetch_open_interest_change(start_ms, end_ms)
+    except Exception as exc:
+        futures = {"available": False, "error": str(exc)[:200]}
+
+    transmission = "NEUTRAL"
+    if spot_direction != "NEUTRAL" and spot_confidence in {"MEDIUM", "HIGH"}:
+        transmission = spot_direction
+
+    leverage_note = "UNKNOWN"
+    oi_change = None
+    if futures.get("available"):
+        oi_change = (futures.get("open_interest") or {}).get("oi_value_change_pct")
+        fut_ratio = float(futures.get("net_taker_ratio") or 0.0)
+        spot_ratio = float(spot.get("net_taker_ratio") or 0.0)
+        if oi_change is not None and oi_change > 1.0 and abs(fut_ratio) > abs(spot_ratio) * 1.3:
+            leverage_note = "FUTURES_LED"
+        elif abs(spot_ratio) >= abs(fut_ratio) * 0.8:
+            leverage_note = "SPOT_CONFIRMED"
+        else:
+            leverage_note = "MIXED"
+
+    return {
+        "window": {
+            "start_utc": datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat(),
+            "end_utc": datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).isoformat(),
+            "interval": interval,
+        },
+        "spot": {
+            **spot,
+            "direction": spot_direction,
+            "confidence": spot_confidence,
+        },
+        "futures": futures,
+        "combined": {
+            "direction": transmission,
+            "confidence": spot_confidence if transmission != "NEUTRAL" else "LOW",
+            "spot_confirmed": transmission != "NEUTRAL",
+            "leverage_note": leverage_note,
+            "oi_value_change_pct": oi_change,
+        },
     }

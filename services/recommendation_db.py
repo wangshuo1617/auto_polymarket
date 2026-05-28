@@ -303,7 +303,7 @@ def _summarize_trigger(spec: dict | None, parse_status: str) -> str | None:
     op = spec.get("operator") or ""
     val = spec.get("value")
     if t == "btc_price_threshold":
-        return f"BTC {op} {val}" if val is not None else None
+        return f"BTC 1m close {op} {val}" if val is not None else None
     if t in ("poly_bid_threshold", "poly_ask_threshold"):
         side = "bid" if "bid" in (t or "") else "ask"
         return f"poly {side} {op} {val}"

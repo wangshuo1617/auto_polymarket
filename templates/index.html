@@ -232,7 +232,7 @@
                                 <label class="form-label small mb-1">触发模式</label>
                                 <select class="form-select form-select-sm row-trigger-kind">
                                     <option value="immediate" selected>立即执行</option>
-                                    <option value="btc_abs">BTC 价触达</option>
+                                    <option value="btc_abs">BTC 1m收盘触达</option>
                                     <option value="share_abs">Share 价触达</option>
                                 </select>
                             </div>
@@ -295,7 +295,7 @@
                             <button type="button" class="btn btn-outline-primary btn-sm" id="addChainedBtn">
                                 + 添加联动卖出 (绑定主档 cost basis)
                             </button>
-                            <small class="text-muted small mt-1">仅在主档为 <strong>buy</strong> 时可用；子档可按 <strong>BTC 价触达</strong>、<strong>share 相对 cost ±%</strong> 或 <strong>持有超时</strong> 触发卖出。</small>
+                            <small class="text-muted small mt-1">仅在主档为 <strong>buy</strong> 时可用；子档可按 <strong>BTC 1m收盘触达</strong>、<strong>share 相对 cost ±%</strong> 或 <strong>持有超时</strong> 触发卖出。</small>
                         </div>
                     </form>
                 </div>
@@ -693,6 +693,11 @@
             return Number(val).toFixed(2);
         }
 
+        function formatPrice(val) {
+            if (val == null || isNaN(Number(val))) return '—';
+            return Number(val).toFixed(3);
+        }
+
         function formatOrderSize(val) {
             if (val == null) return '—';
             const raw = String(val).trim();
@@ -745,14 +750,15 @@
                         content += '<div class="card event-card shadow-sm mb-3"><div class="card-body p-2 p-md-3">';
                         content += '<h3 class="text-wrap-mobile">' + safeTitle + '</h3>';
                         content += '<div class="table-responsive">';
-                        content += '<table class="table table-sm align-middle mb-0"><thead><tr><th>Outcome</th><th>Size</th><th>Avg</th><th>Current</th><th>Value</th><th>PnL%</th><th>Actions</th></tr></thead><tbody>';
+                        content += '<table class="table table-sm align-middle mb-0"><thead><tr><th>Outcome</th><th>Size</th><th>Avg</th><th>Best Bid</th><th>Best Ask</th><th>Value</th><th>PnL%</th><th>Actions</th></tr></thead><tbody>';
                         group.positions.forEach(p => {
-                            const value = p.currentValue != null ? p.currentValue : (p.size * p.curPrice);
+                            const sellRefPrice = p.bestBid != null ? p.bestBid : (p.curPrice != null ? p.curPrice : 0);
+                            const value = p.currentValue != null ? p.currentValue : (p.size * sellRefPrice);
                             const pnlClass = (p.percentPnl != null && Number(p.percentPnl) >= 0) ? 'text-success' : 'text-danger';
                             const marketId = (p.conditionId || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
                             const assetId = (p.asset || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-                            content += '<tr><td class="text-wrap-mobile">' + (p.outcome || '—') + '</td><td>' + formatTokenAmount(p.size) + '</td><td>' + (p.avgPrice != null ? p.avgPrice : '—') + '</td><td>' + (p.curPrice != null ? p.curPrice : '—') + '</td><td>' + formatMoney(value) + '</td><td class="' + pnlClass + '">' + formatPct(p.percentPnl) + '</td><td>';
-                            content += '<button class="btn btn-danger btn-sm" onclick="openSellModal(\'' + marketId + '\', \'' + assetId + '\', ' + (p.curPrice != null ? p.curPrice : 0) + ')">Sell</button>';
+                            content += '<tr><td class="text-wrap-mobile">' + (p.outcome || '—') + '</td><td>' + formatTokenAmount(p.size) + '</td><td>' + formatPrice(p.avgPrice) + '</td><td class="text-success">' + formatPrice(p.bestBid) + '</td><td class="text-danger">' + formatPrice(p.bestAsk) + '</td><td>' + formatMoney(value) + '</td><td class="' + pnlClass + '">' + formatPct(p.percentPnl) + '</td><td>';
+                            content += '<button class="btn btn-danger btn-sm" onclick="openSellModal(\'' + marketId + '\', \'' + assetId + '\', ' + sellRefPrice + ')">Sell</button>';
                             content += '</td></tr>';
                         });
                         content += '</tbody></table></div></div></div>';
@@ -766,7 +772,7 @@
 
         function _formatTriggerDesc(o) {
             const kind = o.trigger_kind || 'btc_abs';
-            if (kind === 'btc_abs') return 'BTC ' + (o.trigger_op === '<=' ? 'dip' : 'reach') + ' $' + (o.trigger_threshold ?? o.trigger_btc_price ?? '?');
+            if (kind === 'btc_abs') return 'BTC 1m close ' + (o.trigger_op === '<=' ? 'dip' : 'reach') + ' $' + (o.trigger_threshold ?? o.trigger_btc_price ?? '?');
             if (kind === 'share_abs') return 'Share ' + (o.trigger_op === '<=' ? 'dip' : 'reach') + ' ' + (o.trigger_threshold ?? '?');
             if (kind === 'share_cost_pct') {
                 const pct = o.trigger_pct;
@@ -1733,7 +1739,7 @@
                 const kind = triggerKindSel.value;
                 triggerFields.style.display = kind === 'immediate' ? 'none' : '';
                 const opCol = row.querySelector('.trigger-op-col');
-                if (kind === 'btc_abs') thresholdLabel.textContent = 'BTC 价 ($)';
+                if (kind === 'btc_abs') thresholdLabel.textContent = 'BTC 1m收盘价 ($)';
                 else if (kind === 'share_abs') thresholdLabel.textContent = 'Share 价 (0~1)';
                 else if (kind === 'share_cost_pct') thresholdLabel.textContent = 'cost ±%';
                 else if (kind === 'time_after_parent_fill') thresholdLabel.textContent = '持有时长 (小时)';
@@ -1849,7 +1855,7 @@
             if (badge) badge.remove();
             // 触发模式: btc_abs / share_cost_pct (相对父档 cost) / time_after_parent_fill (持有超时)
             const trigSel = clone.querySelector('.row-trigger-kind');
-            trigSel.innerHTML = '<option value="btc_abs">BTC 价触达</option>'
+            trigSel.innerHTML = '<option value="btc_abs">BTC 1m收盘触达</option>'
                 + '<option value="share_cost_pct" selected>share 触达 cost ±% (止盈/止损)</option>'
                 + '<option value="time_after_parent_fill">持有 N 小时后平仓 (超时退出)</option>';
             // size 默认 pct_position

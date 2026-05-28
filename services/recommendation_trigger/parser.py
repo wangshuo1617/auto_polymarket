@@ -25,7 +25,7 @@ PARSE_STATUS_PARSED = "parsed"
 PARSE_STATUS_UNPARSEABLE = "unparseable"
 PARSE_STATUS_MANUAL_ONLY = "manual_only"  # 显式不自动触发(如 review/alert)
 
-# 触发类型枚举。engine 按 type 分发到对应价格源。
+# 触发类型枚举。engine 按 type 分发到对应价格源；BTC 阈值用 1m K 线收盘价确认。
 TRIGGER_TYPE_BTC_PRICE = "btc_price_threshold"
 TRIGGER_TYPE_POLY_BID = "poly_bid_threshold"
 TRIGGER_TYPE_POLY_ASK = "poly_ask_threshold"

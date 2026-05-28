@@ -1,6 +1,6 @@
 """Advisory chain_fills poller CLI (v2 B1 + B2).
 
-执行: LD_PRELOAD="" uv run python scripts/advisory_chain_fills_poll.py [--profile analyze|trade|all]
+执行: LD_PRELOAD="" uv run python scripts/advisory_chain_fills_poll.py [--profile analyze|all]
 
 systemd timer 调用此脚本每 60s 跑一次。
 """
@@ -16,12 +16,13 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardi
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from data.advisory_schema import CHAIN_FILL_PROFILES  # noqa: E402
 from services.advisory.chain_fills_poller import poll_profile, poll_all  # noqa: E402
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", default="all", choices=["all", "analyze", "trade"])
+    parser.add_argument("--profile", default="all", choices=["all", *CHAIN_FILL_PROFILES])
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(

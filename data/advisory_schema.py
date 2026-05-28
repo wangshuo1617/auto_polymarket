@@ -390,7 +390,7 @@ BEFORE INSERT OR UPDATE ON advisory_intents
 FOR EACH ROW EXECUTE FUNCTION advisory_intents_validate();
 """
 
-CHAIN_FILL_PROFILES = ("analyze", "trade")
+CHAIN_FILL_PROFILES = ("analyze",)
 
 _DDL_ADVISORY_CHAIN_FILLS = """
 CREATE TABLE IF NOT EXISTS advisory_chain_fills (

@@ -23,7 +23,8 @@ Advisory metrics + alerts (A6).
         # 任一阈值超限则 exit code 2; --json 模式同时输出 alerts 数组
     LD_PRELOAD="" uv run scripts/advisory_metrics.py --check --alert-email
         # 同上, 且若有告警则向 config.TO_EMAIL 发送一封 SMTP 邮件
-        # (带去重 + 冷却, 状态文件 logs/.advisory_alert_state.json)
+        # (同一 fingerprint 只发一次; 新 fingerprint 仍受冷却保护,
+        #  状态文件 logs/.advisory_alert_state.json)
 
 阈值 (CLI 可覆盖):
 - --max-batch-freshness-sec      默认 600 (10 min, dashboard staleness 5 min 的 2x)
@@ -40,6 +41,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -51,6 +53,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from data.database import get_conn  # noqa: E402
+from data.advisory_schema import CHAIN_FILL_PROFILES  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +65,50 @@ logger = logging.getLogger(__name__)
 ALERT_STATE_PATH = os.path.join("logs", ".advisory_alert_state.json")
 
 
+def _format_target(strike_usd: float | None) -> str:
+    if strike_usd is None:
+        return "?"
+    k = strike_usd / 1000.0
+    return f"{int(k)}k" if k.is_integer() else f"{k:.1f}".rstrip("0").rstrip(".") + "k"
+
+
+def _flip_label(slug: str | None, outcome_index: int | None,
+                side_above: bool | None, strike_usd: float | None) -> str:
+    side = "yes" if outcome_index == 0 else ("no" if outcome_index == 1 else "?")
+    if strike_usd is not None and side_above is not None:
+        if outcome_index == 0:
+            market_above = bool(side_above)
+        elif outcome_index == 1:
+            market_above = not bool(side_above)
+        else:
+            market_above = bool(side_above)
+        direction = "reach" if market_above else "dip"
+        return f"{direction} {_format_target(strike_usd)} {side}"
+    if slug:
+        m = re.match(r"^will-bitcoin-(reach|dip-to)-([0-9]+k?)-in-", slug, re.IGNORECASE)
+        if m:
+            direction = "reach" if m.group(1).lower() == "reach" else "dip"
+            target = m.group(2).lower()
+            if not target.endswith("k"):
+                try:
+                    target = _format_target(float(target) * 1000)
+                except ValueError:
+                    pass
+            return f"{direction} {target} {side}"
+    return slug or "unknown token"
+
+
 def _alert_fingerprint(alerts: list[dict]) -> str:
-    key = sorted((a.get("metric"), a.get("severity")) for a in alerts)
+    key = sorted(
+        (
+            a.get("metric"),
+            a.get("severity"),
+            json.dumps(a.get("fingerprint"), sort_keys=True, default=str)
+            if a.get("fingerprint") is not None
+            else a.get("message"),
+        )
+        for a in alerts
+    )
     return json.dumps(key, sort_keys=True)
 
 
@@ -102,7 +147,7 @@ def _format_alert_email(alerts: list[dict], metrics: dict) -> tuple[str, str]:
     bfr = metrics.get("batch_failure_rate", {})
     lines.append(
         f"batch_freshness: id={bf.get('latest_batch_id')} "
-        f"age={bf.get('age_seconds')}s status={bf.get('status')}"
+        f"age={bf.get('freshness_seconds')}s status={bf.get('batch_completed_at')}"
     )
     lines.append(
         f"settlement_coverage: version={sc.get('version')} "
@@ -110,8 +155,17 @@ def _format_alert_email(alerts: list[dict], metrics: dict) -> tuple[str, str]:
     )
     lines.append(
         f"batch_failure_rate: window={bfr.get('window_hours')}h "
-        f"rate={bfr.get('failure_rate')} total={bfr.get('total_count')}"
+        f"rate={bfr.get('failure_rate')} total={bfr.get('total_batches')}"
     )
+    sf = metrics.get("settlement_state_flips", {})
+    if sf.get("flips"):
+        lines.append("")
+        lines.append("--- Recent flips ---")
+        for flip in sf["flips"][:10]:
+            lines.append(
+                f"  {flip.get('label') or flip['condition_id']}: "
+                f"{flip['from']} -> {flip['to']} (v{flip['version']})"
+            )
     lines.append("")
     lines.append(f"generated_at_utc: {datetime.now(timezone.utc).isoformat()}")
     return subject, "\n".join(lines)
@@ -120,11 +174,12 @@ def _format_alert_email(alerts: list[dict], metrics: dict) -> tuple[str, str]:
 def maybe_send_alert_email(alerts: list[dict], metrics: dict,
                            cooldown_seconds: float = 3600.0,
                            dry_run: bool = False) -> dict:
-    """If alerts exist and (fingerprint changed OR cooldown elapsed), send email.
+    """If alerts exist, send once per fingerprint; changed fingerprints still
+    respect cooldown to avoid burst spam.
 
     Returns a status dict describing what happened (sent / skipped / failed).
-    Persists state in `logs/.advisory_alert_state.json` so repeat cron runs
-    don't spam the inbox.
+    Persists state in `logs/.advisory_alert_state.json` so repeat timer runs
+    don't spam the inbox with the same condition over and over.
     """
     if not alerts:
         # clear last fingerprint so next alert (even same as before) is treated as fresh
@@ -140,14 +195,21 @@ def maybe_send_alert_email(alerts: list[dict], metrics: dict,
     last_fp = state.get("last_fingerprint")
     last_sent_iso = state.get("last_sent_at_utc")
 
-    if last_fp == fp and last_sent_iso:
+    if last_fp == fp:
+        return {
+            "action": "skipped",
+            "reason": "same fingerprint already sent; waiting for alert set to clear or change",
+            "fingerprint": fp,
+        }
+
+    if last_sent_iso:
         try:
             last_sent = datetime.fromisoformat(last_sent_iso)
             age = (datetime.now(timezone.utc) - last_sent).total_seconds()
             if age < cooldown_seconds:
                 return {
                     "action": "skipped",
-                    "reason": f"same fingerprint within cooldown ({age:.0f}s < {cooldown_seconds:.0f}s)",
+                    "reason": f"new fingerprint within cooldown ({age:.0f}s < {cooldown_seconds:.0f}s)",
                     "fingerprint": fp,
                 }
         except ValueError:
@@ -315,19 +377,67 @@ def collect_state_flips(window_hours: int = 24) -> dict:
                          ORDER BY settlement_feed_version
                        ) AS prev_state
                 FROM recent
+            ),
+            flips AS (
+                SELECT condition_id, prev_state, settlement_state, settlement_feed_version
+                FROM with_prev
+                WHERE prev_state IS NOT NULL AND prev_state <> settlement_state
+            ),
+            latest_record AS (
+                SELECT DISTINCT ON (condition_id)
+                       condition_id, market_slug, winning_token_id
+                FROM settlement_feed_records
+                WHERE condition_id IN (SELECT condition_id FROM flips)
+                ORDER BY condition_id, settlement_feed_version DESC
+            ),
+            latest_view AS (
+                SELECT DISTINCT ON (s.condition_id)
+                       s.condition_id,
+                       COALESCE(lr.market_slug, s.market_slug) AS market_slug,
+                       s.view_payload
+                FROM market_view_snapshots s
+                JOIN latest_record lr
+                  ON lr.condition_id = s.condition_id
+                WHERE s.condition_id IN (SELECT condition_id FROM flips)
+                ORDER BY s.condition_id,
+                         CASE
+                             WHEN lr.winning_token_id IS NOT NULL
+                                  AND s.token_id = lr.winning_token_id THEN 0
+                             ELSE 1
+                         END,
+                         s.generated_at DESC
             )
-            SELECT condition_id, prev_state, settlement_state, settlement_feed_version
-            FROM with_prev
-            WHERE prev_state IS NOT NULL AND prev_state <> settlement_state
-            ORDER BY settlement_feed_version DESC, condition_id
+            SELECT f.condition_id, f.prev_state, f.settlement_state, f.settlement_feed_version,
+                   lv.market_slug,
+                   lv.view_payload->>'outcome_index' AS outcome_index,
+                   lv.view_payload->>'side_above' AS side_above,
+                   lv.view_payload->>'strike_usd' AS strike_usd
+            FROM flips f
+            LEFT JOIN latest_view lv USING (condition_id)
+            ORDER BY f.settlement_feed_version DESC, f.condition_id
         """, (cutoff,))
         flips = cur.fetchall()
     return {
         "window_hours": window_hours,
         "flip_count": len(flips),
         "flips": [
-            {"condition_id": cid, "from": prev, "to": cur_state, "version": ver}
-            for cid, prev, cur_state, ver in flips[:20]
+            {
+                "condition_id": cid,
+                "from": prev,
+                "to": cur_state,
+                "version": ver,
+                "market_slug": slug,
+                "outcome_index": int(oi) if oi is not None else None,
+                "side_above": (str(sa).lower() == "true") if sa is not None else None,
+                "strike_usd": float(strike) if strike is not None else None,
+                "label": _flip_label(
+                    slug,
+                    int(oi) if oi is not None else None,
+                    (str(sa).lower() == "true") if sa is not None else None,
+                    float(strike) if strike is not None else None,
+                ),
+            }
+            for cid, prev, cur_state, ver, slug, oi, sa, strike in flips[:20]
         ],
     }
 
@@ -340,8 +450,9 @@ def collect_fills_poller_staleness() -> dict:
         cur.execute("""
             SELECT profile, last_success_at, last_error, last_error_at
             FROM advisory_chain_fills_poller_state
+            WHERE profile = ANY(%s)
             ORDER BY profile
-        """)
+        """, (list(CHAIN_FILL_PROFILES),))
         rows = cur.fetchall()
     by_profile: dict = {}
     worst_age: float | None = None
@@ -444,11 +555,25 @@ def evaluate_alerts(metrics: dict, thresholds: dict) -> list[dict]:
     sf = metrics["settlement_state_flips"]
     n_flips = sf.get("flip_count", 0)
     if n_flips > thresholds["max_state_flips_24h"]:
+        labels = [flip.get("label") for flip in sf.get("flips", []) if flip.get("label")]
+        if n_flips == 1 and sf.get("flips"):
+            flip = sf["flips"][0]
+            message = (
+                f"{flip.get('label') or flip['condition_id']}: "
+                f"{flip['from']} -> {flip['to']}"
+            )
+        else:
+            suffix = f" ({', '.join(labels[:3])})" if labels else ""
+            message = f"{n_flips} settlement state flip(s) in last 24h{suffix}"
         alerts.append({
             "metric": "settlement_state_flips",
             "severity": "medium",
-            "message": f"{n_flips} settlement state flip(s) in last 24h",
+            "message": message,
             "value": n_flips,
+            "fingerprint": sorted(
+                f"{flip['condition_id']}:{flip['from']}->{flip['to']}:v{flip['version']}"
+                for flip in sf.get("flips", [])
+            ),
         })
 
     # 6. fills_poller staleness (v2 B4)
@@ -573,10 +698,11 @@ def main():
                         help="Threshold for advisory chain fills poller staleness (default 300s).")
     parser.add_argument("--alert-email", action="store_true",
                         help="Send SMTP email to config.TO_EMAIL when alerts fire "
-                             "(R4). Dedup + cooldown via logs/.advisory_alert_state.json.")
+                             "(R4). Send once per fingerprint; changed fingerprints "
+                             "still use cooldown via logs/.advisory_alert_state.json.")
     parser.add_argument("--alert-cooldown-sec", type=float, default=3600.0,
-                        help="Suppress repeat emails for the same alert fingerprint "
-                             "within this window (default 3600s = 1h).")
+                        help="Suppress emails for changed alert fingerprints within "
+                             "this window (default 3600s = 1h).")
     parser.add_argument("--alert-email-dry-run", action="store_true",
                         help="With --alert-email, format the email but don't send.")
     args = parser.parse_args()
