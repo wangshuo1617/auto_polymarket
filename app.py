@@ -30,6 +30,7 @@ from services.entry_review import (
     complete_entry_review_task,
     list_entry_review_tasks,
 )
+from services.execution_quality import list_recent_execution_quality
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
 from py_clob_client_v2.clob_types import (
@@ -546,6 +547,18 @@ def api_entry_review_complete(task_id: int):
         return jsonify({"error": str(ve)}), 400
     except Exception as e:
         logger.exception("api_entry_review_complete error")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/execution_quality')
+def api_execution_quality():
+    """最近 manual pending 触发后的执行质量记录。"""
+    try:
+        profile = request.args.get("profile", APP_PM_PROFILE)
+        limit = int(request.args.get("limit") or 50)
+        return jsonify({"trades": list_recent_execution_quality(profile=profile, limit=limit)})
+    except Exception as e:
+        logger.exception("api_execution_quality error")
         return jsonify({"error": str(e)}), 500
 
 

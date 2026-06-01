@@ -45,6 +45,7 @@ from services.shared.watchers import BinanceBTCPriceWatcher  # noqa: E402
 from services.recommendation_db import RecommendationDB  # noqa: E402
 from services.recommendation_trigger import auto_trigger_db as atdb  # noqa: E402
 from services.recommendation_trigger.engine import TriggerEngine, _PlanEntry  # noqa: E402
+from services import execution_quality as _eq  # noqa: E402
 from services import manual_pending_orders as _mpo  # noqa: E402
 
 logger = logging.getLogger("recommendation_auto_executor")
@@ -295,8 +296,9 @@ def main() -> int:
     # 手动延迟挂单表幂等建表
     try:
         _mpo.ensure_table()
+        _eq.ensure_tables()
     except Exception:  # noqa: BLE001
-        logger.exception("manual_pending_orders ensure_table 失败,继续")
+        logger.exception("manual_pending/execution_quality ensure_table 失败,继续")
 
     _last_expiry_sweep = [0.0]
 
@@ -518,6 +520,12 @@ def main() -> int:
                 _mpo.mark_order_failed(order_id, error_message=f"resolved size={size}")
                 continue
 
+            pre_fire_quote = {}
+            try:
+                pre_fire_quote = (get_best_prices([token_id], profile=AUTO_EXECUTOR_PM_PROFILE) or {}).get(token_id) or {}
+            except Exception:  # noqa: BLE001
+                logger.exception("[manual_pending %s] execution quote 快照失败,继续下单", order_id)
+
             logger.info(
                 "[manual_pending %s] FIRE action=%s kind=%s btc=%s plan=%s parent=%s price=%s (%s) size=%s (%s)",
                 order_id, action, claimed.get('trigger_kind'), btc_price,
@@ -558,13 +566,38 @@ def main() -> int:
             detail = get_order_detail(str(fired_id), profile=AUTO_EXECUTOR_PM_PROFILE)
             fill_price, fill_size, fill_usdc = _extract_fill_snapshot(detail, fallback_price=limit_price)
             # fill_price 用订单限价/成交快照作为子档 cost basis；fill_size=0 表示父单尚未真实成交。
-            _mpo.mark_order_fired(
+            fired_row = _mpo.mark_order_fired(
                 order_id,
                 fired_order_id=str(fired_id),
                 fill_price=fill_price or limit_price,
                 fill_size_shares=fill_size,
                 fill_size_usdc=fill_usdc,
             )
+            try:
+                execution_row = dict(claimed)
+                if fired_row:
+                    execution_row.update(fired_row)
+                for k in ("_resolved_threshold", "_parent_fill_price", "_parent_fill_size_shares"):
+                    if k in order:
+                        execution_row[k] = order[k]
+                _eq.record_manual_pending_execution(
+                    pending_order=execution_row,
+                    fired_order_id=str(fired_id),
+                    limit_price=limit_price,
+                    fill_price=fill_price or limit_price,
+                    fill_size_shares=fill_size,
+                    fill_size_usdc=fill_usdc,
+                    price_spec=price_spec,
+                    size_spec=size_spec,
+                    price_debug=price_dbg,
+                    size_debug=size_dbg,
+                    pre_fire_quote=pre_fire_quote,
+                    btc_price=btc_price,
+                    share_prices=share_prices,
+                    profile=AUTO_EXECUTOR_PM_PROFILE,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("[manual_pending %s] execution quality 记录失败,不影响已提交订单", order_id)
             logger.info(
                 "[manual_pending %s] DONE order_id=%s fill_price=%s fill_size=%s",
                 order_id, fired_id, fill_price or limit_price, fill_size,
@@ -620,6 +653,17 @@ def main() -> int:
                     )
             except Exception:  # noqa: BLE001
                 logger.exception("manual_pending repair_stale_executing_orders 失败")
+            try:
+                snap_report = _eq.capture_due_snapshots(
+                    get_best_prices_fn=lambda token_ids: get_best_prices(
+                        token_ids,
+                        profile=AUTO_EXECUTOR_PM_PROFILE,
+                    )
+                )
+                if snap_report.get("captured") or snap_report.get("failed") or snap_report.get("expired"):
+                    logger.info("execution_quality 快照采集: %s", snap_report)
+            except Exception:  # noqa: BLE001
+                logger.exception("execution_quality capture_due_snapshots 失败")
 
     # ============ share 价轮询线程 ============
     # 5s 一轮:收集 share_abs / share_cost_pct 类挂单的 token_id,批量取 best_bid/ask,

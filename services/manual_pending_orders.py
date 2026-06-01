@@ -941,7 +941,7 @@ def mark_order_fired(
     fill_price: Optional[float] = None,
     fill_size_shares: Optional[float] = None,
     fill_size_usdc: Optional[float] = None,
-) -> None:
+) -> Optional[dict]:
     """fire 成功:写 status=fired + 实际成交参考价/数量(给链上子档当 cost basis)。"""
     ensure_table()
     with get_conn() as conn, conn.cursor() as cur:
@@ -967,6 +967,8 @@ def mark_order_fired(
             schedule_entry_review_tasks_for_pending(_row_to_dict(row))
         except Exception:
             logger.exception("schedule entry review tasks failed for pending order %s", order_id)
+        return _row_to_dict(row)
+    return None
 
 
 def mark_order_failed(order_id: int, *, error_message: str) -> None:

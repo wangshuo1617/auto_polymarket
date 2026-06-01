@@ -2029,12 +2029,14 @@
                 fetchJsonSafe('/api/manual_pending'),
                 fetchJsonSafe('/api/recommendation_plans/pending'),
                 fetchJsonSafe('/api/entry_reviews?status=pending'),
+                fetchJsonSafe('/api/execution_quality?limit=8'),
             ])
-                .then(([data, recData, reviewData]) => {
+                .then(([data, recData, reviewData, executionData]) => {
                     const manualOrders = data && Array.isArray(data.orders) ? data.orders : [];
                     const recPlans = recData && Array.isArray(recData.plans) ? recData.plans : [];
                     const reviewTasks = reviewData && Array.isArray(reviewData.tasks) ? reviewData.tasks : [];
-                    if (manualOrders.length === 0 && recPlans.length === 0 && reviewTasks.length === 0) { panel.innerHTML = ''; return; }
+                    const executionTrades = executionData && Array.isArray(executionData.trades) ? executionData.trades : [];
+                    if (manualOrders.length === 0 && recPlans.length === 0 && reviewTasks.length === 0 && executionTrades.length === 0) { panel.innerHTML = ''; return; }
                     manualPendingById = {};
                     // 按 plan_id 分组,plan_id 缺失用 id
                     const groups = {};
@@ -2044,8 +2046,31 @@
                         if (!groups[pid]) groups[pid] = [];
                         groups[pid].push(o);
                     });
+                    function _executionSnap(trade, horizon) {
+                        const snaps = Array.isArray(trade.snapshots) ? trade.snapshots : [];
+                        return snaps.find(s => Math.abs(Number(s.horizon_hours || 0) - horizon) < 0.001) || null;
+                    }
+                    function _formatExecutionMoney(value) {
+                        if (value === null || value === undefined || value === '') return '—';
+                        const n = Number(value);
+                        if (!Number.isFinite(n)) return '—';
+                        return (n >= 0 ? '+' : '') + n.toFixed(2);
+                    }
+                    function _formatExecutionPct(value) {
+                        if (value === null || value === undefined || value === '') return '—';
+                        const n = Number(value);
+                        if (!Number.isFinite(n)) return '—';
+                        return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+                    }
+                    function _formatExecutionPerf(snap) {
+                        if (!snap) return '<span class="text-muted">pending</span>';
+                        if (snap.status !== 'captured') return '<span class="text-muted">' + _escapeHtml(snap.status || 'pending') + '</span>';
+                        const pnl = Number(snap.unrealized_pnl_usdc || 0);
+                        const cls = pnl >= 0 ? 'text-success' : 'text-danger';
+                        return '<span class="' + cls + '">' + _escapeHtml(_formatExecutionPct(snap.price_change_from_fill_pct)) + '<br>$' + _escapeHtml(_formatExecutionMoney(snap.unrealized_pnl_usdc)) + '</span>';
+                    }
                     let html = '<div class="card border-warning shadow-sm"><div class="card-body p-2 p-md-3">' +
-                        '<h6 class="mb-2 text-warning">⏳ 待触发计划 / 入场复查 (' + (manualOrders.length + recPlans.length + reviewTasks.length) + ')</h6>';
+                        '<h6 class="mb-2 text-warning">⏳ 待触发计划 / 入场复查 / 执行追踪 (' + (manualOrders.length + recPlans.length + reviewTasks.length + executionTrades.length) + ')</h6>';
                     if (reviewTasks.length > 0) {
                         html += '<div class="small fw-semibold mb-1">Post-entry reviews</div>'
                             + '<div class="table-responsive mb-2"><table class="table table-sm align-middle mb-0">'
@@ -2063,6 +2088,31 @@
                                 + '<td><small>' + (fill.fill_price != null ? (Number(fill.fill_price) * 100).toFixed(1) + '¢' : '—') + '<br>' + _escapeHtml(fill.fill_size_shares || '') + '</small></td>'
                                 + '<td class="text-wrap-mobile"><small>' + _escapeHtml(thesis.note || '复查入场理由、BTC路径、同档预算和是否需要减仓/止盈。') + '</small></td>'
                                 + '<td><div class="d-flex flex-wrap gap-1"><button class="btn btn-sm btn-outline-success" onclick="completeEntryReview(' + Number(task.id) + ', \'done\')">完成</button><button class="btn btn-sm btn-outline-secondary" onclick="completeEntryReview(' + Number(task.id) + ', \'dismissed\')">忽略</button></div></td>'
+                                + '</tr>';
+                        });
+                        html += '</tbody></table></div>';
+                    }
+                    if (executionTrades.length > 0) {
+                        html += '<div class="small fw-semibold mt-2 mb-1">Execution quality</div>'
+                            + '<div class="table-responsive mb-2"><table class="table table-sm align-middle mb-0">'
+                            + '<thead><tr><th>ID</th><th>Action</th><th>Fill</th><th>Quote</th><th>Slippage</th><th>1h</th><th>6h</th><th>Time</th></tr></thead><tbody>';
+                        executionTrades.forEach(trade => {
+                            const action = String(trade.action || '').toLowerCase();
+                            const actionClass = action === 'buy' ? 'success' : 'danger';
+                            const fill = trade.fill_price != null ? (Number(trade.fill_price) * 100).toFixed(1) + '¢' : '—';
+                            const quote = trade.executable_quote_at_fire != null ? (Number(trade.executable_quote_at_fire) * 100).toFixed(1) + '¢' : '—';
+                            const slip = trade.slippage_vs_quote != null ? Number(trade.slippage_vs_quote) * 100 : null;
+                            const slipClass = slip == null ? 'text-muted' : (slip <= 0 ? 'text-success' : 'text-danger');
+                            const slipText = slip == null ? '—' : ((slip >= 0 ? '+' : '') + slip.toFixed(2) + '¢');
+                            html += '<tr>'
+                                + '<td>Q' + Number(trade.id) + '<br><small class="text-muted">P#' + _escapeHtml(trade.manual_pending_order_id || '—') + '</small></td>'
+                                + '<td><span class="badge bg-' + actionClass + '">' + _escapeHtml(action || '—') + '</span></td>'
+                                + '<td><small>' + _escapeHtml(fill) + '<br>' + _escapeHtml(trade.fill_size_shares != null ? Number(trade.fill_size_shares).toFixed(2) + ' sh' : '—') + '</small></td>'
+                                + '<td><small>' + _escapeHtml(quote) + '<br>mid ' + _escapeHtml(trade.mid_at_fire != null ? (Number(trade.mid_at_fire) * 100).toFixed(1) + '¢' : '—') + '</small></td>'
+                                + '<td><small class="' + slipClass + '">' + _escapeHtml(slipText) + '</small></td>'
+                                + '<td><small>' + _formatExecutionPerf(_executionSnap(trade, 1)) + '</small></td>'
+                                + '<td><small>' + _formatExecutionPerf(_executionSnap(trade, 6)) + '</small></td>'
+                                + '<td><small>' + _escapeHtml(trade.fired_at ? formatBjtTime(trade.fired_at) : '—') + '</small></td>'
                                 + '</tr>';
                         });
                         html += '</tbody></table></div>';
