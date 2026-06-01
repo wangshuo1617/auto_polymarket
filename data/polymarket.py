@@ -805,6 +805,18 @@ def _current_btc_month_slug() -> str:
     return f"what-price-will-bitcoin-hit-in-{current_month_year}"
 
 
+def _parse_json_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
 def get_event_situation(market_slug:str=None):
     if not market_slug:
         market_slug = _current_btc_month_slug()
@@ -817,8 +829,10 @@ def get_event_situation(market_slug:str=None):
     polymarket_event_situation["markets"] = [
         {
             "question": i.get("question"),
+            "market_id": i.get("conditionId"),
             "outcomes": i.get("outcomes"),
             "outcomePrices": i.get("outcomePrices"),
+            "token_id": _parse_json_list(i.get("clobTokenIds")),
             # 透传状态字段供上层过滤已结算市场（如存在）
             "active": i.get("active"),
             "status": i.get("status"),
@@ -839,26 +853,15 @@ def get_event_token_id(market_slug:str=None):
     response.raise_for_status()
     result = response.json()
 
-    def parse_json_list(value):
-        if isinstance(value, list):
-            return value
-        if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-                return parsed if isinstance(parsed, list) else []
-            except json.JSONDecodeError:
-                return []
-        return []
-
     polymarket_event_situation = {}
     polymarket_event_situation["event_name"] = result["title"]
     polymarket_event_situation["markets"] = [
         {
             "question": i["question"],
             "market_id": i["conditionId"],
-            "outcomes": parse_json_list(i.get("outcomes")),
-            "outcomePrices": parse_json_list(i.get("outcomePrices")),
-            "token_id": parse_json_list(i.get("clobTokenIds")),
+            "outcomes": _parse_json_list(i.get("outcomes")),
+            "outcomePrices": _parse_json_list(i.get("outcomePrices")),
+            "token_id": _parse_json_list(i.get("clobTokenIds")),
         }
         for i in result["markets"]
     ]

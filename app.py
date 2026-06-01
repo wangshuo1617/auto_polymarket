@@ -23,6 +23,7 @@ from services.monthly_goal_attribution import (
     classify_entry_tier,
     get_monthly_goal_target_pct,
     get_monthly_goal_realized_summary,
+    get_monthly_trade_review_summary,
     save_monthly_goal_target_pct,
 )
 
@@ -281,7 +282,7 @@ def _market_zone_badges(
 def _build_market_badges(market: dict, current_btc_price: float, days_left_in_month: float) -> dict:
     strike, direction = _extract_strike_and_direction(market.get("question") or "")
     yes_price, no_price = _parse_market_prices(market)
-    phase_label = _classify_time_phase(days_left_in_month)[1]
+    phase_key, phase_label = _classify_time_phase(days_left_in_month)
     if current_btc_price <= 0 or strike is None or direction == "unknown":
         return {
             "distance_pct": None,
@@ -399,6 +400,7 @@ def api_events():
                 days_left_in_month=days_left_in_month,
             )
         data["current_btc_price"] = current_btc_price
+        data["phase_key"] = phase_key
         data["phase_label"] = phase_label
         return jsonify(data)
     except Exception as e:
@@ -475,6 +477,17 @@ def api_monthly_goal_realized():
         return jsonify(get_monthly_goal_realized_summary(profile=profile))
     except Exception as e:
         logger.exception("api_monthly_goal_realized error")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/monthly_goal/review')
+def api_monthly_goal_review():
+    """按买入时快照复盘本月已实现收益来源与应加权/降权组合。"""
+    try:
+        profile = request.args.get("profile", "analyze")
+        return jsonify(get_monthly_trade_review_summary(profile=profile))
+    except Exception as e:
+        logger.exception("api_monthly_goal_review error")
         return jsonify({"error": str(e)}), 500
 
 
@@ -2494,7 +2507,6 @@ def _assert_recommendation_request_matches_item(
 def _build_auto_iteration_proposals(memory_context: dict) -> list[dict]:
     feedback_summary = memory_context.get("recent_feedback_summary", {}) if isinstance(memory_context, dict) else {}
     execution_summary = memory_context.get("recent_execution_summary", {}) if isinstance(memory_context, dict) else {}
-    pending_items = memory_context.get("pending_or_deferred_items", []) if isinstance(memory_context, dict) else []
     top_reason_tags = feedback_summary.get("top_reason_tags", []) or []
     action_status_counts = execution_summary.get("action_status_counts", {}) or {}
     decision_counts = feedback_summary.get("decision_counts", {}) or {}
@@ -2547,11 +2559,11 @@ def _build_auto_iteration_proposals(memory_context: dict) -> list[dict]:
                 "failed_action_count": int(action_status_counts.get("failed", 0) or 0),
             },
         })
-    if int(decision_counts.get("defer", 0) or 0) >= 3 or tag_count_map.get("稍后处理", 0) >= 2 or len(pending_items) >= 5:
+    if int(decision_counts.get("defer", 0) or 0) >= 3 or tag_count_map.get("稍后处理", 0) >= 2:
         proposals.append({
             "proposal_type": "cadence_rule",
             "title": "收紧补充建议频率与重复提醒阈值",
-            "rationale": "最近出现较多 defer/稍后处理，且未决建议堆积，说明当前补充建议节奏偏密或重复提醒过多。建议提高去重阈值，并对低优先级建议增加冷却时间。",
+            "rationale": "最近出现较多 defer/稍后处理，说明当前补充建议节奏偏密或重复提醒过多。建议提高去重阈值，并对低优先级建议增加冷却时间。",
             "change_payload": {
                 "target": "cadence_and_dedupe",
                 "suggested_change": "对非高优先级建议增加 cooldown，并在已有 pending/deferred 建议时减少相近新建议生成。",
@@ -2559,7 +2571,6 @@ def _build_auto_iteration_proposals(memory_context: dict) -> list[dict]:
             "evidence_payload": {
                 "defer_count": int(decision_counts.get("defer", 0) or 0),
                 "稍后处理": tag_count_map.get("稍后处理", 0),
-                "pending_or_deferred_count": len(pending_items),
             },
         })
     if int(decision_counts.get("reject", 0) or 0) >= 4 or learning_disabled_count >= 2:

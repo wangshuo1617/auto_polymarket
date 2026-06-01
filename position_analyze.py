@@ -28,6 +28,7 @@ from services.monthly_goal_attribution import (
     build_monthly_goal_context,
     get_monthly_goal_target_pct,
 )
+from services.manual_pending_orders import list_pending_orders as list_manual_pending_orders
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,142 @@ def _filter_unsettled_event_situation(event_situation: dict) -> dict:
     result = dict(event_situation)
     result["markets"] = filtered_markets
     return result
+
+
+def _parse_prompt_list(value: object) -> list:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def _build_event_token_lookup(event_situation: dict) -> dict[str, dict]:
+    """用当前事件 metadata 给 pending 队列补充 question/outcome/现价。"""
+    lookup: dict[str, dict] = {}
+    if not isinstance(event_situation, dict):
+        return lookup
+    for market in event_situation.get("markets") or []:
+        if not isinstance(market, dict):
+            continue
+        question = str(market.get("question") or "")
+        market_id = str(market.get("market_id") or market.get("conditionId") or "")
+        outcomes = _parse_prompt_list(market.get("outcomes"))
+        prices = _parse_prompt_list(market.get("outcomePrices"))
+        token_ids = _parse_prompt_list(market.get("token_id") or market.get("clobTokenIds"))
+        for idx, token_id in enumerate(token_ids):
+            tid = str(token_id or "")
+            if not tid:
+                continue
+            lookup[tid] = {
+                "question": question,
+                "market_id": market_id,
+                "outcome": str(outcomes[idx]) if idx < len(outcomes) else None,
+                "current_price": prices[idx] if idx < len(prices) else None,
+            }
+    return lookup
+
+
+def _pending_estimated_buy_notional(row: dict) -> float | None:
+    if str(row.get("action") or "").lower() != "buy":
+        return None
+    price_spec = row.get("price_spec") if isinstance(row.get("price_spec"), dict) else {}
+    size_spec = row.get("size_spec") if isinstance(row.get("size_spec"), dict) else {}
+    size_type = str(size_spec.get("type") or "").lower()
+    try:
+        if size_type == "usdc":
+            return round(float(size_spec.get("value") or 0.0), 2)
+        if size_type == "shares":
+            price = (
+                float(price_spec.get("value"))
+                if price_spec.get("type") == "absolute" and price_spec.get("value") is not None
+                else float(row.get("price") or 0.0)
+            )
+            return round(float(size_spec.get("value") or 0.0) * price, 2)
+        if not size_type and row.get("price") is not None and row.get("size") is not None:
+            return round(float(row.get("price") or 0.0) * float(row.get("size") or 0.0), 2)
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _compact_active_manual_pending_orders(
+    *,
+    event_situation: dict,
+    profile: str,
+    limit: int = 40,
+) -> dict:
+    """给 AI 的真实待触发订单摘要；只保留 active 队列，避免误当作历史建议。"""
+    token_lookup = _build_event_token_lookup(event_situation)
+    rows = list_manual_pending_orders(include_finished=False, limit=max(limit * 2, 100))
+    active_rows: list[dict] = []
+    status_counts: dict[str, int] = {}
+    plan_ids: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        extra = row.get("extra") if isinstance(row.get("extra"), dict) else {}
+        row_profile = str(extra.get("profile") or "").strip().lower()
+        if row_profile and row_profile != profile:
+            continue
+        status = str(row.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        active_rows.append(row)
+        if row.get("plan_id") is not None:
+            plan_ids.add(str(row.get("plan_id")))
+
+    orders: list[dict] = []
+    for row in active_rows[:limit]:
+        extra = row.get("extra") if isinstance(row.get("extra"), dict) else {}
+        token_id = str(row.get("token_id") or "")
+        meta = token_lookup.get(token_id) or {}
+        trigger = {
+            "kind": row.get("trigger_kind"),
+            "op": row.get("trigger_op"),
+            "threshold": row.get("trigger_threshold"),
+            "pct": row.get("trigger_pct"),
+            "btc_price": row.get("trigger_btc_price"),
+        }
+        orders.append({
+            "id": row.get("id"),
+            "plan_id": row.get("plan_id"),
+            "parent_pending_id": row.get("parent_pending_id"),
+            "status": row.get("status"),
+            "action": row.get("action"),
+            "question": meta.get("question"),
+            "outcome": meta.get("outcome"),
+            "current_token_price": meta.get("current_price"),
+            "market_id": row.get("market_id"),
+            "token_id": token_id,
+            "trigger": {k: v for k, v in trigger.items() if v is not None},
+            "size_spec": row.get("size_spec") or {"type": "shares", "value": row.get("size")},
+            "price_spec": row.get("price_spec") or {"type": "absolute", "value": row.get("price")},
+            "estimated_buy_notional_usdc": _pending_estimated_buy_notional(row),
+            "expires_at": row.get("expires_at"),
+            "created_at": row.get("created_at"),
+            "source": extra.get("source") or "dashboard_manual",
+            "plan_role": extra.get("plan_role"),
+            "notes": str(row.get("notes") or "")[:300] or None,
+        })
+
+    return {
+        "source": "manual_pending_orders",
+        "profile": profile,
+        "active_count": len(active_rows),
+        "returned_count": len(orders),
+        "omitted_count": max(0, len(active_rows) - len(orders)),
+        "active_plan_count": len(plan_ids),
+        "status_counts": status_counts,
+        "orders": orders,
+        "usage_note": (
+            "这些是真实待触发/执行中的 Dashboard pending 订单；"
+            "AI 新建议必须避免重复，若冲突应建议取消或修改现有 pending。"
+        ),
+    }
 
 
 def _load_previous_report() -> dict | None:
@@ -275,6 +412,40 @@ def _build_future_possibility_context(
     }
 
 
+def _build_btc_momentum_context(btc_4h_k_data: list, current_btc_price: float) -> dict:
+    """用近 4h/24h 方向给中价 No barrier 风险做确认。"""
+    closes: list[float] = []
+    for k in btc_4h_k_data or []:
+        if len(k) < 5:
+            continue
+        try:
+            closes.append(float(k[4]))
+        except (TypeError, ValueError):
+            continue
+    current = float(current_btc_price or 0.0)
+    if current <= 0 or len(closes) < 2:
+        return {"direction": "neutral", "fast_move": False, "status": "insufficient_data"}
+
+    last_close = closes[-1]
+    prev_close = closes[-2]
+    reference_24h = closes[-7] if len(closes) >= 7 else closes[0]
+    change_4h_pct = (last_close / prev_close - 1.0) * 100.0 if prev_close > 0 else 0.0
+    change_24h_pct = (last_close / reference_24h - 1.0) * 100.0 if reference_24h > 0 else 0.0
+    if change_4h_pct >= 0.5 or change_24h_pct >= 1.2:
+        direction = "up"
+    elif change_4h_pct <= -0.5 or change_24h_pct <= -1.2:
+        direction = "down"
+    else:
+        direction = "neutral"
+    return {
+        "direction": direction,
+        "fast_move": abs(change_4h_pct) >= 0.9 or abs(change_24h_pct) >= 2.0,
+        "change_4h_pct": round(change_4h_pct, 2),
+        "change_24h_pct": round(change_24h_pct, 2),
+        "status": "ok",
+    }
+
+
 if __name__ == "__main__":
     email_sender = EmailSender()
     recommendation_db = RecommendationDB()
@@ -324,10 +495,12 @@ if __name__ == "__main__":
         btc_1d_k_data,
         float(current_btc_price),
     )
+    btc_momentum_context = _build_btc_momentum_context(btc_4h_k_data, float(current_btc_price))
     print(
         f"{time_now} 未来可能性上下文完成: month_high={future_possibility_context.get('month_high')} "
         f"drawdown={future_possibility_context.get('drawdown_from_month_high_pct')}% "
-        f"space_to_reclaim_target={future_possibility_context.get('space_to_reclaim_target_pct')}%"
+        f"space_to_reclaim_target={future_possibility_context.get('space_to_reclaim_target_pct')}% "
+        f"btc_momentum={btc_momentum_context.get('direction')}/{btc_momentum_context.get('change_4h_pct')}%"
     )
 
     previous_report = _load_previous_report()
@@ -338,16 +511,33 @@ if __name__ == "__main__":
     feedback_count = (
         recommendation_memory_context.get("recent_feedback_summary", {}).get("total_feedback_count") or 0
     )
-    pending_count = len(recommendation_memory_context.get("pending_or_deferred_items", []) or [])
     print(
-        f"{time_now} 建议历史记忆摘要已加载: recent_feedback={feedback_count} "
-        f"pending_or_deferred={pending_count}"
+        f"{time_now} 建议反馈与执行结果记忆已加载: recent_feedback={feedback_count}"
     )
 
     event_situation = get_event_situation()
     raw_market_count = len(event_situation.get("markets", [])) if isinstance(event_situation, dict) else 0
     event_situation = _filter_unsettled_event_situation(event_situation)
     kept_market_count = len(event_situation.get("markets", [])) if isinstance(event_situation, dict) else 0
+    try:
+        active_manual_pending_orders = _compact_active_manual_pending_orders(
+            event_situation=event_situation,
+            profile=ANALYZE_PROFILE,
+        )
+    except Exception as exc:
+        logger.exception("build active manual pending orders context failed")
+        active_manual_pending_orders = {
+            "source": "manual_pending_orders",
+            "profile": ANALYZE_PROFILE,
+            "available": False,
+            "error": str(exc),
+            "orders": [],
+        }
+    print(
+        f"{time_now} 真实 pending 队列上下文已加载: "
+        f"active={active_manual_pending_orders.get('active_count', 0)} "
+        f"plans={active_manual_pending_orders.get('active_plan_count', 0)}"
+    )
     usdc_balance = get_balance_allowance(profile=ANALYZE_PROFILE)
     profit_optimization_context = build_profit_optimization_context(
         polymarket_event_situation=event_situation,
@@ -357,6 +547,7 @@ if __name__ == "__main__":
         positions=positions,
         previous_report=previous_report,
     )
+    profit_optimization_context["active_manual_pending_orders"] = active_manual_pending_orders
     try:
         monthly_progress = profit_optimization_context.get("monthly_progress") or {}
         portfolio_summary = profit_optimization_context.get("portfolio_summary") or {}
@@ -376,6 +567,7 @@ if __name__ == "__main__":
             target_pct_source=str(monthly_goal_setting.get("source") or "backend_default"),
             realized_overrides=monthly_goal_setting.get("realized_overrides") or {},
             target_position_overrides=monthly_goal_setting.get("target_position_overrides") or {},
+            btc_momentum_context=btc_momentum_context,
             profile=ANALYZE_PROFILE,
         )
         profit_optimization_context["monthly_goal_context"] = monthly_goal_context
@@ -444,6 +636,7 @@ if __name__ == "__main__":
             "future_possibility_context": future_possibility_context,
             "profit_optimization_context": profit_optimization_context,
             "recommendation_memory_context": recommendation_memory_context,
+            "active_manual_pending_orders": active_manual_pending_orders,
             "market_sentiment_and_funding": market_sentiment_and_funding,
             "polymarket_event_situation": event_situation,
             "usdc_balance": usdc_balance,

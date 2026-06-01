@@ -30,6 +30,7 @@ from data.binance import get_1m_kline_close_at
 from data.database import get_conn
 from data.polymarket import get_polymarket_context
 from services.monthly_goal_attribution import (
+    build_decision_context_snapshot,
     classify_activity_buy_tier,
     ensure_fill_attribution_columns,
     json_param,
@@ -176,6 +177,9 @@ def _insert_fill(cur, item: dict, wallet: str, profile: str) -> str:
                 price=price,
                 btc_price=btc_price,
             )
+            decision_context = build_decision_context_snapshot(cur, profile=profile, fill_dt=fill_dt)
+            if decision_context:
+                tier_snapshot["decision_context"] = decision_context
             entry_tier_key = tier_snapshot.get("tier_key")
             entry_tier_label = tier_snapshot.get("tier_label")
         except Exception as exc:  # noqa: BLE001

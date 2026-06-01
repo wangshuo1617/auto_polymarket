@@ -459,7 +459,7 @@
         let currentData = null;
         let recommendationFeedbackModal = null;
         let dashboardTargetBaseValue = null;
-        let dashboardPhaseLabel = '月中';
+        let dashboardPhaseLabel = _currentEtMonthPhase().label;
         let openOrdersById = {};
         let manualPendingById = {};
         let fastSignalConfirmState = { direction: 'NEUTRAL', sinceMs: 0 };
@@ -478,6 +478,7 @@
         let monthlyGoalDraftPrefs = null;
         let monthlyGoalRenderTimer = null;
         let monthlyGoalAutoRealized = null;
+        let monthlyGoalTradeReview = null;
         const MONTHLY_GOAL_TIERS = [
             { key: 'comfy_high_no', label: '舒服高价No', outcome: 'No', badgeLabels: ['舒服高价No'], returnPct: 5, contributionPct: 1, tone: 'danger' },
             { key: 'high_no', label: '标准高价No', outcome: 'No', badgeLabels: ['高价No'], returnPct: 10, contributionPct: 3, tone: 'danger' },
@@ -487,6 +488,91 @@
         const MONTHLY_GOAL_MIN_POSITION_PCT_BY_TIER = {
             comfy_high_no: 10,
         };
+        const MONTHLY_GOAL_OVERALL_LOSS_BUDGET_PCT = 5.0;
+        const MONTHLY_GOAL_TIER_LOSS_BUDGET_PCT_BY_TIER = {
+            comfy_high_no: 0.5,
+            high_no: 1.0,
+            mid_no: 2.5,
+            low_yes: 1.0,
+        };
+        const MONTHLY_GOAL_PHASE_POSITION_CAPS_BY_TIER = {
+            month_start: { comfy_high_no: 20, high_no: 30, mid_no: 50, low_yes: 5 },
+            month_mid: { comfy_high_no: 30, high_no: 35, mid_no: 35, low_yes: 3 },
+            month_end: { comfy_high_no: 50, high_no: 35, mid_no: 20, low_yes: 2 },
+        };
+        const MONTHLY_GOAL_MID_NO_ENTRY_RULES = {
+            month_start: { allowDistancePct: 8, blockDistancePct: 6 },
+            month_mid: { allowDistancePct: 7, blockDistancePct: 5 },
+            month_end: { allowDistancePct: 6, blockDistancePct: 4.5 },
+        };
+
+        function _currentEtMonthPhase() {
+            try {
+                const parts = new Intl.DateTimeFormat('en-US', {
+                    timeZone: 'America/New_York',
+                    year: 'numeric',
+                    month: 'numeric',
+                    day: 'numeric',
+                    hour: 'numeric',
+                    hourCycle: 'h23',
+                }).formatToParts(new Date());
+                const values = Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, Number(p.value)]));
+                const year = values.year;
+                const month = values.month;
+                const day = values.day;
+                const hour = values.hour || 0;
+                const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+                const daysLeft = Math.max(0, daysInMonth - day) + (24 - hour) / 24;
+                if (daysLeft <= 7) return { key: 'month_end', label: '月末' };
+                if (daysLeft <= 16) return { key: 'month_mid', label: '月中' };
+                return { key: 'month_start', label: '月初' };
+            } catch (error) {
+                return { key: 'month_mid', label: '月中' };
+            }
+        }
+
+        function _monthlyGoalPhaseKey() {
+            const key = latestEventsData && latestEventsData.phase_key;
+            if (key) return key;
+            if (dashboardPhaseLabel === '月初') return 'month_start';
+            if (dashboardPhaseLabel === '月末') return 'month_end';
+            if (dashboardPhaseLabel === '月中') return 'month_mid';
+            return _currentEtMonthPhase().key;
+        }
+
+        function _monthlyGoalPhaseCaps() {
+            return MONTHLY_GOAL_PHASE_POSITION_CAPS_BY_TIER[_monthlyGoalPhaseKey()]
+                || MONTHLY_GOAL_PHASE_POSITION_CAPS_BY_TIER.month_mid;
+        }
+
+        function _monthlyGoalPlannedReturnForPositions(positions) {
+            return MONTHLY_GOAL_TIERS.reduce((sum, tier, idx) => (
+                sum + Math.max(0, Number(positions[idx] || 0)) * tier.returnPct / 100
+            ), 0);
+        }
+
+        function _monthlyGoalApplyPhaseCaps(positions) {
+            const caps = _monthlyGoalPhaseCaps();
+            const adjusted = positions.map(v => Math.max(0, Number(v) || 0));
+            let excess = 0;
+            MONTHLY_GOAL_TIERS.forEach((tier, idx) => {
+                const cap = Number(caps[tier.key] || 100);
+                if (adjusted[idx] > cap) {
+                    excess += adjusted[idx] - cap;
+                    adjusted[idx] = cap;
+                }
+            });
+            [0, 1, 2, 3].some(idx => {
+                if (excess <= 1e-9) return true;
+                const tier = MONTHLY_GOAL_TIERS[idx];
+                const room = Math.max(0, Number(caps[tier.key] || 100) - adjusted[idx]);
+                const move = Math.min(room, excess);
+                adjusted[idx] += move;
+                excess -= move;
+                return false;
+            });
+            return adjusted;
+        }
 
         function calculateMonthlyGoalTierAllocations(targetPct, targetPositionOverrides) {
             const target = Math.max(0, Number(targetPct) || 0);
@@ -496,9 +582,7 @@
             const minPositions = MONTHLY_GOAL_TIERS.map(tier => (
                 Number(MONTHLY_GOAL_MIN_POSITION_PCT_BY_TIER[tier.key] || 0)
             ));
-            const plannedReturn = () => MONTHLY_GOAL_TIERS.reduce((sum, tier, idx) => (
-                sum + positions[idx] * tier.returnPct / 100
-            ), 0);
+            const plannedReturn = () => _monthlyGoalPlannedReturnForPositions(positions);
             const shiftPosition = (fromIdx, toIdx, remainingDelta) => {
                 if (remainingDelta <= 0) return 0;
                 const effectPerPct = Math.abs(MONTHLY_GOAL_TIERS[toIdx].returnPct - MONTHLY_GOAL_TIERS[fromIdx].returnPct) / 100;
@@ -529,6 +613,8 @@
                 }
             }
 
+            const targetModelPositions = positions.map(v => Math.max(0, Number(v) || 0));
+            const phaseSuggestedPositions = _monthlyGoalApplyPhaseCaps(targetModelPositions);
             const normalizedOverrides = {};
             if (targetPositionOverrides && typeof targetPositionOverrides === 'object') {
                 MONTHLY_GOAL_TIERS.forEach((tier, idx) => {
@@ -540,26 +626,44 @@
                     }
                 });
             }
+            if (!Object.keys(normalizedOverrides).length) {
+                phaseSuggestedPositions.forEach((value, idx) => { positions[idx] = value; });
+            }
 
-            const planned = plannedReturn();
+            const planned = _monthlyGoalPlannedReturnForPositions(positions);
+            const effectivePositions = positions.map((value, idx) => Math.min(
+                Math.max(0, Number(value) || 0),
+                Math.max(0, Number(phaseSuggestedPositions[idx]) || 0)
+            ));
+            const effectivePlanned = _monthlyGoalPlannedReturnForPositions(effectivePositions);
             const allocations = MONTHLY_GOAL_TIERS.map((tier, idx) => {
                 const targetPositionPct = Math.max(0, positions[idx]);
                 const targetContributionPct = targetPositionPct * tier.returnPct / 100;
+                const phaseSuggestedPositionPct = Math.max(0, phaseSuggestedPositions[idx]);
+                const effectivePositionCapPct = Math.max(0, effectivePositions[idx]);
+                const effectiveTargetContributionPct = effectivePositionCapPct * tier.returnPct / 100;
                 return {
                     tierKey: tier.key,
                     targetPositionPct,
                     targetContributionPct,
                     targetProfitSharePct: planned > 0 ? targetContributionPct / planned * 100 : 0,
+                    phaseSuggestedPositionPct,
+                    effectivePositionCapPct,
+                    effectiveTargetContributionPct,
+                    effectiveTargetProfitSharePct: effectivePlanned > 0 ? effectiveTargetContributionPct / effectivePlanned * 100 : 0,
+                    exceedsPhaseSuggestion: targetPositionPct > phaseSuggestedPositionPct + 1e-9,
                 };
             });
             return {
                 targetPct: target,
                 plannedReturnPct: planned,
+                effectivePlannedReturnPct: effectivePlanned,
                 allocationSource: Object.keys(normalizedOverrides).length ? 'dashboard_custom_positions' : 'target_model',
                 targetPositionOverrides: normalizedOverrides,
                 targetFeasibleWithoutLeverage: allocations.reduce((sum, item) => sum + item.targetPositionPct, 0) <= 100.000001,
-                targetReturnMatchesGoal: Math.abs(planned - target) <= 1e-6,
+                targetReturnMatchesGoal: Math.abs(effectivePlanned - target) <= 1e-6,
                 totalPositionPct: allocations.reduce((sum, item) => sum + item.targetPositionPct, 0),
+                effectiveTotalPositionPct: allocations.reduce((sum, item) => sum + item.effectivePositionCapPct, 0),
                 allocations,
             };
         }
@@ -765,6 +869,22 @@
                 });
         }
 
+        function loadMonthlyGoalReview() {
+            fetchJsonSafe('/api/monthly_goal/review')
+                .then(data => {
+                    if (data && !data.error) {
+                        monthlyGoalTradeReview = data;
+                    } else {
+                        monthlyGoalTradeReview = { error: data && data.error ? data.error : '加载失败' };
+                    }
+                    renderMonthlyGoal();
+                })
+                .catch(error => {
+                    monthlyGoalTradeReview = { error: error.message || String(error) };
+                    renderMonthlyGoal();
+                });
+        }
+
         function loadMonthlyGoalSettings() {
             _loadMonthlyGoalPrefs();
             const localTarget = Number(monthlyGoalPrefs.targetPct || 20);
@@ -863,14 +983,22 @@
                     const tokenId = String((market.token_id || [])[index] || '');
                     const price = _entryPriceForOutcome(market, index);
                     const held = positionsByAsset[tokenId] || { shares: 0, value: 0 };
-                    out[tier.key].push({
+                    const barrierMeta = market.barrierMeta || {};
+                    const distancePct = Number(barrierMeta.distance_pct);
+                    const candidate = {
                         question: market.question || '',
                         tokenId,
                         price,
                         heldShares: held.shares,
                         heldValue: held.value,
                         strike: _extractStrikeFromQuestion(market.question),
-                    });
+                        directionInQuestion: _extractDirectionFromQuestion(market.question),
+                        distancePct: Number.isFinite(distancePct) ? distancePct : null,
+                    };
+                    if (tier.key === 'mid_no') {
+                        candidate.midNoEntryGate = _monthlyGoalMidNoEntryGate(candidate);
+                    }
+                    out[tier.key].push(candidate);
                 });
             });
             Object.keys(out).forEach(key => {
@@ -885,9 +1013,126 @@
             MONTHLY_GOAL_TIERS.forEach(tier => {
                 const row = byTier[tier.key];
                 const pnl = row && typeof row === 'object' ? Number(row.realized_pnl || 0) : Number(row || 0);
-                out[tier.key] = Number.isFinite(pnl) ? pnl : 0;
+                const loss = row && typeof row === 'object'
+                    ? Number(row.gross_realized_loss || Math.max(0, -pnl))
+                    : Math.max(0, -pnl);
+                out[tier.key] = {
+                    realizedPnl: Number.isFinite(pnl) ? pnl : 0,
+                    grossRealizedLoss: Number.isFinite(loss) ? Math.max(0, loss) : 0,
+                };
             });
             return out;
+        }
+
+        function _monthlyGoalLossStatus(used, budget) {
+            const usedNum = Math.max(0, Number(used) || 0);
+            const budgetNum = Math.max(0, Number(budget) || 0);
+            if (budgetNum <= 0) {
+                return { status: usedNum > 0 ? 'stop_new_entries' : 'ok', usagePct: null };
+            }
+            const usagePct = usedNum / budgetNum * 100;
+            if (usagePct >= 100) return { status: 'stop_new_entries', usagePct };
+            if (usagePct >= 70) return { status: 'caution', usagePct };
+            return { status: 'ok', usagePct };
+        }
+
+        function _monthlyGoalLossStatusBadge(status) {
+            if (status === 'stop_new_entries' || status === 'block') return '<span class="badge text-bg-danger">暂停加仓</span>';
+            if (status === 'caution') return '<span class="badge text-bg-warning">谨慎</span>';
+            return '<span class="badge text-bg-success">可用</span>';
+        }
+
+        function _combineMonthlyGoalEntryStatus(...statuses) {
+            if (statuses.some(s => s === 'block' || s === 'stop_new_entries')) return 'block';
+            if (statuses.some(s => s === 'caution')) return 'caution';
+            return 'allow';
+        }
+
+        function _extractDirectionFromQuestion(question) {
+            const q = String(question || '').toLowerCase();
+            if (/(below|under|less|at most|lower than|dip|drop|fall)/.test(q)) return 'below';
+            if (/(above|over|greater|at least|reach|hit|higher than)/.test(q)) return 'above';
+            return 'unknown';
+        }
+
+        function _monthlyGoalMidNoEntryGate(candidate) {
+            const phaseKey = _monthlyGoalPhaseKey();
+            const rules = MONTHLY_GOAL_MID_NO_ENTRY_RULES[phaseKey] || MONTHLY_GOAL_MID_NO_ENTRY_RULES.month_mid;
+            const distance = Number(candidate.distancePct);
+            if (!Number.isFinite(distance)) {
+                return { status: 'caution', reasons: ['缺少 barrier distance，按谨慎处理'] };
+            }
+            if (distance < rules.blockDistancePct) {
+                return { status: 'block', reasons: ['distance ' + distance.toFixed(1) + '% 低于硬门槛 ' + rules.blockDistancePct.toFixed(1) + '%'] };
+            }
+            if (distance < rules.allowDistancePct) {
+                return { status: 'caution', reasons: ['distance ' + distance.toFixed(1) + '% 未达到正常门槛 ' + rules.allowDistancePct.toFixed(1) + '%'] };
+            }
+            return { status: 'allow', reasons: ['distance 满足中价No确认'] };
+        }
+
+        function _reviewSeverityClass(severity) {
+            if (severity === 'add') return 'success';
+            if (severity === 'reduce') return 'warning';
+            if (severity === 'block') return 'danger';
+            return 'secondary';
+        }
+
+        function _renderMonthlyGoalReview() {
+            const review = monthlyGoalTradeReview;
+            if (!review) {
+                return '<div class="card shadow-sm mb-3"><div class="card-body text-muted small">复盘层加载中…</div></div>';
+            }
+            if (review.error) {
+                return '<div class="card shadow-sm mb-3"><div class="card-body text-danger small">复盘加载失败：' + escapeHtml(review.error) + '</div></div>';
+            }
+            const summary = review.summary || {};
+            const coverage = review.coverage || {};
+            const conclusions = Array.isArray(review.conclusions) ? review.conclusions : [];
+            const worst = Array.isArray(review.worst_combinations) ? review.worst_combinations : [];
+            const best = Array.isArray(review.best_combinations) ? review.best_combinations : [];
+            const conclusionHtml = conclusions.length
+                ? conclusions.map(item => {
+                    const badge = _reviewSeverityClass(item.severity);
+                    return '<li class="mb-1"><span class="badge text-bg-' + badge + '">' + escapeHtml(item.severity || 'info') + '</span> '
+                        + '<strong>' + escapeHtml(item.title || '复盘结论') + '</strong><br>'
+                        + '<small class="text-muted">' + escapeHtml(item.detail || '') + '</small></li>';
+                }).join('')
+                : '<li class="text-muted">已平仓样本不足，等待更多成交。</li>';
+            const comboRows = worst.concat(best).slice(0, 6).map(item => {
+                const pnl = Number(item.realized_pnl || 0);
+                const pnlClass = pnl >= 0 ? 'text-success' : 'text-danger';
+                return '<tr>'
+                    + '<td class="text-wrap-mobile">' + escapeHtml(item.label || item.key || '—') + '</td>'
+                    + '<td>' + escapeHtml(item.match_count || 0) + '</td>'
+                    + '<td class="' + pnlClass + '">' + formatMoneyNum(pnl) + '</td>'
+                    + '<td>' + (item.return_pct != null ? Number(item.return_pct).toFixed(1) + '%' : '—') + '</td>'
+                    + '<td>' + (item.win_rate_pct != null ? Number(item.win_rate_pct).toFixed(0) + '%' : '—') + '</td>'
+                    + '</tr>';
+            }).join('');
+            const comboTable = comboRows
+                ? '<div class="table-responsive mt-2"><table class="table table-sm align-middle mb-0">'
+                    + '<thead><tr><th>组合</th><th>平仓</th><th>已实现</th><th>回报</th><th>胜率</th></tr></thead>'
+                    + '<tbody>' + comboRows + '</tbody></table></div>'
+                : '<div class="text-muted small mt-2">暂无可排序组合。</div>';
+            return '<div class="card shadow-sm mb-3"><div class="card-body">'
+                + '<div class="d-flex flex-wrap justify-content-between gap-2 mb-2">'
+                + '<div><h2 class="h5 mb-1">本月复盘结论</h2>'
+                + '<div class="text-muted small">作用：把每笔买入时的阶段、距离、entry gate 和最近 AI 市场情绪快照，与后续 sell 的 FIFO 收益对应起来，找出该加权/降权的组合。</div></div>'
+                + '<div class="text-end small text-muted">' + escapeHtml(review.month_label || '') + ' · 快照覆盖 '
+                + (coverage.buy_snapshot_coverage_pct != null ? Number(coverage.buy_snapshot_coverage_pct).toFixed(0) + '%' : '—')
+                + ' · AI情绪覆盖 ' + (coverage.ai_context_coverage_pct != null ? Number(coverage.ai_context_coverage_pct).toFixed(0) + '%' : '—')
+                + '</div></div>'
+                + '<div class="row g-2 mb-2">'
+                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">复盘已实现</div><div class="value ' + (Number(summary.realized_pnl || 0) >= 0 ? 'text-success' : 'text-danger') + '">' + formatMoneyNum(summary.realized_pnl) + '</div></div></div>'
+                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">复盘回报</div><div class="value">' + (summary.return_pct != null ? Number(summary.return_pct).toFixed(1) + '%' : '—') + '</div></div></div>'
+                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">已平仓 lot</div><div class="value">' + escapeHtml(coverage.matched_trade_count || 0) + '</div></div></div>'
+                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">未平仓 lot</div><div class="value">' + escapeHtml(coverage.open_lot_count || 0) + '</div></div></div>'
+                + '</div>'
+                + '<ul class="mb-2">' + conclusionHtml + '</ul>'
+                + comboTable
+                + '<div class="text-muted small mt-2">复盘结论只用于校准纪律：盈利组合也必须通过当前 entry_gate、阶段上限和防错预算；亏损组合后续默认降权、缩小仓位或等待更强确认。</div>'
+                + '</div></div>';
         }
 
         function renderMonthlyGoal() {
@@ -901,7 +1146,7 @@
             const targetPct = Number(activePrefs.targetPct || 20);
             const targetProfit = Number.isFinite(baseValue) ? baseValue * targetPct / 100 : null;
             const allocationPlan = calculateMonthlyGoalTierAllocations(targetPct, activePrefs.targetPositionPct);
-            const planExpectedProfit = Number.isFinite(baseValue) ? baseValue * allocationPlan.plannedReturnPct / 100 : null;
+            const effectivePlanExpectedProfit = Number.isFinite(baseValue) ? baseValue * allocationPlan.effectivePlannedReturnPct / 100 : null;
             const allocationsByTier = {};
             allocationPlan.allocations.forEach(item => { allocationsByTier[item.tierKey] = item; });
             const candidatesByTier = _monthlyGoalCandidatesByTier();
@@ -909,7 +1154,15 @@
             const autoTotalRealized = Number(monthlyGoalAutoRealized && monthlyGoalAutoRealized.total_realized || 0);
             const autoClassifiedRealized = Number(monthlyGoalAutoRealized && monthlyGoalAutoRealized.classified_realized || 0);
             const autoUnclassifiedRealized = Number(monthlyGoalAutoRealized && monthlyGoalAutoRealized.unclassified_realized || 0);
+            const autoUnclassifiedRealizedLoss = Number(monthlyGoalAutoRealized && monthlyGoalAutoRealized.unclassified_realized_loss || 0);
             const autoUntrackedSellUsdc = Number(monthlyGoalAutoRealized && monthlyGoalAutoRealized.untracked_sell_usdc || 0);
+            const derivedTierGrossLoss = Object.values(autoRealizedByTier).reduce((sum, item) => sum + Number(item.grossRealizedLoss || 0), 0);
+            const reportedTotalGrossLoss = Number(monthlyGoalAutoRealized && monthlyGoalAutoRealized.total_realized_loss);
+            const autoTotalGrossRealizedLoss = Number.isFinite(reportedTotalGrossLoss)
+                ? Math.max(0, reportedTotalGrossLoss)
+                : derivedTierGrossLoss + Math.max(0, autoUnclassifiedRealizedLoss);
+            const overallLossBudget = Number.isFinite(baseValue) ? baseValue * MONTHLY_GOAL_OVERALL_LOSS_BUDGET_PCT / 100 : null;
+            const overallLossStatus = _monthlyGoalLossStatus(autoTotalGrossRealizedLoss, overallLossBudget);
             let totalRealized = 0;
             let totalRemaining = 0;
 
@@ -918,26 +1171,56 @@
                 const allocation = allocationsByTier[tier.key] || {};
                 const targetPositionPct = Number(allocation.targetPositionPct || 0);
                 const targetContributionPct = Number(allocation.targetContributionPct || 0);
-                const targetProfitSharePct = Number(allocation.targetProfitSharePct || 0);
+                const phaseSuggestedPositionPct = Number(allocation.phaseSuggestedPositionPct || targetPositionPct);
+                const effectivePositionCapPct = Number(allocation.effectivePositionCapPct || 0);
+                const effectiveTargetContributionPct = Number(allocation.effectiveTargetContributionPct || targetContributionPct);
                 const targetPositionAmount = Number.isFinite(baseValue)
                     ? baseValue * targetPositionPct / 100
                     : null;
+                const effectivePositionCapAmount = Number.isFinite(baseValue)
+                    ? baseValue * effectivePositionCapPct / 100
+                    : null;
                 const tierProfit = Number.isFinite(baseValue)
-                    ? baseValue * targetContributionPct / 100
+                    ? baseValue * effectiveTargetContributionPct / 100
                     : null;
                 const candidates = candidatesByTier[tier.key] || [];
-                const validPrices = candidates.map(c => c.price).filter(p => Number.isFinite(p) && p > 0);
-                const perTokenAmount = targetPositionAmount != null && candidates.length > 0
-                    ? targetPositionAmount / candidates.length
-                    : null;
-                const targetShares = perTokenAmount != null
-                    ? candidates.reduce((sum, c) => Number.isFinite(c.price) && c.price > 0 ? sum + perTokenAmount / c.price : sum, 0)
-                    : null;
                 const heldShares = candidates.reduce((sum, c) => sum + (Number(c.heldShares) || 0), 0);
                 const heldValue = candidates.reduce((sum, c) => sum + (Number(c.heldValue) || 0), 0);
                 const manualRaw = (activePrefs.realized || {})[tier.key];
                 const hasManual = manualRaw !== undefined && manualRaw !== null && manualRaw !== '';
-                const autoRealized = Number(autoRealizedByTier[tier.key] || 0);
+                const autoStats = autoRealizedByTier[tier.key] || { realizedPnl: 0, grossRealizedLoss: 0 };
+                const autoRealized = Number(autoStats.realizedPnl || 0);
+                const grossRealizedLoss = Number(autoStats.grossRealizedLoss || 0);
+                const lossBudgetPct = Number(MONTHLY_GOAL_TIER_LOSS_BUDGET_PCT_BY_TIER[tier.key] || 0);
+                const lossBudgetAmount = Number.isFinite(baseValue) ? baseValue * lossBudgetPct / 100 : null;
+                const lossBudgetStatus = _monthlyGoalLossStatus(grossRealizedLoss, lossBudgetAmount);
+                const riskEntryStatus = (
+                    overallLossStatus.status === 'stop_new_entries' || lossBudgetStatus.status === 'stop_new_entries'
+                ) ? 'block' : (
+                    overallLossStatus.status === 'caution' || lossBudgetStatus.status === 'caution' ? 'caution' : 'ok'
+                );
+                const marketCandidateStatuses = candidates.map(c => (
+                    c.midNoEntryGate ? c.midNoEntryGate.status : 'allow'
+                ));
+                const marketEntryStatus = tier.key === 'mid_no' && marketCandidateStatuses.length
+                    ? (marketCandidateStatuses.includes('allow') ? 'allow' : (marketCandidateStatuses.includes('caution') ? 'caution' : 'block'))
+                    : 'allow';
+                const entryStatus = _combineMonthlyGoalEntryStatus(riskEntryStatus, marketEntryStatus);
+                const riskAdjustedCapAmount = entryStatus === 'block'
+                    ? 0
+                    : (entryStatus === 'caution' ? (effectivePositionCapAmount || 0) * 0.5 : effectivePositionCapAmount);
+                const riskAdjustedHeadroom = riskAdjustedCapAmount != null ? Math.max(0, riskAdjustedCapAmount - heldValue) : null;
+                const eligibleCandidates = candidates.filter(c => _combineMonthlyGoalEntryStatus(
+                    riskEntryStatus,
+                    c.midNoEntryGate ? c.midNoEntryGate.status : 'allow'
+                ) !== 'block');
+                const validPrices = eligibleCandidates.map(c => c.price).filter(p => Number.isFinite(p) && p > 0);
+                const perTokenAmount = riskAdjustedHeadroom != null && eligibleCandidates.length > 0
+                    ? riskAdjustedHeadroom / eligibleCandidates.length
+                    : null;
+                const targetShares = perTokenAmount != null
+                    ? eligibleCandidates.reduce((sum, c) => Number.isFinite(c.price) && c.price > 0 ? sum + perTokenAmount / c.price : sum, 0)
+                    : null;
                 const realized = hasManual ? Number(manualRaw || 0) : autoRealized;
                 const remaining = tierProfit != null ? Math.max(0, tierProfit - realized) : null;
                 if (Number.isFinite(realized)) totalRealized += realized;
@@ -945,27 +1228,41 @@
                 const tokenPreview = candidates.length
                     ? candidates.slice(0, 3).map(c => {
                         const strike = c.strike ? ('$' + c.strike.toLocaleString('en-US')) : '?';
-                        return strike + ' @ ' + (c.price != null ? formatPrice(c.price) : '—');
+                        const gate = c.midNoEntryGate ? ' · ' + (c.midNoEntryGate.status === 'block' ? '暂停' : (c.midNoEntryGate.status === 'caution' ? '谨慎' : '确认')) : '';
+                        const dist = c.distancePct != null ? ' · 距' + Number(c.distancePct).toFixed(1) + '%' : '';
+                        return strike + ' @ ' + (c.price != null ? formatPrice(c.price) : '—') + dist + gate;
                     }).join('<br>')
                     : '<span class="text-muted">当前无符合标签的 token</span>';
                 const priceHint = validPrices.length
-                    ? '候选 ' + candidates.length + ' 个；按候选均分目标仓位'
+                    ? '可新增候选 ' + eligibleCandidates.length + '/' + candidates.length + ' 个；均分有效余量'
                     : '';
                 const realizedHint = monthlyGoalAutoRealized && monthlyGoalAutoRealized.error
                     ? '<small class="text-danger">自动加载失败</small>'
                     : '<small class="text-muted">自动 ' + formatMoneyNum(autoRealized) + (hasManual ? ' · 手动覆盖' : '') + '</small>';
+                const lossBudgetHint = lossBudgetAmount != null
+                    ? '<small class="text-muted">已用 ' + formatMoneyNum(grossRealizedLoss)
+                        + ' / 预算 ' + formatMoneyNum(lossBudgetAmount)
+                        + (lossBudgetStatus.usagePct != null ? ' (' + lossBudgetStatus.usagePct.toFixed(0) + '%)' : '')
+                        + '</small><br><small class="text-muted">余量 ' + formatMoneyNum(Math.max(0, lossBudgetAmount - grossRealizedLoss)) + ' · ' + lossBudgetPct.toFixed(1) + '%基数</small>'
+                    : '<small class="text-muted">缺少目标基数</small>';
+                const phaseHint = allocation.exceedsPhaseSuggestion
+                    ? '<br><small class="text-warning">阶段建议 ' + phaseSuggestedPositionPct.toFixed(1) + '%；新增按更保守上限</small>'
+                    : '<br><small class="text-muted">阶段建议 ' + phaseSuggestedPositionPct.toFixed(1) + '%</small>';
+                const effectiveHint = '<small class="text-muted">有效上限 ' + formatMoneyNum(effectivePositionCapAmount)
+                    + '；风控余量 ' + formatMoneyNum(riskAdjustedHeadroom) + '</small>';
                 rows += '<tr>'
                     + '<td><span class="badge text-bg-' + tier.tone + '">' + tier.label + '</span><br><small class="text-muted">' + tier.outcome + ' · 预期收益 ' + tier.returnPct + '%</small></td>'
                     + '<td><div class="input-group input-group-sm mb-1" style="max-width:130px;"><input type="number" class="form-control" min="0" max="100" step="0.1" value="' + targetPositionPct.toFixed(1) + '" oninput="setMonthlyGoalTargetPosition(' + jsSingleQuoted(tier.key) + ', this.value)"' + (monthlyGoalEditMode ? '' : ' disabled') + '><span class="input-group-text">%</span></div>'
-                    + '<div>' + formatMoneyNum(targetPositionAmount) + '</div><small class="text-muted">' + (priceHint || '可手动调整占比') + '</small></td>'
+                    + '<div>' + formatMoneyNum(targetPositionAmount) + '</div><small class="text-muted">' + (priceHint || '可手动调整占比') + '</small>' + phaseHint + '<br>' + effectiveHint + '</td>'
                     + '<td>' + (targetShares != null ? formatTokenAmount(targetShares) : '—') + '<br><small class="text-muted">当前 ' + formatTokenAmount(heldShares) + ' 张 / ' + formatMoneyNum(heldValue) + '</small></td>'
-                    + '<td>' + formatMoneyNum(tierProfit) + '<br><small class="text-muted">贡献 ' + targetContributionPct.toFixed(1) + '%；占预期收益 ' + targetProfitSharePct.toFixed(1) + '%</small></td>'
+                    + '<td>' + formatMoneyNum(tierProfit) + '<br><small class="text-muted">有效贡献 ' + effectiveTargetContributionPct.toFixed(1) + '%；手动计划 ' + targetContributionPct.toFixed(1) + '%</small></td>'
                     + '<td style="min-width:130px;"><input type="number" class="form-control form-control-sm" step="0.01" value="' + realized.toFixed(2) + '" data-tier-key="' + tier.key + '" oninput="setMonthlyGoalRealized(this.dataset.tierKey, this.value)"' + (monthlyGoalEditMode ? '' : ' disabled') + '>' + realizedHint + '</td>'
+                    + '<td>' + _monthlyGoalLossStatusBadge(entryStatus) + '<br>' + lossBudgetHint + '</td>'
                     + '<td><strong>' + formatMoneyNum(remaining) + '</strong></td>'
                     + '<td class="text-wrap-mobile"><small>' + tokenPreview + '</small></td>'
                     + '</tr>';
             });
-            if (Math.abs(autoUnclassifiedRealized) >= 0.005 || autoUntrackedSellUsdc >= 0.005) {
+            if (Math.abs(autoUnclassifiedRealized) >= 0.005 || autoUnclassifiedRealizedLoss >= 0.005 || autoUntrackedSellUsdc >= 0.005) {
                 totalRealized += Number.isFinite(autoUnclassifiedRealized) ? autoUnclassifiedRealized : 0;
                 const untrackedHint = autoUntrackedSellUsdc >= 0.005
                     ? '<br><small class="text-warning">另有卖出 ' + formatMoneyNum(autoUntrackedSellUsdc) + ' 缺少买入成本，未计入 realized</small>'
@@ -974,12 +1271,13 @@
                     + '<td><span class="badge text-bg-secondary">未归类</span><br><small class="text-muted">历史 entry_tier 缺失 / 非主战区</small></td>'
                     + '<td>—</td><td>—</td><td>—</td>'
                     + '<td><strong>' + formatMoneyNum(autoUnclassifiedRealized) + '</strong>' + untrackedHint + '</td>'
+                    + '<td><strong>' + formatMoneyNum(autoUnclassifiedRealizedLoss) + '</strong><br><small class="text-muted">计入总防错预算</small></td>'
                     + '<td><span class="text-muted">不分摊到单档目标</span></td>'
                     + '<td><small class="text-muted">后续新买入会按成交时等级自动归类</small></td>'
                     + '</tr>';
             }
 
-            const remainingForGoal = planExpectedProfit != null ? Math.max(0, planExpectedProfit - totalRealized) : totalRemaining;
+            const remainingForGoal = effectivePlanExpectedProfit != null ? Math.max(0, effectivePlanExpectedProfit - totalRealized) : totalRemaining;
             const warnings = [];
             if (!allocationPlan.targetFeasibleWithoutLeverage) {
                 warnings.push('当前四档仓位合计 <strong>' + allocationPlan.totalPositionPct.toFixed(1) + '%</strong>，超过 100% 组合。');
@@ -987,7 +1285,16 @@
                 warnings.push('当前四档仓位合计 <strong>' + allocationPlan.totalPositionPct.toFixed(1) + '%</strong>，剩余部分相当于现金。');
             }
             if (!allocationPlan.targetReturnMatchesGoal) {
-                warnings.push('当前仓位组合预期收益率为 <strong>' + allocationPlan.plannedReturnPct.toFixed(1) + '%</strong>，与目标 <strong>' + targetPct.toFixed(1) + '%</strong> 不完全一致。');
+                warnings.push('当前风控有效预期收益率为 <strong>' + allocationPlan.effectivePlannedReturnPct.toFixed(1) + '%</strong>，与目标 <strong>' + targetPct.toFixed(1) + '%</strong> 不完全一致。');
+            }
+            if (allocationPlan.allocationSource === 'dashboard_custom_positions'
+                    && allocationPlan.allocations.some(item => item.exceedsPhaseSuggestion)) {
+                warnings.push('部分手动目标高于当前阶段建议，前端与 AI 会保留你的手动计划显示，但新增买入按更保守的有效上限计算。');
+            }
+            if (overallLossStatus.status === 'stop_new_entries') {
+                warnings.push('本月总防错预算已用完，应暂停新增买入，只做保护利润、降风险或观察。');
+            } else if (overallLossStatus.status === 'caution') {
+                warnings.push('本月总防错预算已进入谨慎区，新买入需要更强确认和更小仓位。');
             }
             const warning = warnings.length
                 ? '<div class="alert alert-warning py-2 small mb-3">' + warnings.join(' ') + '</div>'
@@ -999,6 +1306,7 @@
                 ? '<div class="text-muted small mt-2">自动总已实现 ' + formatMoneyNum(autoTotalRealized)
                     + '；已归类 ' + formatMoneyNum(autoClassifiedRealized)
                     + '；未归类 ' + formatMoneyNum(autoUnclassifiedRealized)
+                    + '；gross亏损占用防错预算 ' + formatMoneyNum(autoTotalGrossRealizedLoss)
                     + (autoUntrackedSellUsdc >= 0.005 ? '；缺少成本的卖出流水 ' + formatMoneyNum(autoUntrackedSellUsdc) + ' 未计入 realized' : '')
                     + '。</div>'
                 : '';
@@ -1015,24 +1323,27 @@
                 + '<div style="width:180px;"><label class="form-label small mb-1">本月目标盈利 %</label><div class="input-group input-group-sm"><input id="monthlyGoalTargetPctInput" type="number" class="form-control" min="0.1" step="0.1" value="' + targetPct + '" onchange="setMonthlyGoalTarget(this.value)"><span class="input-group-text">%</span></div></div>'
                 + '</div>'
                 + '<div class="row g-2 mb-3">'
-                + '<div class="col-6 col-md-3"><div class="monthly-goal-kpi"><div class="label">目标基数（月初净值）</div><div class="value">' + formatMoneyNum(baseValue) + '</div></div></div>'
-                + '<div class="col-6 col-md-3"><div class="monthly-goal-kpi"><div class="label">目标盈利</div><div class="value text-success">' + formatMoneyNum(targetProfit) + '</div></div></div>'
-                + '<div class="col-6 col-md-3"><div class="monthly-goal-kpi"><div class="label">调整后预期收益率</div><div class="value text-info">' + allocationPlan.plannedReturnPct.toFixed(1) + '%</div><small class="text-muted">仓位合计 ' + allocationPlan.totalPositionPct.toFixed(1) + '%</small></div></div>'
-                + '<div class="col-6 col-md-3"><div class="monthly-goal-kpi"><div class="label">待实现盈利</div><div class="value text-primary">' + formatMoneyNum(remainingForGoal) + '</div><small class="text-muted">已实现 ' + formatMoneyNum(totalRealized) + '</small></div></div>'
+                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">目标基数（月初净值）</div><div class="value">' + formatMoneyNum(baseValue) + '</div></div></div>'
+                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">目标盈利</div><div class="value text-success">' + formatMoneyNum(targetProfit) + '</div></div></div>'
+                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">调整后预期收益率</div><div class="value text-info">' + allocationPlan.plannedReturnPct.toFixed(1) + '%</div><small class="text-muted">风控有效 ' + allocationPlan.effectivePlannedReturnPct.toFixed(1) + '%；仓位 ' + allocationPlan.totalPositionPct.toFixed(1) + '%</small></div></div>'
+                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">待实现盈利</div><div class="value text-primary">' + formatMoneyNum(remainingForGoal) + '</div><small class="text-muted">已实现 ' + formatMoneyNum(totalRealized) + '</small></div></div>'
+                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">剩余防错预算</div><div class="value text-danger">' + formatMoneyNum(overallLossBudget != null ? Math.max(0, overallLossBudget - autoTotalGrossRealizedLoss) : null) + '</div><small class="text-muted">已用 ' + formatMoneyNum(autoTotalGrossRealizedLoss) + ' / ' + formatMoneyNum(overallLossBudget) + '</small></div></div>'
                 + '</div>'
                 + warning
                 + editControls
                 + '<div class="table-responsive"><table class="table table-sm align-middle mb-0">'
-                + '<thead><tr><th>等级</th><th>目标仓位金额</th><th>目标仓位数</th><th>目标盈利数</th><th>已实现盈利数</th><th>待实现盈利数</th><th>当前候选 token</th></tr></thead>'
+                + '<thead><tr><th>等级</th><th>目标仓位上限</th><th>目标仓位数</th><th>目标盈利数</th><th>已实现盈利数</th><th>防错预算</th><th>待实现盈利数</th><th>当前候选 token</th></tr></thead>'
                 + '<tbody>' + rows + '</tbody></table></div>'
                 + realizedBreakdown
-                + '<div class="text-muted small mt-2">拆分逻辑：15% 基准组合为 20% 舒服高价No / 30% 标准高价No / 45% 中价No / 5% 低价Yes；未手动调整时，在 100% 组合内相邻调仓且舒服高价No至少保留 10% 防守底仓。手动调整仓位后，各档“目标仓位 × 预期收益”的合计即为调整后预期收益率。成交归因按买入时等级，不再按当前 Events 动态标签重分。</div>'
-                + '</div></div>';
+                + '<div class="text-muted small mt-2">拆分逻辑：未手动调整时按月初/月中/月末动态组合限制进攻档；手动调整后保留你的计划显示，但新增买入按 min(手动上限, 阶段建议上限, 风险预算上限) 计算。目标仓位是上限/余量，不是必须补满的任务；防错预算按自动 FIFO gross亏损计算，手动已实现覆盖不会重置预算消耗。</div>'
+                + '</div></div>'
+                + _renderMonthlyGoalReview();
         }
 
         function _monthlyGoalTargetRow(tier, allocation, profileValue) {
             const targetProfitPct = Number(allocation.targetContributionPct || 0);
             const targetPositionPct = Number(allocation.targetPositionPct || 0);
+            const effectivePositionPct = Number(allocation.effectivePositionCapPct || targetPositionPct);
             const positionAmount = profileValue != null && !isNaN(profileValue) && targetPositionPct != null
                 ? profileValue * targetPositionPct / 100
                 : null;
@@ -1044,6 +1355,7 @@
                 + (positionAmount != null ? '（约 ' + formatMoneyNum(positionAmount) + '）' : '')
                 + ' × ' + tier.returnPct.toFixed(0) + '% = '
                 + targetProfitPct.toFixed(1) + '% 目标盈利'
+                + (effectivePositionPct < targetPositionPct - 1e-9 ? '；当前阶段有效上限 ' + effectivePositionPct.toFixed(1) + '%' : '')
                 + '（' + (profitAmount != null ? formatMoneyNum(profitAmount) : '—') + '）'
                 + '</li>';
         }
@@ -1078,8 +1390,8 @@
                 + "<li><strong>月中</strong>：No 不再默认主战区；只有确认后的中价No才做，Yes 的弹性机会更值得关注。</li>"
                 + "<li><strong>月末</strong>：盈利更偏向 No，继续以防守型 No 为主。</li>"
                 + "</ul></div>"
-                + "<div class='mb-2'><strong>分层盈利目标（当前 " + goalPct.toFixed(1) + "% 目标）</strong><br>先从 15% 基准组合出发：20% 舒服高价No / 30% 标准高价No / 45% 中价No / 5% 低价Yes；未手动调整时只在 100% 组合内相邻调仓，并保留至少 10% 舒服高价No 防守底仓。手动调整仓位后，以实际输入的仓位重新计算组合收益。<br>"
-                + "当前组合预期收益 = <strong>" + allocationPlan.plannedReturnPct.toFixed(1) + "%</strong>，仓位合计 = <strong>" + allocationPlan.totalPositionPct.toFixed(1) + "%</strong>。"
+                + "<div class='mb-2'><strong>分层盈利目标（当前 " + goalPct.toFixed(1) + "% 目标）</strong><br>未手动调整时按月初/月中/月末动态组合限制进攻档；手动调整后保留你的输入，但新增买入按更保守的有效上限。<br>"
+                + "当前组合预期收益 = <strong>" + allocationPlan.plannedReturnPct.toFixed(1) + "%</strong>，风控有效 = <strong>" + allocationPlan.effectivePlannedReturnPct.toFixed(1) + "%</strong>，仓位合计 = <strong>" + allocationPlan.totalPositionPct.toFixed(1) + "%</strong>。"
                 + "</div>"
                 + "<div class='mb-2'><strong>当前目标拆分</strong><ul>" + currentRows + "</ul></div>"
                 + "<div><strong>你常犯的错误</strong><ul>"
@@ -1255,6 +1567,9 @@
                 .then(data => {
                     if (data.error) {
                         document.getElementById('events-content').innerHTML = 'Error: ' + data.error;
+                        dashboardPhaseLabel = _currentEtMonthPhase().label;
+                        document.getElementById('phaseBadge').textContent = dashboardPhaseLabel;
+                        renderMonthlyGoal();
                         return;
                     }
                     latestEventsData = data;
@@ -1320,6 +1635,8 @@
                 })
                 .catch(error => {
                     document.getElementById('events-content').innerHTML = 'Error loading events: ' + error;
+                    dashboardPhaseLabel = _currentEtMonthPhase().label;
+                    document.getElementById('phaseBadge').textContent = dashboardPhaseLabel;
                     renderMonthlyGoal();
                 });
         }
@@ -3098,6 +3415,7 @@
 
         initTooltips(document);
         initPopovers(document);
+        document.getElementById('phaseBadge').textContent = dashboardPhaseLabel;
 
         // Load data on page load
         loadBalance();
@@ -3107,6 +3425,7 @@
         loadPositions();
         loadMonthlyGoalSettings();
         loadMonthlyGoalRealized();
+        loadMonthlyGoalReview();
         loadOrders();
         loadRecommendationsTab();
         fetchChatHistory();
@@ -3120,6 +3439,7 @@
             loadPositions();
             loadMonthlyGoalSettings();
             loadMonthlyGoalRealized();
+            loadMonthlyGoalReview();
             loadOrders();
             loadRecommendationsTab();
         }, 30000);

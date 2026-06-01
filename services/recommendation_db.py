@@ -1456,7 +1456,6 @@ class RecommendationDB:
         pending_days: int = 14,
     ) -> dict:
         feedback_rows: list[dict] = []
-        pending_rows: list[dict] = []
         action_stats: dict[str, int] = {}
         outcome_summary = {
             "evaluated_count": 0,
@@ -1534,22 +1533,6 @@ class RecommendationDB:
                     "total_outcome_items": total_outcome_items,
                 }
 
-            cur.execute(
-                """
-                SELECT ri.id, ri.title, ri.item_kind, ri.action_type, ri.direction,
-                       ri.priority_hint, ri.status, ri.created_at
-                FROM recommendation_items ri
-                JOIN recommendation_runs rr ON rr.id = ri.run_id
-                WHERE rr.asset = %s
-                  AND ri.status IN ('pending', 'approved', 'deferred', 'order_failed')
-                  AND ri.created_at >= NOW() - (%s || ' days')::interval
-                ORDER BY ri.created_at DESC
-                LIMIT %s
-                """,
-                (asset, str(pending_days), int(pending_limit)),
-            )
-            pending_rows = list(cur.fetchall())
-
         decision_counts: dict[str, int] = {}
         tag_counts: dict[str, int] = {}
         recent_feedback: list[dict] = []
@@ -1580,20 +1563,6 @@ class RecommendationDB:
                     "created_at": str(row["created_at"]),
                 })
 
-        pending_items = [
-            {
-                "id": row["id"],
-                "title": row["title"],
-                "item_kind": row["item_kind"],
-                "action_type": row["action_type"],
-                "direction": row["direction"],
-                "priority_hint": row["priority_hint"],
-                "status": row["status"],
-                "created_at": str(row["created_at"]),
-            }
-            for row in pending_rows
-        ]
-
         top_reason_tags = [
             {"tag": tag, "count": count}
             for tag, count in sorted(tag_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
@@ -1613,7 +1582,6 @@ class RecommendationDB:
                 "action_status_counts": action_stats,
                 "outcomes": outcome_summary,
             },
-            "pending_or_deferred_items": pending_items,
         }
 
     def list_model_change_proposals(self, limit: int = 20) -> list[dict]:
