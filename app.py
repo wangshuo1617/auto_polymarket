@@ -26,6 +26,10 @@ from services.monthly_goal_attribution import (
     get_monthly_trade_review_summary,
     save_monthly_goal_target_pct,
 )
+from services.entry_review import (
+    complete_entry_review_task,
+    list_entry_review_tasks,
+)
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
 from py_clob_client_v2.clob_types import (
@@ -465,6 +469,28 @@ def _apply_intent_tier_snapshot(extra: dict, token_id: object, tier_map: dict[st
     return extra
 
 
+def _apply_post_entry_review_extra(extra: dict, source: dict) -> dict:
+    """把显式配置的入场后复查窗口带入 pending extra。"""
+    raw_hours = source.get("post_entry_review_hours") if isinstance(source, dict) else None
+    if not isinstance(raw_hours, list):
+        return extra
+    hours: list[float] = []
+    for value in raw_hours[:6]:
+        try:
+            hour = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 < hour <= 720 and hour not in hours:
+            hours.append(hour)
+    if not hours:
+        return extra
+    extra["post_entry_review_hours"] = hours
+    note = str(source.get("post_entry_review_note") or "").strip()
+    if note:
+        extra["post_entry_review_note"] = note[:500]
+    return extra
+
+
 @app.route('/api/monthly_goal/realized')
 def api_monthly_goal_realized():
     """按 ET 本月 sell 成交估算已实现盈亏，并按买入 lot 的 entry_tier 归因。
@@ -488,6 +514,38 @@ def api_monthly_goal_review():
         return jsonify(get_monthly_trade_review_summary(profile=profile))
     except Exception as e:
         logger.exception("api_monthly_goal_review error")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/entry_reviews')
+def api_entry_reviews():
+    """买入成交后的复查任务列表。"""
+    try:
+        profile = request.args.get("profile", APP_PM_PROFILE)
+        status = request.args.get("status") or None
+        return jsonify({"tasks": list_entry_review_tasks(profile=profile, status=status)})
+    except Exception as e:
+        logger.exception("api_entry_reviews error")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/entry_reviews/<int:task_id>/complete', methods=['POST'])
+def api_entry_review_complete(task_id: int):
+    """人工标记复查任务完成或忽略。"""
+    data = request.get_json(silent=True) or {}
+    try:
+        row = complete_entry_review_task(
+            task_id,
+            status=str(data.get("status") or "done"),
+            result_payload=data.get("result_payload") if isinstance(data.get("result_payload"), dict) else data,
+        )
+        if not row:
+            return jsonify({"error": "复查任务不存在或已不是 pending 状态"}), 404
+        return jsonify({"ok": True, "task": row})
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as e:
+        logger.exception("api_entry_review_complete error")
         return jsonify({"error": str(e)}), 500
 
 
@@ -1153,6 +1211,7 @@ def api_manual_pending_plan():
             return jsonify({'error': f'items[{idx}].expires_hours 必须在 (0, 720]'}), 400
         extra = {'profile': APP_PM_PROFILE}
         _apply_intent_tier_snapshot(extra, raw.get('token_id'), intent_tier_map)
+        _apply_post_entry_review_extra(extra, raw)
         item = {
             'action': str(raw.get('action') or '').strip().lower(),
             'market_id': str(raw.get('market_id') or '').strip(),
@@ -2271,6 +2330,25 @@ def _extract_recommendation_target_order_id(raw_payload: dict | None) -> str | N
     return None
 
 
+def _extract_pending_management(raw_payload: dict | None) -> dict | None:
+    if not isinstance(raw_payload, dict):
+        return None
+    value = raw_payload.get("pending_management") or raw_payload.get("待触发订单管理")
+    if not isinstance(value, dict):
+        return None
+    target_id = value.get("target_pending_order_id") or value.get("目标pending订单ID")
+    action = str(value.get("action") or value.get("处理动作") or "").strip().lower()
+    if action not in {"keep", "modify", "cancel", "replace"}:
+        action = "modify" if value.get("suggested_updates") else "keep"
+    return {
+        "target_pending_order_id": target_id,
+        "target_plan_id": value.get("target_plan_id") or value.get("目标plan_id"),
+        "action": action,
+        "reason": value.get("reason") or value.get("理由"),
+        "suggested_updates": value.get("suggested_updates") if isinstance(value.get("suggested_updates"), dict) else {},
+    }
+
+
 def _find_open_order_by_id(order_id: str) -> dict | None:
     target_order_id = str(order_id or "").strip()
     if not target_order_id:
@@ -2919,6 +2997,7 @@ def api_recommendations_latest():
         response_items = [
             {
                 "target_order_id": _extract_recommendation_target_order_id(item["raw_payload"]),
+                "pending_management": _extract_pending_management(item["raw_payload"]),
                 "id": item["id"],
                 "source_section": item["source_section"],
                 "item_kind": item["item_kind"],
@@ -3735,6 +3814,18 @@ def _convert_recommendation_plan_to_manual_pending_item(
         "recommendation_plan_ordinal": int(plan.get("ordinal") or index + 1),
         "plan_role": sugg.get("plan_role"),
     }
+    review_source = {}
+    if isinstance(sugg, dict):
+        review_source.update({
+            "post_entry_review_hours": sugg.get("post_entry_review_hours"),
+            "post_entry_review_note": sugg.get("post_entry_review_note"),
+        })
+    if isinstance(pending_order, dict):
+        review_source.update({
+            "post_entry_review_hours": pending_order.get("post_entry_review_hours", review_source.get("post_entry_review_hours")),
+            "post_entry_review_note": pending_order.get("post_entry_review_note", review_source.get("post_entry_review_note")),
+        })
+    _apply_post_entry_review_extra(extra, review_source)
     _apply_intent_tier_snapshot(extra, token_id, intent_tier_map)
     return {
         "action": action,

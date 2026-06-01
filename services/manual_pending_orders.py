@@ -956,9 +956,17 @@ def mark_order_fired(
                 fill_size_usdc=%s,
                 updated_at=NOW()
             WHERE id=%s
+            RETURNING *
             """,
             (fired_order_id, fill_price, fill_size_shares, fill_size_usdc, order_id),
         )
+        row = cur.fetchone()
+    if row:
+        try:
+            from services.entry_review import schedule_entry_review_tasks_for_pending
+            schedule_entry_review_tasks_for_pending(_row_to_dict(row))
+        except Exception:
+            logger.exception("schedule entry review tasks failed for pending order %s", order_id)
 
 
 def mark_order_failed(order_id: int, *, error_message: str) -> None:

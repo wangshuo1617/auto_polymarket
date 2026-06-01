@@ -1112,6 +1112,34 @@
             return { status: 'allow', reasons: ['distance 满足中价No确认'] };
         }
 
+        function _monthlyGoalCandidateQuality(candidate, tierKey, entryGate, tierHeadroom) {
+            let score = 50;
+            const reasons = [];
+            const gate = String(entryGate || 'allow');
+            if (gate === 'allow') { score += 20; reasons.push('gate'); }
+            else if (gate === 'caution') { score -= 10; reasons.push('caution'); }
+            else { score -= 45; reasons.push('block'); }
+            const distance = Number(candidate.distancePct);
+            if (Number.isFinite(distance)) {
+                if ((tierKey === 'comfy_high_no' || tierKey === 'high_no') && distance >= 8) { score += 10; reasons.push('distance'); }
+                else if (tierKey === 'mid_no' && distance >= 4 && distance <= 10) { score += 8; reasons.push('distance'); }
+                else if (tierKey === 'low_yes' && distance >= 2 && distance <= 8) { score += 8; reasons.push('distance'); }
+                else if (distance < 3 || distance > 12) { score -= 12; reasons.push('distance_mismatch'); }
+            }
+            const price = Number(candidate.price);
+            if (Number.isFinite(price)) {
+                if ((tierKey === 'comfy_high_no' || tierKey === 'high_no') && price >= 0.82) score += 8;
+                else if (tierKey === 'mid_no' && price >= 0.58 && price < 0.82) score += 8;
+                else if (tierKey === 'low_yes' && price >= 0.08 && price <= 0.30) score += 8;
+                else score -= 8;
+            }
+            if (Number(candidate.pendingBuyNotional || 0) > 0) { score -= 10; reasons.push('pending'); }
+            if (Number.isFinite(Number(tierHeadroom)) && Number(tierHeadroom) <= 0) { score -= 25; reasons.push('no_headroom'); }
+            score = Math.max(0, Math.min(100, score));
+            const label = score >= 80 ? 'excellent' : (score >= 65 ? 'good' : (score >= 45 ? 'watch' : 'avoid'));
+            return { score, label, reasons };
+        }
+
         function _reviewSeverityClass(severity) {
             if (severity === 'add') return 'success';
             if (severity === 'reduce') return 'warning';
@@ -1261,6 +1289,14 @@
                     ? 0
                     : (entryStatus === 'caution' ? (effectivePositionCapAmount || 0) * 0.5 : effectivePositionCapAmount);
                 const riskAdjustedHeadroom = riskAdjustedCapAmount != null ? Math.max(0, riskAdjustedCapAmount - committedValue) : null;
+                candidates.forEach(c => {
+                    const gate = _combineMonthlyGoalEntryStatus(
+                        riskEntryStatus,
+                        c.midNoEntryGate ? c.midNoEntryGate.status : 'allow'
+                    );
+                    c.entryGate = gate;
+                    c.quality = _monthlyGoalCandidateQuality(c, tier.key, gate, riskAdjustedHeadroom);
+                });
                 const eligibleCandidates = candidates.filter(c => _combineMonthlyGoalEntryStatus(
                     riskEntryStatus,
                     c.midNoEntryGate ? c.midNoEntryGate.status : 'allow'
@@ -1276,12 +1312,14 @@
                 const remaining = tierProfit != null ? Math.max(0, tierProfit - realized) : null;
                 if (Number.isFinite(realized)) totalRealized += realized;
                 if (remaining != null) totalRemaining += remaining;
-                const tokenPreview = candidates.length
-                    ? candidates.slice(0, 3).map(c => {
+                const previewCandidates = candidates.slice().sort((a, b) => Number((b.quality || {}).score || 0) - Number((a.quality || {}).score || 0));
+                const tokenPreview = previewCandidates.length
+                    ? previewCandidates.slice(0, 3).map(c => {
                         const strike = c.strike ? ('$' + c.strike.toLocaleString('en-US')) : '?';
                         const gate = c.midNoEntryGate ? ' · ' + (c.midNoEntryGate.status === 'block' ? '暂停' : (c.midNoEntryGate.status === 'caution' ? '谨慎' : '确认')) : '';
                         const dist = c.distancePct != null ? ' · 距' + Number(c.distancePct).toFixed(1) + '%' : '';
-                        return strike + ' @ ' + (c.price != null ? formatPrice(c.price) : '—') + dist + gate;
+                        const quality = c.quality ? ' · Q' + Math.round(c.quality.score) + '/' + c.quality.label : '';
+                        return strike + ' @ ' + (c.price != null ? formatPrice(c.price) : '—') + dist + gate + quality;
                     }).join('<br>')
                     : '<span class="text-muted">当前无符合标签的 token</span>';
                 const priceHint = validPrices.length
@@ -1990,11 +2028,13 @@
             Promise.all([
                 fetchJsonSafe('/api/manual_pending'),
                 fetchJsonSafe('/api/recommendation_plans/pending'),
+                fetchJsonSafe('/api/entry_reviews?status=pending'),
             ])
-                .then(([data, recData]) => {
+                .then(([data, recData, reviewData]) => {
                     const manualOrders = data && Array.isArray(data.orders) ? data.orders : [];
                     const recPlans = recData && Array.isArray(recData.plans) ? recData.plans : [];
-                    if (manualOrders.length === 0 && recPlans.length === 0) { panel.innerHTML = ''; return; }
+                    const reviewTasks = reviewData && Array.isArray(reviewData.tasks) ? reviewData.tasks : [];
+                    if (manualOrders.length === 0 && recPlans.length === 0 && reviewTasks.length === 0) { panel.innerHTML = ''; return; }
                     manualPendingById = {};
                     // 按 plan_id 分组,plan_id 缺失用 id
                     const groups = {};
@@ -2005,7 +2045,28 @@
                         groups[pid].push(o);
                     });
                     let html = '<div class="card border-warning shadow-sm"><div class="card-body p-2 p-md-3">' +
-                        '<h6 class="mb-2 text-warning">⏳ 待触发计划 (' + (manualOrders.length + recPlans.length) + ')</h6>';
+                        '<h6 class="mb-2 text-warning">⏳ 待触发计划 / 入场复查 (' + (manualOrders.length + recPlans.length + reviewTasks.length) + ')</h6>';
+                    if (reviewTasks.length > 0) {
+                        html += '<div class="small fw-semibold mb-1">Post-entry reviews</div>'
+                            + '<div class="table-responsive mb-2"><table class="table table-sm align-middle mb-0">'
+                            + '<thead><tr><th>ID</th><th>Due</th><th>Token</th><th>Fill</th><th>Thesis</th><th></th></tr></thead><tbody>';
+                        reviewTasks.slice(0, 12).forEach(task => {
+                            const dueMs = task.due_at ? new Date(task.due_at).getTime() : NaN;
+                            const due = Number.isFinite(dueMs) ? formatBjtTime(task.due_at) : '—';
+                            const dueClass = Number.isFinite(dueMs) && dueMs <= Date.now() ? 'text-danger fw-semibold' : 'text-muted';
+                            const thesis = task.thesis_snapshot || {};
+                            const fill = task.fill_snapshot || {};
+                            html += '<tr>'
+                                + '<td>R' + Number(task.id) + '</td>'
+                                + '<td class="' + dueClass + '"><small>' + _escapeHtml(due) + '</small></td>'
+                                + '<td><small>' + _escapeHtml(task.token_id || '—') + '<br>' + _escapeHtml(thesis.intent_tier_label || thesis.intent_tier_key || '') + '</small></td>'
+                                + '<td><small>' + (fill.fill_price != null ? (Number(fill.fill_price) * 100).toFixed(1) + '¢' : '—') + '<br>' + _escapeHtml(fill.fill_size_shares || '') + '</small></td>'
+                                + '<td class="text-wrap-mobile"><small>' + _escapeHtml(thesis.note || '复查入场理由、BTC路径、同档预算和是否需要减仓/止盈。') + '</small></td>'
+                                + '<td><div class="d-flex flex-wrap gap-1"><button class="btn btn-sm btn-outline-success" onclick="completeEntryReview(' + Number(task.id) + ', \'done\')">完成</button><button class="btn btn-sm btn-outline-secondary" onclick="completeEntryReview(' + Number(task.id) + ', \'dismissed\')">忽略</button></div></td>'
+                                + '</tr>';
+                        });
+                        html += '</tbody></table></div>';
+                    }
                     if (manualOrders.length > 0) {
                         html += '<div class="small fw-semibold mb-1">Manual pending orders</div>' +
                         '<div class="table-responsive"><table class="table table-sm align-middle mb-0">' +
@@ -2095,6 +2156,77 @@
                     loadManualPending();
                 })
                 .catch(err => alert('取消失败: ' + err.message));
+        }
+
+        function applyPendingManagement(itemId, pendingManagement, btn) {
+            const pm = pendingManagement || {};
+            const pendingId = Number(pm.target_pending_order_id || 0);
+            if (!pendingId) { alert('缺少 target_pending_order_id'); return; }
+            const action = String(pm.action || '');
+            if (action === 'cancel') {
+                if (!confirm('按 AI 建议取消 pending #' + pendingId + '？\\n\\n' + (pm.reason || ''))) return;
+                if (btn) btn.disabled = true;
+                fetchJsonSafe('/api/manual_pending/' + pendingId, { method: 'DELETE' })
+                    .then(data => {
+                        if (data && data.error) { alert('取消失败: ' + data.error); return; }
+                        recordRecommendationFeedback(itemId, 'execute', ['pending_management_cancel'], '已按建议取消 manual pending #' + pendingId);
+                        loadManualPending();
+                    })
+                    .catch(err => alert('取消失败: ' + err.message))
+                    .finally(() => { if (btn) btn.disabled = false; });
+                return;
+            }
+            if (action === 'modify') {
+                const updates = pm.suggested_updates || {};
+                if (!Object.keys(updates).length) { alert('缺少 suggested_updates'); return; }
+                if (!confirm('按 AI 建议修改 pending #' + pendingId + '？\\n\\n' + JSON.stringify(updates, null, 2))) return;
+                if (btn) btn.disabled = true;
+                fetchJsonSafe('/api/manual_pending/' + pendingId, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(updates),
+                })
+                    .then(data => {
+                        if (data && data.error) { alert('修改失败: ' + data.error); return; }
+                        recordRecommendationFeedback(itemId, 'execute', ['pending_management_modify'], '已按建议修改 manual pending #' + pendingId);
+                        loadManualPending();
+                    })
+                    .catch(err => alert('修改失败: ' + err.message))
+                    .finally(() => { if (btn) btn.disabled = false; });
+            }
+        }
+
+        function recordRecommendationFeedback(itemId, decision, reasonTags, feedbackText) {
+            return fetchJsonSafe('/api/recommendations/feedback', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    item_id: itemId,
+                    decision: decision,
+                    reason_tags: reasonTags || [],
+                    feedback_text: feedbackText || '',
+                    allow_model_learning: true,
+                }),
+            }).then(data => {
+                if (data && data.error) throw new Error(data.error);
+                loadRecommendationsTab();
+                return data;
+            });
+        }
+
+        function completeEntryReview(taskId, status) {
+            const label = status === 'dismissed' ? '忽略' : '完成';
+            if (!confirm(label + '复查任务 R' + taskId + '？')) return;
+            fetchJsonSafe('/api/entry_reviews/' + Number(taskId) + '/complete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status: status, result_payload: { source: 'dashboard' } }),
+            })
+                .then(data => {
+                    if (data && data.error) { alert(label + '失败: ' + data.error); return; }
+                    loadManualPending();
+                })
+                .catch(err => alert(label + '失败: ' + err.message));
         }
 
         function editManualPending(id) {
@@ -2466,6 +2598,33 @@
                         html += '</div>';
                         if (item.target_order_id) {
                             html += '<div class="small mt-2"><strong>target order:</strong> ' + _escapeHtml(item.target_order_id) + '</div>';
+                        }
+                        if (item.pending_management) {
+                            const pm = item.pending_management || {};
+                            const pmAction = String(pm.action || 'keep');
+                            const pmId = pm.target_pending_order_id;
+                            const badgeClass = pmAction === 'cancel' ? 'danger' : (pmAction === 'modify' || pmAction === 'replace' ? 'warning' : 'secondary');
+                            html += '<div class="alert alert-light border mt-2 mb-2 small">';
+                            html += '<div><span class="badge text-bg-' + badgeClass + '">pending ' + _escapeHtml(pmAction) + '</span> '
+                                + '<strong>#' + _escapeHtml(pmId || '?') + '</strong>'
+                                + (pm.target_plan_id ? ' <span class="text-muted">plan #' + _escapeHtml(pm.target_plan_id) + '</span>' : '')
+                                + '</div>';
+                            if (pm.reason) {
+                                html += '<div class="mt-1 text-wrap-mobile">' + _escapeHtml(pm.reason) + '</div>';
+                            }
+                            if (pm.suggested_updates && Object.keys(pm.suggested_updates).length) {
+                                html += '<div class="mt-1 text-wrap-mobile text-muted">建议修改: ' + _escapeHtml(JSON.stringify(pm.suggested_updates)) + '</div>';
+                            }
+                            if (pmId && (pmAction === 'cancel' || pmAction === 'modify')) {
+                                html += '<div class="d-flex flex-wrap gap-1 mt-2">';
+                                if (pmAction === 'cancel') {
+                                    html += '<button class="btn btn-sm btn-outline-danger" onclick="applyPendingManagement(' + Number(item.id) + ', ' + _escapeJsInHtmlAttr(JSON.stringify(pm)) + ', this)">按建议取消 Pending</button>';
+                                } else if (pmAction === 'modify') {
+                                    html += '<button class="btn btn-sm btn-outline-primary" onclick="applyPendingManagement(' + Number(item.id) + ', ' + _escapeJsInHtmlAttr(JSON.stringify(pm)) + ', this)">按建议修改 Pending</button>';
+                                }
+                                html += '</div>';
+                            }
+                            html += '</div>';
                         }
 
                         if (item.strategy_type) {

@@ -191,6 +191,123 @@ def _combine_entry_status(*statuses: str | None) -> str:
     return "allow"
 
 
+def _review_bias_by_tier(trade_review_context: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """把复盘结论压成按 tier 的轻量偏置，供候选质量评分使用。"""
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(trade_review_context, dict):
+        return out
+    for item in trade_review_context.get("conclusions") or []:
+        if not isinstance(item, dict):
+            continue
+        group_key = str(item.get("group_key") or "")
+        tier_key = group_key.split("|")[0] if group_key else ""
+        if tier_key not in ACTIONABLE_TIER_LABELS:
+            continue
+        if str(item.get("sample_quality") or "").lower() == "insufficient":
+            continue
+        severity = str(item.get("severity") or "").lower()
+        current = out.setdefault(tier_key, {"add": 0, "reduce": 0, "block": 0, "labels": []})
+        if severity in {"add", "reduce", "block"}:
+            current[severity] += 1
+            title = str(item.get("title") or "")
+            if title:
+                current["labels"].append(title[:80])
+    return out
+
+
+def _candidate_quality(
+    *,
+    candidate: dict[str, Any],
+    tier_key: str,
+    phase_key: str,
+    entry_gate: str,
+    review_bias: dict[str, dict[str, Any]],
+    tier_headroom: float | None,
+) -> dict[str, Any]:
+    """启发式候选质量分；只用于排序和提示，不是校准概率。"""
+    score = 50.0
+    reasons: list[str] = ["heuristic_not_calibrated"]
+    gate = str(entry_gate or "allow")
+    if gate == "allow":
+        score += 20
+        reasons.append("entry_gate_allow")
+    elif gate == "caution":
+        score -= 10
+        reasons.append("entry_gate_caution")
+    else:
+        score -= 45
+        reasons.append("entry_gate_block")
+
+    distance = _to_float(candidate.get("distance_pct"), None)
+    price = _to_float(candidate.get("price"), None)
+    if distance is not None:
+        if tier_key in {"comfy_high_no", "high_no"}:
+            if distance >= (12 if phase_key == "month_early" else 8):
+                score += 10
+                reasons.append("wide_distance")
+            elif distance < 5:
+                score -= 15
+                reasons.append("thin_distance")
+        elif tier_key == "mid_no":
+            if 4 <= distance <= 10:
+                score += 8
+                reasons.append("mid_no_distance_fit")
+            elif distance < 3:
+                score -= 18
+                reasons.append("too_close_to_barrier")
+        elif tier_key == "low_yes":
+            if 2 <= distance <= 8:
+                score += 8
+                reasons.append("low_yes_distance_fit")
+            elif distance > 12:
+                score -= 15
+                reasons.append("too_far_for_low_yes")
+    if price is not None:
+        if tier_key in {"comfy_high_no", "high_no"} and price >= 0.82:
+            score += 8
+            reasons.append("defensive_no_price_fit")
+        elif tier_key == "mid_no" and 0.58 <= price < 0.82:
+            score += 8
+            reasons.append("mid_no_price_fit")
+        elif tier_key == "low_yes" and 0.08 <= price <= 0.30:
+            score += 8
+            reasons.append("low_yes_price_fit")
+        else:
+            score -= 8
+            reasons.append("price_band_mismatch")
+
+    held_value = _to_float(candidate.get("held_value_usdc"), 0.0) or 0.0
+    pending_value = _to_float(candidate.get("pending_buy_notional_usdc"), 0.0) or 0.0
+    if pending_value > 0:
+        score -= 10
+        reasons.append("active_pending_uses_headroom")
+    if tier_headroom is not None and tier_headroom <= 0:
+        score -= 25
+        reasons.append("no_tier_headroom")
+    elif held_value > 0:
+        score -= 4
+        reasons.append("already_held")
+
+    bias = review_bias.get(tier_key) or {}
+    if bias.get("block"):
+        score -= 18
+        reasons.append("review_block_bias")
+    elif bias.get("reduce"):
+        score -= 10
+        reasons.append("review_reduce_bias")
+    elif bias.get("add"):
+        score += 8
+        reasons.append("review_add_bias")
+
+    score = max(0.0, min(100.0, score))
+    label = "excellent" if score >= 80 else ("good" if score >= 65 else ("watch" if score >= 45 else "avoid"))
+    return {
+        "quality_score": round(score, 1),
+        "quality_label": label,
+        "quality_reasons": reasons[:8],
+    }
+
+
 def _distance_bucket(distance_pct: Any) -> str:
     distance = _to_float(distance_pct, None)
     if distance is None:
@@ -1675,6 +1792,7 @@ def build_monthly_goal_context(
             logger.warning("monthly trade review summary unavailable: %s", exc)
             trade_review_summary = None
     trade_review_context = compact_monthly_trade_review_for_ai(trade_review_summary)
+    review_bias = _review_bias_by_tier(trade_review_context)
     base = max(0.0, _to_float(base_value, 0.0) or 0.0)
     pct = max(0.0, _to_float(target_pct, MONTHLY_GOAL_DEFAULT_TARGET_PCT) or 0.0)
     total_target_profit = base * pct / 100.0 if base > 0 and pct > 0 else None
@@ -1864,6 +1982,15 @@ def build_monthly_goal_context(
             max(0.0, (risk_adjusted_position_cap or 0.0) - committed_value)
             if risk_adjusted_position_cap is not None else None
         )
+        for enriched in enriched_candidates:
+            enriched.update(_candidate_quality(
+                candidate=enriched,
+                tier_key=tier_key,
+                phase_key=phase_key,
+                entry_gate=str(enriched.get("entry_gate") or entry_gate),
+                review_bias=review_bias,
+                tier_headroom=risk_adjusted_headroom,
+            ))
         eligible_candidates_for_allocation = [
             c for c in enriched_candidates
             if c.get("entry_gate") != "block"

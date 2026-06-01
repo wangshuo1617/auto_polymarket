@@ -93,6 +93,15 @@ _PENDING_ORDER_SCHEMA = {
         "expires_hours": {"type": "number", "description": "从入队开始的有效小时数,默认 24;子单会在父单到期基础上顺延"},
         "expires_at": {"type": "string", "description": "可选 ISO8601 截止时间;若同时给 expires_hours,优先 expires_at"},
         "notes": {"type": "string", "description": "给 Dashboard 展示的简短说明"},
+        "post_entry_review_hours": {
+            "type": "array",
+            "description": "仅 buy 主单可选。成交后需要人工复查的小时窗口,如 [6,24,48]。不填写则不自动创建复查任务。",
+            "items": {"type": "number"},
+        },
+        "post_entry_review_note": {
+            "type": "string",
+            "description": "成交后复查时需要核对的原始入场理由/失效条件。",
+        },
     },
     "required": ["trigger_kind", "trigger_op", "size_spec", "price_spec"],
 }
@@ -153,6 +162,36 @@ _ACTION_PLANS_SCHEMA = {
         "若该建议是纯观察/纯描述,可留空数组。"
     ),
     "items": _ACTION_PLAN_SCHEMA,
+}
+
+
+_PENDING_MANAGEMENT_SCHEMA = {
+    "type": "object",
+    "description": (
+        "对 Dashboard/manual_pending_orders 中真实待触发订单的管理建议。"
+        "这是人工确认的建议,不会进入 Polymarket open order 撤单路径。"
+    ),
+    "properties": {
+        "target_pending_order_id": {"type": "integer", "description": "manual_pending_orders.id"},
+        "target_plan_id": {"type": "integer", "description": "manual_pending_orders.plan_id,可选"},
+        "action": {"type": "string", "enum": ["keep", "modify", "cancel", "replace"], "description": "保留/修改/取消/取消后替换"},
+        "reason": {"type": "string", "description": "为什么当前 pending 仍有效或需要调整"},
+        "suggested_updates": {
+            "type": "object",
+            "description": "action=modify 时给 Dashboard PATCH /api/manual_pending/<id> 的建议字段。",
+            "properties": {
+                "trigger_kind": {"type": "string", "enum": ["immediate", "btc_abs", "share_abs", "share_cost_pct", "time_after_parent_fill"]},
+                "trigger_op": {"type": "string", "enum": [">=", "<="]},
+                "trigger_threshold": {"type": "number"},
+                "trigger_pct": {"type": "number"},
+                "size_spec": _PENDING_SIZE_SPEC_SCHEMA,
+                "price_spec": _PENDING_PRICE_SPEC_SCHEMA,
+                "expires_hours": {"type": "number"},
+                "notes": {"type": "string"},
+            },
+        },
+    },
+    "required": ["target_pending_order_id", "action", "reason"],
 }
 
 
@@ -238,6 +277,7 @@ RESPONSE_SCHEMA = {
                     "最长持仓": {"type": "string", "description": "可选 (波段/恐慌错配类强烈推荐)。表达 '若 N 小时/天 内既未止盈也未止损则强制平仓' 的超时退出规则。例如 '24h 内未触达止盈则市价平仓' 或 '持有 3 天未修复错配则认错退出'。系统支持把这条与止盈/止损共同写成 3 档独立链式子档执行。"},
                     "策略类型": {"type": "string", "description": "可选：hold_to_expiry / 方向性波段 / 恐慌错配 / 安全垫收割 等，用于区分进场目的"},
                     "优先级": {"type": "string", "enum": ["立即执行", "挂单等待", "仅观察"]},
+                    "pending_management": _PENDING_MANAGEMENT_SCHEMA,
                     "理由": {
                         "type": "string",
                         "description": "必须是可执行解释，不要空泛。新建仓/加仓/持有观察类建议应直接写明这属于【高价No】【中价No】【低价Yes】或【持仓处理】中的哪类，并说明为什么是现在。"
@@ -479,6 +519,7 @@ def _compact_monthly_goal_context(monthly_goal_context):
                 "direction_in_question", "distance_pct", "held_shares",
                 "held_value_usdc", "pending_buy_notional_usdc", "pending_order_ids",
                 "pending_plan_ids", "target_position_usdc", "target_shares",
+                "quality_score", "quality_label", "quality_reasons",
                 "mid_no_entry_gate", "entry_gate", "entry_gate_reasons",
             ], text_limit=400)
             for c in kept_candidates
@@ -673,7 +714,7 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 9. **收益优化上下文**（大幅增强）：包含：
    - `portfolio_summary`：总净值（USDC + 持仓市值）、现金比例
    - `monthly_progress`：月度进度（月初基准净值、当前净值、月度盈亏金额与百分比）
-   - `monthly_goal_context`：本月目标分层上下文（各档目标仓位上限/余量、阶段建议上限、风控有效上限、目标盈利、已实现盈利、待实现盈利、gross realized loss 防错预算、entry_gate、候选 token、阶段阈值和纪律备注；active buy pending 已计入 `current_committed_value_usdc` 并扣减新增余量；`trade_review_context` 会总结已平仓 lot 的买入时快照复盘结论，包括哪些档位/阶段/距离/gate 组合应加权、降权或暂停；`sample_quality=insufficient` 的复盘结论只能提示观察；`plan_expected_return_pct` 表示按 Dashboard 当前手动/自动目标仓位组合计算的预期收益率，`effective_plan_expected_return_pct` 表示按 min(手动上限, 阶段建议上限, 风险预算上限) 计算的风控有效预期收益率；若 `custom_target_positions_included=true`，说明 Dashboard 手动目标仓位占比已被纳入但不能绕过阶段/风险有效上限；若 `manual_ui_realized_overrides_included=true`，说明 Dashboard 手动 realized 覆盖已被纳入；注意 realized 手动覆盖只影响目标进度，防错预算仍使用自动 FIFO gross realized loss）
+   - `monthly_goal_context`：本月目标分层上下文（各档目标仓位上限/余量、阶段建议上限、风控有效上限、目标盈利、已实现盈利、待实现盈利、gross realized loss 防错预算、entry_gate、候选 token、候选 `quality_score/quality_label` 启发式质量分、阶段阈值和纪律备注；active buy pending 已计入 `current_committed_value_usdc` 并扣减新增余量；`trade_review_context` 会总结已平仓 lot 的买入时快照复盘结论，包括哪些档位/阶段/距离/gate 组合应加权、降权或暂停；`sample_quality=insufficient` 的复盘结论只能提示观察；`plan_expected_return_pct` 表示按 Dashboard 当前手动/自动目标仓位组合计算的预期收益率，`effective_plan_expected_return_pct` 表示按 min(手动上限, 阶段建议上限, 风险预算上限) 计算的风控有效预期收益率；若 `custom_target_positions_included=true`，说明 Dashboard 手动目标仓位占比已被纳入但不能绕过阶段/风险有效上限；若 `manual_ui_realized_overrides_included=true`，说明 Dashboard 手动 realized 覆盖已被纳入；注意 realized 手动覆盖只影响目标进度，防错预算仍使用自动 FIFO gross realized loss）
    - `risk_budget`：基于总净值的风险预算（非仅 USDC 余额）
    - `position_safety_assessment`：每个持仓的安全度分级（safe_to_hold / monitor / at_risk）
    - `theta_income`：每个持仓的 Theta 日收益和到期总收益
@@ -701,8 +742,9 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
   - 若用户反复因同一原因拒绝某类建议，本期必须调整建议表达、价格、仓位或触发条件，不能机械重复。
 * 若有 `active_manual_pending_orders.orders`，必须检查：
   - 是否已有同 market/outcome/方向/触发价的待触发买入或卖出，避免重复建议。
-  - 若已有 pending 与本轮判断冲突，应输出“取消/修改现有 pending”的操作建议，而不是新增相似 pending。
+  - 若已有 pending 与本轮判断冲突，应输出带 `pending_management` 的“取消/修改/替换现有 pending”操作建议，而不是新增相似 pending。
   - 对 buy pending，要把 `estimated_buy_notional_usdc` 或 `size_spec` 视为计划中风险敞口，评估现金占用、分档仓位上限和相关性风险。
+  - `操作=撤单` 只用于 Polymarket open_orders 里的真实 CLOB order_id；manual_pending_orders 的取消/修改一律写入 `pending_management`，不要把 manual pending id 填入 `目标挂单ID`。
 * **自校准规则**：若上期判断与实际走势不符，本期必须修正概率评估，不能重复相同的错误判断。
 * 若无 `prediction_review`，跳过此步。
 
@@ -721,8 +763,10 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 * **EV 优先级**：必须参考 `top_edge_opportunities`，优先推荐 edge 为正的标的。
 * **分层检查（强制）**：必须结合 `polymarket_event_situation` 的当前市场价格、`top_edge_opportunities.distance_pct` 和月内剩余时间，把候选机会先分成“高价No / 中价No / 低价Yes / 不参与”四类，再决定是否输出动作。不能跳过这一步直接按 edge 排序。
 * **分层目标与防错预算检查（强制）**：必须参考 `monthly_goal_context.tiers`，识别哪些档位已经完成、哪些仍有 `remaining_profit_usdc` 缺口、哪些候选 token 符合当前阶段阈值，以及每档 `entry_gate` 是否为 allow/caution/block。`target_position_gap_usdc` / `headroom_to_position_limit_usdc` 已扣除当前持仓与 active buy pending，但仍只是手动/计划仓位余量，不是必须补满的任务；新增买入只能使用 `headroom_to_risk_adjusted_cap_usdc` 与候选的 `target_position_usdc`。若 `unattributed_pending_buy_notional_usdc > 0`，必须提示有 pending 未能归入当前分层，新增买入更保守。若手动目标高于 `phase_suggested_position_pct` 或 `effective_position_cap_pct`，必须明确说明“保留手动计划显示，但新增按更保守有效上限”。若 `entry_gate=block` 或 `overall_loss_budget_status=stop_new_entries`，默认不得新增买入该档，只能观察、减风险或保护利润；若 `entry_gate=caution`，只能给更小仓位、更强确认、分批 pending。缺口只能用于决定“优先看哪档”，不能用于推荐不符合阶段阈值或风控纪律的 token。
+* **候选质量分使用（强制）**：`quality_score/quality_label` 是后端启发式排序分，不是校准胜率；优先查看 good/excellent 且 entry_gate 允许的候选。watch/avoid 候选只有在你能明确说明外部催化、趋势确认和止损保护时才可输出，否则应仅观察。
 * **复盘结论校准（强制）**：若 `monthly_goal_context.trade_review_context.conclusions` 存在，必须把它作为加权/降权依据：历史亏损组合默认缩小仓位、等更强确认或暂停；历史盈利组合也只能在当前 `entry_gate`、阶段上限、防错预算均允许且 `sample_quality` 不是 `insufficient` 时加权。不得因为复盘样本盈利就绕过当前 `entry_gate=block`、追价或突破仓位上限。
 * **真实 pending 队列校验（强制）**：必须参考 `active_manual_pending_orders`，把活跃 buy pending 当成计划中仓位/资金占用，把活跃 sell pending 当成已有离场/止损/止盈计划。新建议不得重复已有 pending；若想改变执行计划，应明确建议取消、修改或替换哪一个 pending id/plan_id。
+* **入场后复查（强制）**：若输出新的 buy `pending_order`，且该买入不是纯防守 hold-to-expiry 小仓，应在 buy 主单的 `pending_order.post_entry_review_hours` 中给出 `[6,24,48]` 或更短/更长的人工复查窗口，并在 `post_entry_review_note` 写清复查要验证的入场理由、失效条件和是否需要减仓/止盈/取消同类 pending。
 * **常犯错误复核（强制）**：分层后必须再复核候选是否触发用户常犯错误：下方 dip No、月中逆势抄 No、无催化低价 Yes、单 token 仓位过大。若触发，默认降级为观察或小仓 pending，除非能明确说明“本次不同”的确认信号。
 
 ### 模型校准偏差（Model Calibration Bias — 已自动校正）

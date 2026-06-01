@@ -24,6 +24,7 @@ from services.position import match_orders_with_positions, format_matched_data
 from services.market_sentiment import get_market_sentiment_and_funding
 from services.profit_optimizer import build_profit_optimization_context
 from services.recommendation_db import RecommendationDB, build_recommendation_items
+from services.prompt_metrics import persist_ai_prompt_metrics
 from services.volatility import build_daily_volatility_profile
 from services.monthly_goal_attribution import (
     build_monthly_goal_context,
@@ -353,7 +354,7 @@ def _build_prompt_metrics(
     previous_report: dict | None,
     operator_intent: str | None,
 ) -> dict[str, Any]:
-    """持久化 prompt 长度，防止上下文膨胀而不可见。"""
+    """计算 prompt 长度，防止上下文膨胀而不可见。"""
     system_prompt = get_system_instruction(current_date, monthly_target=monthly_target)
     user_prompt = get_user_prompt(
         polymarket_status,
@@ -704,7 +705,6 @@ if __name__ == "__main__":
         schema_hash=prompt_metadata["schema_hash"],
         btc_price=float(current_btc_price),
         days_left_in_month=float(future_possibility_context.get("days_left_in_month") or 0.0),
-        prompt_metrics=prompt_metrics,
         input_snapshot={
             "positions": positions,
             "formatted_positions": formatted,
@@ -714,7 +714,6 @@ if __name__ == "__main__":
             "profit_optimization_context": profit_optimization_context,
             "recommendation_memory_context": recommendation_memory_context,
             "active_manual_pending_orders": active_manual_pending_orders,
-            "prompt_metrics": prompt_metrics,
             "market_sentiment_and_funding": market_sentiment_and_funding,
             "polymarket_event_situation": event_situation,
             "usdc_balance": usdc_balance,
@@ -729,6 +728,18 @@ if __name__ == "__main__":
         # 只要 "整体分析" 非空且 "操作清单" 是 list，就认为模型给出了完整判断；
         # 此时 items=0 应记为 completed_no_action；其它情况才落 partial。
         status=_classify_run_status(analyze_result, recommendation_items),
+    )
+    persist_ai_prompt_metrics(
+        asset="btc",
+        analysis_kind="position_analyze",
+        profile=ANALYZE_PROFILE,
+        source_run_id=run_id,
+        model_id=GEMINI_MODEL_ID,
+        prompt_family=prompt_metadata["prompt_family"],
+        prompt_version=prompt_metadata["prompt_version"],
+        system_prompt_hash=prompt_metadata["system_prompt_hash"],
+        schema_hash=prompt_metadata["schema_hash"],
+        metrics=prompt_metrics,
     )
     print(
         f"{time_now} 建议持久化完成: run_id={run_id} items={len(recommendation_items)} "
