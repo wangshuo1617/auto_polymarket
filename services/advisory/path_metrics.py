@@ -16,10 +16,12 @@ import time
 import threading
 from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from data.binance import get_path_extrema
 
 logger = logging.getLogger(__name__)
+ET_TIMEZONE = ZoneInfo("America/New_York")
 
 
 # --- slug → window helpers --------------------------------------------------
@@ -32,8 +34,8 @@ def parse_slug_to_month_window(slug: str) -> Optional[tuple[datetime, datetime]]
     """Return (start_utc, end_utc) for a `*-in-<month>-<year>` slug.
 
     Window is the **resolution window** for the monthly BTC barrier markets:
-        start = first day of month 00:00:00 UTC (inclusive)
-        end   = last day of month 23:59:59 UTC (inclusive)
+        start = first day of month 00:00:00 ET (inclusive), converted to UTC
+        end   = last day of month 23:59:59 ET (inclusive), converted to UTC
     """
     m = _MONTH_RE.search(slug)
     if not m:
@@ -43,9 +45,9 @@ def parse_slug_to_month_window(slug: str) -> Optional[tuple[datetime, datetime]]
         return None
     year = int(m.group(2))
     last_day = calendar.monthrange(year, month)[1]
-    start = datetime(year, month, 1, 0, 0, 0, tzinfo=timezone.utc)
-    end = datetime(year, month, last_day, 23, 59, 59, tzinfo=timezone.utc)
-    return start, end
+    start_et = datetime(year, month, 1, 0, 0, 0, tzinfo=ET_TIMEZONE)
+    end_et = datetime(year, month, last_day, 23, 59, 59, tzinfo=ET_TIMEZONE)
+    return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
 
 
 # --- path-to-date extrema ---------------------------------------------------

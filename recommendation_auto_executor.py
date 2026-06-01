@@ -32,7 +32,15 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from py_clob_client_v2.clob_types import OrderType  # noqa: E402
 
-from data.polymarket import buy_order, sell_order, get_best_prices, get_balance_allowance, get_positions  # noqa: E402
+from data.polymarket import (
+    buy_order,
+    sell_order,
+    get_best_prices,
+    get_balance_allowance,
+    get_positions,
+    get_order_detail,
+    get_last_order_error,
+)  # noqa: E402
 from services.shared.watchers import BinanceBTCPriceWatcher  # noqa: E402
 from services.recommendation_db import RecommendationDB  # noqa: E402
 from services.recommendation_trigger import auto_trigger_db as atdb  # noqa: E402
@@ -298,6 +306,7 @@ def main() -> int:
         token_id: str,
         size_spec: dict,
         limit_price: float,
+        parent_available_size: Optional[float] = None,
     ) -> tuple[float, str]:
         """根据 size_spec 在 fire 瞬间计算实际下单 shares,返回 (size, debug_info)。
         失败抛 ValueError(error_message)。
@@ -306,12 +315,23 @@ def main() -> int:
         sv = float(size_spec.get("value") or 0)
         if sv <= 0:
             raise ValueError(f"size_spec.value={sv} 非法")
+        parent_available = None
+        if parent_available_size is not None:
+            parent_available = max(0.0, float(parent_available_size))
+            if action == "sell" and parent_available <= 0:
+                raise ValueError("父单可用成交仓位为 0")
+
+        def _cap_parent(size: float, dbg: str) -> tuple[float, str]:
+            if action == "sell" and parent_available is not None and size > parent_available:
+                return round(parent_available, 2), f"{dbg}; capped_by_parent={parent_available}"
+            return round(size, 2), dbg
+
         if st == "shares":
-            return round(sv, 2), f"shares={sv}"
+            return _cap_parent(sv, f"shares={sv}")
         if st == "usdc":
             if limit_price <= 0:
                 raise ValueError("usdc sizing 需要正 limit_price")
-            return round(sv / limit_price, 2), f"usdc={sv}/price={limit_price}"
+            return _cap_parent(sv / limit_price, f"usdc={sv}/price={limit_price}")
         if st == "pct_balance":
             try:
                 bal_str = get_balance_allowance(profile=AUTO_EXECUTOR_PM_PROFILE)
@@ -323,6 +343,8 @@ def main() -> int:
                 raise ValueError(f"pct_balance 计算结果非法: balance={balance} pct={sv} price={limit_price}")
             return round(usdc_to_use / limit_price, 2), f"balance={balance}*{sv}%/price={limit_price}"
         if st == "pct_position":
+            if parent_available is not None:
+                return round(parent_available * sv / 100.0, 2), f"parent_available={parent_available}*{sv}%"
             try:
                 positions = get_positions(profile=AUTO_EXECUTOR_PM_PROFILE)
             except Exception as exc:  # noqa: BLE001
@@ -373,10 +395,59 @@ def main() -> int:
             return max(0.01, min(0.99, computed)), f"cost={parent_fill_price}*(1+{pct}%)"
         raise ValueError(f"未知 price_spec.type={pt}")
 
+    def _extract_fill_snapshot(
+        order_detail: Optional[dict],
+        *,
+        fallback_price: float,
+    ) -> tuple[Optional[float], Optional[float], Optional[float]]:
+        """从 CLOB order detail 提取真实成交快照: (avg_price, matched_shares, matched_usdc)。"""
+        if not isinstance(order_detail, dict):
+            return None, None, None
+        try:
+            matched = float(order_detail.get("size_matched") or order_detail.get("matched_size") or 0.0)
+        except (TypeError, ValueError):
+            matched = 0.0
+        try:
+            price = float(order_detail.get("price") or fallback_price)
+        except (TypeError, ValueError):
+            price = fallback_price
+        if matched <= 0:
+            return price, 0.0, 0.0
+        return price, matched, matched * price
+
+    def _refresh_manual_pending_parent_fills() -> None:
+        """刷新有 pending 子档的父单真实成交数量；未成交父单不会激活子单。"""
+        try:
+            parents = _mpo.list_fired_parents_with_pending_children(limit=50)
+        except Exception:  # noqa: BLE001
+            logger.exception("manual_pending parent fill refresh list 失败")
+            return
+        for parent in parents:
+            order_id = parent.get("fired_order_id")
+            if not order_id:
+                continue
+            detail = get_order_detail(str(order_id), profile=AUTO_EXECUTOR_PM_PROFILE)
+            if not detail:
+                continue
+            price, matched, matched_usdc = _extract_fill_snapshot(
+                detail,
+                fallback_price=float(parent.get("fill_price") or parent.get("price") or 0.5),
+            )
+            try:
+                _mpo.update_order_fill_snapshot(
+                    int(parent["id"]),
+                    fill_price=price,
+                    fill_size_shares=matched,
+                    fill_size_usdc=matched_usdc,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("manual_pending parent fill refresh update 失败 id=%s", parent.get("id"))
+
     def _process_manual_pending(
         btc_price: Optional[float] = None,
         share_prices: Optional[dict[str, float]] = None,
     ) -> None:
+        _refresh_manual_pending_parent_fills()
         try:
             triggered = _mpo.fetch_triggered_orders(btc_price, share_prices=share_prices)
         except Exception:  # noqa: BLE001
@@ -406,7 +477,14 @@ def main() -> int:
                 else:
                     price_spec = {"type": "absolute", "value": float(claimed.get('price') or 0.5)}
 
+            parent_ctx = None
+            parent_available_size = None
             parent_fill_price = order.get('_parent_fill_price')
+            if claimed.get("parent_pending_id") is not None:
+                parent_ctx = _mpo.get_parent_execution_context(int(order_id))
+                if parent_ctx:
+                    parent_fill_price = parent_ctx.get("parent_fill_price") or parent_fill_price
+                    parent_available_size = float(parent_ctx.get("available_size_shares") or 0.0)
 
             # 1. 先算 limit price (usdc/pct_balance sizing 需要)
             try:
@@ -429,6 +507,7 @@ def main() -> int:
                     token_id=token_id,
                     size_spec=size_spec,
                     limit_price=limit_price,
+                    parent_available_size=parent_available_size,
                 )
             except ValueError as ve:
                 logger.warning("[manual_pending %s] size 解析失败: %s", order_id, ve)
@@ -466,17 +545,30 @@ def main() -> int:
                         price=limit_price,
                         size=size,
                         profile=AUTO_EXECUTOR_PM_PROFILE,
+                        order_type=OrderType.GTC,
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("[manual_pending %s] 下单异常", order_id)
                 _mpo.mark_order_failed(order_id, error_message=f"{type(exc).__name__}: {exc}")
                 continue
             if not fired_id:
-                _mpo.mark_order_failed(order_id, error_message=f"{action}_order returned empty id")
+                err_detail = get_last_order_error() or f"{action}_order returned empty id"
+                _mpo.mark_order_failed(order_id, error_message=err_detail)
                 continue
-            # fill_price = limit price (Polymarket limit 单成交不会差于限价,作为子档 cost basis)
-            _mpo.mark_order_fired(order_id, fired_order_id=str(fired_id), fill_price=limit_price)
-            logger.info("[manual_pending %s] DONE order_id=%s fill_price=%s", order_id, fired_id, limit_price)
+            detail = get_order_detail(str(fired_id), profile=AUTO_EXECUTOR_PM_PROFILE)
+            fill_price, fill_size, fill_usdc = _extract_fill_snapshot(detail, fallback_price=limit_price)
+            # fill_price 用订单限价/成交快照作为子档 cost basis；fill_size=0 表示父单尚未真实成交。
+            _mpo.mark_order_fired(
+                order_id,
+                fired_order_id=str(fired_id),
+                fill_price=fill_price or limit_price,
+                fill_size_shares=fill_size,
+                fill_size_usdc=fill_usdc,
+            )
+            logger.info(
+                "[manual_pending %s] DONE order_id=%s fill_price=%s fill_size=%s",
+                order_id, fired_id, fill_price or limit_price, fill_size,
+            )
 
     def _on_btc(payload: dict[str, Any]) -> None:
         try:

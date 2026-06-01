@@ -312,6 +312,28 @@ def _summarize_trigger(spec: dict | None, parse_status: str) -> str | None:
     return f"{t} {op} {val}".strip()
 
 
+def _summarize_manual_pending_trigger(spec: dict | None) -> str | None:
+    if not isinstance(spec, dict):
+        return None
+    kind = str(spec.get("trigger_kind") or "").strip()
+    op = str(spec.get("trigger_op") or "").strip()
+    threshold = spec.get("trigger_threshold")
+    pct = spec.get("trigger_pct")
+    parent = spec.get("parent_index")
+    parent_text = f" parent#{int(parent) + 1}" if isinstance(parent, int) and parent >= 0 else ""
+    if kind == "immediate":
+        return "manual pending: 立即执行"
+    if kind == "btc_abs":
+        return f"manual pending: BTC 1m close {op} {threshold}"
+    if kind == "share_abs":
+        return f"manual pending: share {op} {threshold}{parent_text}"
+    if kind == "share_cost_pct":
+        return f"manual pending: cost {op} {pct}%{parent_text}"
+    if kind == "time_after_parent_fill":
+        return f"manual pending: parent fill 后 {threshold}h{parent_text}"
+    return "manual pending"
+
+
 def _extract_expires_at(spec: dict | None):
     """从 trigger_spec 提取 expires_at(只接受标准字段名)。
     阶段4 后续修复:统一只承认 `expires_at`,删除 `ttl` 别名 —— 历史上多处对 TTL 字段
@@ -689,59 +711,34 @@ class RecommendationDB:
                     )
                     item_id = cur.fetchone()[0]
 
-                    # 阶段4 主路径:写 action_plans。AI 输出在 raw_payload['action_plans'] 数组,
-                    # 兼容旧路径:若 AI 没给 action_plans 但给了 trigger_spec + 顶层 action_type,
-                    # 自动合成单条 plan。
+                    # 只保留 manual_pending 兼容的新格式计划。旧 trigger_spec/parsed plan
+                    # 不再写入 recommendation_action_plans，避免再次堆积不可联动的待触发计划。
                     raw_plans = raw_payload.get("action_plans")
                     if not isinstance(raw_plans, list) or not raw_plans:
-                        if item_action_type in {"buy", "sell", "cancel"}:
-                            raw_plans = [{
-                                "action_type": item_action_type,
-                                "side": item.get("direction"),
-                                "price_cents": item.get("suggested_price_low_cents") or item.get("suggested_price_high_cents"),
-                                "size_text": item.get("size_text"),
-                                "target_order_id": raw_payload.get("目标挂单ID") or raw_payload.get("target_order_id"),
-                                "trigger_spec": legacy_trigger_spec,
-                                "reason": item.get("reason"),
-                            }]
-                        else:
-                            raw_plans = []
+                        raw_plans = []
 
                     for ordinal_zero, raw_plan in enumerate(raw_plans):
                         if not isinstance(raw_plan, dict):
                             continue
                         plan_action = str(raw_plan.get("action_type") or "").strip().lower()
-                        if plan_action not in {"buy", "sell", "cancel"}:
+                        if plan_action not in {"buy", "sell"}:
                             logger.debug("跳过非法 action_plan action_type=%r item=%s", plan_action, item_id)
                             continue
-                        plan_trigger_spec = raw_plan.get("trigger_spec") if isinstance(raw_plan.get("trigger_spec"), dict) else None
-                        # item-level trigger_condition 仅在以下两种情况可作 fallback:
-                        # ① 仅有 1 条 plan 且其 action_type 与 item.action_type 一致 (兼容旧路径,见上面 raw_plans 兜底);
-                        # ② plan 自己显式带了 trigger_condition 字符串。
-                        # 否则不要回退——多 plan 时 item 级文案只属于其中一条具体动作,套用到其他 plan 会产生
-                        # 例如 "sell BTC>=77500" 这种与 buy plan 冲突的错误触发。
-                        plan_trigger_condition = raw_plan.get("trigger_condition")
-                        if not plan_trigger_condition and not plan_trigger_spec:
-                            single_plan_match = (
-                                len(raw_plans) == 1
-                                and plan_action == str(item_action_type or "").lower()
-                            )
-                            if single_plan_match:
-                                plan_trigger_condition = item.get("trigger_condition")
-                        plan_parse_input = {
-                            "action_type": plan_action,
-                            "item_kind": item.get("item_kind"),
-                            "trigger_condition": plan_trigger_condition,
-                            "trigger_spec": plan_trigger_spec,
+                        pending_order = raw_plan.get("pending_order") if isinstance(raw_plan.get("pending_order"), dict) else None
+                        if not pending_order:
+                            logger.debug("跳过旧格式 action_plan item=%s ordinal=%s: 缺少 pending_order", item_id, ordinal_zero)
+                            continue
+                        # manual_pending 兼容计划由 /api/recommendations/<id>/queue_pending_plan
+                        # 事务性写入 manual_pending_orders,不进入 recommendation 独立触发引擎。
+                        plan_parse_status = PARSE_STATUS_UNPARSEABLE
+                        plan_spec_dict = {
+                            "type": "manual_pending",
+                            "trigger_kind": pending_order.get("trigger_kind"),
+                            "trigger_op": pending_order.get("trigger_op"),
+                            "trigger_threshold": pending_order.get("trigger_threshold"),
+                            "trigger_pct": pending_order.get("trigger_pct"),
+                            "parent_index": pending_order.get("parent_index"),
                         }
-                        try:
-                            plan_parsed = parse_trigger(plan_parse_input)
-                            plan_parse_status = plan_parsed.status
-                            plan_spec_dict = plan_parsed.trigger.to_jsonable() if plan_parsed.trigger else (plan_trigger_spec or {})
-                        except Exception:  # noqa: BLE001
-                            logger.exception("plan parse 异常 item=%s ordinal=%s", item_id, ordinal_zero)
-                            plan_parse_status = PARSE_STATUS_UNPARSEABLE
-                            plan_spec_dict = plan_trigger_spec or {}
                         # plan_spec_dict 始终是 dict(供 NOT NULL 列);unparseable 时为 raw 或空
                         if plan_spec_dict is None:
                             plan_spec_dict = {}
@@ -753,7 +750,7 @@ class RecommendationDB:
                             trigger_spec=plan_spec_dict,
                             payload=suggested_payload,
                         )
-                        trigger_summary = _summarize_trigger(plan_spec_dict, plan_parse_status)
+                        trigger_summary = _summarize_manual_pending_trigger(pending_order)
                         expires_at = _extract_expires_at(plan_spec_dict)
 
                         # supersede 检查:同 semantic_key 且 status='proposed' 的旧 plan 标 superseded;
@@ -826,6 +823,7 @@ class RecommendationDB:
             or (item.get("default_target_question") or "").strip()
             or None
         )
+        pending_order = raw_plan.get("pending_order") if isinstance(raw_plan.get("pending_order"), dict) else None
         return {
             "action_type": action,
             "side": side,
@@ -835,6 +833,9 @@ class RecommendationDB:
             "target_order_id": target_order_id,
             "target_question": target_question,
             "subject_key": item.get("subject_key"),
+            "plan_role": str(raw_plan.get("plan_role") or "").strip() or None,
+            "pending_order": pending_order,
+            "manual_pending_only": bool(pending_order),
         }
 
     @staticmethod
@@ -857,6 +858,7 @@ class RecommendationDB:
                 "side": (payload or {}).get("side"),
                 "price_cents": (payload or {}).get("price_cents"),
                 "target_order_id": (payload or {}).get("target_order_id"),
+                "pending_order": (payload or {}).get("pending_order"),
             },
         }
         s = json.dumps(sig, sort_keys=True, ensure_ascii=False, default=str)

@@ -27,6 +27,29 @@ def get_1h_klines_data(limit: int = 1) -> list:
     return response.json()
 
 
+def get_1m_kline_close_at(ts_utc) -> float | None:
+    """获取指定 UTC 时间所在 1m K 线的 BTC close，用于成交时点归因。"""
+    if isinstance(ts_utc, datetime):
+        ts_ms = int(ts_utc.astimezone(timezone.utc).timestamp() * 1000)
+    else:
+        ts_ms = int(ts_utc)
+    minute_open_ms = ts_ms - (ts_ms % 60_000)
+    url = "https://data-api.binance.vision"
+    params = {
+        "symbol": "BTCUSDT",
+        "interval": "1m",
+        "startTime": minute_open_ms,
+        "endTime": minute_open_ms + 60_000,
+        "limit": 1,
+    }
+    response = requests.get(url + "/api/v3/klines", params=params, timeout=10)
+    response.raise_for_status()
+    rows = response.json()
+    if not rows:
+        return None
+    return float(rows[0][4])
+
+
 def get_1h_klines_data_range(start_time_ms: int, end_time_ms: int) -> list:
     """
     获取 BTC 1h K 线区间数据（分页拉取）。

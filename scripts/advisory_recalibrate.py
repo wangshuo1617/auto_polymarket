@@ -35,6 +35,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _PROJECT_ROOT not in sys.path:
@@ -55,6 +56,7 @@ from data.polymarket import get_event_token_id  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("recalibrate")
+ET_TIMEZONE = ZoneInfo("America/New_York")
 
 _BUCKETS = [(0, 3), (3, 8), (8, 15), (15, 30), (30, 100)]
 _PREDICTION_OFFSETS_DAYS = [2, 5, 10, 15, 20, 25]
@@ -309,7 +311,7 @@ def _run_sweep(slugs: list[str], all_klines: list) -> None:
 
 def main(start: tuple[int, int] = (2025, 11),
          end: Optional[tuple[int, int]] = None) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(ET_TIMEZONE)
     if end is None:
         # exclude current month (not all settled yet)
         prev_y, prev_m = (now.year, now.month - 1) if now.month > 1 else (now.year - 1, 12)
@@ -360,7 +362,7 @@ def main(start: tuple[int, int] = (2025, 11),
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "sweep":
         # Quick sweep of (fat_tail, wick) configurations
-        now = datetime.now(timezone.utc)
+        now = datetime.now(ET_TIMEZONE)
         prev_y, prev_m = (now.year, now.month - 1) if now.month > 1 else (now.year - 1, 12)
         slugs = _iter_slugs(2025, 11, prev_y, prev_m)
         end_window = parse_slug_to_month_window(slugs[-1])

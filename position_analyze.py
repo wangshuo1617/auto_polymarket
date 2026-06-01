@@ -24,6 +24,10 @@ from services.market_sentiment import get_market_sentiment_and_funding
 from services.profit_optimizer import build_profit_optimization_context
 from services.recommendation_db import RecommendationDB, build_recommendation_items
 from services.volatility import build_daily_volatility_profile
+from services.monthly_goal_attribution import (
+    build_monthly_goal_context,
+    get_monthly_goal_target_pct,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,22 @@ LAST_REPORT_PATH = Path(__file__).resolve().parent / "last_report.json"
 ET_TIMEZONE = ZoneInfo("America/New_York")
 ANALYZE_PROFILE = "analyze"
 PROMPT_FAMILY = "btc-monthly-position-analyze"
+
+
+def _parse_polymarket_end_datetime(raw: object) -> datetime | None:
+    """解析 Polymarket endDate；显式 offset/Z 保留，naive 按 ET 处理。"""
+    if not raw:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    end_dt = datetime.fromisoformat(text)
+    if end_dt.tzinfo is None:
+        logger.warning("Polymarket endDate 缺少时区，按 ET 处理: %r", raw)
+        end_dt = end_dt.replace(tzinfo=ET_TIMEZONE)
+    return end_dt
 
 
 def _build_intraday_volatility_hint() -> dict:
@@ -63,14 +83,8 @@ def _is_position_settled(position: dict) -> bool:
         if status_text in {"resolved", "redeemed", "closed", "settled", "expired"}:
             return True
 
-        end_date_raw = position.get("endDate")
-        if end_date_raw:
-            text = str(end_date_raw).strip()
-            if text.endswith("Z"):
-                text = text[:-1] + "+00:00"
-            end_dt = datetime.fromisoformat(text)
-            if end_dt.tzinfo is None:
-                end_dt = end_dt.replace(tzinfo=timezone.utc)
+        end_dt = _parse_polymarket_end_datetime(position.get("endDate"))
+        if end_dt:
             if end_dt <= datetime.now(timezone.utc):
                 return True
     except Exception:
@@ -107,14 +121,8 @@ def _is_settled_market(market: dict) -> bool:
         if active_flag is False:
             return True
 
-        end_date_raw = market.get("endDate")
-        if end_date_raw:
-            text = str(end_date_raw).strip()
-            if text.endswith("Z"):
-                text = text[:-1] + "+00:00"
-            end_dt = datetime.fromisoformat(text)
-            if end_dt.tzinfo is None:
-                end_dt = end_dt.replace(tzinfo=timezone.utc)
+        end_dt = _parse_polymarket_end_datetime(market.get("endDate"))
+        if end_dt:
             if end_dt <= datetime.now(timezone.utc):
                 return True
     except Exception:
@@ -349,6 +357,40 @@ if __name__ == "__main__":
         positions=positions,
         previous_report=previous_report,
     )
+    try:
+        monthly_progress = profit_optimization_context.get("monthly_progress") or {}
+        portfolio_summary = profit_optimization_context.get("portfolio_summary") or {}
+        monthly_goal_base_value = (
+            monthly_progress.get("baseline_net_value")
+            or portfolio_summary.get("total_net_value")
+            or 0.0
+        )
+        monthly_goal_setting = get_monthly_goal_target_pct(profile=ANALYZE_PROFILE)
+        monthly_goal_context = build_monthly_goal_context(
+            polymarket_event_situation=event_situation,
+            positions=positions,
+            base_value=float(monthly_goal_base_value or 0.0),
+            current_btc_price=float(current_btc_price),
+            days_left_in_month=float(future_possibility_context.get("days_left_in_month") or 0.0),
+            target_pct=float(monthly_goal_setting.get("target_pct") or 20.0),
+            target_pct_source=str(monthly_goal_setting.get("source") or "backend_default"),
+            realized_overrides=monthly_goal_setting.get("realized_overrides") or {},
+            target_position_overrides=monthly_goal_setting.get("target_position_overrides") or {},
+            profile=ANALYZE_PROFILE,
+        )
+        profit_optimization_context["monthly_goal_context"] = monthly_goal_context
+        print(
+            f"{time_now} 本月目标上下文完成: target_pct={monthly_goal_context.get('target_pct')} "
+            f"remaining_profit={monthly_goal_context.get('total_remaining_profit_usdc')}"
+        )
+    except Exception as exc:
+        logger.exception("build monthly goal context failed")
+        monthly_goal_context = {
+            "error": str(exc),
+            "source": "backend_monthly_goal_context",
+            "available": False,
+        }
+        profit_optimization_context["monthly_goal_context"] = monthly_goal_context
     print(
         f"{time_now} 收益优化上下文完成: edge_count={profit_optimization_context.get('all_edge_count')} "
         f"top_edges={len(profit_optimization_context.get('top_edge_opportunities', []))} "
@@ -373,6 +415,7 @@ if __name__ == "__main__":
         recommendation_memory_context=recommendation_memory_context,
         previous_report=previous_report,
         operator_intent=os.environ.get("OPERATOR_INTENT") or None,
+        monthly_target=f"月度净值目标 +{float(monthly_goal_context.get('target_pct') or 20.0):g}%",
     )
     recommendation_items = build_recommendation_items(
         analyze_result,

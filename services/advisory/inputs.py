@@ -23,6 +23,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from data.binance import get_btc_price, get_1d_klines_data
 from data.polymarket import get_event_token_id, get_best_prices
@@ -41,6 +42,7 @@ from services.advisory.path_metrics import (
 )
 
 logger = logging.getLogger(__name__)
+ET_TIMEZONE = ZoneInfo("America/New_York")
 
 
 @dataclass
@@ -68,7 +70,7 @@ class BatchInputs:
 
 
 def select_current_month_slug() -> str:
-    return f"what-price-will-bitcoin-hit-in-{datetime.now(timezone.utc).strftime('%B-%Y').lower()}"
+    return f"what-price-will-bitcoin-hit-in-{datetime.now(ET_TIMEZONE).strftime('%B-%Y').lower()}"
 
 
 def _slug_for_month(year: int, month: int) -> str:
@@ -106,9 +108,8 @@ def select_active_month_slug(now: Optional[datetime] = None,
     """Pick the slug for the active BTC month-end event with month-rollover handoff.
 
     Strategy:
-    1. Start from `now`'s calendar month (UTC).
-    2. If month-end has already passed (rare — `now` is past the 23:59 of last
-       day), advance to next month immediately.
+    1. Start from `now`'s calendar month in ET, matching Polymarket BTC monthlies.
+    2. If ET month-end has already passed, advance to next month immediately.
     3. Probe gamma: if event resolves with ≥1 market → use it.
     4. Otherwise advance 1 month and re-probe; cap at `lookahead_months`
        advances (default 2 = current/next/next+1).
@@ -116,10 +117,13 @@ def select_active_month_slug(now: Optional[datetime] = None,
        surface a clear error rather than silently picking a stale slug).
     """
     now = now or datetime.now(timezone.utc)
-    year, month = now.year, now.month
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now_et = now.astimezone(ET_TIMEZONE)
+    year, month = now_et.year, now_et.month
 
     current_end = parse_slug_to_month_end(_slug_for_month(year, month))
-    if current_end is not None and now > current_end:
+    if current_end is not None and now_et > current_end:
         year, month = _advance_month(year, month, 1)
 
     for offset in range(lookahead_months + 1):
@@ -146,7 +150,7 @@ def parse_slug_to_month_end(slug: str) -> Optional[datetime]:
     if not month:
         return None
     last_day = calendar.monthrange(year, month)[1]
-    return datetime(year, month, last_day, 23, 59, 59, tzinfo=timezone.utc)
+    return datetime(year, month, last_day, 23, 59, 59, tzinfo=ET_TIMEZONE)
 
 
 def _fetch_universe(slug: str, max_strikes: int, btc_now: float

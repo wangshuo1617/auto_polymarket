@@ -76,6 +76,8 @@ from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
 from py_clob_client_v2.order_builder.helpers import round_down
 from py_clob_client_v2.order_builder.constants import BUY, SELL
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+ET_TIMEZONE = ZoneInfo("America/New_York")
 from config import (
     POLYMARKET_KEY,
     WALLET_ADDRESS,
@@ -797,10 +799,15 @@ def get_order_detail(order_id: str, profile: Optional[str] = None) -> Optional[D
         logger.warning("get_order_detail failed: order_id=%s error=%s", order_id, e)
         return None
 
+def _current_btc_month_slug() -> str:
+    """按 Polymarket BTC 月度市场的 ET 日期生成默认 slug。"""
+    current_month_year = datetime.now(ET_TIMEZONE).strftime("%B-%Y").lower()  # e.g. february-2026
+    return f"what-price-will-bitcoin-hit-in-{current_month_year}"
+
+
 def get_event_situation(market_slug:str=None):
-    current_month_year = datetime.now().strftime("%B-%Y").lower()  # e.g. february-2026
     if not market_slug:
-        market_slug = f"what-price-will-bitcoin-hit-in-{current_month_year}"
+        market_slug = _current_btc_month_slug()
     url = f"https://gamma-api.polymarket.com/events/slug/{market_slug}"
     response = requests.get(url)
     response.raise_for_status()
@@ -825,9 +832,8 @@ def get_event_situation(market_slug:str=None):
     return polymarket_event_situation
 
 def get_event_token_id(market_slug:str=None):
-    current_month_year = datetime.now().strftime("%B-%Y").lower()  # e.g. february-2026
     if not market_slug:
-        market_slug = f"what-price-will-bitcoin-hit-in-{current_month_year}"
+        market_slug = _current_btc_month_slug()
     url = f"https://gamma-api.polymarket.com/events/slug/{market_slug}"
     response = requests.get(url)
     response.raise_for_status()

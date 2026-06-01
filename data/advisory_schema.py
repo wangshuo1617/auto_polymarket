@@ -407,10 +407,17 @@ CREATE TABLE IF NOT EXISTS advisory_chain_fills (
     profile             TEXT NOT NULL {profile_check},
     market_slug         TEXT,
     event_slug          TEXT,
+    entry_tier_key      TEXT,
+    entry_tier_label    TEXT,
+    tier_snapshot       JSONB,
     raw_json            JSONB NOT NULL,
     fetched_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (tx_hash, log_index, token_id)
 );
+ALTER TABLE advisory_chain_fills
+    ADD COLUMN IF NOT EXISTS entry_tier_key TEXT,
+    ADD COLUMN IF NOT EXISTS entry_tier_label TEXT,
+    ADD COLUMN IF NOT EXISTS tier_snapshot JSONB;
 CREATE INDEX IF NOT EXISTS advisory_chain_fills_ts_idx
     ON advisory_chain_fills (fill_timestamp DESC);
 CREATE INDEX IF NOT EXISTS advisory_chain_fills_token_ts_idx
@@ -419,6 +426,8 @@ CREATE INDEX IF NOT EXISTS advisory_chain_fills_wallet_ts_idx
     ON advisory_chain_fills (wallet_address, fill_timestamp DESC);
 CREATE INDEX IF NOT EXISTS advisory_chain_fills_profile_ts_idx
     ON advisory_chain_fills (profile, fill_timestamp DESC);
+CREATE INDEX IF NOT EXISTS advisory_chain_fills_entry_tier_idx
+    ON advisory_chain_fills (entry_tier_key, fill_timestamp DESC);
 """.format(profile_check=_enum_check("profile", CHAIN_FILL_PROFILES))
 
 _DDL_ADVISORY_CHAIN_FILLS_POLLER_STATE = """

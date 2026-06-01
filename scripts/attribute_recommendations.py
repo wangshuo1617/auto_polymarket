@@ -19,6 +19,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import psycopg2
 import psycopg2.extras
@@ -26,6 +27,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 PG_DSN = os.environ["PG_DSN"]
+ET_TIMEZONE = ZoneInfo("America/New_York")
 
 MONTHS = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
@@ -48,7 +50,7 @@ class ParsedMarket:
     @property
     def expiry(self) -> datetime:
         last_day = monthrange(self.year, self.month)[1]
-        return datetime(self.year, self.month, last_day, 23, 59, 59, tzinfo=timezone.utc)
+        return datetime(self.year, self.month, last_day, 23, 59, 59, tzinfo=ET_TIMEZONE)
 
 
 def parse_title(title: str, ref_year: int) -> Optional[ParsedMarket]:
@@ -138,7 +140,10 @@ def main():
     ap.add_argument("--include-open", action="store_true", help="Include not-yet-settled items (mark-to-now)")
     args = ap.parse_args()
 
-    since_dt = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
+    since_dt = datetime.fromisoformat(args.since)
+    if since_dt.tzinfo is None:
+        since_dt = since_dt.replace(tzinfo=ET_TIMEZONE)
+    since_dt = since_dt.astimezone(timezone.utc)
 
     conn = psycopg2.connect(PG_DSN, cursor_factory=psycopg2.extras.RealDictCursor)
 

@@ -17,8 +17,10 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+ET_TIMEZONE = ZoneInfo("America/New_York")
 
 # 解析状态常量,与 DB 列 trigger_parse_status 对应。
 PARSE_STATUS_PARSED = "parsed"
@@ -312,9 +314,9 @@ def _parse_expires_at(value: Any) -> Optional[datetime]:
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return value if value.tzinfo else value.replace(tzinfo=ET_TIMEZONE)
     s = str(value).strip()
-    # 支持 "2026-05-31" / "2026-05-31T23:59:59Z" / "2026-05-31T23:59:59+08:00"
+    # 支持 "2026-05-31" / "2026-05-31T23:59:59Z" / "2026-05-31T23:59:59+08:00"；naive 按 ET。
     fmts = [
         "%Y-%m-%dT%H:%M:%S%z",
         "%Y-%m-%dT%H:%M:%SZ",
@@ -325,7 +327,7 @@ def _parse_expires_at(value: Any) -> Optional[datetime]:
         try:
             dt = datetime.strptime(s.replace("Z", "+0000") if fmt.endswith("%z") else s, fmt)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+                dt = dt.replace(tzinfo=ET_TIMEZONE)
             return dt
         except ValueError:
             continue

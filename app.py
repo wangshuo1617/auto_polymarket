@@ -19,6 +19,12 @@ from data.database import get_conn, get_cursor
 from services.recommendation_db import RecommendationDB, RecommendationGateError
 from services.profit_optimizer import get_or_set_monthly_baseline
 from services.profit_optimizer import _extract_strike_and_direction, _parse_market_prices
+from services.monthly_goal_attribution import (
+    classify_entry_tier,
+    get_monthly_goal_target_pct,
+    get_monthly_goal_realized_summary,
+    save_monthly_goal_target_pct,
+)
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
 from py_clob_client_v2.clob_types import (
@@ -48,6 +54,7 @@ from data.polymarket import (
     buy_order,
     sell_order,
     cancel_order,
+    get_order_detail,
     get_balance_allowance,
     get_event_token_id,
     get_best_prices,
@@ -128,6 +135,14 @@ def _normalize_utc_iso(raw: str, default: str) -> str:
         return parsed.isoformat()
     except Exception:
         return default
+
+
+def _parse_dashboard_datetime(raw: object) -> datetime:
+    """解析 Dashboard 人工输入时间；naive 默认按北京时间。"""
+    dt = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC8_TIMEZONE)
+    return dt
 
 
 
@@ -388,6 +403,106 @@ def api_events():
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+def _current_et_month_bounds() -> tuple[datetime, datetime, str]:
+    now_et = datetime.now(ET_TIMEZONE)
+    start_et = now_et.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if start_et.month == 12:
+        end_et = start_et.replace(year=start_et.year + 1, month=1)
+    else:
+        end_et = start_et.replace(month=start_et.month + 1)
+    return start_et, end_et, start_et.strftime("%Y-%m")
+
+
+def _build_current_intent_tier_map() -> dict[str, dict]:
+    """按当前行情给 token 生成 intent_tier 快照；失败时返回空 map。"""
+    try:
+        data = get_event_token_id()
+        btc_price = float(get_btc_price())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("build current intent tier map failed: %s", exc)
+        return {}
+
+    now_utc = datetime.now(timezone.utc)
+    out: dict[str, dict] = {}
+    for market in data.get("markets") or []:
+        question = str(market.get("question") or "")
+        outcomes = market.get("outcomes") or []
+        prices = market.get("outcomePrices") or []
+        token_ids = market.get("token_id") or []
+        for idx, token_id in enumerate(token_ids):
+            if not token_id or idx >= len(outcomes):
+                continue
+            try:
+                price = float(prices[idx]) if idx < len(prices) else None
+            except (TypeError, ValueError):
+                price = None
+            if price is None or not (0 < price < 1):
+                continue
+            snapshot = classify_entry_tier(
+                question=question,
+                outcome=str(outcomes[idx] or ""),
+                fill_price=price,
+                btc_price=btc_price,
+                as_of_utc=now_utc,
+            )
+            snapshot["source"] = "current_event_at_order_creation"
+            out[str(token_id)] = snapshot
+    return out
+
+
+def _apply_intent_tier_snapshot(extra: dict, token_id: object, tier_map: dict[str, dict] | None) -> dict:
+    snapshot = (tier_map or {}).get(str(token_id or ""))
+    if not snapshot:
+        return extra
+    extra["intent_tier_snapshot"] = snapshot
+    if snapshot.get("tier_key"):
+        extra["intent_tier_key"] = snapshot.get("tier_key")
+        extra["intent_tier_label"] = snapshot.get("tier_label")
+    return extra
+
+
+@app.route('/api/monthly_goal/realized')
+def api_monthly_goal_realized():
+    """按 ET 本月 sell 成交估算已实现盈亏，并按买入 lot 的 entry_tier 归因。
+
+    数据源使用 advisory_chain_fills（由 Polymarket activity poller 增量写入）。
+    新成交买入会锁定 entry_tier；历史缺失 entry_tier 的 lot 归入未归类。
+    """
+    try:
+        profile = request.args.get("profile", "analyze")
+        return jsonify(get_monthly_goal_realized_summary(profile=profile))
+    except Exception as e:
+        logger.exception("api_monthly_goal_realized error")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/monthly_goal/settings', methods=['GET', 'POST'])
+def api_monthly_goal_settings():
+    """Dashboard 本月目标设置；AI 分析脚本从同一处读取。"""
+    try:
+        if request.method == "GET":
+            profile = request.args.get("profile", "analyze")
+            return jsonify(get_monthly_goal_target_pct(profile=profile))
+
+        payload = request.get_json(silent=True) or {}
+        target_pct = float(payload.get("target_pct"))
+        if target_pct <= 0:
+            return jsonify({"error": "target_pct must be positive"}), 400
+        profile = str(payload.get("profile") or "analyze").strip() or "analyze"
+        return jsonify(save_monthly_goal_target_pct(
+            target_pct=target_pct,
+            realized_overrides=payload.get("realized_overrides") or {},
+            target_position_overrides=payload.get("target_position_overrides") or {},
+            profile=profile,
+            source="dashboard",
+        ))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid target_pct"}), 400
+    except Exception as e:
+        logger.exception("api_monthly_goal_settings error")
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------- 交易讨论室 (Chat with AI) ----------
@@ -760,6 +875,7 @@ from services.manual_pending_orders import (
     insert_plan as _mpo_insert_plan,
     list_pending_orders as _mpo_list,
     cancel_pending_order as _mpo_cancel,
+    update_pending_order as _mpo_update,
     VALID_OPS as _MPO_VALID_OPS,
     VALID_TRIGGER_KINDS as _MPO_VALID_KINDS,
     VALID_SIZE_TYPES as _MPO_VALID_SIZE_TYPES,
@@ -797,6 +913,7 @@ def _maybe_queue_manual_pending(action: str, data: dict, recommendation_item_id)
             return jsonify({'error': 'trigger_expiry_hours 必须是 (0, 720] 的数字(小时)'}), 400
 
     extra: dict = {'profile': APP_PM_PROFILE}
+    _apply_intent_tier_snapshot(extra, data.get('token_id'), _build_current_intent_tier_map())
     raw_offset = data.get('trigger_market_offset')
     if raw_offset is not None and raw_offset != '':
         if action != 'sell':
@@ -882,6 +999,69 @@ def api_manual_pending_list():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/recommendation_plans/pending', methods=['GET'])
+def api_recommendation_plans_pending():
+    """仅把 approved 且可转入 manual_pending_orders 的 recommendation plans 暴露给 pending 面板。"""
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                SELECT p.id AS plan_id,
+                       p.item_id,
+                       p.ordinal,
+                       p.action_type,
+                       p.status,
+                       p.trigger_parse_status,
+                       p.trigger_summary,
+                       p.trigger_spec,
+                       p.suggested_execution_payload,
+                       p.armed_execution_payload,
+                       p.expires_at,
+                       p.reason_text,
+                       i.title,
+                       i.direction,
+                       i.status AS item_status
+                  FROM recommendation_action_plans p
+                  JOIN recommendation_items i ON i.id = p.item_id
+                 WHERE p.status = 'proposed'
+                   AND i.status = 'approved'
+                   AND COALESCE((p.suggested_execution_payload->>'manual_pending_only')::boolean, false) = true
+                 ORDER BY p.id DESC
+                 LIMIT 200
+                """
+            )
+            rows = cur.fetchall()
+        out = []
+        for row in rows:
+            d = dict(row)
+            expires_at = d.get("expires_at")
+            if isinstance(expires_at, datetime):
+                d["expires_at"] = expires_at.isoformat()
+                d["expires_at_bjt"] = expires_at.astimezone(UTC8_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+            payload = d.get("armed_execution_payload") or d.get("suggested_execution_payload") or {}
+            d["side"] = payload.get("direction") or payload.get("side") or d.get("direction")
+            d["price_cents"] = payload.get("price_cents")
+            if d["price_cents"] is None and payload.get("price") is not None:
+                try:
+                    d["price_cents"] = float(payload.get("price")) * 100.0
+                except (TypeError, ValueError):
+                    d["price_cents"] = None
+            d["size_text"] = payload.get("size_text")
+            if not d["size_text"] and payload.get("size_shares") is not None:
+                try:
+                    d["size_text"] = f'{float(payload.get("size_shares")):.2f} 张'
+                except (TypeError, ValueError):
+                    d["size_text"] = str(payload.get("size_shares"))
+            d["target_question"] = payload.get("target_question") or d.get("title")
+            d["pending_order"] = payload.get("pending_order") if isinstance(payload.get("pending_order"), dict) else None
+            d["manual_pending_only"] = bool(payload.get("manual_pending_only"))
+            out.append(d)
+        return jsonify({"plans": out})
+    except Exception as e:
+        logger.exception("api_recommendation_plans_pending error")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/manual_pending/<int:order_id>', methods=['DELETE'])
 def api_manual_pending_cancel(order_id: int):
     try:
@@ -894,6 +1074,34 @@ def api_manual_pending_cancel(order_id: int):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/manual_pending/<int:order_id>', methods=['PATCH'])
+def api_manual_pending_update(order_id: int):
+    data = request.get_json(silent=True) or {}
+    updates: dict = {}
+    allowed = {"trigger_kind", "trigger_op", "trigger_threshold", "trigger_pct", "size_spec", "price_spec", "notes"}
+    for key in allowed:
+        if key in data:
+            updates[key] = data[key]
+    try:
+        if "expires_hours" in data and data["expires_hours"] not in (None, ""):
+            hours = float(data["expires_hours"])
+            if hours <= 0 or hours > 720:
+                return jsonify({"error": "expires_hours 必须在 (0,720]"}), 400
+            updates["expires_at"] = datetime.now(timezone.utc) + timedelta(hours=hours)
+        elif "expires_at" in data and data["expires_at"]:
+            raw = str(data["expires_at"]).strip()
+            updates["expires_at"] = _parse_dashboard_datetime(raw)
+        row = _mpo_update(order_id, updates)
+        if not row:
+            return jsonify({"error": "订单不存在或已不是 pending 状态"}), 404
+        return jsonify({"updated": True, "order": row})
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as e:
+        logger.exception("api_manual_pending_update error")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/manual_pending/plan', methods=['POST'])
 def api_manual_pending_plan():
     """提交联动计划: { items: [...] }
@@ -901,9 +1109,9 @@ def api_manual_pending_plan():
     每个 item 字段:
       action               buy / sell
       market_id, token_id  必填
-      trigger_kind         btc_abs | share_abs | share_cost_pct
+      trigger_kind         immediate | btc_abs | share_abs | share_cost_pct
       trigger_op           >= / <=
-      trigger_threshold    btc_abs/share_abs 用 (BTC 1m收盘价 或 share 价)
+      trigger_threshold    btc_abs/share_abs 用 (BTC 1m收盘价 或 share 绝对价 0~1); immediate 不需要
       trigger_pct          share_cost_pct 用 (-100~+1000)
       size_spec            {type, value} type ∈ shares/usdc/pct_balance/pct_position
       price_spec           {type, value?/offset?} type ∈ absolute/market/cost_pct
@@ -919,6 +1127,7 @@ def api_manual_pending_plan():
         return jsonify({'error': 'items 单次最多 10 项'}), 400
 
     now = datetime.now(timezone.utc)
+    intent_tier_map = _build_current_intent_tier_map()
     parsed_items: list[dict] = []
     for idx, raw in enumerate(items):
         if not isinstance(raw, dict):
@@ -929,6 +1138,8 @@ def api_manual_pending_plan():
                 raise ValueError('hours out of range')
         except (TypeError, ValueError):
             return jsonify({'error': f'items[{idx}].expires_hours 必须在 (0, 720]'}), 400
+        extra = {'profile': APP_PM_PROFILE}
+        _apply_intent_tier_snapshot(extra, raw.get('token_id'), intent_tier_map)
         item = {
             'action': str(raw.get('action') or '').strip().lower(),
             'market_id': str(raw.get('market_id') or '').strip(),
@@ -941,7 +1152,7 @@ def api_manual_pending_plan():
             'price_spec': raw.get('price_spec') or {},
             'expires_at': now + timedelta(hours=hours),
             'notes': raw.get('notes'),
-            'extra': {'profile': APP_PM_PROFILE},
+            'extra': extra,
             'parent_index': raw.get('parent_index'),
         }
         parsed_items.append(item)
@@ -1077,6 +1288,128 @@ def api_open_orders():
     except Exception as e:
         logger.exception("api_open_orders failed: error=%s", e)
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/open_orders/edit', methods=['POST'])
+def api_open_order_edit():
+    """编辑交易所 open order：先撤旧单，再按剩余数量重挂新限价单。"""
+    data = request.json or {}
+    order_id = str(data.get("order_id") or "").strip()
+    if not order_id:
+        return jsonify({"error": "Missing order_id"}), 400
+    try:
+        new_price = float(data.get("price"))
+        new_size = float(data.get("size"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "price/size 必须是数字"}), 400
+    if not (0 < new_price < 1):
+        return jsonify({"error": "price 必须在 (0,1)"}), 400
+    if new_size <= 0:
+        return jsonify({"error": "size 必须 > 0"}), 400
+
+    try:
+        orders = get_open_orders(profile=APP_PM_PROFILE)
+        order = next((o for o in orders if str(o.get("id")) == order_id), None)
+        if order is None:
+            detail = get_order_detail(order_id, profile=APP_PM_PROFILE)
+            if isinstance(detail, dict) and str(detail.get("id") or detail.get("orderID") or "") == order_id:
+                order = detail
+        if not order:
+            return jsonify({"error": "订单不存在或已不在 open orders 中"}), 404
+
+        market_id = str(order.get("market") or order.get("market_id") or "").strip()
+        token_id = str(order.get("asset_id") or order.get("token_id") or "").strip()
+        side = str(order.get("side") or "").strip().upper()
+        try:
+            original_size = float(order.get("original_size") or order.get("size") or 0)
+            matched_size = float(order.get("size_matched") or order.get("matched_size") or 0)
+        except (TypeError, ValueError):
+            original_size = 0.0
+            matched_size = 0.0
+        remaining_size = max(original_size - matched_size, 0.0)
+
+        if not market_id or not token_id or side not in {"BUY", "SELL"}:
+            return jsonify({"error": "原订单缺少 market/token/side，无法安全编辑"}), 400
+        if remaining_size <= 0:
+            return jsonify({"error": "原订单已无剩余可编辑数量"}), 409
+        if new_size > remaining_size + 1e-9:
+            return jsonify({"error": f"新 size 不能超过当前剩余数量 {remaining_size:.6f}"}), 400
+
+        logger.info(
+            "api_open_order_edit requested: order_id=%s side=%s market=%s token=%s old_price=%s remaining=%s new_price=%s new_size=%s",
+            order_id, side, market_id, token_id, order.get("price"), remaining_size, new_price, new_size,
+        )
+
+        cancel_result = cancel_order(order_id, profile=APP_PM_PROFILE)
+        if isinstance(cancel_result, dict):
+            not_canceled = cancel_result.get("not_canceled") or cancel_result.get("notCanceled") or {}
+            canceled = cancel_result.get("canceled")
+            if (
+                (isinstance(not_canceled, dict) and order_id in not_canceled)
+                or (isinstance(canceled, list) and order_id not in [str(x) for x in canceled])
+            ):
+                return jsonify({"error": f"撤销原订单失败: {cancel_result}", "cancel_result": cancel_result}), 409
+        _advisory_record_cancel(
+            order_id=order_id,
+            user_note="dashboard-edit",
+            submission_payload={"edit_to": {"price": new_price, "size": new_size}, "cancel_result": cancel_result},
+        )
+
+        if side == "BUY":
+            new_order_id = buy_order(
+                market_id=market_id,
+                token_id=token_id,
+                price=new_price,
+                size=new_size,
+                profile=APP_PM_PROFILE,
+            )
+            action_side = "buy"
+        else:
+            new_order_id = sell_order(
+                market_id=market_id,
+                token_id=token_id,
+                price=new_price,
+                size=new_size,
+                profile=APP_PM_PROFILE,
+                order_type=OrderType.GTC,
+            )
+            action_side = "sell"
+
+        if not new_order_id:
+            error_detail = get_last_order_error() or "替换订单下单失败；原订单已撤销"
+            logger.warning("api_open_order_edit replacement failed: old_order_id=%s reason=%s", order_id, error_detail)
+            return jsonify({
+                "error": error_detail,
+                "cancelled_order_id": order_id,
+                "cancel_result": cancel_result,
+            }), 500
+
+        _advisory_record_place(
+            token_id=token_id,
+            side=action_side,
+            price=new_price,
+            size_shares=new_size,
+            polymarket_order_id=str(new_order_id),
+            user_note="dashboard-edit",
+            submission_payload={
+                "replaces_order_id": order_id,
+                "old_price": order.get("price"),
+                "old_remaining_size": remaining_size,
+                "cancel_result": cancel_result,
+            },
+        )
+        logger.info("api_open_order_edit success: old_order_id=%s new_order_id=%s", order_id, new_order_id)
+        return jsonify({
+            "old_order_id": order_id,
+            "new_order_id": str(new_order_id),
+            "cancel_result": cancel_result,
+            "price": new_price,
+            "size": new_size,
+        })
+    except Exception as e:
+        logger.exception("api_open_order_edit failed: order_id=%s error=%s", order_id, e)
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route('/api/buy', methods=['POST'])
 def api_buy():
@@ -1504,6 +1837,19 @@ def api_btc_1h_kline():
             "close": float(candle[4]),
         })
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/btc_fast_move_signal')
+def api_btc_fast_move_signal():
+    """Return Binance WS fast up/down pressure signal for BTCUSDT."""
+    try:
+        from services.fast_move_signal import get_default_signal_service
+
+        service = get_default_signal_service(auto_start=True)
+        return jsonify(service.get_snapshot())
+    except Exception as e:
+        logger.exception("api_btc_fast_move_signal failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -2473,7 +2819,9 @@ def api_recommendations_latest():
                        ra.order_id AS latest_action_order_id,
                        ra.error_text AS latest_action_error_text,
                        ra.created_at AS latest_action_at,
-                       plans.plans AS plans
+                       plans.plans AS plans,
+                       mpo.queued_pending_order_count,
+                       mpo.active_queued_pending_order_count
                 FROM recommendation_items ri
                 LEFT JOIN LATERAL (
                     SELECT decision, reason_tags, feedback_text, allow_model_learning, created_at
@@ -2512,6 +2860,13 @@ def api_recommendations_latest():
                         WHERE p.item_id = ri.id
                     ) sub
                 ) plans ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT COUNT(*)::int AS queued_pending_order_count,
+                           COUNT(*) FILTER (WHERE mpo.status IN ('pending','executing'))::int AS active_queued_pending_order_count
+                    FROM manual_pending_orders mpo
+                    WHERE mpo.extra->>'source' = 'recommendation_pending_order'
+                      AND mpo.extra->>'recommendation_item_id' = ri.id::text
+                ) mpo ON TRUE
                 WHERE ri.run_id = %s
                 ORDER BY
                     CASE ri.priority_hint
@@ -2610,6 +2965,8 @@ def api_recommendations_latest():
                     if item["latest_action_status"]
                     else None
                 ),
+                "queued_pending_order_count": int(item["queued_pending_order_count"] or 0),
+                "active_queued_pending_order_count": int(item["active_queued_pending_order_count"] or 0),
                 "action_plans": item.get("plans") or [],
                 "take_profit": (item.get("raw_payload") or {}).get("止盈目标") or (item.get("raw_payload") or {}).get("止盈阈值"),
                 "stop_loss": (item.get("raw_payload") or {}).get("止损规则") or (item.get("raw_payload") or {}).get("止损阈值") or (item.get("raw_payload") or {}).get("认错止损价"),
@@ -3237,64 +3594,304 @@ def _build_plan_frozen_payload(plan: dict) -> tuple[dict | None, str | None]:
     }, None
 
 
+def _normalize_ai_pending_price_spec(raw: object, plan: dict) -> dict:
+    spec = raw if isinstance(raw, dict) else {}
+    ptype = str(spec.get("type") or "").strip().lower()
+    if ptype in _MPO_VALID_PRICE_TYPES:
+        if ptype == "absolute":
+            value = spec.get("value")
+            if value is None:
+                raise ValueError("price_spec.absolute 需要 value")
+            return {"type": "absolute", "value": float(value)}
+        if ptype == "market":
+            return {"type": "market", "offset": float(spec.get("offset") or 0.0)}
+        return {"type": "cost_pct", "value": float(spec.get("value") or 0.0)}
+
+    sugg = plan.get("suggested_execution_payload") or {}
+    raw_cents = spec.get("price_cents") or sugg.get("price_cents")
+    if raw_cents is None:
+        raw_cents = _recommendation_default_price(
+            plan["action_type"],
+            plan.get("suggested_price_low_cents"),
+            plan.get("suggested_price_high_cents"),
+        )
+        if raw_cents is not None:
+            return {"type": "absolute", "value": float(raw_cents)}
+    if raw_cents is None:
+        raise ValueError("pending_order 缺少 price_spec")
+    return {"type": "absolute", "value": float(raw_cents) / 100.0}
+
+
+def _normalize_ai_pending_size_spec(raw: object, plan: dict) -> dict:
+    spec = raw if isinstance(raw, dict) else {}
+    stype = str(spec.get("type") or "").strip().lower()
+    if stype in _MPO_VALID_SIZE_TYPES:
+        value = spec.get("value")
+        if value is None:
+            raise ValueError("size_spec 需要 value")
+        return {"type": stype, "value": float(value)}
+
+    # 兼容旧 recommendation size_spec.mode,转换为 manual_pending_orders 的 size_spec.type。
+    sugg = plan.get("suggested_execution_payload") or {}
+    legacy = spec if str(spec.get("mode") or "").strip() else (sugg.get("size_spec") if isinstance(sugg.get("size_spec"), dict) else {})
+    mode = str((legacy or {}).get("mode") or "").strip().lower()
+    value = (legacy or {}).get("value")
+    if value is None:
+        raise ValueError("pending_order 缺少可转换的 size_spec.value")
+    if mode == "amount_usdc":
+        return {"type": "usdc", "value": float(value)}
+    if mode == "shares":
+        return {"type": "shares", "value": float(value)}
+    if mode == "portion_cash":
+        return {"type": "pct_balance", "value": float(value)}
+    if mode == "portion_position":
+        return {"type": "pct_position", "value": float(value)}
+    raise ValueError("pending_order 缺少可转换的 size_spec")
+
+
+def _parse_ai_pending_expires_at(raw: object, expires_hours: object) -> datetime:
+    if raw not in (None, ""):
+        dt = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ET_TIMEZONE)
+        return dt.astimezone(timezone.utc)
+    try:
+        hours = float(expires_hours or 24)
+    except (TypeError, ValueError):
+        raise ValueError("expires_hours 必须是数字") from None
+    if hours <= 0 or hours > 720:
+        raise ValueError("expires_hours 必须在 (0,720]")
+    return datetime.now(timezone.utc) + timedelta(hours=hours)
+
+
+def _convert_recommendation_plan_to_manual_pending_item(
+    plan: dict,
+    *,
+    index: int,
+    intent_tier_map: dict[str, dict] | None = None,
+) -> dict:
+    sugg = plan.get("suggested_execution_payload") or {}
+    pending_order = sugg.get("pending_order")
+    if not isinstance(pending_order, dict):
+        raise ValueError(f"plan #{plan.get('plan_id')} 缺少 pending_order")
+
+    action = str(plan.get("action_type") or "").strip().lower()
+    if action not in {"buy", "sell"}:
+        raise ValueError(f"plan #{plan.get('plan_id')} action_type={action} 不支持转入 manual pending")
+    direction = str(sugg.get("side") or plan.get("direction") or "").strip()
+    if not direction:
+        raise ValueError(f"plan #{plan.get('plan_id')} 缺少方向(side)")
+    target_question = (sugg.get("target_question") or "").strip() or str(plan.get("title") or "").strip()
+    market_snapshot = _resolve_recommendation_market_snapshot(target_question, direction)
+    market_id = str(market_snapshot.get("market_id") or "").strip()
+    token_id = str(market_snapshot.get("token_id") or "").strip()
+    if not market_id or not token_id:
+        raise ValueError(f"plan #{plan.get('plan_id')} 无法解析 market_id/token_id")
+
+    trigger_kind = str(pending_order.get("trigger_kind") or "").strip().lower()
+    trigger_op = str(pending_order.get("trigger_op") or ">=").strip()
+    if trigger_kind == "share_cost_pct" and pending_order.get("trigger_pct") is None and pending_order.get("trigger_threshold") is not None:
+        trigger_pct = pending_order.get("trigger_threshold")
+        trigger_threshold = None
+    else:
+        trigger_pct = pending_order.get("trigger_pct")
+        trigger_threshold = pending_order.get("trigger_threshold")
+
+    parent_index = pending_order.get("parent_index")
+    if parent_index in ("", None):
+        parent_index = None
+    else:
+        try:
+            parent_index = int(parent_index)
+        except (TypeError, ValueError):
+            raise ValueError(f"plan #{plan.get('plan_id')} parent_index 必须是整数") from None
+        if parent_index < 0 or parent_index >= index:
+            raise ValueError(f"plan #{plan.get('plan_id')} parent_index={parent_index} 必须引用前序 plan")
+
+    price_spec = _normalize_ai_pending_price_spec(pending_order.get("price_spec"), plan)
+    size_spec = _normalize_ai_pending_size_spec(pending_order.get("size_spec"), plan)
+    expires_at = _parse_ai_pending_expires_at(pending_order.get("expires_at"), pending_order.get("expires_hours"))
+    notes = (
+        pending_order.get("notes")
+        or plan.get("reason_text")
+        or f"AI recommendation #{plan.get('item_id')} plan #{plan.get('plan_id')}"
+    )
+    extra = {
+        "profile": APP_PM_PROFILE,
+        "source": "recommendation_pending_order",
+        "recommendation_item_id": int(plan["item_id"]),
+        "recommendation_plan_id": int(plan["plan_id"]),
+        "recommendation_plan_ordinal": int(plan.get("ordinal") or index + 1),
+        "plan_role": sugg.get("plan_role"),
+    }
+    _apply_intent_tier_snapshot(extra, token_id, intent_tier_map)
+    return {
+        "action": action,
+        "market_id": market_id,
+        "token_id": token_id,
+        "trigger_kind": trigger_kind,
+        "trigger_op": trigger_op,
+        "trigger_threshold": trigger_threshold,
+        "trigger_pct": trigger_pct,
+        "size_spec": size_spec,
+        "price_spec": price_spec,
+        "expires_at": expires_at,
+        "notes": notes,
+        "extra": extra,
+        "parent_index": parent_index,
+    }
+
+
 @app.route('/api/recommendation_plans/<int:plan_id>/enable', methods=['POST'])
 def api_recommendation_plan_enable(plan_id: int):
-    """阶段4 plan 维度:proposed→armed,冻结 armed_execution_payload。"""
+    """旧 recommendation action_plan 独立自动执行入口已下线。"""
+    return jsonify({
+        "error": "旧 recommendation action_plan 独立自动执行已下线；请使用 recommendation 的 pending_order 一键转入统一 pending 队列。",
+        "code": "legacy_action_plan_disabled",
+    }), 410
+
+
+@app.route('/api/recommendations/<int:item_id>/enable_all_plans', methods=['POST'])
+def api_recommendation_enable_all_plans(item_id: int):
+    """旧 parsed plans 批量启用入口已下线。"""
+    return jsonify({
+        "error": "旧 parsed plans 批量启用已下线；请使用 pending_order 一键转入统一 pending 队列。",
+        "code": "legacy_action_plan_disabled",
+    }), 410
+
+
+@app.route('/api/recommendations/<int:item_id>/queue_pending_plan', methods=['POST'])
+def api_recommendation_queue_pending_plan(item_id: int):
+    """把 AI 明确输出的 linked plan 转入 manual_pending_orders 统一队列。
+
+    与 enable_all_plans 不同,这里要求每条 buy/sell action_plan 都带 pending_order,
+    并一次性写入 manual_pending_orders.insert_plan,保留 parent_index 联动关系。
+    """
     from services.recommendation_trigger import auto_trigger_db as atdb
+    data = request.get_json(silent=True) or {}
     try:
-        plan = _fetch_plan_with_item(int(plan_id))
-        if not plan:
-            return jsonify({"error": "plan 不存在"}), 404
-        if plan["item_status"] != "approved":
-            return jsonify({"error": f"item 必须 approved;当前 {plan['item_status']}", "code": "item_not_approved"}), 409
-        if plan["plan_status"] != "proposed":
-            return jsonify({"error": f"plan 状态必须为 proposed;当前 {plan['plan_status']}", "code": "plan_not_proposed"}), 409
-        if plan["action_type"] not in {"buy", "sell"}:
-            return jsonify({"error": "v1 仅支持 buy/sell 自动执行", "code": "action_not_supported"}), 400
-        # 无 trigger / unparseable 的 plan: 自动升级为 immediate, 启用后由 engine 在下一 tick 立即下单。
-        if plan["trigger_parse_status"] != "parsed":
-            ok = atdb.promote_plan_to_immediate(plan_id=int(plan_id))
-            if not ok:
-                return jsonify({"error": "trigger 不可解析且 plan 状态非 proposed,无法升级为 immediate", "code": "promote_failed"}), 400
-            # 重新拉取最新 plan 状态供后续 frozen_payload / 校验使用
-            plan = _fetch_plan_with_item(int(plan_id))
-            if not plan or plan["trigger_parse_status"] != "parsed":
-                return jsonify({"error": "升级 immediate 后再读取 plan 失败", "code": "refetch_failed"}), 500
-
-        frozen_payload, err = _build_plan_frozen_payload(plan)
-        if err:
-            return jsonify({"error": err, "code": "build_payload_failed"}), 400
-
-        # 阶段4 plan 级绑定校验:不能复用 item 级 _assert_recommendation_request_matches_item
-        # (它会用 item.action_type 跟 plan.action_type 比较, 导致 warning/review 类 item 下的
-        # buy/sell 子 plan 被误拒);改用 plan 自身的字段做校验。
-        try:
-            _assert_plan_request_binding(
-                plan=plan,
-                request_market_id=frozen_payload.get("market_id"),
-                request_token_id=frozen_payload.get("token_id"),
-                request_price=float(frozen_payload.get("price") or 0.0),
-                request_size=float(frozen_payload.get("size") or 0.0),
-                # frozen_payload 已经在 _build_plan_frozen_payload 里完成了 size 解析,
-                # 这里直接复用,避免对 portion_* 类 spec 再次调用 _build_profile_snapshot。
-                precomputed_estimated_shares=float(frozen_payload.get("size") or 0.0),
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, status, title
+                  FROM recommendation_items
+                 WHERE id = %s
+                """,
+                (int(item_id),),
             )
-        except RecommendationBindingError as bind_exc:
-            return jsonify({"error": str(bind_exc), "code": bind_exc.code}), 409
+            item = cur.fetchone()
+        if not item:
+            return jsonify({"error": "recommendation item 不存在"}), 404
 
-        operator_label = (session.get('user') or 'dashboard')[:64]
-        try:
-            row = atdb.enable_auto_execute_plan(
-                plan_id=int(plan_id),
-                frozen_payload=frozen_payload,
-                operator_label=operator_label,
+        item_status = str(item["status"] or "")
+        feedback_result = None
+        if item_status != "approved":
+            if item_status not in {"pending", "read", "deferred", "order_failed", "cancel_failed"}:
+                return jsonify({"error": f"item 当前状态 {item_status} 不允许转入 pending", "code": "item_not_queueable"}), 409
+            feedback_result = _recommendation_db.submit_feedback(
+                item_id=int(item_id),
+                decision="execute",
+                reason_tags=["queue_pending_plan"],
+                feedback_text=str(data.get("feedback_text") or "批准并转入统一 pending 计划")[:500],
+                allow_model_learning=bool(data.get("allow_model_learning", True)),
+                raw_payload={"source": "queue_pending_plan", **data},
             )
-        except atdb.AutoTriggerClaimError as exc:
-            return jsonify({"error": str(exc), "code": exc.code}), 409
-        return jsonify({"ok": True, "plan": row, "frozen_payload": frozen_payload})
+
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                SELECT p.id AS plan_id, p.item_id, p.ordinal, p.action_type, p.status AS plan_status,
+                       p.trigger_spec, p.trigger_parse_status, p.trigger_summary, p.expires_at,
+                       p.suggested_execution_payload, p.armed_execution_payload, p.semantic_key,
+                       p.reason_text,
+                       i.title, i.direction, i.item_kind, i.size_text,
+                       i.suggested_price_low_cents, i.suggested_price_high_cents,
+                       i.status AS item_status, i.raw_payload
+                  FROM recommendation_action_plans p
+                  JOIN recommendation_items i ON i.id = p.item_id
+                 WHERE p.item_id = %s
+                   AND p.action_type IN ('buy','sell')
+                    AND p.status IN ('proposed','armed','executing')
+                  ORDER BY p.ordinal, p.id
+                """,
+                (int(item_id),),
+            )
+            plans = [dict(r) for r in cur.fetchall()]
+
+        if not plans:
+            return jsonify({"ok": False, "error": "没有 buy/sell action plans 可转入 pending", "feedback": feedback_result}), 400
+        blocking = [p for p in plans if str(p.get("plan_status") or "") not in {"proposed"}]
+        if blocking:
+            return jsonify({
+                "ok": False,
+                "error": "存在非 proposed 的 action plan,为避免重复触发已取消转入",
+                "blocking": [{"plan_id": p.get("plan_id"), "status": p.get("plan_status")} for p in blocking],
+                "feedback": feedback_result,
+            }), 409
+        missing = [
+            p.get("plan_id") for p in plans
+            if not isinstance((p.get("suggested_execution_payload") or {}).get("pending_order"), dict)
+        ]
+        if missing:
+            return jsonify({
+                "ok": False,
+                "error": "该 recommendation 仍是旧式独立 plan,缺少 pending_order 结构,不能安全转入统一 pending",
+                "missing_plan_ids": missing,
+                "feedback": feedback_result,
+            }), 400
+
+        parsed_items: list[dict] = []
+        errors: list[dict] = []
+        intent_tier_map = _build_current_intent_tier_map()
+        for idx, plan in enumerate(plans):
+            try:
+                parsed_items.append(_convert_recommendation_plan_to_manual_pending_item(
+                    plan,
+                    index=idx,
+                    intent_tier_map=intent_tier_map,
+                ))
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"plan_id": plan.get("plan_id"), "error": str(exc)})
+        if errors:
+            return jsonify({
+                "ok": False,
+                "error": "部分 plan 无法转换为 manual pending,已取消本次转入",
+                "errors": errors,
+                "feedback": feedback_result,
+            }), 409
+
+        rows = _mpo_insert_plan(
+            parsed_items,
+            requested_by=session.get('user') or 'dashboard',
+        )
+        try:
+            disarmed_count = atdb.cascade_cancel_plans_for_item(
+                item_id=int(item_id),
+                reason="queued_to_manual_pending",
+            )
+        except Exception:
+            for row in rows:
+                try:
+                    _mpo_cancel(int(row["id"]))
+                except Exception:
+                    logger.exception("rollback queued manual pending failed: %s", row)
+            raise
+        return jsonify({
+            "ok": True,
+            "item_id": int(item_id),
+            "feedback": feedback_result,
+            "queued": True,
+            "plan_id": rows[0].get("plan_id") if rows else None,
+            "items": rows,
+            "disarmed_recommendation_plan_count": disarmed_count,
+            "note": "已转入 Positions / Orders 的统一 pending 队列；原 recommendation action plans 已关闭,避免重复触发。",
+        })
+    except RecommendationGateError as ge:
+        return jsonify({"error": str(ge), "code": ge.code}), 409
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
+        logger.exception("api_recommendation_queue_pending_plan failed item_id=%s", item_id)
         return jsonify({"error": str(e)}), 500
 
 

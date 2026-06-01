@@ -109,6 +109,21 @@
             font-size: 0.82rem;
             padding: 0.2rem 0.35rem;
         }
+        .monthly-goal-kpi {
+            border: 1px solid #dee2e6;
+            border-radius: 0.5rem;
+            background: #fff;
+            padding: 0.75rem;
+            height: 100%;
+        }
+        .monthly-goal-kpi .label {
+            color: #6c757d;
+            font-size: 0.78rem;
+        }
+        .monthly-goal-kpi .value {
+            font-weight: 700;
+            font-size: 1.05rem;
+        }
     </style>
     <style>
         .chat-typing { display: inline-flex; align-items: center; }
@@ -148,6 +163,7 @@
         <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
             <div id="balance" class="balance-chip">Loading...</div>
             <div id="btc-price" class="balance-chip">BTC: Loading...</div>
+            <div id="btc-fast-signal" class="balance-chip">Fast: warming...</div>
             <button type="button" class="btn btn-outline-primary btn-sm" id="btnPositionAnalyze">Position Analyze</button>
             <a href="/report/latest" target="_blank" rel="noopener" class="btn btn-outline-secondary btn-sm">Latest Report</a>
             <button type="button" class="btn btn-outline-success btn-sm" id="btnWalletTransfer" data-bs-toggle="modal" data-bs-target="#walletTransferModal">💰 充值/提现</button>
@@ -162,13 +178,13 @@
                 <button class="nav-link active" id="events-tab" data-bs-toggle="tab" data-bs-target="#events" type="button" role="tab" aria-controls="events" aria-selected="true">Events</button>
             </li>
             <li class="nav-item" role="presentation">
-                <button class="nav-link" id="positions-tab" data-bs-toggle="tab" data-bs-target="#positions" type="button" role="tab" aria-controls="positions" aria-selected="false">My Position</button>
-            </li>
-            <li class="nav-item" role="presentation">
-                <button class="nav-link" id="orders-tab" data-bs-toggle="tab" data-bs-target="#orders" type="button" role="tab" aria-controls="orders" aria-selected="false">Open Orders</button>
+                <button class="nav-link" id="positions-tab" data-bs-toggle="tab" data-bs-target="#positions" type="button" role="tab" aria-controls="positions" aria-selected="false">Positions / Orders</button>
             </li>
             <li class="nav-item" role="presentation">
                 <button class="nav-link" id="recommendations-tab" data-bs-toggle="tab" data-bs-target="#recommendations" type="button" role="tab" aria-controls="recommendations" aria-selected="false">Recommendations</button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="monthly-goal-tab" data-bs-toggle="tab" data-bs-target="#monthly-goal" type="button" role="tab" aria-controls="monthly-goal" aria-selected="false">本月目标</button>
             </li>
             <li class="nav-item" role="presentation">
                 <a class="nav-link" href="/recommendations" target="_blank" rel="noopener" title="Fair-value advisory recommendations (independent page)">📊 Advisory ↗</a>
@@ -182,14 +198,14 @@
                 <div id="events-content">Loading...</div>
             </div>
             <div class="tab-pane fade" id="positions" role="tabpanel" aria-labelledby="positions-tab">
-                <div id="positions-content">Loading...</div>
-            </div>
-            <div class="tab-pane fade" id="orders" role="tabpanel" aria-labelledby="orders-tab">
                 <div id="manual-pending-panel" class="mb-3"></div>
-                <div id="orders-content">Loading...</div>
+                <div id="exposure-content">Loading...</div>
             </div>
             <div class="tab-pane fade" id="recommendations" role="tabpanel" aria-labelledby="recommendations-tab">
                 <div id="recommendations-content">Loading...</div>
+            </div>
+            <div class="tab-pane fade" id="monthly-goal" role="tabpanel" aria-labelledby="monthly-goal-tab">
+                <div id="monthly-goal-content">Loading...</div>
             </div>
             <div class="tab-pane fade" id="chat" role="tabpanel" aria-labelledby="chat-tab">
                 <div class="d-flex flex-column" style="height: calc(100vh - 220px); min-height: 500px;">
@@ -444,50 +460,608 @@
         let recommendationFeedbackModal = null;
         let dashboardTargetBaseValue = null;
         let dashboardPhaseLabel = '月中';
+        let openOrdersById = {};
+        let manualPendingById = {};
+        let fastSignalConfirmState = { direction: 'NEUTRAL', sinceMs: 0 };
+        let latestBalanceSummary = null;
+        let latestEventsData = null;
+        let latestPositionsData = [];
+        let latestOpenOrdersData = [];
+        let positionsLoadError = null;
+        let openOrdersLoadError = null;
+        let monthlyGoalPrefsLoadedFor = null;
+        let monthlyGoalPrefsHadLocalTarget = false;
+        let monthlyGoalPrefsHadLocalRealized = false;
+        let monthlyGoalPrefsHadLocalTargetPositions = false;
+        let monthlyGoalPrefs = { targetPct: 20, realized: {}, targetPositionPct: {} };
+        let monthlyGoalEditMode = false;
+        let monthlyGoalDraftPrefs = null;
+        let monthlyGoalRenderTimer = null;
+        let monthlyGoalAutoRealized = null;
+        const MONTHLY_GOAL_TIERS = [
+            { key: 'comfy_high_no', label: '舒服高价No', outcome: 'No', badgeLabels: ['舒服高价No'], returnPct: 5, contributionPct: 1, tone: 'danger' },
+            { key: 'high_no', label: '标准高价No', outcome: 'No', badgeLabels: ['高价No'], returnPct: 10, contributionPct: 3, tone: 'danger' },
+            { key: 'mid_no', label: '中价No', outcome: 'No', badgeLabels: ['中价No'], returnPct: 20, contributionPct: 9, tone: 'warning' },
+            { key: 'low_yes', label: '低价Yes', outcome: 'Yes', badgeLabels: ['低价Yes'], returnPct: 40, contributionPct: 2, tone: 'success' },
+        ];
+        const MONTHLY_GOAL_MIN_POSITION_PCT_BY_TIER = {
+            comfy_high_no: 10,
+        };
+
+        function calculateMonthlyGoalTierAllocations(targetPct, targetPositionOverrides) {
+            const target = Math.max(0, Number(targetPct) || 0);
+            const positions = MONTHLY_GOAL_TIERS.map(tier => (
+                tier.returnPct > 0 ? tier.contributionPct / tier.returnPct * 100 : 0
+            ));
+            const minPositions = MONTHLY_GOAL_TIERS.map(tier => (
+                Number(MONTHLY_GOAL_MIN_POSITION_PCT_BY_TIER[tier.key] || 0)
+            ));
+            const plannedReturn = () => MONTHLY_GOAL_TIERS.reduce((sum, tier, idx) => (
+                sum + positions[idx] * tier.returnPct / 100
+            ), 0);
+            const shiftPosition = (fromIdx, toIdx, remainingDelta) => {
+                if (remainingDelta <= 0) return 0;
+                const effectPerPct = Math.abs(MONTHLY_GOAL_TIERS[toIdx].returnPct - MONTHLY_GOAL_TIERS[fromIdx].returnPct) / 100;
+                if (effectPerPct <= 0) return 0;
+                const availablePct = Math.max(0, positions[fromIdx] - minPositions[fromIdx]);
+                const movePct = Math.min(availablePct, remainingDelta / effectPerPct);
+                positions[fromIdx] -= movePct;
+                positions[toIdx] += movePct;
+                return movePct * effectPerPct;
+            };
+
+            let current = plannedReturn();
+            if (target > current) {
+                let remaining = target - current;
+                [[0, 1], [1, 2], [2, 3]].some(([fromIdx, toIdx]) => {
+                    remaining -= shiftPosition(fromIdx, toIdx, remaining);
+                    return remaining <= 1e-9;
+                });
+            } else if (target < current) {
+                let remaining = current - target;
+                [[3, 2], [2, 1], [1, 0]].some(([fromIdx, toIdx]) => {
+                    remaining -= shiftPosition(fromIdx, toIdx, remaining);
+                    return remaining <= 1e-9;
+                });
+                current = plannedReturn();
+                if (target < current && positions[0] > 0) {
+                    positions[0] *= current > 0 ? target / current : 0;
+                }
+            }
+
+            const normalizedOverrides = {};
+            if (targetPositionOverrides && typeof targetPositionOverrides === 'object') {
+                MONTHLY_GOAL_TIERS.forEach((tier, idx) => {
+                    const value = Number(targetPositionOverrides[tier.key]);
+                    if (Number.isFinite(value)) {
+                        const positionPct = Math.min(100, Math.max(0, value));
+                        normalizedOverrides[tier.key] = positionPct;
+                        positions[idx] = positionPct;
+                    }
+                });
+            }
+
+            const planned = plannedReturn();
+            const allocations = MONTHLY_GOAL_TIERS.map((tier, idx) => {
+                const targetPositionPct = Math.max(0, positions[idx]);
+                const targetContributionPct = targetPositionPct * tier.returnPct / 100;
+                return {
+                    tierKey: tier.key,
+                    targetPositionPct,
+                    targetContributionPct,
+                    targetProfitSharePct: planned > 0 ? targetContributionPct / planned * 100 : 0,
+                };
+            });
+            return {
+                targetPct: target,
+                plannedReturnPct: planned,
+                allocationSource: Object.keys(normalizedOverrides).length ? 'dashboard_custom_positions' : 'target_model',
+                targetPositionOverrides: normalizedOverrides,
+                targetFeasibleWithoutLeverage: allocations.reduce((sum, item) => sum + item.targetPositionPct, 0) <= 100.000001,
+                targetReturnMatchesGoal: Math.abs(planned - target) <= 1e-6,
+                totalPositionPct: allocations.reduce((sum, item) => sum + item.targetPositionPct, 0),
+                allocations,
+            };
+        }
+
+        function formatBjtTime(value) {
+            if (!value) return '—';
+            const dt = new Date(value);
+            if (isNaN(dt.getTime())) return String(value);
+            return dt.toLocaleString('zh-CN', {
+                timeZone: 'Asia/Shanghai',
+                hour12: false
+            }) + ' BJT';
+        }
 
         function formatMoneyNum(num) {
             if (num == null || isNaN(num)) return '—';
             return '$' + Number(num).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         }
 
-        function _bucketTargetRow(label, allocPct, returnPct, profileValue) {
-            const contributionPct = allocPct * returnPct / 100;
-            const positionAmount = profileValue != null && !isNaN(profileValue)
-                ? profileValue * allocPct / 100
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function jsSingleQuoted(value) {
+            return "'" + String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/"/g, '&quot;')
+                .replace(/\\/g, '\\\\')
+                .replace(/'/g, "\\'")
+                .replace(/\r?\n/g, ' ')
+                + "'";
+        }
+
+        function _monthlyGoalStorageKey() {
+            const eventName = latestEventsData && latestEventsData.event_name ? latestEventsData.event_name : 'current';
+            return 'monthlyGoalPrefs:v2-entry-tier:' + eventName;
+        }
+
+        function _loadMonthlyGoalPrefs() {
+            const key = _monthlyGoalStorageKey();
+            if (monthlyGoalPrefsLoadedFor === key) return;
+            monthlyGoalPrefsLoadedFor = key;
+            monthlyGoalPrefsHadLocalTarget = false;
+            monthlyGoalPrefsHadLocalRealized = false;
+            monthlyGoalPrefsHadLocalTargetPositions = false;
+            monthlyGoalPrefs = { targetPct: 20, realized: {}, targetPositionPct: {} };
+            try {
+                const raw = localStorage.getItem(key);
+                if (!raw) return;
+                const parsed = JSON.parse(raw);
+                if (parsed && parsed.targetPct != null && Number.isFinite(Number(parsed.targetPct))) {
+                    monthlyGoalPrefs.targetPct = Number(parsed.targetPct);
+                    monthlyGoalPrefsHadLocalTarget = true;
+                }
+                if (parsed && parsed.realized && typeof parsed.realized === 'object') {
+                    monthlyGoalPrefs.realized = parsed.realized;
+                    monthlyGoalPrefsHadLocalRealized = Object.keys(parsed.realized).length > 0;
+                }
+                if (parsed && parsed.targetPositionPct && typeof parsed.targetPositionPct === 'object') {
+                    monthlyGoalPrefs.targetPositionPct = parsed.targetPositionPct;
+                    monthlyGoalPrefsHadLocalTargetPositions = Object.keys(parsed.targetPositionPct).length > 0;
+                }
+            } catch (error) {
+                console.warn('load monthly goal prefs failed', error);
+            }
+        }
+
+        function _saveMonthlyGoalPrefs() {
+            try {
+                localStorage.setItem(_monthlyGoalStorageKey(), JSON.stringify(monthlyGoalPrefs));
+            } catch (error) {
+                console.warn('save monthly goal prefs failed', error);
+            }
+        }
+
+        function _saveMonthlyGoalSettingsServer() {
+            return fetchJsonSafe('/api/monthly_goal/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    target_pct: Number(monthlyGoalPrefs.targetPct || 20),
+                    realized_overrides: monthlyGoalPrefs.realized || {},
+                    target_position_overrides: monthlyGoalPrefs.targetPositionPct || {}
+                })
+            });
+        }
+
+        function _cloneMonthlyGoalPrefs(prefs) {
+            return {
+                targetPct: Number((prefs || {}).targetPct || 20),
+                realized: { ...(((prefs || {}).realized) || {}) },
+                targetPositionPct: { ...(((prefs || {}).targetPositionPct) || {}) },
+            };
+        }
+
+        function _activeMonthlyGoalPrefs() {
+            return monthlyGoalEditMode && monthlyGoalDraftPrefs
+                ? monthlyGoalDraftPrefs
+                : monthlyGoalPrefs;
+        }
+
+        function _scheduleMonthlyGoalRender() {
+            if (monthlyGoalRenderTimer) clearTimeout(monthlyGoalRenderTimer);
+            monthlyGoalRenderTimer = setTimeout(() => {
+                monthlyGoalRenderTimer = null;
+                renderMonthlyGoal();
+                updateDashboardHelpPopover();
+            }, 150);
+        }
+
+        function editMonthlyGoalTargets() {
+            monthlyGoalDraftPrefs = _cloneMonthlyGoalPrefs(monthlyGoalPrefs);
+            monthlyGoalEditMode = true;
+            renderMonthlyGoal();
+            updateDashboardHelpPopover();
+        }
+
+        function saveMonthlyGoalTargets() {
+            if (!monthlyGoalEditMode || !monthlyGoalDraftPrefs) return;
+            monthlyGoalPrefs = _cloneMonthlyGoalPrefs(monthlyGoalDraftPrefs);
+            monthlyGoalEditMode = false;
+            monthlyGoalDraftPrefs = null;
+            _saveMonthlyGoalPrefs();
+            _saveMonthlyGoalSettingsServer().catch(error => {
+                console.warn('save monthly goal draft to server failed', error);
+            });
+            renderMonthlyGoal();
+            updateDashboardHelpPopover();
+        }
+
+        function cancelMonthlyGoalTargets() {
+            monthlyGoalEditMode = false;
+            monthlyGoalDraftPrefs = null;
+            renderMonthlyGoal();
+            updateDashboardHelpPopover();
+        }
+
+        function setMonthlyGoalTarget(value) {
+            const n = Number(value);
+            if (!Number.isFinite(n) || n <= 0) {
+                alert('本月目标盈利百分比必须大于 0');
+                renderMonthlyGoal();
+                return;
+            }
+            if (monthlyGoalEditMode && monthlyGoalDraftPrefs) {
+                monthlyGoalDraftPrefs.targetPct = n;
+                _scheduleMonthlyGoalRender();
+                return;
+            }
+            monthlyGoalPrefs.targetPct = n;
+            _saveMonthlyGoalPrefs();
+            _saveMonthlyGoalSettingsServer().catch(error => {
+                console.warn('save monthly goal settings to server failed', error);
+            });
+            renderMonthlyGoal();
+            updateDashboardHelpPopover();
+        }
+
+        function setMonthlyGoalRealized(tierKey, value) {
+            if (!monthlyGoalEditMode || !monthlyGoalDraftPrefs) return;
+            const n = Number(value);
+            monthlyGoalDraftPrefs.realized[tierKey] = Number.isFinite(n) ? n : 0;
+            _scheduleMonthlyGoalRender();
+        }
+
+        function setMonthlyGoalTargetPosition(tierKey, value) {
+            if (!monthlyGoalEditMode || !monthlyGoalDraftPrefs) return;
+            const n = Number(value);
+            if (!Number.isFinite(n) || n < 0 || n > 100) {
+                alert('目标仓位占比必须在 0 到 100 之间');
+                renderMonthlyGoal();
+                return;
+            }
+            monthlyGoalDraftPrefs.targetPositionPct[tierKey] = n;
+            _scheduleMonthlyGoalRender();
+        }
+
+        function resetMonthlyGoalTargetPositions() {
+            if (!monthlyGoalEditMode || !monthlyGoalDraftPrefs) return;
+            monthlyGoalDraftPrefs.targetPositionPct = {};
+            renderMonthlyGoal();
+            updateDashboardHelpPopover();
+        }
+
+        function loadMonthlyGoalRealized() {
+            fetchJsonSafe('/api/monthly_goal/realized')
+                .then(data => {
+                    if (data && !data.error) {
+                        monthlyGoalAutoRealized = data;
+                    } else {
+                        monthlyGoalAutoRealized = { error: data && data.error ? data.error : '加载失败' };
+                    }
+                    renderMonthlyGoal();
+                })
+                .catch(error => {
+                    monthlyGoalAutoRealized = { error: error.message || String(error) };
+                    renderMonthlyGoal();
+                });
+        }
+
+        function loadMonthlyGoalSettings() {
+            _loadMonthlyGoalPrefs();
+            const localTarget = Number(monthlyGoalPrefs.targetPct || 20);
+            fetchJsonSafe('/api/monthly_goal/settings')
+                .then(data => {
+                    const serverTarget = Number(data && data.target_pct);
+                    const serverRealized = (data && data.realized_overrides && typeof data.realized_overrides === 'object')
+                        ? data.realized_overrides
+                        : {};
+                    const serverHasRealized = data && data.has_realized_overrides;
+                    const serverTargetPositions = (data && data.target_position_overrides && typeof data.target_position_overrides === 'object')
+                        ? data.target_position_overrides
+                        : {};
+                    const serverHasTargetPositions = data && data.has_target_position_overrides;
+                    let shouldSyncLocal = false;
+                    if (data && data.saved && Number.isFinite(serverTarget) && serverTarget > 0) {
+                        monthlyGoalPrefs.targetPct = serverTarget;
+                    } else if (monthlyGoalPrefsHadLocalTarget && Number.isFinite(localTarget) && localTarget > 0) {
+                        monthlyGoalPrefs.targetPct = localTarget;
+                        shouldSyncLocal = true;
+                    } else if (Number.isFinite(serverTarget) && serverTarget > 0) {
+                        monthlyGoalPrefs.targetPct = serverTarget;
+                    }
+                    if (serverHasRealized) {
+                        monthlyGoalPrefs.realized = serverRealized;
+                    } else if (monthlyGoalPrefsHadLocalRealized) {
+                        shouldSyncLocal = true;
+                    }
+                    if (serverHasTargetPositions) {
+                        monthlyGoalPrefs.targetPositionPct = serverTargetPositions;
+                    } else if (monthlyGoalPrefsHadLocalTargetPositions) {
+                        shouldSyncLocal = true;
+                    }
+                    _saveMonthlyGoalPrefs();
+                    if (shouldSyncLocal) {
+                        _saveMonthlyGoalSettingsServer().catch(error => {
+                            console.warn('migrate monthly goal settings to server failed', error);
+                        });
+                    }
+                    renderMonthlyGoal();
+                    updateDashboardHelpPopover();
+                })
+                .catch(error => {
+                    console.warn('load monthly goal settings failed', error);
+                    renderMonthlyGoal();
+                    updateDashboardHelpPopover();
+                });
+        }
+
+        function _extractStrikeFromQuestion(question) {
+            const m = String(question || '').match(/\$([\d,]+)/);
+            return m ? Number(m[1].replace(/,/g, '')) : 0;
+        }
+
+        function _hasMonthlyGoalBadge(market, tier) {
+            const badges = (((market || {}).barrierMeta || {}).zone_badges || []).map(b => b && b.label).filter(Boolean);
+            return tier.badgeLabels.some(label => badges.includes(label));
+        }
+
+        function _marketOutcomeIndex(market, outcome) {
+            const outcomes = market.outcomes || [];
+            return outcomes.findIndex(o => String(o || '').toLowerCase() === String(outcome || '').toLowerCase());
+        }
+
+        function _entryPriceForOutcome(market, index) {
+            const ask = Number((market.bestAsks || [])[index]);
+            if (Number.isFinite(ask) && ask > 0 && ask < 1) return ask;
+            const mid = Number((market.outcomePrices || [])[index]);
+            if (Number.isFinite(mid) && mid > 0 && mid < 1) return mid;
+            const bid = Number((market.bestBids || [])[index]);
+            if (Number.isFinite(bid) && bid > 0 && bid < 1) return bid;
+            return null;
+        }
+
+        function _monthlyGoalCandidatesByTier() {
+            const positionsByAsset = {};
+            (latestPositionsData || []).forEach(p => {
+                const asset = String(p.asset || '');
+                if (!asset) return;
+                if (!positionsByAsset[asset]) positionsByAsset[asset] = { shares: 0, value: 0 };
+                const size = Number(p.size || 0);
+                const value = Number(p.currentValue != null ? p.currentValue : (size * Number(p.curPrice || 0)));
+                if (Number.isFinite(size)) positionsByAsset[asset].shares += size;
+                if (Number.isFinite(value)) positionsByAsset[asset].value += value;
+            });
+
+            const out = {};
+            MONTHLY_GOAL_TIERS.forEach(tier => { out[tier.key] = []; });
+            ((latestEventsData || {}).markets || []).forEach(market => {
+                const hasSettledPrice = (market.outcomePrices || []).some(price => Number(price) === 1);
+                if (hasSettledPrice) return;
+                MONTHLY_GOAL_TIERS.forEach(tier => {
+                    if (!_hasMonthlyGoalBadge(market, tier)) return;
+                    const index = _marketOutcomeIndex(market, tier.outcome);
+                    if (index < 0) return;
+                    const tokenId = String((market.token_id || [])[index] || '');
+                    const price = _entryPriceForOutcome(market, index);
+                    const held = positionsByAsset[tokenId] || { shares: 0, value: 0 };
+                    out[tier.key].push({
+                        question: market.question || '',
+                        tokenId,
+                        price,
+                        heldShares: held.shares,
+                        heldValue: held.value,
+                        strike: _extractStrikeFromQuestion(market.question),
+                    });
+                });
+            });
+            Object.keys(out).forEach(key => {
+                out[key].sort((a, b) => b.strike - a.strike);
+            });
+            return out;
+        }
+
+        function _monthlyGoalAutoRealizedByTier() {
+            const byTier = (monthlyGoalAutoRealized && monthlyGoalAutoRealized.by_tier) || {};
+            const out = {};
+            MONTHLY_GOAL_TIERS.forEach(tier => {
+                const row = byTier[tier.key];
+                const pnl = row && typeof row === 'object' ? Number(row.realized_pnl || 0) : Number(row || 0);
+                out[tier.key] = Number.isFinite(pnl) ? pnl : 0;
+            });
+            return out;
+        }
+
+        function renderMonthlyGoal() {
+            const el = document.getElementById('monthly-goal-content');
+            if (!el) return;
+            _loadMonthlyGoalPrefs();
+            const baseValue = Number(
+                dashboardTargetBaseValue != null ? dashboardTargetBaseValue : (latestBalanceSummary && latestBalanceSummary.profile_value)
+            );
+            const activePrefs = _activeMonthlyGoalPrefs();
+            const targetPct = Number(activePrefs.targetPct || 20);
+            const targetProfit = Number.isFinite(baseValue) ? baseValue * targetPct / 100 : null;
+            const allocationPlan = calculateMonthlyGoalTierAllocations(targetPct, activePrefs.targetPositionPct);
+            const planExpectedProfit = Number.isFinite(baseValue) ? baseValue * allocationPlan.plannedReturnPct / 100 : null;
+            const allocationsByTier = {};
+            allocationPlan.allocations.forEach(item => { allocationsByTier[item.tierKey] = item; });
+            const candidatesByTier = _monthlyGoalCandidatesByTier();
+            const autoRealizedByTier = _monthlyGoalAutoRealizedByTier();
+            const autoTotalRealized = Number(monthlyGoalAutoRealized && monthlyGoalAutoRealized.total_realized || 0);
+            const autoClassifiedRealized = Number(monthlyGoalAutoRealized && monthlyGoalAutoRealized.classified_realized || 0);
+            const autoUnclassifiedRealized = Number(monthlyGoalAutoRealized && monthlyGoalAutoRealized.unclassified_realized || 0);
+            const autoUntrackedSellUsdc = Number(monthlyGoalAutoRealized && monthlyGoalAutoRealized.untracked_sell_usdc || 0);
+            let totalRealized = 0;
+            let totalRemaining = 0;
+
+            let rows = '';
+            MONTHLY_GOAL_TIERS.forEach(tier => {
+                const allocation = allocationsByTier[tier.key] || {};
+                const targetPositionPct = Number(allocation.targetPositionPct || 0);
+                const targetContributionPct = Number(allocation.targetContributionPct || 0);
+                const targetProfitSharePct = Number(allocation.targetProfitSharePct || 0);
+                const targetPositionAmount = Number.isFinite(baseValue)
+                    ? baseValue * targetPositionPct / 100
+                    : null;
+                const tierProfit = Number.isFinite(baseValue)
+                    ? baseValue * targetContributionPct / 100
+                    : null;
+                const candidates = candidatesByTier[tier.key] || [];
+                const validPrices = candidates.map(c => c.price).filter(p => Number.isFinite(p) && p > 0);
+                const perTokenAmount = targetPositionAmount != null && candidates.length > 0
+                    ? targetPositionAmount / candidates.length
+                    : null;
+                const targetShares = perTokenAmount != null
+                    ? candidates.reduce((sum, c) => Number.isFinite(c.price) && c.price > 0 ? sum + perTokenAmount / c.price : sum, 0)
+                    : null;
+                const heldShares = candidates.reduce((sum, c) => sum + (Number(c.heldShares) || 0), 0);
+                const heldValue = candidates.reduce((sum, c) => sum + (Number(c.heldValue) || 0), 0);
+                const manualRaw = (activePrefs.realized || {})[tier.key];
+                const hasManual = manualRaw !== undefined && manualRaw !== null && manualRaw !== '';
+                const autoRealized = Number(autoRealizedByTier[tier.key] || 0);
+                const realized = hasManual ? Number(manualRaw || 0) : autoRealized;
+                const remaining = tierProfit != null ? Math.max(0, tierProfit - realized) : null;
+                if (Number.isFinite(realized)) totalRealized += realized;
+                if (remaining != null) totalRemaining += remaining;
+                const tokenPreview = candidates.length
+                    ? candidates.slice(0, 3).map(c => {
+                        const strike = c.strike ? ('$' + c.strike.toLocaleString('en-US')) : '?';
+                        return strike + ' @ ' + (c.price != null ? formatPrice(c.price) : '—');
+                    }).join('<br>')
+                    : '<span class="text-muted">当前无符合标签的 token</span>';
+                const priceHint = validPrices.length
+                    ? '候选 ' + candidates.length + ' 个；按候选均分目标仓位'
+                    : '';
+                const realizedHint = monthlyGoalAutoRealized && monthlyGoalAutoRealized.error
+                    ? '<small class="text-danger">自动加载失败</small>'
+                    : '<small class="text-muted">自动 ' + formatMoneyNum(autoRealized) + (hasManual ? ' · 手动覆盖' : '') + '</small>';
+                rows += '<tr>'
+                    + '<td><span class="badge text-bg-' + tier.tone + '">' + tier.label + '</span><br><small class="text-muted">' + tier.outcome + ' · 预期收益 ' + tier.returnPct + '%</small></td>'
+                    + '<td><div class="input-group input-group-sm mb-1" style="max-width:130px;"><input type="number" class="form-control" min="0" max="100" step="0.1" value="' + targetPositionPct.toFixed(1) + '" oninput="setMonthlyGoalTargetPosition(' + jsSingleQuoted(tier.key) + ', this.value)"' + (monthlyGoalEditMode ? '' : ' disabled') + '><span class="input-group-text">%</span></div>'
+                    + '<div>' + formatMoneyNum(targetPositionAmount) + '</div><small class="text-muted">' + (priceHint || '可手动调整占比') + '</small></td>'
+                    + '<td>' + (targetShares != null ? formatTokenAmount(targetShares) : '—') + '<br><small class="text-muted">当前 ' + formatTokenAmount(heldShares) + ' 张 / ' + formatMoneyNum(heldValue) + '</small></td>'
+                    + '<td>' + formatMoneyNum(tierProfit) + '<br><small class="text-muted">贡献 ' + targetContributionPct.toFixed(1) + '%；占预期收益 ' + targetProfitSharePct.toFixed(1) + '%</small></td>'
+                    + '<td style="min-width:130px;"><input type="number" class="form-control form-control-sm" step="0.01" value="' + realized.toFixed(2) + '" data-tier-key="' + tier.key + '" oninput="setMonthlyGoalRealized(this.dataset.tierKey, this.value)"' + (monthlyGoalEditMode ? '' : ' disabled') + '>' + realizedHint + '</td>'
+                    + '<td><strong>' + formatMoneyNum(remaining) + '</strong></td>'
+                    + '<td class="text-wrap-mobile"><small>' + tokenPreview + '</small></td>'
+                    + '</tr>';
+            });
+            if (Math.abs(autoUnclassifiedRealized) >= 0.005 || autoUntrackedSellUsdc >= 0.005) {
+                totalRealized += Number.isFinite(autoUnclassifiedRealized) ? autoUnclassifiedRealized : 0;
+                const untrackedHint = autoUntrackedSellUsdc >= 0.005
+                    ? '<br><small class="text-warning">另有卖出 ' + formatMoneyNum(autoUntrackedSellUsdc) + ' 缺少买入成本，未计入 realized</small>'
+                    : '';
+                rows += '<tr class="table-light">'
+                    + '<td><span class="badge text-bg-secondary">未归类</span><br><small class="text-muted">历史 entry_tier 缺失 / 非主战区</small></td>'
+                    + '<td>—</td><td>—</td><td>—</td>'
+                    + '<td><strong>' + formatMoneyNum(autoUnclassifiedRealized) + '</strong>' + untrackedHint + '</td>'
+                    + '<td><span class="text-muted">不分摊到单档目标</span></td>'
+                    + '<td><small class="text-muted">后续新买入会按成交时等级自动归类</small></td>'
+                    + '</tr>';
+            }
+
+            const remainingForGoal = planExpectedProfit != null ? Math.max(0, planExpectedProfit - totalRealized) : totalRemaining;
+            const warnings = [];
+            if (!allocationPlan.targetFeasibleWithoutLeverage) {
+                warnings.push('当前四档仓位合计 <strong>' + allocationPlan.totalPositionPct.toFixed(1) + '%</strong>，超过 100% 组合。');
+            } else if (allocationPlan.totalPositionPct < 99.9) {
+                warnings.push('当前四档仓位合计 <strong>' + allocationPlan.totalPositionPct.toFixed(1) + '%</strong>，剩余部分相当于现金。');
+            }
+            if (!allocationPlan.targetReturnMatchesGoal) {
+                warnings.push('当前仓位组合预期收益率为 <strong>' + allocationPlan.plannedReturnPct.toFixed(1) + '%</strong>，与目标 <strong>' + targetPct.toFixed(1) + '%</strong> 不完全一致。');
+            }
+            const warning = warnings.length
+                ? '<div class="alert alert-warning py-2 small mb-3">' + warnings.join(' ') + '</div>'
+                : '';
+            const autoSource = monthlyGoalAutoRealized && !monthlyGoalAutoRealized.error
+                ? '自动已实现收益来自 Polymarket activity 成交流水（' + (monthlyGoalAutoRealized.month_label || '本月') + ' ET，按买入成交时 entry_tier + FIFO lot 归因）。'
+                : '自动已实现收益加载中；加载失败时仍可手动填写。';
+            const realizedBreakdown = monthlyGoalAutoRealized && !monthlyGoalAutoRealized.error
+                ? '<div class="text-muted small mt-2">自动总已实现 ' + formatMoneyNum(autoTotalRealized)
+                    + '；已归类 ' + formatMoneyNum(autoClassifiedRealized)
+                    + '；未归类 ' + formatMoneyNum(autoUnclassifiedRealized)
+                    + (autoUntrackedSellUsdc >= 0.005 ? '；缺少成本的卖出流水 ' + formatMoneyNum(autoUntrackedSellUsdc) + ' 未计入 realized' : '')
+                    + '。</div>'
+                : '';
+            const editControls = monthlyGoalEditMode
+                ? '<div class="d-flex flex-wrap justify-content-end gap-2 mb-2">'
+                    + '<button class="btn btn-outline-secondary btn-sm" onclick="resetMonthlyGoalTargetPositions()">恢复推荐仓位</button>'
+                    + '<button class="btn btn-outline-secondary btn-sm" onclick="cancelMonthlyGoalTargets()">取消</button>'
+                    + '<button class="btn btn-primary btn-sm" onclick="saveMonthlyGoalTargets()">保存</button>'
+                    + '</div>'
+                : '<div class="d-flex justify-content-end mb-2"><button class="btn btn-outline-primary btn-sm" onclick="editMonthlyGoalTargets()">编辑目标仓位/已实现</button></div>';
+            el.innerHTML = '<div class="card shadow-sm mb-3"><div class="card-body">'
+                + '<div class="d-flex flex-wrap justify-content-between align-items-end gap-2 mb-3">'
+                + '<div><h2 class="h4 mb-1">本月目标</h2><div class="text-muted small">基于月初净值、当前 Events 标签和目标仓位组合计算；' + autoSource + '</div></div>'
+                + '<div style="width:180px;"><label class="form-label small mb-1">本月目标盈利 %</label><div class="input-group input-group-sm"><input id="monthlyGoalTargetPctInput" type="number" class="form-control" min="0.1" step="0.1" value="' + targetPct + '" onchange="setMonthlyGoalTarget(this.value)"><span class="input-group-text">%</span></div></div>'
+                + '</div>'
+                + '<div class="row g-2 mb-3">'
+                + '<div class="col-6 col-md-3"><div class="monthly-goal-kpi"><div class="label">目标基数（月初净值）</div><div class="value">' + formatMoneyNum(baseValue) + '</div></div></div>'
+                + '<div class="col-6 col-md-3"><div class="monthly-goal-kpi"><div class="label">目标盈利</div><div class="value text-success">' + formatMoneyNum(targetProfit) + '</div></div></div>'
+                + '<div class="col-6 col-md-3"><div class="monthly-goal-kpi"><div class="label">调整后预期收益率</div><div class="value text-info">' + allocationPlan.plannedReturnPct.toFixed(1) + '%</div><small class="text-muted">仓位合计 ' + allocationPlan.totalPositionPct.toFixed(1) + '%</small></div></div>'
+                + '<div class="col-6 col-md-3"><div class="monthly-goal-kpi"><div class="label">待实现盈利</div><div class="value text-primary">' + formatMoneyNum(remainingForGoal) + '</div><small class="text-muted">已实现 ' + formatMoneyNum(totalRealized) + '</small></div></div>'
+                + '</div>'
+                + warning
+                + editControls
+                + '<div class="table-responsive"><table class="table table-sm align-middle mb-0">'
+                + '<thead><tr><th>等级</th><th>目标仓位金额</th><th>目标仓位数</th><th>目标盈利数</th><th>已实现盈利数</th><th>待实现盈利数</th><th>当前候选 token</th></tr></thead>'
+                + '<tbody>' + rows + '</tbody></table></div>'
+                + realizedBreakdown
+                + '<div class="text-muted small mt-2">拆分逻辑：15% 基准组合为 20% 舒服高价No / 30% 标准高价No / 45% 中价No / 5% 低价Yes；未手动调整时，在 100% 组合内相邻调仓且舒服高价No至少保留 10% 防守底仓。手动调整仓位后，各档“目标仓位 × 预期收益”的合计即为调整后预期收益率。成交归因按买入时等级，不再按当前 Events 动态标签重分。</div>'
+                + '</div></div>';
+        }
+
+        function _monthlyGoalTargetRow(tier, allocation, profileValue) {
+            const targetProfitPct = Number(allocation.targetContributionPct || 0);
+            const targetPositionPct = Number(allocation.targetPositionPct || 0);
+            const positionAmount = profileValue != null && !isNaN(profileValue) && targetPositionPct != null
+                ? profileValue * targetPositionPct / 100
                 : null;
             const profitAmount = profileValue != null && !isNaN(profileValue)
-                ? profileValue * contributionPct / 100
+                ? profileValue * targetProfitPct / 100
                 : null;
-            return '<li><strong>' + label + '</strong>：'
-                + allocPct.toFixed(0) + '% 仓位'
+            return '<li><strong>' + tier.label + '</strong>：'
+                + targetPositionPct.toFixed(1) + '% 仓位'
                 + (positionAmount != null ? '（约 ' + formatMoneyNum(positionAmount) + '）' : '')
-                + ' × ' + returnPct.toFixed(0) + '% = '
-                + contributionPct.toFixed(1) + '%'
-                + (profitAmount != null ? '（约 ' + formatMoneyNum(profitAmount) + '）' : '')
+                + ' × ' + tier.returnPct.toFixed(0) + '% = '
+                + targetProfitPct.toFixed(1) + '% 目标盈利'
+                + '（' + (profitAmount != null ? formatMoneyNum(profitAmount) : '—') + '）'
                 + '</li>';
         }
 
-        function buildDashboardHelpContent(profileValue, phaseLabel) {
+        function buildDashboardHelpContent(profileValue, phaseLabel, targetPct) {
             const phase = phaseLabel || '月中';
+            const goalPct = Number.isFinite(Number(targetPct)) && Number(targetPct) > 0 ? Number(targetPct) : 20;
+            const activePrefs = _activeMonthlyGoalPrefs();
+            const allocationPlan = calculateMonthlyGoalTierAllocations(goalPct, activePrefs.targetPositionPct);
+            const allocationsByTier = {};
+            allocationPlan.allocations.forEach(item => { allocationsByTier[item.tierKey] = item; });
             const profileLine = profileValue != null && !isNaN(profileValue)
                 ? '<div class="mb-2"><strong>月度目标基数（按月初净值）</strong>：' + formatMoneyNum(profileValue) + '</div>'
                 : '<div class="mb-2"><strong>月度目标基数（按月初净值）</strong>：载入中…</div>';
 
-            const stableRows = [
-                _bucketTargetRow('舒服高价No', 20, 5, profileValue),
-                _bucketTargetRow('标准高价No', 20, 10, profileValue),
-                _bucketTargetRow('中价No', 60, 20, profileValue),
-                _bucketTargetRow('低价Yes', 0, 40, profileValue),
-            ].join('');
-            const balancedRows = [
-                _bucketTargetRow('舒服高价No', 20, 5, profileValue),
-                _bucketTargetRow('标准高价No', 30, 10, profileValue),
-                _bucketTargetRow('中价No', 45, 20, profileValue),
-                _bucketTargetRow('低价Yes', 5, 40, profileValue),
-            ].join('');
-            const exampleAmount = profileValue != null && !isNaN(profileValue)
-                ? formatMoneyNum(profileValue * 0.40 * 0.10)
-                : '载入中…';
+            const currentRows = MONTHLY_GOAL_TIERS
+                .map(tier => _monthlyGoalTargetRow(tier, allocationsByTier[tier.key] || {}, profileValue))
+                .join('');
 
             return "<div class='text-start'>"
                 + profileLine
@@ -504,15 +1078,16 @@
                 + "<li><strong>月中</strong>：No 不再默认主战区；只有确认后的中价No才做，Yes 的弹性机会更值得关注。</li>"
                 + "<li><strong>月末</strong>：盈利更偏向 No，继续以防守型 No 为主。</li>"
                 + "</ul></div>"
-                + "<div class='mb-2'><strong>分层盈利目标（公式）</strong><br>仓位目标 × 该类收益目标 = 对总净值的月度贡献目标。<br>例如：<code>标准高价No 40% × 10%</code> = <strong>4.0%</strong>，"
-                + (profileValue != null && !isNaN(profileValue) ? "按月初净值约为 <strong>" + exampleAmount + "</strong>。" : "")
+                + "<div class='mb-2'><strong>分层盈利目标（当前 " + goalPct.toFixed(1) + "% 目标）</strong><br>先从 15% 基准组合出发：20% 舒服高价No / 30% 标准高价No / 45% 中价No / 5% 低价Yes；未手动调整时只在 100% 组合内相邻调仓，并保留至少 10% 舒服高价No 防守底仓。手动调整仓位后，以实际输入的仓位重新计算组合收益。<br>"
+                + "当前组合预期收益 = <strong>" + allocationPlan.plannedReturnPct.toFixed(1) + "%</strong>，仓位合计 = <strong>" + allocationPlan.totalPositionPct.toFixed(1) + "%</strong>。"
                 + "</div>"
-                + "<div class='mb-2'><strong>15% 目标拆分（更稳版）</strong><ul>" + stableRows + "</ul></div>"
-                + "<div class='mb-2'><strong>15% 目标拆分（稳中带弹性）</strong><ul>" + balancedRows + "</ul></div>"
+                + "<div class='mb-2'><strong>当前目标拆分</strong><ul>" + currentRows + "</ul></div>"
                 + "<div><strong>你常犯的错误</strong><ul>"
-                + "<li>把高价No当主利润引擎去追价 → 改成只把它当防守底盘</li>"
-                + "<li>第一次逼近 barrier 就抄中价No → 改成等试探失败确认后再进</li>"
-                + "<li>没有催化就买低价Yes → 改成只在突破/催化确认后小仓位做</li>"
+                + "<li>因为标准高价No近期赚钱就放大仓位 → 改成只把它当防守/稳定仓，不用它追月度目标</li>"
+                + "<li>第一次逼近 barrier 就抄中价No，尤其是下方 dip No → 改成等试探失败确认后再进，并把单 token 仓位压小</li>"
+                + "<li>看到下方 dip No 价格进入中价No/舒服高价No区间就觉得安全 → 改成先看 barrier 方向、是否 downside/dip 和离场纪律，再看分类标签</li>"
+                + "<li>没有催化就买低价Yes，或用低价Yes追月度目标 → 改成只做小额尾部对冲，突破/跌破催化确认后才短线参与</li>"
+                + "<li>到 +10%/+20% 浮盈后太贪、没有主动止盈 → 改成 +10% 先卖 30%-50%，+20% 再卖 30%-50%，剩余仓位再博弹性</li>"
                 + "<li>因月度进度落后拖延止损 → 改成先保本金，再谈追目标</li>"
                 + "<li>把核心No轮动到高风险Yes → 改成核心防守仓默认不轮动</li>"
                 + "</ul></div></div>";
@@ -521,7 +1096,8 @@
         function updateDashboardHelpPopover() {
             const el = document.getElementById('dashboardHelpTrigger');
             if (!el) return;
-            el.setAttribute('data-bs-content', buildDashboardHelpContent(dashboardTargetBaseValue, dashboardPhaseLabel));
+            const activePrefs = _activeMonthlyGoalPrefs();
+            el.setAttribute('data-bs-content', buildDashboardHelpContent(dashboardTargetBaseValue, dashboardPhaseLabel, activePrefs.targetPct));
             const instance = bootstrap.Popover.getInstance(el);
             if (instance) instance.dispose();
             bootstrap.Popover.getOrCreateInstance(el);
@@ -534,6 +1110,7 @@
                         document.getElementById('balance').innerHTML = 'Error: ' + data.error;
                         return;
                     }
+                    latestBalanceSummary = data;
                     const profileStr = formatMoneyNum(data.profile_value);
                     const monthStartStr = formatMoneyNum(data.month_start_profile_value);
                     const monthlyReturnStr = formatPct(data.monthly_return_pct);
@@ -551,10 +1128,12 @@
                         + ' &nbsp;|&nbsp; 月初收益率: <strong>' + monthlyReturnStr + '</strong>'
                         + ' &nbsp;|&nbsp; 月初净值: <strong>' + monthStartStr + '</strong>';
                     updateDashboardHelpPopover();
+                    renderMonthlyGoal();
                 })
                 .catch(error => {
                     document.getElementById('balance').innerText = 'Error loading balance';
                     console.error(error);
+                    renderMonthlyGoal();
                 });
         }
 
@@ -579,6 +1158,72 @@
                 })
                 .catch(error => {
                     document.getElementById('btc-price').textContent = 'BTC: Error';
+                    console.error(error);
+                });
+        }
+
+        function loadBtcFastSignal() {
+            const el = document.getElementById('btc-fast-signal');
+            if (!el) return;
+            fetchJsonSafe('/api/btc_fast_move_signal')
+                .then(data => {
+                    if (data.error) {
+                        el.textContent = 'Fast: Error';
+                        return;
+                    }
+                    const rawDirection = data.direction || 'NEUTRAL';
+                    const rawConfidence = Number(data.confidence || 0);
+                    const confidence = Math.round(rawConfidence * 100);
+                    const status = data.status || 'unknown';
+                    const reasons = Array.isArray(data.reasons) ? data.reasons.join('；') : '';
+                    const features = data.features || {};
+                    const nowMs = Date.now();
+                    const canConfirm = status === 'ok'
+                        && (rawDirection === 'UP' || rawDirection === 'DOWN')
+                        && rawConfidence >= 0.35;
+                    if (!canConfirm) {
+                        fastSignalConfirmState = { direction: 'NEUTRAL', sinceMs: 0 };
+                    } else if (fastSignalConfirmState.direction !== rawDirection) {
+                        fastSignalConfirmState = { direction: rawDirection, sinceMs: nowMs };
+                    }
+                    const heldSec = fastSignalConfirmState.sinceMs
+                        ? Math.max(0, Math.floor((nowMs - fastSignalConfirmState.sinceMs) / 1000))
+                        : 0;
+                    let displayDirection = 'NEUTRAL';
+                    let level = '中性';
+                    if (canConfirm && heldSec >= 60 && rawConfidence >= 0.60) {
+                        displayDirection = rawDirection;
+                        level = '强确认';
+                    } else if (canConfirm && heldSec >= 25 && rawConfidence >= 0.50) {
+                        displayDirection = rawDirection;
+                        level = '标准确认';
+                    } else if (canConfirm && heldSec >= 10 && rawConfidence >= 0.40) {
+                        displayDirection = rawDirection;
+                        level = '弱确认';
+                    }
+                    const arrow = displayDirection === 'UP' ? '↑' : (displayDirection === 'DOWN' ? '↓' : '→');
+                    const color = displayDirection === 'UP' ? '#0f5132' : (displayDirection === 'DOWN' ? '#842029' : '#495057');
+                    const bg = displayDirection === 'UP' ? '#d1e7dd' : (displayDirection === 'DOWN' ? '#f8d7da' : '#fff');
+                    const tip = [
+                        '显示规则: 弱确认=同向≥10s且置信≥40%；标准=≥25s且≥50%；强=≥60s且≥60%',
+                        '当前显示: ' + (displayDirection === 'NEUTRAL' ? '中性' : level + '-' + displayDirection),
+                        '原始信号: ' + rawDirection + ' ' + confidence + '%，已持续 ' + heldSec + 's',
+                        data.summary || '',
+                        reasons,
+                        'taker_buy_15s=' + (features.taker_buy_ratio_15s != null ? Math.round(features.taker_buy_ratio_15s * 100) + '%' : '—'),
+                        'vel15=' + (features.velocity_15s_bps != null ? features.velocity_15s_bps + 'bps' : '—'),
+                        'depth_imb=' + (features.depth_imbalance != null ? features.depth_imbalance : '—'),
+                        'status=' + status,
+                    ].filter(Boolean).join('\n');
+                    el.style.color = color;
+                    el.style.background = bg;
+                    el.title = tip;
+                    el.innerHTML = displayDirection === 'NEUTRAL'
+                        ? 'Fast: <strong>→ 中性</strong>'
+                        : 'Fast: <strong>' + arrow + ' ' + level + '-' + displayDirection + '</strong>';
+                })
+                .catch(error => {
+                    el.textContent = 'Fast: Error';
                     console.error(error);
                 });
         }
@@ -612,6 +1257,7 @@
                         document.getElementById('events-content').innerHTML = 'Error: ' + data.error;
                         return;
                     }
+                    latestEventsData = data;
                     const escapeAttr = value => String(value ?? '')
                         .replace(/&/g, '&amp;')
                         .replace(/"/g, '&quot;')
@@ -670,9 +1316,11 @@
                     disposeTooltips(container);
                     container.innerHTML = content;
                     initTooltips(container);
+                    renderMonthlyGoal();
                 })
                 .catch(error => {
                     document.getElementById('events-content').innerHTML = 'Error loading events: ' + error;
+                    renderMonthlyGoal();
                 });
         }
 
@@ -717,61 +1365,197 @@
             return raw;
         }
 
+        function _orderMarketId(order) {
+            return order.market_id || order.market || order.condition_id || order.conditionId || '';
+        }
+
+        function _orderRemainingSize(order) {
+            const remaining = Number(order.remaining_size);
+            if (Number.isFinite(remaining)) return remaining;
+            const original = Number(order.original_size);
+            const matched = Number(order.size_matched);
+            if (Number.isFinite(original) && Number.isFinite(matched)) return Math.max(0, original - matched);
+            return 0;
+        }
+
+        function _buildExposureGroups() {
+            const groups = {};
+            const ensureGroup = (key, title) => {
+                const safeKey = String(key || title || 'other');
+                if (!groups[safeKey]) {
+                    groups[safeKey] = { title: title || '—', positions: [], orders: [] };
+                } else if ((!groups[safeKey].title || groups[safeKey].title === '—') && title) {
+                    groups[safeKey].title = title;
+                }
+                return groups[safeKey];
+            };
+
+            latestPositionsData.forEach(p => {
+                ensureGroup(p.conditionId || p.title, p.title).positions.push(p);
+            });
+            latestOpenOrdersData.forEach(order => {
+                ensureGroup(_orderMarketId(order) || order.event_name, order.event_name).orders.push(order);
+            });
+            return groups;
+        }
+
+        function renderExposureOverview() {
+            const el = document.getElementById('exposure-content');
+            if (!el) return;
+
+            const groups = _buildExposureGroups();
+            const groupKeys = Object.keys(groups).sort((a, b) => {
+                const extract = t => { const m = (t || '').match(/\$([\d,]+)/); return m ? parseInt(m[1].replace(/,/g, ''), 10) : 0; };
+                return extract(groups[b].title) - extract(groups[a].title);
+            });
+
+            let totalPositionValue = 0;
+            latestPositionsData.forEach(p => {
+                const sellRefPrice = p.bestBid != null ? Number(p.bestBid) : Number(p.curPrice || 0);
+                const value = p.currentValue != null ? Number(p.currentValue) : (Number(p.size || 0) * sellRefPrice);
+                if (Number.isFinite(value)) totalPositionValue += value;
+            });
+
+            let openBuyNotional = 0;
+            let openSellShares = 0;
+            latestOpenOrdersData.forEach(order => {
+                const remaining = _orderRemainingSize(order);
+                const price = Number(order.price);
+                const side = String(order.side || '').toUpperCase();
+                if (side === 'BUY' && Number.isFinite(price)) openBuyNotional += remaining * price;
+                if (side === 'SELL') openSellShares += remaining;
+            });
+
+            const warnings = [];
+            if (positionsLoadError) warnings.push('<div class="alert alert-warning py-2 mb-2">Positions 加载失败：' + escapeHtml(positionsLoadError) + '</div>');
+            if (openOrdersLoadError) warnings.push('<div class="alert alert-warning py-2 mb-2">Open orders 加载失败：' + escapeHtml(openOrdersLoadError) + '</div>');
+
+            let content = '<div class="card shadow-sm mb-3"><div class="card-body">'
+                + '<div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">'
+                + '<div><h2 class="h4 mb-1">Positions / Orders</h2><div class="text-muted small">按 market 合并已成交持仓、交易所 open order 和上方待触发延迟挂单，便于查看真实暴露。</div></div>'
+                + '<button class="btn btn-outline-secondary btn-sm" onclick="loadPositions(); loadOrders(); loadBalance();">Refresh</button>'
+                + '</div>'
+                + warnings.join('')
+                + '<div class="row g-2">'
+                + '<div class="col-6 col-md-3"><div class="monthly-goal-kpi"><div class="label">持仓市值</div><div class="value">' + formatMoney(totalPositionValue) + '</div></div></div>'
+                + '<div class="col-6 col-md-3"><div class="monthly-goal-kpi"><div class="label">Open BUY 潜在加仓</div><div class="value text-success">' + formatMoney(openBuyNotional) + '</div></div></div>'
+                + '<div class="col-6 col-md-3"><div class="monthly-goal-kpi"><div class="label">Open SELL 待退出</div><div class="value text-danger">' + formatTokenAmount(openSellShares) + ' 张</div></div></div>'
+                + '<div class="col-6 col-md-3"><div class="monthly-goal-kpi"><div class="label">涉及 markets</div><div class="value">' + groupKeys.length + '</div></div></div>'
+                + '</div></div></div>';
+
+            if (groupKeys.length === 0) {
+                content += '<div class="card shadow-sm"><div class="card-body text-muted">No positions or open orders yet.</div></div>';
+                el.innerHTML = content;
+                return;
+            }
+
+            groupKeys.forEach(key => {
+                const group = groups[key];
+                const groupPositionValue = group.positions.reduce((sum, p) => {
+                    const sellRefPrice = p.bestBid != null ? Number(p.bestBid) : Number(p.curPrice || 0);
+                    const value = p.currentValue != null ? Number(p.currentValue) : (Number(p.size || 0) * sellRefPrice);
+                    return Number.isFinite(value) ? sum + value : sum;
+                }, 0);
+                const groupBuyNotional = group.orders.reduce((sum, order) => {
+                    const price = Number(order.price);
+                    return String(order.side || '').toUpperCase() === 'BUY' && Number.isFinite(price)
+                        ? sum + _orderRemainingSize(order) * price
+                        : sum;
+                }, 0);
+                const groupSellShares = group.orders.reduce((sum, order) => {
+                    return String(order.side || '').toUpperCase() === 'SELL'
+                        ? sum + _orderRemainingSize(order)
+                        : sum;
+                }, 0);
+
+                content += '<div class="card event-card shadow-sm mb-3"><div class="card-body p-2 p-md-3">';
+                content += '<div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-2">';
+                content += '<h3 class="text-wrap-mobile mb-0">' + escapeHtml(group.title || '—') + '</h3>';
+                content += '<div class="d-flex flex-wrap gap-1 small">'
+                    + '<span class="badge text-bg-secondary">持仓 ' + formatMoney(groupPositionValue) + '</span>'
+                    + '<span class="badge text-bg-success">BUY ' + formatMoney(groupBuyNotional) + '</span>'
+                    + '<span class="badge text-bg-danger">SELL ' + formatTokenAmount(groupSellShares) + ' 张</span>'
+                    + '</div></div>';
+                content += '<div class="table-responsive">';
+                content += '<table class="table table-sm align-middle mb-0"><thead><tr><th>Type</th><th>Outcome</th><th>Side</th><th>Size / Remaining</th><th>Price</th><th>Value / Exposure</th><th>PnL / Status</th><th>Actions</th></tr></thead><tbody>';
+
+                group.positions.forEach(p => {
+                    const sellRefPrice = p.bestBid != null ? Number(p.bestBid) : Number(p.curPrice || 0);
+                    const value = p.currentValue != null ? Number(p.currentValue) : (Number(p.size || 0) * sellRefPrice);
+                    const pnlClass = (p.percentPnl != null && Number(p.percentPnl) >= 0) ? 'text-success' : 'text-danger';
+                    content += '<tr>'
+                        + '<td><span class="badge text-bg-primary">Position</span></td>'
+                        + '<td class="text-wrap-mobile">' + escapeHtml(p.outcome || '—') + '</td>'
+                        + '<td><span class="badge text-bg-secondary">HELD</span></td>'
+                        + '<td>' + formatTokenAmount(p.size) + '</td>'
+                        + '<td><small>Avg ' + formatPrice(p.avgPrice) + '<br><span class="text-success">Bid ' + formatPrice(p.bestBid) + '</span> / <span class="text-danger">Ask ' + formatPrice(p.bestAsk) + '</span></small></td>'
+                        + '<td>' + formatMoney(value) + '</td>'
+                        + '<td class="' + pnlClass + '">' + formatPct(p.percentPnl) + '</td>'
+                        + '<td><button class="btn btn-danger btn-sm" onclick="openSellModal(' + jsSingleQuoted(p.conditionId || '') + ', ' + jsSingleQuoted(p.asset || '') + ', ' + sellRefPrice + ')">Sell</button></td>'
+                        + '</tr>';
+                });
+
+                group.orders.forEach(order => {
+                    const side = String(order.side || '').toUpperCase();
+                    const remaining = _orderRemainingSize(order);
+                    const price = Number(order.price);
+                    const sideClass = side === 'BUY' ? 'success' : (side === 'SELL' ? 'danger' : 'secondary');
+                    const exposure = side === 'BUY' && Number.isFinite(price)
+                        ? formatMoney(remaining * price)
+                        : (side === 'SELL' ? '退出 ' + formatTokenAmount(remaining) + ' 张' : '—');
+                    content += '<tr>'
+                        + '<td><span class="badge text-bg-warning">Open</span></td>'
+                        + '<td class="text-wrap-mobile">' + escapeHtml(order.outcome || '—') + '</td>'
+                        + '<td><span class="badge text-bg-' + sideClass + '">' + escapeHtml(side || '—') + '</span></td>'
+                        + '<td>' + formatTokenAmount(remaining) + '<br><small class="text-muted">filled ' + formatOrderSize(order.size) + '</small></td>'
+                        + '<td>' + formatPrice(order.price) + '</td>'
+                        + '<td>' + exposure + '</td>'
+                        + '<td><span class="badge text-bg-secondary">' + escapeHtml(order.status || 'open') + '</span></td>'
+                        + '<td><div class="d-flex flex-wrap gap-1">'
+                        + '<button class="btn btn-primary btn-sm" onclick="editOpenOrder(' + jsSingleQuoted(order.id) + ')">Edit</button>'
+                        + '<button class="btn btn-warning btn-sm" onclick="cancelOrder(' + jsSingleQuoted(order.id) + ')">Cancel</button>'
+                        + '</div></td>'
+                        + '</tr>';
+                });
+
+                content += '</tbody></table></div></div></div>';
+            });
+            el.innerHTML = content;
+        }
+
         function loadPositions() {
             fetchJsonSafe('/api/positions')
                 .then(data => {
                     if (data.error) {
-                        document.getElementById('positions-content').innerHTML = '<div class="alert alert-warning">' + data.error + '</div>';
+                        positionsLoadError = data.error;
+                        latestPositionsData = [];
+                        renderExposureOverview();
+                        renderMonthlyGoal();
                         return;
                     }
-                    if (!Array.isArray(data) || data.length === 0) {
-                        document.getElementById('positions-content').innerHTML = '<div class="card shadow-sm"><div class="card-body text-muted">No positions yet.</div></div>';
+                    if (!Array.isArray(data)) {
+                        positionsLoadError = 'Positions 响应格式异常';
+                        latestPositionsData = [];
+                        renderExposureOverview();
+                        renderMonthlyGoal();
                         return;
                     }
-                    const byMarket = {};
-                    let totalValue = 0;
-                    data.forEach(p => {
-                        const cid = p.conditionId || p.title || 'other';
-                        if (!byMarket[cid]) byMarket[cid] = { title: p.title, positions: [] };
-                        byMarket[cid].positions.push(p);
-                        const val = p.currentValue != null ? p.currentValue : (p.size * p.curPrice);
-                        if (typeof val === 'number' && !isNaN(val)) totalValue += val;
-                    });
-                    let content = '<h2 class="h4 mb-3 text-wrap-mobile">My Position</h2>';
-                    content += '<p class="mb-3"><strong>Total position value:</strong> ' + formatMoney(totalValue) + '</p>';
-                    // 按 title 中的 BTC 目标价格由高到低排列
-                    const sortedCids = Object.keys(byMarket).sort((a, b) => {
-                        const extract = t => { const m = (t || '').match(/\$([\d,]+)/); return m ? parseInt(m[1].replace(/,/g, ''), 10) : 0; };
-                        return extract(byMarket[b].title) - extract(byMarket[a].title);
-                    });
-                    sortedCids.forEach(cid => {
-                        const group = byMarket[cid];
-                        const safeTitle = (group.title || '—').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-                        content += '<div class="card event-card shadow-sm mb-3"><div class="card-body p-2 p-md-3">';
-                        content += '<h3 class="text-wrap-mobile">' + safeTitle + '</h3>';
-                        content += '<div class="table-responsive">';
-                        content += '<table class="table table-sm align-middle mb-0"><thead><tr><th>Outcome</th><th>Size</th><th>Avg</th><th>Best Bid</th><th>Best Ask</th><th>Value</th><th>PnL%</th><th>Actions</th></tr></thead><tbody>';
-                        group.positions.forEach(p => {
-                            const sellRefPrice = p.bestBid != null ? p.bestBid : (p.curPrice != null ? p.curPrice : 0);
-                            const value = p.currentValue != null ? p.currentValue : (p.size * sellRefPrice);
-                            const pnlClass = (p.percentPnl != null && Number(p.percentPnl) >= 0) ? 'text-success' : 'text-danger';
-                            const marketId = (p.conditionId || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-                            const assetId = (p.asset || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-                            content += '<tr><td class="text-wrap-mobile">' + (p.outcome || '—') + '</td><td>' + formatTokenAmount(p.size) + '</td><td>' + formatPrice(p.avgPrice) + '</td><td class="text-success">' + formatPrice(p.bestBid) + '</td><td class="text-danger">' + formatPrice(p.bestAsk) + '</td><td>' + formatMoney(value) + '</td><td class="' + pnlClass + '">' + formatPct(p.percentPnl) + '</td><td>';
-                            content += '<button class="btn btn-danger btn-sm" onclick="openSellModal(\'' + marketId + '\', \'' + assetId + '\', ' + sellRefPrice + ')">Sell</button>';
-                            content += '</td></tr>';
-                        });
-                        content += '</tbody></table></div></div></div>';
-                    });
-                    document.getElementById('positions-content').innerHTML = content;
+                    positionsLoadError = null;
+                    latestPositionsData = data;
+                    renderExposureOverview();
+                    renderMonthlyGoal();
                 })
                 .catch(error => {
-                    document.getElementById('positions-content').innerHTML = 'Error loading positions: ' + error;
+                    positionsLoadError = error.message || String(error);
+                    latestPositionsData = [];
+                    renderExposureOverview();
+                    renderMonthlyGoal();
                 });
         }
 
         function _formatTriggerDesc(o) {
             const kind = o.trigger_kind || 'btc_abs';
+            if (kind === 'immediate') return '立即触发';
             if (kind === 'btc_abs') return 'BTC 1m close ' + (o.trigger_op === '<=' ? 'dip' : 'reach') + ' $' + (o.trigger_threshold ?? o.trigger_btc_price ?? '?');
             if (kind === 'share_abs') return 'Share ' + (o.trigger_op === '<=' ? 'dip' : 'reach') + ' ' + (o.trigger_threshold ?? '?');
             if (kind === 'share_cost_pct') {
@@ -799,69 +1583,133 @@
             if (!p) {
                 const offset = o.extra && o.extra.trigger_market_offset;
                 if (offset !== undefined && offset !== null)
-                    return '<span class="badge bg-info text-dark">MKT' + (offset >= 0 ? '+' : '') + offset + '</span>';
+                    return '<span class="badge bg-info text-dark">MKT' + (offset >= 0 ? '+' : '') + _escapeHtml(offset) + '</span>';
                 return (Number(o.price)*100).toFixed(1) + '¢';
             }
             if (p.type === 'absolute') return (p.value*100).toFixed(1) + '¢';
-            if (p.type === 'market') return '<span class="badge bg-info text-dark">MKT' + (p.offset >= 0 ? '+' : '') + p.offset + '</span>';
-            if (p.type === 'cost_pct') return '<span class="badge bg-primary">cost' + (p.value >= 0 ? '+' : '') + p.value + '%</span>';
-            return JSON.stringify(p);
+            if (p.type === 'market') return '<span class="badge bg-info text-dark">MKT' + (p.offset >= 0 ? '+' : '') + _escapeHtml(p.offset) + '</span>';
+            if (p.type === 'cost_pct') return '<span class="badge bg-primary">cost' + (p.value >= 0 ? '+' : '') + _escapeHtml(p.value) + '%</span>';
+            return _escapeHtml(JSON.stringify(p));
+        }
+        function _formatRecPendingOrderHtml(po) {
+            if (!po || typeof po !== 'object') return '—';
+            const parts = [];
+            const kind = String(po.trigger_kind || '');
+            if (kind === 'immediate') parts.push('立即');
+            else if (kind === 'btc_abs') parts.push('BTC ' + (po.trigger_op || '?') + ' ' + (po.trigger_threshold ?? '?'));
+            else if (kind === 'share_abs') parts.push('share ' + (po.trigger_op || '?') + ' ' + (po.trigger_threshold ?? '?'));
+            else if (kind === 'share_cost_pct') parts.push('cost ' + (po.trigger_op || '?') + ' ' + (po.trigger_pct ?? '?') + '%');
+            else if (kind === 'time_after_parent_fill') parts.push('父单成交后 ' + (po.trigger_threshold ?? '?') + 'h');
+            else parts.push(kind || 'trigger?');
+            if (po.parent_index !== undefined && po.parent_index !== null && po.parent_index !== '') {
+                parts.push('parent #' + (Number(po.parent_index) + 1));
+            }
+            const ss = po.size_spec || {};
+            const ps = po.price_spec || {};
+            if (ss.type) parts.push('size=' + ss.type + ':' + (ss.value ?? '?'));
+            const textHtml = _escapeHtml(parts.join(' · '));
+            const priceHtml = ps.type ? (' · price ' + _formatPriceSpec({ price_spec: ps })) : '';
+            return textHtml + priceHtml;
         }
 
         function loadManualPending() {
             const panel = document.getElementById('manual-pending-panel');
             if (!panel) return;
-            fetchJsonSafe('/api/manual_pending')
-                .then(data => {
-                    if (!data || !Array.isArray(data.orders)) { panel.innerHTML = ''; return; }
-                    if (data.orders.length === 0) { panel.innerHTML = ''; return; }
+            Promise.all([
+                fetchJsonSafe('/api/manual_pending'),
+                fetchJsonSafe('/api/recommendation_plans/pending'),
+            ])
+                .then(([data, recData]) => {
+                    const manualOrders = data && Array.isArray(data.orders) ? data.orders : [];
+                    const recPlans = recData && Array.isArray(recData.plans) ? recData.plans : [];
+                    if (manualOrders.length === 0 && recPlans.length === 0) { panel.innerHTML = ''; return; }
+                    manualPendingById = {};
                     // 按 plan_id 分组,plan_id 缺失用 id
                     const groups = {};
-                    data.orders.forEach(o => {
+                    manualOrders.forEach(o => {
+                        manualPendingById[String(o.id)] = o;
                         const pid = o.plan_id || o.id;
                         if (!groups[pid]) groups[pid] = [];
                         groups[pid].push(o);
                     });
                     let html = '<div class="card border-warning shadow-sm"><div class="card-body p-2 p-md-3">' +
-                        '<h6 class="mb-2 text-warning">⏳ 待触发的延迟挂单 (' + data.orders.length + ')</h6>' +
+                        '<h6 class="mb-2 text-warning">⏳ 待触发计划 (' + (manualOrders.length + recPlans.length) + ')</h6>';
+                    if (manualOrders.length > 0) {
+                        html += '<div class="small fw-semibold mb-1">Manual pending orders</div>' +
                         '<div class="table-responsive"><table class="table table-sm align-middle mb-0">' +
                         '<thead><tr><th>ID</th><th>Action</th><th>Trigger</th><th>Price</th><th>Size</th><th>Status</th><th>Fill</th><th>Expires</th><th>Notes</th><th></th></tr></thead><tbody>';
-                    Object.keys(groups).sort((a,b) => Number(b) - Number(a)).forEach(pid => {
-                        const rows = groups[pid].sort((a,b) => a.id - b.id);
-                        const isPlan = rows.length > 1;
-                        const head = rows[0];
-                        const planLabel = (head.event_name || '(unknown market)') +
-                            (head.outcome ? ' · ' + head.outcome : '');
-                        if (isPlan) {
-                            html += '<tr class="table-light"><td colspan="10"><small class="text-muted">📋 Plan #' + pid + ' · <strong>' + planLabel + '</strong> · ' + rows.length + ' 档</small></td></tr>';
-                        } else {
-                            html += '<tr class="table-light"><td colspan="10"><small class="text-muted">📌 #' + pid + ' · <strong>' + planLabel + '</strong></small></td></tr>';
-                        }
-                        rows.forEach((o, idx) => {
-                            const isChild = isPlan && idx > 0;
-                            const indent = isChild ? '<span class="text-muted">↳ </span>' : '';
-                            const isPending = o.status === 'pending';
-                            const statusBadge = isPending ? '<span class="badge bg-warning text-dark">pending</span>'
-                                : '<span class="badge bg-secondary">' + o.status + '</span>';
-                            const cancelBtn = isPending
-                                ? '<button class="btn btn-sm btn-outline-danger" onclick="cancelManualPending(' + o.id + ')">取消</button>'
-                                : '';
-                            const fillCell = o.fill_price ? (Number(o.fill_price)*100).toFixed(1) + '¢' : '-';
+                        Object.keys(groups).sort((a,b) => Number(b) - Number(a)).forEach(pid => {
+                            const rows = groups[pid].sort((a,b) => a.id - b.id);
+                            const isPlan = rows.length > 1;
+                            const head = rows[0];
+                            const planLabel = (head.event_name || '(unknown market)') +
+                                (head.outcome ? ' · ' + head.outcome : '');
+                            if (isPlan) {
+                                html += '<tr class="table-light"><td colspan="10"><small class="text-muted">📋 Plan #' + pid + ' · <strong>' + _escapeHtml(planLabel) + '</strong> · ' + rows.length + ' 档</small></td></tr>';
+                            } else {
+                                html += '<tr class="table-light"><td colspan="10"><small class="text-muted">📌 #' + pid + ' · <strong>' + _escapeHtml(planLabel) + '</strong></small></td></tr>';
+                            }
+                            rows.forEach((o, idx) => {
+                                const isChild = isPlan && idx > 0;
+                                const indent = isChild ? '<span class="text-muted">↳ </span>' : '';
+                                const isPending = o.status === 'pending';
+                                const statusBadge = isPending ? '<span class="badge bg-warning text-dark">pending</span>'
+                                    : '<span class="badge bg-secondary">' + _escapeHtml(o.status) + '</span>';
+                                const cancelBtn = isPending
+                                    ? '<div class="d-flex flex-wrap gap-1"><button class="btn btn-sm btn-outline-primary" onclick="editManualPending(' + o.id + ')">编辑</button><button class="btn btn-sm btn-outline-danger" onclick="cancelManualPending(' + o.id + ')">取消</button></div>'
+                                    : '';
+                                const fillCell = o.fill_price ? (Number(o.fill_price)*100).toFixed(1) + '¢' : '-';
+                                html += '<tr>' +
+                                    '<td>' + indent + o.id + '</td>' +
+                                    '<td><span class="badge bg-' + (o.action === 'buy' ? 'success' : 'danger') + '">' + _escapeHtml(o.action) + '</span></td>' +
+                                    '<td><code class="small">' + _escapeHtml(_formatTriggerDesc(o)) + '</code></td>' +
+                                    '<td>' + _formatPriceSpec(o) + '</td>' +
+                                    '<td><small>' + _escapeHtml(_formatSizeSpec(o)) + '</small></td>' +
+                                    '<td>' + statusBadge + '</td>' +
+                                    '<td><small>' + fillCell + '</small></td>' +
+                                    '<td><small>' + (o.expires_at ? formatBjtTime(o.expires_at) : '-') + '</small></td>' +
+                                    '<td><small>' + _escapeHtml(o.notes || '') + '</small></td>' +
+                                    '<td>' + cancelBtn + '</td>' +
+                                    '</tr>';
+                            });
+                        });
+                        html += '</tbody></table></div>';
+                    }
+                    if (recPlans.length > 0) {
+                        html += '<div class="small fw-semibold mt-2 mb-1">Recommendation action plans</div>' +
+                            '<div class="table-responsive"><table class="table table-sm align-middle mb-0">' +
+                            '<thead><tr><th>Plan</th><th>Item</th><th>Action</th><th>Trigger</th><th>Price</th><th>Size</th><th>Status</th><th>Expires</th><th></th></tr></thead><tbody>';
+                        recPlans.forEach(p => {
+                            const action = String(p.action_type || '').toLowerCase();
+                            const st = String(p.status || 'proposed');
+                            const statusClass = st === 'armed' ? 'success' : (st === 'executing' ? 'info' : 'secondary');
+                            const itemStatus = String(p.item_status || '');
+                            const price = p.price_cents != null ? (Number(p.price_cents).toFixed(1) + '¢') : '—';
+                            const recPriceSpec = p.pending_order && p.pending_order.price_spec;
+                            const priceHtml = recPriceSpec ? _formatPriceSpec({ price_spec: recPriceSpec }) : _escapeHtml(price);
+                            const sizeText = p.size_text || ((p.armed_execution_payload && p.armed_execution_payload.size_shares != null) ? (Number(p.armed_execution_payload.size_shares).toFixed(2) + ' 张') : '—');
+                            let controls = '';
+                            if (itemStatus === 'approved' && st === 'proposed' && p.manual_pending_only && (action === 'buy' || action === 'sell')) {
+                                controls = '<button class="btn btn-sm btn-outline-primary" onclick="queueRecommendationPendingPlan(' + Number(p.item_id) + ', this)">转入</button> '
+                                    + '<button class="btn btn-sm btn-outline-danger" onclick="dismissPlan(' + Number(p.plan_id) + ', this)">忽略</button>';
+                            } else if (itemStatus === 'pending') {
+                                controls = '<span class="text-muted small">先到 Recommendations 批准</span>';
+                            }
                             html += '<tr>' +
-                                '<td>' + indent + o.id + '</td>' +
-                                '<td><span class="badge bg-' + (o.action === 'buy' ? 'success' : 'danger') + '">' + o.action + '</span></td>' +
-                                '<td><code class="small">' + _formatTriggerDesc(o) + '</code></td>' +
-                                '<td>' + _formatPriceSpec(o) + '</td>' +
-                                '<td><small>' + _formatSizeSpec(o) + '</small></td>' +
-                                '<td>' + statusBadge + '</td>' +
-                                '<td><small>' + fillCell + '</small></td>' +
-                                '<td><small>' + (o.expires_at ? new Date(o.expires_at).toLocaleString() : '-') + '</small></td>' +
-                                '<td><small>' + (o.notes || '') + '</small></td>' +
-                                '<td>' + cancelBtn + '</td>' +
+                                '<td>R#' + Number(p.plan_id) + '</td>' +
+                                '<td class="text-wrap-mobile"><small>' + _escapeHtml(p.title || '—') + '<br><span class="text-muted">item #' + Number(p.item_id) + ' / ' + _escapeHtml(itemStatus) + '</span></small></td>' +
+                                '<td><span class="badge bg-' + (action === 'buy' ? 'success' : 'danger') + '">' + _escapeHtml(action) + '</span>' + (p.side ? '<br><small>' + _escapeHtml(p.side) + '</small>' : '') + '</td>' +
+                                '<td><code class="small">' + _escapeHtml(p.trigger_summary || p.trigger_parse_status || '—') + '</code></td>' +
+                                '<td>' + priceHtml + '</td>' +
+                                '<td><small>' + _escapeHtml(sizeText) + '</small></td>' +
+                                '<td><span class="badge text-bg-' + statusClass + '">' + _escapeHtml(st) + '</span></td>' +
+                                '<td><small>' + (p.expires_at ? formatBjtTime(p.expires_at) : '—') + '</small></td>' +
+                                '<td>' + controls + '</td>' +
                                 '</tr>';
                         });
-                    });
-                    html += '</tbody></table></div></div></div>';
+                        html += '</tbody></table></div>';
+                    }
+                    html += '</div></div>';
                     panel.innerHTML = html;
                 })
                 .catch(() => { panel.innerHTML = ''; });
@@ -877,30 +1725,118 @@
                 .catch(err => alert('取消失败: ' + err.message));
         }
 
+        function editManualPending(id) {
+            const o = manualPendingById[String(id)];
+            if (!o || o.status !== 'pending') {
+                alert('只能编辑 pending 状态的延迟挂单');
+                return;
+            }
+            const kind = o.trigger_kind || 'btc_abs';
+            let triggerValue = null;
+            if (kind !== 'immediate') {
+                const triggerLabel = kind === 'share_cost_pct' ? '触发 cost ±%' :
+                    (kind === 'time_after_parent_fill' ? '持有时长(小时)' :
+                     (kind === 'share_abs' ? 'Share 触发价' : 'BTC 1m收盘触发价'));
+                const oldTrigger = kind === 'share_cost_pct' ? o.trigger_pct : o.trigger_threshold;
+                const triggerText = prompt(triggerLabel + '：', oldTrigger != null ? oldTrigger : '');
+                if (triggerText === null) return;
+                triggerValue = Number(triggerText);
+                if (!Number.isFinite(triggerValue)) { alert('触发值必须是数字'); return; }
+            }
+
+            let triggerOp = o.trigger_op || '>=';
+            if (kind !== 'immediate' && kind !== 'share_cost_pct' && kind !== 'time_after_parent_fill') {
+                const opText = prompt('触发方向 (>= 或 <=)：', triggerOp);
+                if (opText === null) return;
+                if (opText !== '>=' && opText !== '<=') { alert('触发方向只能是 >= 或 <='); return; }
+                triggerOp = opText;
+            }
+
+            const sizeSpec = Object.assign({}, o.size_spec || { type: 'shares', value: o.size || 0 });
+            const sizeText = prompt('Size value (' + sizeSpec.type + ')：', sizeSpec.value != null ? sizeSpec.value : '');
+            if (sizeText === null) return;
+            const sizeValue = Number(sizeText);
+            if (!Number.isFinite(sizeValue) || sizeValue <= 0) { alert('size 必须 > 0'); return; }
+            sizeSpec.value = sizeValue;
+
+            const priceSpec = Object.assign({}, o.price_spec || { type: 'absolute', value: o.price || 0.5 });
+            let priceKey = 'value';
+            let priceLabel = '限价 (0~1)';
+            if (priceSpec.type === 'market') { priceKey = 'offset'; priceLabel = 'market offset (±)'; }
+            else if (priceSpec.type === 'cost_pct') { priceKey = 'value'; priceLabel = '挂单价 cost ±%'; }
+            const priceText = prompt(priceLabel + '：', priceSpec[priceKey] != null ? priceSpec[priceKey] : '');
+            if (priceText === null) return;
+            const priceValue = Number(priceText);
+            if (!Number.isFinite(priceValue)) { alert('价格参数必须是数字'); return; }
+            priceSpec[priceKey] = priceValue;
+
+            const expiresAt = o.expires_at ? new Date(o.expires_at) : null;
+            const hoursLeft = expiresAt ? Math.max(0.1, Math.round((expiresAt.getTime() - Date.now()) / 360000) / 10) : 24;
+            const hoursText = prompt('从现在起新的有效期(小时)：', hoursLeft);
+            if (hoursText === null) return;
+            const expiresHours = Number(hoursText);
+            if (!Number.isFinite(expiresHours) || expiresHours <= 0 || expiresHours > 720) {
+                alert('有效期必须在 (0,720] 小时');
+                return;
+            }
+            const notesText = prompt('备注：', o.notes || '');
+            if (notesText === null) return;
+
+            const payload = {
+                trigger_kind: kind,
+                trigger_op: triggerOp,
+                size_spec: sizeSpec,
+                price_spec: priceSpec,
+                expires_hours: expiresHours,
+                notes: notesText,
+            };
+            if (kind === 'share_cost_pct') payload.trigger_pct = triggerValue;
+            else if (kind !== 'immediate') payload.trigger_threshold = triggerValue;
+
+            fetchJsonSafe('/api/manual_pending/' + id, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            })
+            .then(data => {
+                if (data.error) { alert('编辑失败: ' + data.error); return; }
+                loadManualPending();
+            })
+            .catch(err => alert('编辑失败: ' + err.message));
+        }
+
         function loadOrders() {
             loadManualPending();
             fetchJsonSafe('/api/open_orders')
                 .then(data => {
                     if (data && data.error) {
-                        document.getElementById('orders-content').innerHTML = '<div class="alert alert-warning">' + data.error + '</div>';
+                        openOrdersLoadError = data.error;
+                        latestOpenOrdersData = [];
+                        openOrdersById = {};
+                        renderExposureOverview();
                         return;
                     }
                     if (!Array.isArray(data)) {
-                        document.getElementById('orders-content').innerHTML = '<div class="alert alert-warning">Open orders 响应格式异常</div>';
+                        openOrdersLoadError = 'Open orders 响应格式异常';
+                        latestOpenOrdersData = [];
+                        openOrdersById = {};
+                        renderExposureOverview();
                         return;
                     }
-                    let content = '<div class="card shadow-sm"><div class="card-body p-2 p-md-3"><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Event</th><th>Outcome</th><th>Side</th><th>Size</th><th>Price</th><th>Actions</th></tr></thead><tbody>';
+                    openOrdersById = {};
                     data.forEach(order => {
-                        const eventName = order.event_name || '-';
-                        const outcome = order.outcome || '-';
-                        content += '<tr><td class="text-wrap-mobile">' + eventName + '</td><td>' + outcome + '</td><td>' + order.side + '</td><td>' + formatOrderSize(order.size) + '</td><td>' + order.price + '</td><td>';
-                        content += '<button class="btn btn-warning btn-sm" onclick="cancelOrder(\'' + order.id + '\')">Cancel</button>';
-                        content += '</td></tr>';
+                        openOrdersById[String(order.id)] = order;
                     });
-                    content += '</tbody></table></div></div></div>';
-                    document.getElementById('orders-content').innerHTML = content;
+                    openOrdersLoadError = null;
+                    latestOpenOrdersData = data;
+                    renderExposureOverview();
                 })
-                .catch(error => console.error('Error loading orders:', error));
+                .catch(error => {
+                    openOrdersLoadError = error.message || String(error);
+                    latestOpenOrdersData = [];
+                    openOrdersById = {};
+                    renderExposureOverview();
+                });
         }
 
         function setRecItemFilter(key) {
@@ -1077,6 +2013,7 @@
                     const _planTerminal = new Set(['fired','disarmed','expired','superseded']);
                     function _effectiveItemStatus(item) {
                         const s = String(item.status || '');
+                        if (Number(item.queued_pending_order_count || 0) > 0) return 'queued_pending';
                         if (s !== 'approved') return s;
                         const plans = Array.isArray(item.action_plans) ? item.action_plans : [];
                         if (!plans.length) return s;
@@ -1088,8 +2025,7 @@
                     const _filterDefs = [
                         { key: 'all',       label: '全部',         match: (s) => true },
                         { key: 'pending',   label: '待处理',       match: (s) => s === 'pending' },
-                        { key: 'approved',  label: '已批准/进行中', match: (s) => ['approved','executing','order_failed','cancel_failed'].indexOf(s) >= 0 },
-                        { key: 'done',      label: '已完成',       match: (s) => ['order_submitted','cancel_submitted','won','lost','expired'].indexOf(s) >= 0 },
+                        { key: 'done',      label: '已转Pending/完成', match: (s) => ['queued_pending','order_submitted','cancel_submitted','won','lost','expired'].indexOf(s) >= 0 },
                         { key: 'rejected',  label: '已拒绝/暂缓',  match: (s) => ['rejected','deferred'].indexOf(s) >= 0 },
                     ];
                     const _activeKey = window.__recItemFilter || 'all';
@@ -1111,17 +2047,21 @@
 
                     _filteredItems.forEach(item => {
                         const safeTitleJs = _escapeJsInHtmlAttr(item.title || '');
-                        const statusBadge = item.status === 'pending'
+                        const effectiveStatus = _effectiveItemStatus(item);
+                        const statusLabel = effectiveStatus === 'queued_pending' ? '已转Pending' : (item.status || '--');
+                        const statusBadge = effectiveStatus === 'pending'
                             ? 'text-bg-warning'
-                            : item.status === 'approved'
+                            : effectiveStatus === 'approved'
                                 ? 'text-bg-success'
-                                : item.status === 'order_submitted'
+                                : effectiveStatus === 'queued_pending'
+                                    ? 'text-bg-primary'
+                                : effectiveStatus === 'order_submitted'
                                     ? 'text-bg-success'
-                                    : item.status === 'order_failed'
+                                    : effectiveStatus === 'order_failed'
                                         ? 'text-bg-danger'
-                                    : item.status === 'rejected'
+                                    : effectiveStatus === 'rejected'
                                         ? 'text-bg-danger'
-                                        : item.status === 'deferred'
+                                        : effectiveStatus === 'deferred'
                                         ? 'text-bg-info'
                                         : 'text-bg-secondary';
                         const priorityBadge = item.priority_hint === '立即执行'
@@ -1134,7 +2074,7 @@
                         html += '<div><div class="fw-semibold text-wrap-mobile">' + _escapeHtml(item.title || '--') + '</div>';
                         html += '<div class="small text-muted">' + _escapeHtml(item.source_section || '--') + ' / ' + _escapeHtml(item.item_kind || '--') + '</div></div>';
                         html += '<div class="d-flex flex-wrap gap-1">';
-                        html += '<span class="badge rounded-pill ' + statusBadge + '">' + _escapeHtml(item.status || '--') + '</span>';
+                        html += '<span class="badge rounded-pill ' + statusBadge + '">' + _escapeHtml(statusLabel) + '</span>';
                         if (item.priority_hint) {
                             html += '<span class="badge rounded-pill ' + priorityBadge + '">' + _escapeHtml(item.priority_hint) + '</span>';
                         }
@@ -1219,26 +2159,17 @@
                                 html += '<li class="mb-1">';
                                 html += '<code>#' + Number(plan.ordinal || 0) + ' ' + _escapeHtml(plan.action_type || '?') + '</code> ';
                                 html += _escapeHtml(summary + ttl) + _orderBits + statusBadge;
-                                // per-plan 控制按钮: 仅在 item.status=approved 时可控制
+                                if (sugg.pending_order) {
+                                    html += '<div class="text-muted ps-3"><small>pending_order: ' + _formatRecPendingOrderHtml(sugg.pending_order) + '</small></div>';
+                                }
+                                // per-plan 控制只保留放弃入口；转入 pending 统一走 item 级按钮，避免误以为逐条 plan 独立执行。
                                 if (item.status === 'approved') {
-                                    if (st === 'proposed' && (plan.action_type === 'buy' || plan.action_type === 'sell')) {
-                                        const _isParsed = plan.trigger_parse_status === 'parsed';
-                                        const _label = _isParsed ? '启用自动' : '立即挂单';
-                                        const _cls = _isParsed ? 'btn-warning' : 'btn-primary';
-                                        html += ' <button class="btn btn-sm ' + _cls + ' py-0 px-2 ms-2" style="font-size:11px;" onclick="enableAutoPlan(' + Number(plan.id) + ', this)">' + _label + '</button>';
-                                    } else if (st === 'armed') {
-                                        html += ' <button class="btn btn-sm btn-outline-secondary py-0 px-2 ms-2" style="font-size:11px;" onclick="disableAutoPlan(' + Number(plan.id) + ', this)">关闭自动</button>';
-                                    }
                                     // 忽略按钮:任何 proposed plan 均可由用户主动放弃,避免 item 因残留 proposed 一直停在 approved。
                                     if (st === 'proposed') {
                                         html += ' <button class="btn btn-sm btn-outline-danger py-0 px-2 ms-1" style="font-size:11px;" onclick="dismissPlan(' + Number(plan.id) + ', this)" title="标记此 plan 已放弃,不再执行">忽略</button>';
                                     }
                                 } else if (item.status === 'pending' && st === 'proposed' && (plan.action_type === 'buy' || plan.action_type === 'sell')) {
-                                    html += ' <span class="text-muted ms-2" style="font-size:11px;">⇡ 先点「批准执行」即可启用</span>';
-                                }
-                                // executing 状态下提供修复入口(record_action 与 mark_plan_fired 之间崩溃会卡)
-                                if (st === 'executing') {
-                                    html += ' <button class="btn btn-sm btn-outline-danger py-0 px-2 ms-2" style="font-size:11px;" onclick="repairExecutingPlan(' + Number(plan.id) + ', this)">修复 executing</button>';
+                                    html += ' <span class="text-muted ms-2" style="font-size:11px;">⇡ 使用下方「批准并转入统一 pending 计划」</span>';
                                 }
                                 if (plan.fired_order_id) {
                                     html += '<div class="text-muted ps-3"><small>fired @ ' + _escapeHtml(plan.fired_at || '') + ' order=' + _escapeHtml(plan.fired_order_id) + '</small></div>';
@@ -1278,23 +2209,29 @@
                         }
                         html += '<div class="d-flex flex-wrap gap-2 mt-3">';
                         const _terminalStatuses = ['order_submitted', 'cancel_submitted', 'won', 'lost', 'expired', 'executing'];
+                        const _isQueuedPending = Number(item.queued_pending_order_count || 0) > 0;
                         const _isTerminal = _terminalStatuses.indexOf(item.status) >= 0;
-                        if (_isTerminal) {
+                        if (_isQueuedPending) {
+                            const activeQueued = Number(item.active_queued_pending_order_count || 0);
+                            const queuedText = '已转入 Positions / Orders 的统一 pending 队列'
+                                + (activeQueued > 0 ? '，其中 ' + activeQueued + ' 条仍在等待/执行' : '，后续状态请在 Positions / Orders 查看');
+                            html += '<span class="text-muted small align-self-center">' + _escapeHtml(queuedText) + '</span>';
+                        } else if (_isTerminal) {
                             html += '<span class="text-muted small align-self-center">已进入终态（' + _escapeHtml(item.status) + '），不可再反馈或执行</span>';
                             html += '<button class="btn btn-sm btn-outline-info" onclick="recordRecommendationOutcome(' + Number(item.id) + ', \'' + safeTitleJs + '\')">登记结果</button>';
                         } else {
-                            html += '<button class="btn btn-sm btn-success" onclick="openRecommendationFeedbackModal(' + Number(item.id) + ', \'execute\', \'' + safeTitleJs + '\')">批准执行</button>';
                             html += '<button class="btn btn-sm btn-outline-danger" onclick="openRecommendationFeedbackModal(' + Number(item.id) + ', \'reject\', \'' + safeTitleJs + '\')">不执行</button>';
                             html += '<button class="btn btn-sm btn-outline-warning" onclick="openRecommendationFeedbackModal(' + Number(item.id) + ', \'defer\', \'' + safeTitleJs + '\')">暂缓</button>';
                             html += '<button class="btn btn-sm btn-outline-secondary" onclick="openRecommendationFeedbackModal(' + Number(item.id) + ', \'read\', \'' + safeTitleJs + '\')">已读</button>';
-                            if ((item.status === 'approved' || item.status === 'order_failed' || item.status === 'cancel_failed') && (item.action_type === 'buy' || item.action_type === 'sell' || item.action_type === 'cancel')) {
-                                const _planList = Array.isArray(item.action_plans) ? item.action_plans : [];
-                                const _planTakingOver = _planList.some(p => ['armed','executing','fired'].indexOf(String(p && p.status || '')) >= 0);
-                                if (!_planTakingOver) {
-                                    html += '<button class="btn btn-sm btn-primary" onclick="openRecommendationExecution(' + Number(item.id) + ')">' + (item.action_type === 'cancel' ? '撤单执行' : '下单执行') + '</button>';
-                                } else {
-                                    html += '<span class="text-muted small align-self-center">已交由 action plan 自动执行,不再提供 item 级手动下单</span>';
-                                }
+                            const _pendingOrderPlans = plans.filter(p => {
+                                const s = (p && p.suggested_execution_payload) || {};
+                                return String(p.status || '') === 'proposed' && s.pending_order && ['buy','sell'].indexOf(String(p.action_type || '').toLowerCase()) >= 0;
+                            });
+                            if (_pendingOrderPlans.length > 0 && ['pending','approved','read','deferred','order_failed','cancel_failed'].indexOf(String(item.status || '')) >= 0) {
+                                const _queueLabel = item.status === 'approved'
+                                    ? ('转入统一 pending 计划 (' + _pendingOrderPlans.length + ')')
+                                    : ('批准并转入统一 pending 计划 (' + _pendingOrderPlans.length + ')');
+                                html += '<button class="btn btn-sm btn-primary" onclick="queueRecommendationPendingPlan(' + Number(item.id) + ', this)">' + _escapeHtml(_queueLabel) + '</button>';
                             }
                         }
                         html += '</div>';
@@ -1342,64 +2279,52 @@
                 .finally(() => { if (btn) { btn.disabled = false; } });
         }
 
-        function enableAutoPlan(planId, btn) {
-            if (!confirm('启用自动执行后,当 trigger 条件命中时系统会自动调用 buy/sell。\n\n本操作会冻结当前的 market_id/token_id/价格/估算 size。\n\n确定要启用吗?')) { return; }
+        function _formatRecPendingOrder(po) {
+            if (!po || typeof po !== 'object') return '—';
+            const parts = [];
+            const kind = String(po.trigger_kind || '');
+            if (kind === 'immediate') parts.push('立即');
+            else if (kind === 'btc_abs') parts.push('BTC ' + (po.trigger_op || '?') + ' ' + (po.trigger_threshold ?? '?'));
+            else if (kind === 'share_abs') parts.push('share ' + (po.trigger_op || '?') + ' ' + (po.trigger_threshold ?? '?'));
+            else if (kind === 'share_cost_pct') parts.push('cost ' + (po.trigger_op || '?') + ' ' + (po.trigger_pct ?? '?') + '%');
+            else if (kind === 'time_after_parent_fill') parts.push('父单成交后 ' + (po.trigger_threshold ?? '?') + 'h');
+            else parts.push(kind || 'trigger?');
+            if (po.parent_index !== undefined && po.parent_index !== null && po.parent_index !== '') {
+                parts.push('parent #' + (Number(po.parent_index) + 1));
+            }
+            const ss = po.size_spec || {};
+            const ps = po.price_spec || {};
+            if (ss.type) parts.push('size=' + ss.type + ':' + (ss.value ?? '?'));
+            if (ps.type) parts.push('price=' + ps.type + ':' + (ps.value ?? ps.offset ?? ''));
+            return parts.join(' · ');
+        }
+
+        function queueRecommendationPendingPlan(itemId, btn) {
+            const ok = confirm(
+                '将该 recommendation 的 pending_order 结构一次性转入 Positions / Orders 的统一 pending 队列。\n\n' +
+                '转入后原 recommendation action plans 会关闭，避免重复触发；父子联动关系按 AI 输出的 parent_index 保留。\n\n' +
+                '确定继续吗？'
+            );
+            if (!ok) { return; }
             if (btn) { btn.disabled = true; }
-            fetch('/api/recommendation_plans/' + encodeURIComponent(planId) + '/enable', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+            fetchJsonSafe('/api/recommendations/' + encodeURIComponent(itemId) + '/queue_pending_plan', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ feedback_text: '批准并转入统一 pending 计划' }),
             })
-                .then(r => r.json().then(data => ({ ok: r.ok, data })))
-                .then(({ ok, data }) => {
-                    if (!ok) {
-                        alert('启用失败: ' + (data.error || '未知错误') + (data.code ? ' [' + data.code + ']' : ''));
+                .then(data => {
+                    if (data.error) {
+                        const details = Array.isArray(data.errors) && data.errors.length
+                            ? '\n\n' + data.errors.map(e => 'plan #' + e.plan_id + ': ' + e.error).join('\n')
+                            : '';
+                        alert('转入失败: ' + data.error + details);
                         return;
                     }
-                    alert('已启用自动执行 plan #' + planId + '。frozen size=' + (data.frozen_payload && data.frozen_payload.size));
+                    alert('已转入统一 pending 计划 #' + data.plan_id + '，共 ' + ((data.items || []).length) + ' 档。\n\n' + (data.note || ''));
                     loadRecommendationsTab();
+                    if (typeof loadManualPending === 'function') loadManualPending();
                 })
-                .catch(err => alert('启用失败: ' + err.message))
-                .finally(() => { if (btn) { btn.disabled = false; } });
-        }
-
-        function repairExecutingPlan(planId, btn) {
-            const target = prompt('修复 plan #' + planId + ' 卡 executing → 输入目标状态:\n  fired   = 订单已挂出(需要 order_id)\n  disarmed = 确认未挂出,放弃\n  armed   = 重新尝试自动触发', 'fired');
-            if (!target) { return; }
-            const t = String(target).trim().toLowerCase();
-            if (['fired','disarmed','armed'].indexOf(t) < 0) { alert('target 必须 in fired/disarmed/armed'); return; }
-            let orderId = null;
-            if (t === 'fired') {
-                orderId = prompt('请输入已挂出的 order_id', '') || '';
-                if (!orderId.trim()) { alert('fired 必须给 order_id'); return; }
-            }
-            const reason = prompt('修复原因(必填,会进 audit)', 'manual repair');
-            if (!reason) { return; }
-            if (btn) { btn.disabled = true; }
-            fetch('/api/recommendation_plans/' + encodeURIComponent(planId) + '/repair_executing', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ target_status: t, reason: reason, order_id: orderId }),
-            })
-                .then(r => r.json().then(data => ({ ok: r.ok, data })))
-                .then(({ ok, data }) => {
-                    if (!ok) { alert('修复失败: ' + (data.error || '未知')); return; }
-                    alert('plan #' + planId + ' 已修复 → ' + t);
-                    loadRecommendationsTab();
-                })
-                .catch(err => alert('修复失败: ' + err.message))
-                .finally(() => { if (btn) { btn.disabled = false; } });
-        }
-
-        function disableAutoPlan(planId, btn) {
-            const reason = prompt('关闭自动执行 plan #' + planId + ' 的原因(可留空)', '') || 'user_disabled';
-            if (btn) { btn.disabled = true; }
-            fetch('/api/recommendation_plans/' + encodeURIComponent(planId) + '/disable', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: reason }),
-            })
-                .then(r => r.json().then(data => ({ ok: r.ok, data })))
-                .then(({ ok, data }) => {
-                    if (!ok) { alert('关闭失败: ' + (data.error || '未知错误')); return; }
-                    loadRecommendationsTab();
-                })
-                .catch(err => alert('关闭失败: ' + err.message))
+                .catch(err => alert('转入失败: ' + err.message))
                 .finally(() => { if (btn) { btn.disabled = false; } });
         }
 
@@ -1413,6 +2338,7 @@
                 .then(({ ok, data }) => {
                     if (!ok) { alert('忽略失败: ' + (data.error || '未知错误')); return; }
                     loadRecommendationsTab();
+                    if (typeof loadManualPending === 'function') loadManualPending();
                 })
                 .catch(err => alert('忽略失败: ' + err.message))
                 .finally(() => { if (btn) { btn.disabled = false; } });
@@ -1734,15 +2660,29 @@
             const priceValueLabel = row.querySelector('.row-price-value-label');
             const priceValueInput = row.querySelector('.row-price-value');
             const priceHint = row.querySelector('.row-price-hint');
+            const thresholdInput = row.querySelector('.row-trigger-threshold');
 
             function updateTriggerUI() {
                 const kind = triggerKindSel.value;
                 triggerFields.style.display = kind === 'immediate' ? 'none' : '';
                 const opCol = row.querySelector('.trigger-op-col');
-                if (kind === 'btc_abs') thresholdLabel.textContent = 'BTC 1m收盘价 ($)';
-                else if (kind === 'share_abs') thresholdLabel.textContent = 'Share 价 (0~1)';
-                else if (kind === 'share_cost_pct') thresholdLabel.textContent = 'cost ±%';
-                else if (kind === 'time_after_parent_fill') thresholdLabel.textContent = '持有时长 (小时)';
+                if (kind === 'btc_abs') {
+                    thresholdLabel.textContent = 'BTC 1m收盘价 ($)';
+                    thresholdInput.min = 0; thresholdInput.max = ''; thresholdInput.step = 1;
+                    thresholdInput.placeholder = '如 71500';
+                } else if (kind === 'share_abs') {
+                    thresholdLabel.textContent = 'Share 绝对价 (0~1)';
+                    thresholdInput.min = 0.001; thresholdInput.max = 0.999; thresholdInput.step = 0.001;
+                    thresholdInput.placeholder = '如 0.90';
+                } else if (kind === 'share_cost_pct') {
+                    thresholdLabel.textContent = 'cost ±%';
+                    thresholdInput.min = -100; thresholdInput.max = 1000; thresholdInput.step = 0.1;
+                    thresholdInput.placeholder = '+10 表示 cost×1.10';
+                } else if (kind === 'time_after_parent_fill') {
+                    thresholdLabel.textContent = '持有时长 (小时)';
+                    thresholdInput.min = 0.1; thresholdInput.max = 720; thresholdInput.step = 0.5;
+                    thresholdInput.placeholder = '如 48';
+                }
                 // time_after_parent_fill 无方向条件,隐藏 op 列
                 if (opCol) opCol.style.display = (kind === 'time_after_parent_fill') ? 'none' : '';
                 if (kind === 'immediate' && isChained) {
@@ -1760,7 +2700,12 @@
                 if (t === 'shares') { sizeValueLabel.textContent = '张数'; sizeHint.textContent = '直接固定张数下单'; }
                 else if (t === 'usdc') { sizeValueLabel.textContent = '金额 ($)'; sizeHint.textContent = '触发时按 amount÷limit_price 换算成 shares'; }
                 else if (t === 'pct_balance') { sizeValueLabel.textContent = '% (1~100)'; sizeHint.textContent = '📌 按触发瞬间 USDC 可用余额计算 (buy 专用)'; }
-                else if (t === 'pct_position') { sizeValueLabel.textContent = '% (1~100)'; sizeHint.textContent = '📌 按触发瞬间该 token 持仓张数计算 (sell 专用)'; }
+                else if (t === 'pct_position') {
+                    sizeValueLabel.textContent = '% (1~100)';
+                    sizeHint.textContent = isChained
+                        ? '📌 联动子单按父单剩余成交仓位计算 (sell 专用)'
+                        : '📌 按触发瞬间该 token 持仓张数计算 (sell 专用)';
+                }
             }
             function updatePriceUI() {
                 const t = priceTypeSel.value;
@@ -1772,7 +2717,7 @@
                 } else if (t === 'market') {
                     priceValueLabel.textContent = 'offset (±)';
                     priceValueInput.min = -0.5; priceValueInput.max = 0.5; priceValueInput.step = 0.01;
-                    priceValueInput.placeholder = 'buy +0.05 / sell -0.05';
+                    priceValueInput.placeholder = 'buy +0.02 / sell -0.02';
                     priceHint.textContent = '触发瞬间取 best_ask (buy) / best_bid (sell) + offset';
                 } else if (t === 'cost_pct') {
                     priceValueLabel.textContent = '相对 cost ±%';
@@ -1809,7 +2754,7 @@
                 action,
                 market_id: currentData.market_id,
                 token_id: currentData.token_id,
-                trigger_kind: kind === 'immediate' ? 'btc_abs' : kind,
+                trigger_kind: kind,
                 trigger_op: op,
                 size_spec: { type: sizeType, value: sizeValue },
                 price_spec: null,
@@ -1817,8 +2762,11 @@
                 notes: notes || null,
             };
 
-            if (kind === 'btc_abs' || kind === 'share_abs') {
+            if (kind === 'immediate') {
+                // 无触发阈值，提交到 pending executor 后尽快执行。
+            } else if (kind === 'btc_abs' || kind === 'share_abs') {
                 if (!isFinite(threshold) || threshold <= 0) throw new Error('触发阈值必须 > 0');
+                if (kind === 'share_abs' && threshold >= 1) throw new Error('Share 绝对价必须在 (0,1)，例如 90¢ 请填 0.90');
                 spec.trigger_threshold = threshold;
             } else if (kind === 'share_cost_pct') {
                 if (!isFinite(threshold)) throw new Error('cost ±% 必填');
@@ -1833,7 +2781,7 @@
                 if (!isFinite(priceValue) || priceValue <= 0 || priceValue >= 1) throw new Error('限价必须在 (0,1)');
                 spec.price_spec = { type: 'absolute', value: priceValue };
             } else if (priceType === 'market') {
-                const off = isFinite(priceValue) ? priceValue : (action === 'buy' ? 0.05 : -0.05);
+                const off = isFinite(priceValue) ? priceValue : (action === 'buy' ? 0.02 : -0.02);
                 if (Math.abs(off) > 0.5) throw new Error('offset 必须在 ±0.5');
                 spec.price_spec = { type: 'market', offset: off };
             } else if (priceType === 'cost_pct') {
@@ -1853,9 +2801,10 @@
             if (header) header.textContent = '联动子档 (sell)';
             const badge = clone.querySelector('#orderMainActionBadge');
             if (badge) badge.remove();
-            // 触发模式: btc_abs / share_cost_pct (相对父档 cost) / time_after_parent_fill (持有超时)
+            // 触发模式: btc_abs / share_abs / share_cost_pct / time_after_parent_fill
             const trigSel = clone.querySelector('.row-trigger-kind');
             trigSel.innerHTML = '<option value="btc_abs">BTC 1m收盘触达</option>'
+                + '<option value="share_abs">share 绝对价触达 (如 0.90)</option>'
                 + '<option value="share_cost_pct" selected>share 触达 cost ±% (止盈/止损)</option>'
                 + '<option value="time_after_parent_fill">持有 N 小时后平仓 (超时退出)</option>';
             // size 默认 pct_position
@@ -1879,7 +2828,7 @@
             // 默认值
             clone.querySelector('.row-trigger-threshold').value = '10';
             clone.querySelector('.row-size-value').value = '50';
-            clone.querySelector('.row-price-value').value = '-0.05';
+            clone.querySelector('.row-price-value').value = '-0.02';
             clone.querySelector('.row-expiry-hours').value = '24';
             return clone;
         }
@@ -1985,15 +2934,16 @@
             const mainKind = mainRow.querySelector('.row-trigger-kind').value;
             const isImmediate = mainKind === 'immediate' && chainedRows.length === 0;
 
-            // 立即下单 (无触发 + 无联动) → 走旧 /api/buy /api/sell 兼容路径
-            if (isImmediate) {
+            // 推荐执行项保持旧的立即下单路径；普通订单统一走 pending executor，
+            // 这样 immediate 也能使用百分比 sizing 和联动子档。
+            if (isImmediate && currentData.recommendation_item_id) {
                 let spec;
                 try { spec = _row_collectSpec(mainRow, false); } catch (e) { showError(e.message); return; }
                 if (spec.size_spec.type === 'pct_balance' || spec.size_spec.type === 'pct_position') {
-                    showError('立即模式不支持百分比 sizing,请改用触发模式'); return;
+                    showError('推荐立即执行暂不支持百分比 sizing'); return;
                 }
                 if (spec.price_spec.type !== 'absolute') {
-                    showError('立即模式仅支持限价 absolute'); return;
+                    showError('推荐立即执行仅支持限价 absolute'); return;
                 }
                 const limitPrice = spec.price_spec.value;
                 let size = spec.size_spec.type === 'shares'
@@ -2022,7 +2972,7 @@
                 return;
             }
 
-            // 触发 / 联动模式 → /api/manual_pending/plan
+            // 普通订单: immediate / 触发 / 联动模式 → /api/manual_pending/plan
             if (currentData.recommendation_item_id) {
                 showError('推荐执行项不支持延迟/联动触发,请改为立即模式'); return;
             }
@@ -2073,6 +3023,56 @@
             }
         }
 
+        function editOpenOrder(orderId) {
+            const order = openOrdersById[String(orderId)];
+            if (!order) {
+                alert('找不到该订单，请刷新 Positions / Orders 后重试');
+                return;
+            }
+            const oldPrice = Number(order.price);
+            const remaining = Number(order.remaining_size || 0);
+            const defaultSize = Number.isFinite(remaining) && remaining > 0 ? remaining : Number(order.original_size || 0);
+            const priceText = prompt('新的限价 (0~1)：', Number.isFinite(oldPrice) ? oldPrice : '');
+            if (priceText === null) return;
+            const newPrice = Number(priceText);
+            if (!Number.isFinite(newPrice) || newPrice <= 0 || newPrice >= 1) {
+                alert('价格必须在 (0,1)');
+                return;
+            }
+            const sizeText = prompt('新的剩余挂单数量（不能超过当前 remaining）：', Number.isFinite(defaultSize) ? defaultSize : '');
+            if (sizeText === null) return;
+            const newSize = Number(sizeText);
+            if (!Number.isFinite(newSize) || newSize <= 0) {
+                alert('数量必须 > 0');
+                return;
+            }
+            if (Number.isFinite(remaining) && remaining > 0 && newSize > remaining + 1e-9) {
+                alert('新数量不能超过当前 remaining: ' + remaining);
+                return;
+            }
+            if (!confirm('编辑会先撤销原订单，再用新价格/数量重挂。若重挂失败，原订单也已撤销。确认继续？')) {
+                return;
+            }
+            fetchJsonSafe('/api/open_orders/edit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ order_id: orderId, price: newPrice, size: newSize }),
+            })
+            .then(data => {
+                if (data.error) {
+                    const suffix = data.cancelled_order_id ? '\n\n注意：原订单已撤销: ' + data.cancelled_order_id : '';
+                    alert('编辑失败: ' + data.error + suffix);
+                    loadOrders();
+                    loadBalance();
+                    return;
+                }
+                alert('已替换订单:\n旧订单: ' + data.old_order_id + '\n新订单: ' + data.new_order_id);
+                loadOrders();
+                loadBalance();
+            })
+            .catch(error => alert('编辑失败: ' + error.message));
+        }
+
         function disposeTooltips(root = document) {
             if (!root) return;
             root.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => {
@@ -2102,11 +3102,15 @@
         // Load data on page load
         loadBalance();
         loadBtcPrice();
+        loadBtcFastSignal();
         loadEvents();
         loadPositions();
+        loadMonthlyGoalSettings();
+        loadMonthlyGoalRealized();
         loadOrders();
         loadRecommendationsTab();
         fetchChatHistory();
+        setInterval(loadBtcFastSignal, 5000);
 
         // Refresh every 30 seconds
         setInterval(() => {
@@ -2114,6 +3118,8 @@
             loadBtcPrice();
             loadEvents();
             loadPositions();
+            loadMonthlyGoalSettings();
+            loadMonthlyGoalRealized();
             loadOrders();
             loadRecommendationsTab();
         }, 30000);

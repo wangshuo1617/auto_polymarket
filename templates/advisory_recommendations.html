@@ -120,6 +120,13 @@ function fmt(v, digits) {
   return String(v);
 }
 
+function fmtBjtTime(value) {
+  if (!value) return '—';
+  const dt = new Date(value);
+  if (Number.isNaN(dt.getTime())) return String(value);
+  return dt.toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai', hour12: false}) + ' BJT';
+}
+
 // 把 market_slug + view_payload 组装为 "month-up to/down to TARGET-yes/no" 友好标签
 // 兼容两种 slug:
 //   per-condition (旧 chain_fills): "will-bitcoin-reach-90k-in-may-2026"  → 直接从 slug 解析
@@ -414,7 +421,7 @@ function renderPortfolio(data) {
       advisoryPill = `<span class="pill pill-locked">no edge</span>`;
     }
     const lastTrade = p.last_trade_at
-      ? new Date(p.last_trade_at).toISOString().replace('T', ' ').slice(0, 16) + 'Z'
+      ? fmtBjtTime(p.last_trade_at)
       : '—';
     html += `<tr>
       <td class="txt"><div title="${p.market_slug || ''}">${label}</div><div style="color:#999;font-size:11px" title="${p.token_id || ''}">${tok}</div></td>

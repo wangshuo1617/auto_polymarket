@@ -1,0 +1,25 @@
+[Unit]
+Description=Auto Polymarket - BTC adaptive price email watcher
+After=network-online.target
+Wants=network-online.target
+
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+WorkingDirectory=/root/auto_polymarket
+EnvironmentFile=/root/auto_polymarket/.env
+Environment=BTC_WATCHER_ENABLE_EMAIL=1
+Environment=BTC_WATCHER_POLL_SECONDS=60
+Environment=BTC_WATCHER_QUIET_START=22:00
+Environment=BTC_WATCHER_QUIET_END=06:00
+ExecStart=/bin/bash -c 'exec /snap/astral-uv/current/bin/uv run btc_price_watcher.py'
+Restart=on-failure
+RestartSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

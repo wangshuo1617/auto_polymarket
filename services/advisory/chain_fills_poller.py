@@ -26,8 +26,14 @@ from typing import Optional
 import requests
 
 from data.advisory_schema import CHAIN_FILL_PROFILES
+from data.binance import get_1m_kline_close_at
 from data.database import get_conn
 from data.polymarket import get_polymarket_context
+from services.monthly_goal_attribution import (
+    classify_activity_buy_tier,
+    ensure_fill_attribution_columns,
+    json_param,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +142,7 @@ def _write_state_error(cur, profile: str, err: str) -> None:
 
 def _insert_fill(cur, item: dict, wallet: str, profile: str) -> str:
     """Return 'inserted' / 'duplicate' / 'filter'."""
+    ensure_fill_attribution_columns()
     slug = str(item.get("eventSlug") or "")
     if not slug.startswith(ADVISORY_SLUG_PREFIX):
         return "filter"
@@ -157,16 +164,32 @@ def _insert_fill(cur, item: dict, wallet: str, profile: str) -> str:
         return "filter"
     log_index = int(item.get("logIndex") or 0)
     fill_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    tier_snapshot = None
+    entry_tier_key = None
+    entry_tier_label = None
+    if side == "buy":
+        try:
+            btc_price = get_1m_kline_close_at(fill_dt)
+            tier_snapshot = classify_activity_buy_tier(
+                item,
+                fill_dt=fill_dt,
+                price=price,
+                btc_price=btc_price,
+            )
+            entry_tier_key = tier_snapshot.get("tier_key")
+            entry_tier_label = tier_snapshot.get("tier_label")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fill tier attribution failed tx=%s log=%s: %s", tx_hash, log_index, exc)
     cur.execute(
         """
         INSERT INTO advisory_chain_fills (
             tx_hash, log_index, fill_timestamp, token_id, side,
             price, size_shares, size_usdc, wallet_address, profile,
-            market_slug, event_slug, raw_json
+            market_slug, event_slug, entry_tier_key, entry_tier_label, tier_snapshot, raw_json
         ) VALUES (
             %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s,
-            %s, %s, %s::jsonb
+            %s, %s, %s, %s, %s::jsonb, %s::jsonb
         )
         ON CONFLICT (tx_hash, log_index, token_id) DO NOTHING
         RETURNING id
@@ -174,7 +197,8 @@ def _insert_fill(cur, item: dict, wallet: str, profile: str) -> str:
         (
             tx_hash, log_index, fill_dt, asset, side,
             price, size_shares, size_usdc, wallet, profile,
-            item.get("slug"), slug, json.dumps(item),
+            item.get("slug"), slug, entry_tier_key, entry_tier_label,
+            json_param(tier_snapshot), json.dumps(item),
         ),
     )
     row = cur.fetchone()

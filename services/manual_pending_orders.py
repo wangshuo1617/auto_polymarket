@@ -6,8 +6,9 @@ recommendation_auto_executor 进程订阅 BTC + Polymarket share 价，
 扫描表中已触发(且未过期)的订单 → 原子 claim → 解析 spec → 下单 → 写回结果。
 
 触发种类 (trigger_kind):
+  - immediate              : 不等价格条件，进入队列后由 executor 尽快触发
   - btc_abs                : BTC 1m K 线收盘价 op threshold (防插针)
-  - share_abs              : token (share) 价 op threshold
+  - share_abs              : token (share) 绝对价 op threshold；有父档时只触发父档仓位的子卖单
   - share_cost_pct         : token 价相对父档 fill_price 的 ±% 偏移 (链式联动)
   - time_after_parent_fill : 父档成交 N 小时后到期平仓 (与 TP/SL 同档独立 fire,
                               其中任何一条 fire 后系统不会自动撤销其他几条,
@@ -17,7 +18,7 @@ size 表达 (size_spec):
   - {"type":"shares",        "value": N}     固定张数
   - {"type":"usdc",          "value": N}     固定金额, fire 时 / price 换算
   - {"type":"pct_balance",   "value": pct}   触发瞬间可用 USDC 余额 × pct%
-  - {"type":"pct_position",  "value": pct}   触发瞬间该 token 持仓张数 × pct%
+  - {"type":"pct_position",  "value": pct}   无父档时按该 token 持仓；有父档时按父档剩余成交张数 × pct%
 
 价格表达 (price_spec):
   - {"type":"absolute", "value": p}                   原 limit
@@ -26,7 +27,7 @@ size 表达 (size_spec):
 
 约束:
   - share_cost_pct trigger 必须挂 parent_pending_id, 且 parent.action='buy'
-  - 子档在 parent.status != 'fired' OR parent.fill_price IS NULL 时不会被 fetch_triggered_orders 选中
+  - 子档在 parent.status != 'fired' OR parent.fill_size_shares <= 0 时不会被 fetch_triggered_orders 选中
   - 父档 cancel / expired / failed → 子档级联标 cancelled
   - claim 用 `UPDATE ... WHERE status='pending' RETURNING *` 保证单次 fire
   - 失败不重试(避免重复下单),手工取消用 cancel_pending_order
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 VALID_OPS = (">=", "<=")
 VALID_ACTIONS = ("buy", "sell")
-VALID_TRIGGER_KINDS = ("btc_abs", "share_abs", "share_cost_pct", "time_after_parent_fill")
+VALID_TRIGGER_KINDS = ("immediate", "btc_abs", "share_abs", "share_cost_pct", "time_after_parent_fill")
 VALID_SIZE_TYPES = ("shares", "usdc", "pct_balance", "pct_position")
 VALID_PRICE_TYPES = ("absolute", "market", "cost_pct")
 DEFAULT_EXPIRY_HOURS = 24
@@ -87,7 +88,9 @@ CREATE TABLE IF NOT EXISTS manual_pending_orders (
     trigger_pct       DOUBLE PRECISION,
     size_spec         JSONB,
     price_spec        JSONB,
-    fill_price        DOUBLE PRECISION
+    fill_price        DOUBLE PRECISION,
+    fill_size_shares  DOUBLE PRECISION,
+    fill_size_usdc    DOUBLE PRECISION
 );
 CREATE INDEX IF NOT EXISTS idx_manual_pending_status_op
     ON manual_pending_orders (status, trigger_op);
@@ -103,6 +106,8 @@ ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS trigger_pct DOUBLE PR
 ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS size_spec JSONB;
 ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS price_spec JSONB;
 ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS fill_price DOUBLE PRECISION;
+ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS fill_size_shares DOUBLE PRECISION;
+ALTER TABLE manual_pending_orders ADD COLUMN IF NOT EXISTS fill_size_usdc DOUBLE PRECISION;
 CREATE INDEX IF NOT EXISTS idx_manual_pending_plan
     ON manual_pending_orders (plan_id);
 CREATE INDEX IF NOT EXISTS idx_manual_pending_parent_status
@@ -147,9 +152,14 @@ def _validate_spec(
     if trigger_kind not in VALID_TRIGGER_KINDS:
         raise ValueError(f"trigger_kind 必须是 {VALID_TRIGGER_KINDS}")
 
-    if trigger_kind in ("btc_abs", "share_abs"):
+    if trigger_kind == "immediate":
+        pass
+    elif trigger_kind == "btc_abs":
         if trigger_threshold is None or trigger_threshold <= 0:
-            raise ValueError(f"{trigger_kind} 触发需要 trigger_threshold > 0")
+            raise ValueError("btc_abs 触发需要 trigger_threshold > 0")
+    elif trigger_kind == "share_abs":
+        if trigger_threshold is None or not (0 < trigger_threshold < 1):
+            raise ValueError("share_abs 触发需要 0 < trigger_threshold < 1")
     elif trigger_kind == "share_cost_pct":
         if trigger_pct is None:
             raise ValueError("share_cost_pct 触发需要 trigger_pct")
@@ -307,6 +317,10 @@ def insert_plan(
                 if not market_id or not token_id:
                     raise ValueError(f"item[{idx}] market_id/token_id 必填")
 
+                if trigger_kind == "immediate":
+                    trigger_threshold = None
+                    trigger_pct = None
+
                 # btc_abs 触发时同时写 trigger_btc_price 兼容旧列展示
                 trigger_btc_price = None
                 if trigger_kind == "btc_abs" and trigger_threshold is not None:
@@ -431,6 +445,100 @@ def cancel_pending_order(order_id: int) -> Optional[dict]:
     return _row_to_dict(row)
 
 
+def update_pending_order(order_id: int, updates: dict) -> Optional[dict]:
+    """编辑一档尚未触发的 pending 订单。
+
+    只允许改触发条件、size_spec、price_spec、expires_at、notes；不允许改 action/market/token/parent。
+    """
+    ensure_table()
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT * FROM manual_pending_orders
+                WHERE id=%s AND status='pending'
+                FOR UPDATE
+                """,
+                (order_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            action = str(row["action"]).strip().lower()
+            trigger_kind = str(updates.get("trigger_kind", row.get("trigger_kind") or "btc_abs")).strip().lower()
+            trigger_op = str(updates.get("trigger_op", row.get("trigger_op") or ">=")).strip()
+            trigger_threshold = updates.get("trigger_threshold", row.get("trigger_threshold"))
+            trigger_pct = updates.get("trigger_pct", row.get("trigger_pct"))
+            size_spec = updates.get("size_spec", row.get("size_spec") or {})
+            price_spec = updates.get("price_spec", row.get("price_spec") or {})
+            expires_at = updates.get("expires_at", row.get("expires_at"))
+            notes = updates.get("notes", row.get("notes"))
+            parent_pending_id = row.get("parent_pending_id")
+
+            if trigger_kind == "immediate":
+                trigger_threshold = None
+                trigger_pct = None
+            elif trigger_kind == "share_cost_pct":
+                trigger_threshold = None
+            else:
+                trigger_pct = None
+
+            trigger_threshold_f = float(trigger_threshold) if trigger_threshold is not None else None
+            trigger_pct_f = float(trigger_pct) if trigger_pct is not None else None
+            _validate_spec(
+                action=action,
+                trigger_kind=trigger_kind,
+                trigger_op=trigger_op,
+                trigger_threshold=trigger_threshold_f,
+                trigger_pct=trigger_pct_f,
+                size_spec=size_spec,
+                price_spec=price_spec,
+                has_parent=parent_pending_id is not None,
+            )
+            if expires_at is None or expires_at <= datetime.now(timezone.utc):
+                raise ValueError("expires_at 必须在未来")
+
+            price, size = _derive_snapshot_price_size(price_spec=price_spec, size_spec=size_spec)
+            trigger_btc_price = trigger_threshold_f if trigger_kind == "btc_abs" else None
+
+            cur.execute(
+                """
+                UPDATE manual_pending_orders
+                SET trigger_kind=%s,
+                    trigger_op=%s,
+                    trigger_threshold=%s,
+                    trigger_pct=%s,
+                    trigger_btc_price=%s,
+                    size_spec=%s,
+                    price_spec=%s,
+                    price=%s,
+                    size=%s,
+                    expires_at=%s,
+                    notes=%s,
+                    updated_at=NOW()
+                WHERE id=%s AND status='pending'
+                RETURNING *
+                """,
+                (
+                    trigger_kind,
+                    trigger_op,
+                    trigger_threshold_f,
+                    trigger_pct_f,
+                    trigger_btc_price,
+                    psycopg2.extras.Json(size_spec),
+                    psycopg2.extras.Json(price_spec),
+                    price,
+                    size,
+                    expires_at,
+                    (str(notes or "")[:500] or None),
+                    order_id,
+                ),
+            )
+            updated = cur.fetchone()
+    return _row_to_dict(updated)
+
+
 def repair_stale_executing_orders(*, timeout_minutes: int = 10) -> dict[str, int]:
     """巡检卡死的 executing 单。
 
@@ -511,9 +619,10 @@ def fetch_triggered_orders(
     """返回当前满足触发条件、未过期、未 claim 的 pending 订单。
 
     - btc_abs                : 用 BTC 1m K 线收盘价与 trigger_threshold 比较
+    - immediate              : 无需行情输入，进入队列后尽快触发
     - share_abs              : 用 share_prices[token_id] 与 trigger_threshold 比较
-    - share_cost_pct         : 父档必须 fired 且 fill_price 已写,阈值 = parent.fill_price*(1+trigger_pct/100)
-    - time_after_parent_fill : 父档 fired_at 起 trigger_threshold (小时) 后到期
+    - share_cost_pct         : 父档必须有实际成交,阈值 = parent.fill_price*(1+trigger_pct/100)
+    - time_after_parent_fill : 父档实际成交后 fired_at 起 trigger_threshold (小时) 后到期
 
     只读;真正的 claim 在 try_claim_order 里做。
     """
@@ -521,29 +630,76 @@ def fetch_triggered_orders(
     share_prices = share_prices or {}
     results: list[dict] = []
     with get_cursor() as cur:
+        # immediate: 不等待价格条件；父档若存在则必须已有实际成交。
+        cur.execute(
+            """
+            SELECT c.*,
+                   p.fill_price AS parent_fill_price,
+                   p.fill_size_shares AS parent_fill_size_shares
+            FROM manual_pending_orders c
+            LEFT JOIN manual_pending_orders p ON p.id = c.parent_pending_id
+            WHERE c.status='pending'
+              AND c.expires_at > NOW()
+              AND c.trigger_kind='immediate'
+              AND (
+                    c.parent_pending_id IS NULL
+                 OR (p.status='fired' AND COALESCE(p.fill_size_shares, 0) > 0)
+              )
+            ORDER BY c.id ASC
+            """
+        )
+        for r in cur.fetchall():
+            d = _row_to_dict(r)
+            parent_fp = d.pop("parent_fill_price", None)
+            if parent_fp is not None:
+                d["_parent_fill_price"] = float(parent_fp)
+            parent_size = d.pop("parent_fill_size_shares", None)
+            if parent_size is not None:
+                d["_parent_fill_size_shares"] = float(parent_size)
+            results.append(d)
+
         # btc_abs: 调用方传入的是已收盘的 1m K 线 close,不是 tick 价。
         if btc_price is not None:
             cur.execute(
                 """
-                SELECT * FROM manual_pending_orders
-                WHERE status='pending'
-                  AND expires_at > NOW()
-                  AND trigger_kind='btc_abs'
-                  AND trigger_threshold IS NOT NULL
+                SELECT c.*,
+                       p.fill_price AS parent_fill_price,
+                       p.fill_size_shares AS parent_fill_size_shares
+                FROM manual_pending_orders c
+                LEFT JOIN manual_pending_orders p ON p.id = c.parent_pending_id
+                WHERE c.status='pending'
+                  AND c.expires_at > NOW()
+                  AND c.trigger_kind='btc_abs'
+                  AND c.trigger_threshold IS NOT NULL
                   AND (
-                       (trigger_op='>=' AND %s >= trigger_threshold)
-                    OR (trigger_op='<=' AND %s <= trigger_threshold)
+                        c.parent_pending_id IS NULL
+                     OR (p.status='fired' AND COALESCE(p.fill_size_shares, 0) > 0)
                   )
-                ORDER BY id ASC
+                  AND (
+                       (c.trigger_op='>=' AND %s >= c.trigger_threshold)
+                    OR (c.trigger_op='<=' AND %s <= c.trigger_threshold)
+                  )
+                ORDER BY c.id ASC
                 """,
                 (btc_price, btc_price),
             )
-            results.extend(_row_to_dict(r) for r in cur.fetchall())
+            for r in cur.fetchall():
+                d = _row_to_dict(r)
+                parent_fp = d.pop("parent_fill_price", None)
+                if parent_fp is not None:
+                    d["_parent_fill_price"] = float(parent_fp)
+                parent_size = d.pop("parent_fill_size_shares", None)
+                if parent_size is not None:
+                    d["_parent_fill_size_shares"] = float(parent_size)
+                results.append(d)
 
         # time_after_parent_fill: 父档 fired_at 起 N 小时后到期。无需任何价格输入。
         cur.execute(
             """
-            SELECT c.*, p.fired_at AS parent_fired_at, p.fill_price AS parent_fill_price
+            SELECT c.*,
+                   p.fired_at AS parent_fired_at,
+                   p.fill_price AS parent_fill_price,
+                   p.fill_size_shares AS parent_fill_size_shares
             FROM manual_pending_orders c
             JOIN manual_pending_orders p ON p.id = c.parent_pending_id
             WHERE c.status='pending'
@@ -552,6 +708,7 @@ def fetch_triggered_orders(
               AND c.trigger_threshold IS NOT NULL
               AND p.status='fired'
               AND p.fired_at IS NOT NULL
+              AND COALESCE(p.fill_size_shares, 0) > 0
               AND NOW() >= p.fired_at + make_interval(secs => c.trigger_threshold * 3600)
             ORDER BY c.id ASC
             """
@@ -562,6 +719,9 @@ def fetch_triggered_orders(
             parent_fp = d.pop("parent_fill_price", None)
             if parent_fp is not None:
                 d["_parent_fill_price"] = float(parent_fp)
+            parent_size = d.pop("parent_fill_size_shares", None)
+            if parent_size is not None:
+                d["_parent_fill_size_shares"] = float(parent_size)
             results.append(d)
 
         if not share_prices:
@@ -571,18 +731,32 @@ def fetch_triggered_orders(
         # share_abs
         cur.execute(
             """
-            SELECT * FROM manual_pending_orders
-            WHERE status='pending'
-              AND expires_at > NOW()
-              AND trigger_kind='share_abs'
-              AND trigger_threshold IS NOT NULL
-              AND token_id = ANY(%s)
-            ORDER BY id ASC
+            SELECT c.*,
+                   p.fill_price AS parent_fill_price,
+                   p.fill_size_shares AS parent_fill_size_shares
+            FROM manual_pending_orders c
+            LEFT JOIN manual_pending_orders p ON p.id = c.parent_pending_id
+            WHERE c.status='pending'
+              AND c.expires_at > NOW()
+              AND c.trigger_kind='share_abs'
+              AND c.trigger_threshold IS NOT NULL
+              AND c.token_id = ANY(%s)
+              AND (
+                    c.parent_pending_id IS NULL
+                 OR (p.status='fired' AND COALESCE(p.fill_size_shares, 0) > 0)
+              )
+            ORDER BY c.id ASC
             """,
             (token_ids,),
         )
         for r in cur.fetchall():
             d = _row_to_dict(r)
+            parent_fp = d.pop("parent_fill_price", None)
+            if parent_fp is not None:
+                d["_parent_fill_price"] = float(parent_fp)
+            parent_size = d.pop("parent_fill_size_shares", None)
+            if parent_size is not None:
+                d["_parent_fill_size_shares"] = float(parent_size)
             sp = share_prices.get(d["token_id"])
             if sp is None:
                 continue
@@ -591,10 +765,13 @@ def fetch_triggered_orders(
             if (op == ">=" and sp >= thr) or (op == "<=" and sp <= thr):
                 results.append(d)
 
-        # share_cost_pct: 必须 parent fired + fill_price 已写
+        # share_cost_pct: 必须 parent 有实际成交 + fill_price 已写
         cur.execute(
             """
-            SELECT c.*, p.fill_price AS parent_fill_price, p.status AS parent_status
+            SELECT c.*,
+                   p.fill_price AS parent_fill_price,
+                   p.fill_size_shares AS parent_fill_size_shares,
+                   p.status AS parent_status
             FROM manual_pending_orders c
             JOIN manual_pending_orders p ON p.id = c.parent_pending_id
             WHERE c.status='pending'
@@ -603,6 +780,7 @@ def fetch_triggered_orders(
               AND c.trigger_pct IS NOT NULL
               AND p.status='fired'
               AND p.fill_price IS NOT NULL
+              AND COALESCE(p.fill_size_shares, 0) > 0
               AND c.token_id = ANY(%s)
             ORDER BY c.id ASC
             """,
@@ -614,12 +792,15 @@ def fetch_triggered_orders(
             if sp is None:
                 continue
             cost = float(d.pop("parent_fill_price"))
+            parent_size = d.pop("parent_fill_size_shares", None)
             d.pop("parent_status", None)
             thr = cost * (1.0 + float(d["trigger_pct"]) / 100.0)
             op = d["trigger_op"]
             if (op == ">=" and sp >= thr) or (op == "<=" and sp <= thr):
                 d["_resolved_threshold"] = thr
                 d["_parent_fill_price"] = cost
+                if parent_size is not None:
+                    d["_parent_fill_size_shares"] = float(parent_size)
                 results.append(d)
     return results
 
@@ -661,13 +842,107 @@ def try_claim_order(order_id: int) -> Optional[dict]:
     return _row_to_dict(row) if row else None
 
 
+def list_fired_parents_with_pending_children(*, limit: int = 50) -> list[dict]:
+    """返回有 pending 子档的已提交父档,供 executor 刷新真实成交数量。"""
+    ensure_table()
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT p.*
+            FROM manual_pending_orders p
+            JOIN manual_pending_orders c ON c.parent_pending_id = p.id
+            WHERE p.status='fired'
+              AND p.fired_order_id IS NOT NULL
+              AND c.status='pending'
+              AND c.expires_at > NOW()
+            ORDER BY p.updated_at ASC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return [_row_to_dict(r) for r in cur.fetchall()]
+
+
+def update_order_fill_snapshot(
+    order_id: int,
+    *,
+    fill_price: Optional[float],
+    fill_size_shares: Optional[float],
+    fill_size_usdc: Optional[float],
+) -> None:
+    """刷新已提交订单的真实成交快照。
+
+    fill_size_shares 可为 0,表示订单已提交但尚未成交；子档不会因此激活。
+    """
+    ensure_table()
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE manual_pending_orders
+            SET fill_price=COALESCE(%s, fill_price),
+                fill_size_shares=%s,
+                fill_size_usdc=%s,
+                updated_at=NOW()
+            WHERE id=%s
+            """,
+            (fill_price, fill_size_shares, fill_size_usdc, order_id),
+        )
+
+
+def get_parent_execution_context(child_order_id: int) -> Optional[dict]:
+    """返回子档绑定父档的成交上下文与剩余可用父仓位。
+
+    available_size_shares = 父档真实成交张数 - 已由兄弟 sell 子档消耗的张数。
+    """
+    ensure_table()
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                c.id AS child_id,
+                c.parent_pending_id,
+                p.fill_price AS parent_fill_price,
+                p.fill_size_shares AS parent_fill_size_shares,
+                p.fill_size_usdc AS parent_fill_size_usdc,
+                COALESCE((
+                    SELECT SUM(
+                        CASE
+                            WHEN s.fill_size_shares IS NOT NULL AND s.fill_size_shares > 0
+                                THEN s.fill_size_shares
+                            ELSE COALESCE(s.size, 0)
+                        END
+                    )
+                    FROM manual_pending_orders s
+                    WHERE s.parent_pending_id = p.id
+                      AND s.id <> c.id
+                      AND s.action = 'sell'
+                      AND s.status IN ('executing','fired')
+                ), 0) AS consumed_size_shares
+            FROM manual_pending_orders c
+            JOIN manual_pending_orders p ON p.id = c.parent_pending_id
+            WHERE c.id = %s
+            """,
+            (child_order_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    d = _row_to_dict(row)
+    parent_size = float(d.get("parent_fill_size_shares") or 0.0)
+    consumed = float(d.get("consumed_size_shares") or 0.0)
+    d["available_size_shares"] = max(0.0, parent_size - consumed)
+    return d
+
+
 def mark_order_fired(
     order_id: int,
     *,
     fired_order_id: str,
     fill_price: Optional[float] = None,
+    fill_size_shares: Optional[float] = None,
+    fill_size_usdc: Optional[float] = None,
 ) -> None:
-    """fire 成功:写 status=fired + 实际成交参考价 fill_price(给链上子档当 cost basis)。"""
+    """fire 成功:写 status=fired + 实际成交参考价/数量(给链上子档当 cost basis)。"""
     ensure_table()
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -677,10 +952,12 @@ def mark_order_fired(
                 fired_at=NOW(),
                 fired_order_id=%s,
                 fill_price=COALESCE(%s, fill_price),
+                fill_size_shares=%s,
+                fill_size_usdc=%s,
                 updated_at=NOW()
             WHERE id=%s
             """,
-            (fired_order_id, fill_price, order_id),
+            (fired_order_id, fill_price, fill_size_shares, fill_size_usdc, order_id),
         )
 
 

@@ -104,7 +104,7 @@ def analyze_market_with_grounding(
     recommendation_memory_context: dict | None = None,
     previous_report: dict | None = None,
     operator_intent: str | None = None,
-    monthly_target: str = "月度净值翻倍（+100%）",
+    monthly_target: str = "月度净值目标 +20%",
 ) -> Dict[str, Any]:
     """
     Analyze the polymarket positions, orders, event situation, USDC balance, and btc 4h k data.
