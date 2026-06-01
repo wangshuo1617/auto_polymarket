@@ -108,6 +108,11 @@ MONTHLY_REVIEW_GATE_LABELS = {
     "block": "暂停",
     "unknown": "未知",
 }
+MONTHLY_REVIEW_SAMPLE_QUALITY_LABELS = {
+    "insufficient": "样本不足",
+    "limited": "样本有限",
+    "reliable": "样本较可靠",
+}
 
 
 def _loss_budget_status(used_usdc: float, budget_usdc: float) -> tuple[str, float | None]:
@@ -119,6 +124,62 @@ def _loss_budget_status(used_usdc: float, budget_usdc: float) -> tuple[str, floa
     if usage_pct >= 70.0:
         return "caution", usage_pct
     return "ok", usage_pct
+
+
+def _pending_order_buy_notional(order: dict[str, Any]) -> float:
+    """估算 active buy pending 的最大占用；缺价格时保守返回 0 并在 unmatched 中暴露。"""
+    if not isinstance(order, dict):
+        return 0.0
+    try:
+        estimated = _to_float(order.get("estimated_buy_notional_usdc"), None)
+        if estimated is not None and estimated > 0:
+            return float(estimated)
+        size_spec = order.get("size_spec") if isinstance(order.get("size_spec"), dict) else {}
+        price_spec = order.get("price_spec") if isinstance(order.get("price_spec"), dict) else {}
+        size_type = str(size_spec.get("type") or "").lower()
+        if size_type == "usdc":
+            return max(0.0, float(size_spec.get("value") or 0.0))
+        if size_type == "shares":
+            price = _to_float(price_spec.get("value"), None)
+            if price is None or price <= 0:
+                price = _to_float(order.get("current_token_price"), None)
+            if price is None or price <= 0:
+                return 0.0
+            return max(0.0, float(size_spec.get("value") or 0.0) * float(price))
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0
+
+
+def _active_pending_buys_by_token(active_manual_pending_orders: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    by_token: dict[str, dict[str, Any]] = {}
+    if not isinstance(active_manual_pending_orders, dict):
+        return by_token
+    orders = active_manual_pending_orders.get("orders") or []
+    if not isinstance(orders, list):
+        return by_token
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("action") or "").strip().lower() != "buy":
+            continue
+        if str(order.get("status") or "pending").strip().lower() not in {"pending", "executing"}:
+            continue
+        token_id = str(order.get("token_id") or "").strip()
+        if not token_id:
+            continue
+        notional = _pending_order_buy_notional(order)
+        row = by_token.setdefault(token_id, {
+            "pending_buy_notional_usdc": 0.0,
+            "pending_order_ids": [],
+            "pending_plan_ids": [],
+        })
+        row["pending_buy_notional_usdc"] += notional
+        if order.get("id") is not None:
+            row["pending_order_ids"].append(order.get("id"))
+        if order.get("plan_id") is not None and order.get("plan_id") not in row["pending_plan_ids"]:
+            row["pending_plan_ids"].append(order.get("plan_id"))
+    return by_token
 
 
 def _combine_entry_status(*statuses: str | None) -> str:
@@ -1186,6 +1247,7 @@ def _new_review_group(key: str, label: str) -> dict[str, Any]:
         "realized_pnl": 0.0,
         "gross_profit": 0.0,
         "gross_loss": 0.0,
+        "worst_match_pnl": None,
         "matched_shares": 0.0,
         "token_count": 0,
         "_tokens": set(),
@@ -1205,20 +1267,32 @@ def _add_review_match(group: dict[str, Any], *, token_id: str, shares: float, co
     else:
         group["loss_count"] += 1
         group["gross_loss"] += -realized
+    worst = group.get("worst_match_pnl")
+    group["worst_match_pnl"] = realized if worst is None else min(float(worst), realized)
     group["_tokens"].add(token_id)
 
 
 def _finalize_review_group(group: dict[str, Any]) -> dict[str, Any]:
     out = dict(group)
     tokens = out.pop("_tokens", set())
-    out["token_count"] = len(tokens)
     cost = float(out.get("matched_buy_cost") or 0.0)
     count = int(out.get("match_count") or 0)
     wins = int(out.get("win_count") or 0)
+    token_count = len(tokens)
+    out["token_count"] = token_count
+    if count < 3 or token_count < 2:
+        sample_quality = "insufficient"
+    elif count < 5 or token_count < 3:
+        sample_quality = "limited"
+    else:
+        sample_quality = "reliable"
+    out["sample_quality"] = sample_quality
+    out["sample_quality_label"] = MONTHLY_REVIEW_SAMPLE_QUALITY_LABELS.get(sample_quality, sample_quality)
     out["return_pct"] = round(float(out.get("realized_pnl") or 0.0) / cost * 100.0, 2) if cost > 0 else None
     out["win_rate_pct"] = round(wins / count * 100.0, 2) if count > 0 else None
-    for key in ("matched_buy_cost", "sell_proceeds", "realized_pnl", "gross_profit", "gross_loss", "matched_shares"):
-        out[key] = round(float(out.get(key) or 0.0), 6)
+    for key in ("matched_buy_cost", "sell_proceeds", "realized_pnl", "gross_profit", "gross_loss", "matched_shares", "worst_match_pnl"):
+        if out.get(key) is not None:
+            out[key] = round(float(out.get(key) or 0.0), 6)
     return out
 
 
@@ -1264,27 +1338,46 @@ def _build_review_conclusions(combos: list[dict[str, Any]], coverage: dict[str, 
     losing = [c for c in combos if float(c.get("realized_pnl") or 0.0) < -0.01]
     winning = [c for c in combos if float(c.get("realized_pnl") or 0.0) > 0.01]
     for item in sorted(losing, key=lambda x: float(x.get("gross_loss") or 0.0), reverse=True)[:3]:
-        severity = "block" if item.get("entry_gate") == "block" or float(item.get("return_pct") or 0.0) <= -20.0 else "reduce"
+        sample_quality = str(item.get("sample_quality") or "insufficient")
+        if sample_quality == "insufficient":
+            severity = "monitor"
+        else:
+            severity = "block" if item.get("entry_gate") == "block" or float(item.get("return_pct") or 0.0) <= -20.0 else "reduce"
         conclusions.append({
             "severity": severity,
             "title": f"降权/复核：{item.get('label')}",
             "detail": (
                 f"已实现 {item.get('realized_pnl'):+.2f} USDC，"
                 f"回报 {item.get('return_pct') if item.get('return_pct') is not None else '—'}%，"
-                f"亏损 {item.get('gross_loss'):.2f} USDC。后续同类入场需要更强确认或更小仓位。"
+                f"亏损 {item.get('gross_loss'):.2f} USDC，"
+                f"最差单次 {item.get('worst_match_pnl') if item.get('worst_match_pnl') is not None else '—'} USDC，"
+                f"样本质量 {item.get('sample_quality_label')}。后续同类入场需要更强确认或更小仓位。"
             ),
             "group_key": item.get("key"),
+            "match_count": item.get("match_count"),
+            "token_count": item.get("token_count"),
+            "worst_match_pnl": item.get("worst_match_pnl"),
+            "sample_quality": sample_quality,
+            "sample_quality_label": item.get("sample_quality_label"),
         })
     for item in sorted(winning, key=lambda x: float(x.get("realized_pnl") or 0.0), reverse=True)[:2]:
+        sample_quality = str(item.get("sample_quality") or "insufficient")
+        severity = "add" if sample_quality != "insufficient" else "info"
         conclusions.append({
-            "severity": "add",
+            "severity": severity,
             "title": f"可保留：{item.get('label')}",
             "detail": (
                 f"已实现 {item.get('realized_pnl'):+.2f} USDC，"
                 f"回报 {item.get('return_pct') if item.get('return_pct') is not None else '—'}%，"
-                f"胜率 {item.get('win_rate_pct') if item.get('win_rate_pct') is not None else '—'}%。"
+                f"胜率 {item.get('win_rate_pct') if item.get('win_rate_pct') is not None else '—'}%，"
+                f"样本质量 {item.get('sample_quality_label')}。"
             ),
             "group_key": item.get("key"),
+            "match_count": item.get("match_count"),
+            "token_count": item.get("token_count"),
+            "worst_match_pnl": item.get("worst_match_pnl"),
+            "sample_quality": sample_quality,
+            "sample_quality_label": item.get("sample_quality_label"),
         })
     if not conclusions:
         conclusions.append({
@@ -1570,6 +1663,7 @@ def build_monthly_goal_context(
     realized_summary: dict | None = None,
     btc_momentum_context: dict[str, Any] | None = None,
     trade_review_summary: dict[str, Any] | None = None,
+    active_manual_pending_orders: dict[str, Any] | None = None,
     profile: str = "analyze",
 ) -> dict[str, Any]:
     """构建供 AI 使用的本月目标分层上下文。"""
@@ -1587,6 +1681,8 @@ def build_monthly_goal_context(
     phase_key, phase_label = _classify_time_phase(days_left_in_month)
     thresholds = _current_phase_thresholds(phase_key)
     by_token, by_question_outcome = _build_position_indexes(positions)
+    pending_buys_by_token = _active_pending_buys_by_token(active_manual_pending_orders)
+    pending_tokens_seen: set[str] = set()
     normalized_realized_overrides = _normalize_realized_overrides(realized_overrides or {})
 
     candidates_by_tier: dict[str, list[dict]] = {tier["key"]: [] for tier in MONTHLY_GOAL_TIERS}
@@ -1625,6 +1721,10 @@ def build_monthly_goal_context(
             held = by_token.get(token_id) if token_id else None
             if held is None:
                 held = by_question_outcome.get(_position_match_key(question, tier["outcome"]), {"shares": 0.0, "value": 0.0})
+            pending_row = pending_buys_by_token.get(token_id) if token_id else None
+            pending_buy_notional = float((pending_row or {}).get("pending_buy_notional_usdc") or 0.0)
+            if pending_buy_notional > 0 and token_id:
+                pending_tokens_seen.add(token_id)
             price = _entry_price_for_outcome(market, outcome_index)
             candidate = {
                 "question": question,
@@ -1636,6 +1736,9 @@ def build_monthly_goal_context(
                 "distance_pct": round(distance_pct, 2),
                 "held_shares": round(float(held.get("shares") or 0.0), 6),
                 "held_value_usdc": round(float(held.get("value") or 0.0), 2),
+                "pending_buy_notional_usdc": round(pending_buy_notional, 2),
+                "pending_order_ids": list((pending_row or {}).get("pending_order_ids") or [])[:8],
+                "pending_plan_ids": list((pending_row or {}).get("pending_plan_ids") or [])[:8],
             }
             if tier["key"] == "mid_no":
                 candidate["mid_no_entry_gate"] = _mid_no_entry_gate(
@@ -1653,6 +1756,18 @@ def build_monthly_goal_context(
     total_planned_position = 0.0
     total_tier_remaining = 0.0
     total_target_shares = 0.0
+    total_pending_buy_notional = sum(
+        float(item.get("pending_buy_notional_usdc") or 0.0)
+        for item in pending_buys_by_token.values()
+    )
+    unattributed_pending_tokens = [
+        token_id for token_id in pending_buys_by_token
+        if token_id not in pending_tokens_seen
+    ]
+    unattributed_pending_buy_notional = sum(
+        float(pending_buys_by_token[token_id].get("pending_buy_notional_usdc") or 0.0)
+        for token_id in unattributed_pending_tokens
+    )
     allocation_plan = calculate_monthly_goal_tier_allocations(pct, target_position_overrides, phase_key=phase_key)
     plan_expected_return_pct = float(allocation_plan["planned_return_pct"])
     effective_plan_expected_return_pct = float(allocation_plan.get("effective_planned_return_pct") or plan_expected_return_pct)
@@ -1708,6 +1823,8 @@ def build_monthly_goal_context(
         remaining = max(0.0, (tier_target_profit or 0.0) - realized) if tier_target_profit is not None else None
         held_value = sum(float(c.get("held_value_usdc") or 0.0) for c in candidates)
         held_shares = sum(float(c.get("held_shares") or 0.0) for c in candidates)
+        pending_buy_notional = sum(float(c.get("pending_buy_notional_usdc") or 0.0) for c in candidates)
+        committed_value = held_value + pending_buy_notional
 
         candidate_gate_statuses: list[str] = []
         eligible_candidate_count = 0
@@ -1744,18 +1861,30 @@ def build_monthly_goal_context(
         else:
             risk_adjusted_position_cap = effective_position_cap
         risk_adjusted_headroom = (
-            max(0.0, (risk_adjusted_position_cap or 0.0) - held_value)
+            max(0.0, (risk_adjusted_position_cap or 0.0) - committed_value)
             if risk_adjusted_position_cap is not None else None
         )
-        per_candidate_target = (
-            risk_adjusted_headroom / eligible_candidate_count
-            if risk_adjusted_headroom is not None and eligible_candidate_count > 0 else None
+        eligible_candidates_for_allocation = [
+            c for c in enriched_candidates
+            if c.get("entry_gate") != "block"
+        ]
+        per_candidate_headroom = (
+            (risk_adjusted_headroom or 0.0) / len(eligible_candidates_for_allocation)
+            if risk_adjusted_headroom is not None and eligible_candidates_for_allocation else None
         )
-        target_shares = 0.0 if per_candidate_target is not None else None
+        allocatable_candidate_headroom = 0.0 if per_candidate_headroom is not None else None
+        target_shares = 0.0 if per_candidate_headroom is not None else None
         for enriched in enriched_candidates:
             price = enriched.get("price")
             candidate_target_shares = None
-            candidate_target = per_candidate_target if enriched.get("entry_gate") != "block" else 0.0
+            if enriched.get("entry_gate") == "block":
+                candidate_target = 0.0
+            elif per_candidate_headroom is not None:
+                candidate_target = max(0.0, per_candidate_headroom)
+                if allocatable_candidate_headroom is not None:
+                    allocatable_candidate_headroom += candidate_target
+            else:
+                candidate_target = None
             if candidate_target is not None and price:
                 candidate_target_shares = candidate_target / float(price)
                 if target_shares is not None:
@@ -1789,10 +1918,13 @@ def build_monthly_goal_context(
             "risk_adjusted_position_cap_usdc": round(risk_adjusted_position_cap, 2) if risk_adjusted_position_cap is not None else None,
             "current_held_value_usdc": round(held_value, 2),
             "current_held_shares": round(held_shares, 6),
-            "target_position_gap_usdc": round(max(0.0, (target_position or 0.0) - held_value), 2) if target_position is not None else None,
-            "headroom_to_position_limit_usdc": round(max(0.0, (target_position or 0.0) - held_value), 2) if target_position is not None else None,
-            "headroom_to_effective_cap_usdc": round(max(0.0, (effective_position_cap or 0.0) - held_value), 2) if effective_position_cap is not None else None,
+            "current_pending_buy_notional_usdc": round(pending_buy_notional, 2),
+            "current_committed_value_usdc": round(committed_value, 2),
+            "target_position_gap_usdc": round(max(0.0, (target_position or 0.0) - committed_value), 2) if target_position is not None else None,
+            "headroom_to_position_limit_usdc": round(max(0.0, (target_position or 0.0) - committed_value), 2) if target_position is not None else None,
+            "headroom_to_effective_cap_usdc": round(max(0.0, (effective_position_cap or 0.0) - committed_value), 2) if effective_position_cap is not None else None,
             "headroom_to_risk_adjusted_cap_usdc": round(risk_adjusted_headroom, 2) if risk_adjusted_headroom is not None else None,
+            "allocatable_candidate_headroom_usdc": round(allocatable_candidate_headroom, 2) if allocatable_candidate_headroom is not None else None,
             "target_shares": round(target_shares, 6) if target_shares is not None else None,
             "realized_pnl_usdc": round(realized, 2),
             "auto_realized_pnl_usdc": round(auto_realized, 2),
@@ -1842,6 +1974,11 @@ def build_monthly_goal_context(
         "requested_target_profit_usdc": round(base * pct / 100.0, 2) if base > 0 and pct > 0 else None,
         "total_target_profit_usdc": round(total_target_profit, 2) if total_target_profit is not None else None,
         "total_planned_position_usdc": round(total_planned_position, 2),
+        "total_pending_buy_notional_usdc": round(total_pending_buy_notional, 2),
+        "attributed_pending_buy_notional_usdc": round(total_pending_buy_notional - unattributed_pending_buy_notional, 2),
+        "unattributed_pending_buy_notional_usdc": round(unattributed_pending_buy_notional, 2),
+        "unattributed_pending_token_count": len(unattributed_pending_tokens),
+        "unattributed_pending_token_ids": unattributed_pending_tokens[:20],
         "total_planned_position_pct": round(float(allocation_plan["total_position_pct"]), 4),
         "effective_total_position_pct": round(float(allocation_plan.get("effective_total_position_pct") or allocation_plan["total_position_pct"]), 4),
         "planned_return_pct": round(float(allocation_plan["planned_return_pct"]), 4),
@@ -1874,9 +2011,10 @@ def build_monthly_goal_context(
             "remaining_profit_usdc 只用于排序和选择机会，不能作为放宽止损、追价或突破仓位上限的理由。",
             "target_position_gap_usdc/headroom_to_position_limit_usdc 是仓位上限余量，不是必须补满的任务。",
             "新增建议必须优先使用 headroom_to_risk_adjusted_cap_usdc；若手动目标超过阶段建议，不得按手动上限补仓。",
+            "active manual pending buy 已计入 current_committed_value_usdc 并扣减新增余量；unattributed pending 需要人工复核。",
             "entry_gate 为 block 时，不应新增该档买入；entry_gate 为 caution 时，只能小仓位且必须有更强确认。",
             "中价No需要同时满足价格区间、barrier distance、BTC未朝barrier快速移动；快速逼近后需要冷却确认。",
-            "trade_review_context 的结论用于校准加权/降权，不得用少量样本推翻当前 entry_gate 或防错预算。",
+            "trade_review_context 的结论用于校准加权/降权；sample_quality=insufficient 只能提示观察，不得作为加仓依据。",
             "不得为了补某档缺口而买入不在 current_phase_threshold 内的 token。",
             "若某档已超额完成，应优先保护利润或转入观察，除非出现更高质量且符合风控的机会。",
             "低价 Yes 缺口不能通过无催化彩票仓补；下方 dip No 缺口不能通过第一次逼近 barrier 逆势抄底补。",

@@ -72,10 +72,12 @@ CREATE TABLE IF NOT EXISTS recommendation_runs (
     btc_price DOUBLE PRECISION,
     days_left_in_month DOUBLE PRECISION,
     recommendation_count INTEGER NOT NULL DEFAULT 0,
+    prompt_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
     input_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
     analysis_output JSONB NOT NULL DEFAULT '{}'::jsonb,
     summary_text TEXT
 );
+ALTER TABLE recommendation_runs ADD COLUMN IF NOT EXISTS prompt_metrics JSONB NOT NULL DEFAULT '{}'::jsonb;
 """
 
 _DDL_RECOMMENDATION_RUNS_INDICES = """
@@ -595,6 +597,7 @@ class RecommendationDB:
         input_snapshot: dict,
         analysis_output: dict,
         items: list[dict],
+        prompt_metrics: dict | None = None,
         status: str = "completed",
     ) -> int:
         normalized_status = str(status or "completed").strip().lower()
@@ -608,12 +611,12 @@ class RecommendationDB:
                     asset, analysis_kind, profile, status, trigger_type, trigger_reason,
                     operator_intent, model_id, prompt_family, prompt_version,
                     system_prompt_hash, schema_hash, btc_price, days_left_in_month,
-                    recommendation_count, input_snapshot, analysis_output, summary_text
+                    recommendation_count, prompt_metrics, input_snapshot, analysis_output, summary_text
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s,
                     %s, %s, %s, %s,
-                    %s, %s, %s, %s
+                    %s, %s, %s, %s, %s
                 )
                 RETURNING id
                 """,
@@ -633,6 +636,7 @@ class RecommendationDB:
                     btc_price,
                     days_left_in_month,
                     len(items),
+                    Json(prompt_metrics or {}, dumps=_json_dumps),
                     Json(input_snapshot, dumps=_json_dumps),
                     Json(analysis_output, dumps=_json_dumps),
                     str(analysis_output.get("整体分析") or "").strip() or None,

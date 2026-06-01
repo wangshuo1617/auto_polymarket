@@ -959,6 +959,42 @@
             return null;
         }
 
+        function _manualPendingBuyNotional(order, fallbackPrice) {
+            if (!order || String(order.action || '').toLowerCase() !== 'buy') return 0;
+            const status = String(order.status || 'pending').toLowerCase();
+            if (!['pending', 'executing'].includes(status)) return 0;
+            const sizeSpec = order.size_spec && typeof order.size_spec === 'object' ? order.size_spec : {};
+            const priceSpec = order.price_spec && typeof order.price_spec === 'object' ? order.price_spec : {};
+            const sizeType = String(sizeSpec.type || '').toLowerCase();
+            const sizeValue = Number(sizeSpec.value);
+            if (sizeType === 'usdc' && Number.isFinite(sizeValue) && sizeValue > 0) return sizeValue;
+            if (sizeType === 'shares' && Number.isFinite(sizeValue) && sizeValue > 0) {
+                let price = Number(priceSpec.value);
+                if (!Number.isFinite(price) || price <= 0) price = Number(order.price);
+                if (!Number.isFinite(price) || price <= 0) price = Number(fallbackPrice);
+                return Number.isFinite(price) && price > 0 ? sizeValue * price : 0;
+            }
+            const legacyPrice = Number(order.price);
+            const legacySize = Number(order.size);
+            return Number.isFinite(legacyPrice) && legacyPrice > 0 && Number.isFinite(legacySize) && legacySize > 0
+                ? legacyPrice * legacySize
+                : 0;
+        }
+
+        function _activeManualPendingBuysByToken() {
+            const out = {};
+            Object.values(manualPendingById || {}).forEach(order => {
+                if (!order || String(order.action || '').toLowerCase() !== 'buy') return;
+                const status = String(order.status || 'pending').toLowerCase();
+                if (!['pending', 'executing'].includes(status)) return;
+                const tokenId = String(order.token_id || '');
+                if (!tokenId) return;
+                if (!out[tokenId]) out[tokenId] = [];
+                out[tokenId].push(order);
+            });
+            return out;
+        }
+
         function _monthlyGoalCandidatesByTier() {
             const positionsByAsset = {};
             (latestPositionsData || []).forEach(p => {
@@ -972,6 +1008,7 @@
             });
 
             const out = {};
+            const pendingBuysByToken = _activeManualPendingBuysByToken();
             MONTHLY_GOAL_TIERS.forEach(tier => { out[tier.key] = []; });
             ((latestEventsData || {}).markets || []).forEach(market => {
                 const hasSettledPrice = (market.outcomePrices || []).some(price => Number(price) === 1);
@@ -983,6 +1020,8 @@
                     const tokenId = String((market.token_id || [])[index] || '');
                     const price = _entryPriceForOutcome(market, index);
                     const held = positionsByAsset[tokenId] || { shares: 0, value: 0 };
+                    const pendingOrders = pendingBuysByToken[tokenId] || [];
+                    const pendingBuyNotional = pendingOrders.reduce((sum, order) => sum + _manualPendingBuyNotional(order, price), 0);
                     const barrierMeta = market.barrierMeta || {};
                     const distancePct = Number(barrierMeta.distance_pct);
                     const candidate = {
@@ -991,6 +1030,8 @@
                         price,
                         heldShares: held.shares,
                         heldValue: held.value,
+                        pendingBuyNotional,
+                        pendingOrderIds: pendingOrders.map(o => o.id).filter(v => v != null).slice(0, 8),
                         strike: _extractStrikeFromQuestion(market.question),
                         directionInQuestion: _extractDirectionFromQuestion(market.question),
                         distancePct: Number.isFinite(distancePct) ? distancePct : null,
@@ -1094,9 +1135,15 @@
             const conclusionHtml = conclusions.length
                 ? conclusions.map(item => {
                     const badge = _reviewSeverityClass(item.severity);
+                    const quality = item.sample_quality_label || item.sample_quality;
+                    const qualityHint = quality
+                        ? ' · 样本' + escapeHtml(quality)
+                            + '（' + escapeHtml(item.match_count || 0) + '笔/'
+                            + escapeHtml(item.token_count || 0) + ' token）'
+                        : '';
                     return '<li class="mb-1"><span class="badge text-bg-' + badge + '">' + escapeHtml(item.severity || 'info') + '</span> '
                         + '<strong>' + escapeHtml(item.title || '复盘结论') + '</strong><br>'
-                        + '<small class="text-muted">' + escapeHtml(item.detail || '') + '</small></li>';
+                        + '<small class="text-muted">' + escapeHtml(item.detail || '') + qualityHint + '</small></li>';
                 }).join('')
                 : '<li class="text-muted">已平仓样本不足，等待更多成交。</li>';
             const comboRows = worst.concat(best).slice(0, 6).map(item => {
@@ -1104,15 +1151,17 @@
                 const pnlClass = pnl >= 0 ? 'text-success' : 'text-danger';
                 return '<tr>'
                     + '<td class="text-wrap-mobile">' + escapeHtml(item.label || item.key || '—') + '</td>'
-                    + '<td>' + escapeHtml(item.match_count || 0) + '</td>'
+                    + '<td>' + escapeHtml(item.match_count || 0) + '<br><small class="text-muted">' + escapeHtml(item.token_count || 0) + ' token</small></td>'
+                    + '<td>' + escapeHtml(item.sample_quality_label || item.sample_quality || '—') + '</td>'
                     + '<td class="' + pnlClass + '">' + formatMoneyNum(pnl) + '</td>'
+                    + '<td>' + (item.worst_match_pnl != null ? formatMoneyNum(item.worst_match_pnl) : '—') + '</td>'
                     + '<td>' + (item.return_pct != null ? Number(item.return_pct).toFixed(1) + '%' : '—') + '</td>'
                     + '<td>' + (item.win_rate_pct != null ? Number(item.win_rate_pct).toFixed(0) + '%' : '—') + '</td>'
                     + '</tr>';
             }).join('');
             const comboTable = comboRows
                 ? '<div class="table-responsive mt-2"><table class="table table-sm align-middle mb-0">'
-                    + '<thead><tr><th>组合</th><th>平仓</th><th>已实现</th><th>回报</th><th>胜率</th></tr></thead>'
+                    + '<thead><tr><th>组合</th><th>平仓</th><th>样本</th><th>已实现</th><th>最差单笔</th><th>回报</th><th>胜率</th></tr></thead>'
                     + '<tbody>' + comboRows + '</tbody></table></div>'
                 : '<div class="text-muted small mt-2">暂无可排序组合。</div>';
             return '<div class="card shadow-sm mb-3"><div class="card-body">'
@@ -1186,6 +1235,8 @@
                 const candidates = candidatesByTier[tier.key] || [];
                 const heldShares = candidates.reduce((sum, c) => sum + (Number(c.heldShares) || 0), 0);
                 const heldValue = candidates.reduce((sum, c) => sum + (Number(c.heldValue) || 0), 0);
+                const pendingBuyValue = candidates.reduce((sum, c) => sum + (Number(c.pendingBuyNotional) || 0), 0);
+                const committedValue = heldValue + pendingBuyValue;
                 const manualRaw = (activePrefs.realized || {})[tier.key];
                 const hasManual = manualRaw !== undefined && manualRaw !== null && manualRaw !== '';
                 const autoStats = autoRealizedByTier[tier.key] || { realizedPnl: 0, grossRealizedLoss: 0 };
@@ -1209,7 +1260,7 @@
                 const riskAdjustedCapAmount = entryStatus === 'block'
                     ? 0
                     : (entryStatus === 'caution' ? (effectivePositionCapAmount || 0) * 0.5 : effectivePositionCapAmount);
-                const riskAdjustedHeadroom = riskAdjustedCapAmount != null ? Math.max(0, riskAdjustedCapAmount - heldValue) : null;
+                const riskAdjustedHeadroom = riskAdjustedCapAmount != null ? Math.max(0, riskAdjustedCapAmount - committedValue) : null;
                 const eligibleCandidates = candidates.filter(c => _combineMonthlyGoalEntryStatus(
                     riskEntryStatus,
                     c.midNoEntryGate ? c.midNoEntryGate.status : 'allow'
@@ -1249,12 +1300,16 @@
                     ? '<br><small class="text-warning">阶段建议 ' + phaseSuggestedPositionPct.toFixed(1) + '%；新增按更保守上限</small>'
                     : '<br><small class="text-muted">阶段建议 ' + phaseSuggestedPositionPct.toFixed(1) + '%</small>';
                 const effectiveHint = '<small class="text-muted">有效上限 ' + formatMoneyNum(effectivePositionCapAmount)
+                    + '；已承诺 ' + formatMoneyNum(committedValue)
                     + '；风控余量 ' + formatMoneyNum(riskAdjustedHeadroom) + '</small>';
+                const pendingHint = pendingBuyValue >= 0.005
+                    ? '<br><small class="text-warning">待触发买入 ' + formatMoneyNum(pendingBuyValue) + ' 已占用余量</small>'
+                    : '';
                 rows += '<tr>'
                     + '<td><span class="badge text-bg-' + tier.tone + '">' + tier.label + '</span><br><small class="text-muted">' + tier.outcome + ' · 预期收益 ' + tier.returnPct + '%</small></td>'
                     + '<td><div class="input-group input-group-sm mb-1" style="max-width:130px;"><input type="number" class="form-control" min="0" max="100" step="0.1" value="' + targetPositionPct.toFixed(1) + '" oninput="setMonthlyGoalTargetPosition(' + jsSingleQuoted(tier.key) + ', this.value)"' + (monthlyGoalEditMode ? '' : ' disabled') + '><span class="input-group-text">%</span></div>'
                     + '<div>' + formatMoneyNum(targetPositionAmount) + '</div><small class="text-muted">' + (priceHint || '可手动调整占比') + '</small>' + phaseHint + '<br>' + effectiveHint + '</td>'
-                    + '<td>' + (targetShares != null ? formatTokenAmount(targetShares) : '—') + '<br><small class="text-muted">当前 ' + formatTokenAmount(heldShares) + ' 张 / ' + formatMoneyNum(heldValue) + '</small></td>'
+                    + '<td>' + (targetShares != null ? formatTokenAmount(targetShares) : '—') + '<br><small class="text-muted">当前 ' + formatTokenAmount(heldShares) + ' 张 / ' + formatMoneyNum(heldValue) + '</small>' + pendingHint + '</td>'
                     + '<td>' + formatMoneyNum(tierProfit) + '<br><small class="text-muted">有效贡献 ' + effectiveTargetContributionPct.toFixed(1) + '%；手动计划 ' + targetContributionPct.toFixed(1) + '%</small></td>'
                     + '<td style="min-width:130px;"><input type="number" class="form-control form-control-sm" step="0.01" value="' + realized.toFixed(2) + '" data-tier-key="' + tier.key + '" oninput="setMonthlyGoalRealized(this.dataset.tierKey, this.value)"' + (monthlyGoalEditMode ? '' : ' disabled') + '>' + realizedHint + '</td>'
                     + '<td>' + _monthlyGoalLossStatusBadge(entryStatus) + '<br>' + lossBudgetHint + '</td>'

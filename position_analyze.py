@@ -10,12 +10,13 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from typing import Any
 
 from config import TO_EMAIL, GEMINI_MODEL_ID
 from data.polymarket import get_positions, get_open_orders, get_event_situation, get_balance_allowance
 from data.binance import get_btc_price, get_4h_klines_data, get_1d_klines_data
 from data.deribit import get_btc_dvol
-from ai.prompts import RESPONSE_SCHEMA, get_system_instruction
+from ai.prompts import RESPONSE_SCHEMA, get_system_instruction, get_user_prompt
 from ai.researcher import analyze_market_with_grounding
 from notifications.email import EmailSender
 from notifications.html import generate_html_template
@@ -334,6 +335,55 @@ def _build_prompt_metadata() -> dict[str, str]:
     }
 
 
+def _build_prompt_metrics(
+    *,
+    current_date: str,
+    monthly_target: str,
+    polymarket_status: list,
+    btc_4h_k_data: list,
+    btc_1d_k_data: list,
+    daily_volatility_profile: dict,
+    intraday_volatility_hint: dict,
+    future_possibility_context: dict,
+    profit_optimization_context: dict,
+    market_sentiment_and_funding: dict,
+    polymarket_event_situation: dict,
+    usdc_balance: str,
+    recommendation_memory_context: dict | None,
+    previous_report: dict | None,
+    operator_intent: str | None,
+) -> dict[str, Any]:
+    """持久化 prompt 长度，防止上下文膨胀而不可见。"""
+    system_prompt = get_system_instruction(current_date, monthly_target=monthly_target)
+    user_prompt = get_user_prompt(
+        polymarket_status,
+        btc_4h_k_data,
+        btc_1d_k_data,
+        daily_volatility_profile,
+        intraday_volatility_hint,
+        future_possibility_context,
+        profit_optimization_context,
+        market_sentiment_and_funding,
+        polymarket_event_situation,
+        usdc_balance,
+        recommendation_memory_context=recommendation_memory_context,
+        previous_report=previous_report,
+        operator_intent=operator_intent,
+    )
+    schema_text = json.dumps(RESPONSE_SCHEMA, ensure_ascii=False, sort_keys=True)
+    total_chars = len(system_prompt) + len(user_prompt) + len(schema_text)
+    return {
+        "system_chars": len(system_prompt),
+        "user_chars": len(user_prompt),
+        "schema_chars": len(schema_text),
+        "system_user_chars": len(system_prompt) + len(user_prompt),
+        "total_chars_with_schema": total_chars,
+        "estimated_tokens_chars_div_4": int((total_chars + 3) // 4),
+        "estimated_tokens_method": "ceil((system+user+schema chars)/4)",
+        "measurement_source": "position_analyze_reconstructed_before_call",
+    }
+
+
 def _build_future_possibility_context(
     btc_1d_k_data: list,
     current_btc_price: float,
@@ -568,6 +618,7 @@ if __name__ == "__main__":
             realized_overrides=monthly_goal_setting.get("realized_overrides") or {},
             target_position_overrides=monthly_goal_setting.get("target_position_overrides") or {},
             btc_momentum_context=btc_momentum_context,
+            active_manual_pending_orders=active_manual_pending_orders,
             profile=ANALYZE_PROFILE,
         )
         profit_optimization_context["monthly_goal_context"] = monthly_goal_context
@@ -592,6 +643,31 @@ if __name__ == "__main__":
         f"{time_now} Event市场过滤完成: raw={raw_market_count} kept={kept_market_count}"
     )
     print(f"{time_now} Polymarket 事件/市场现价与 USDC 余额获取完成,开始进行AI分析")
+    monthly_target_text = f"月度净值目标 +{float(monthly_goal_context.get('target_pct') or 20.0):g}%"
+    operator_intent = os.environ.get("OPERATOR_INTENT") or None
+    current_prompt_date = datetime.now(ET_TIMEZONE).strftime("%Y-%m-%d")
+    prompt_metrics = _build_prompt_metrics(
+        current_date=current_prompt_date,
+        monthly_target=monthly_target_text,
+        polymarket_status=formatted,
+        btc_4h_k_data=btc_4h_k_data,
+        btc_1d_k_data=btc_1d_k_data,
+        daily_volatility_profile=daily_volatility_profile,
+        intraday_volatility_hint=intraday_volatility_hint,
+        future_possibility_context=future_possibility_context,
+        profit_optimization_context=profit_optimization_context,
+        market_sentiment_and_funding=market_sentiment_and_funding,
+        polymarket_event_situation=event_situation,
+        usdc_balance=usdc_balance,
+        recommendation_memory_context=recommendation_memory_context,
+        previous_report=previous_report,
+        operator_intent=operator_intent,
+    )
+    print(
+        f"{time_now} Prompt长度: system={prompt_metrics['system_chars']} "
+        f"user={prompt_metrics['user_chars']} total+schema={prompt_metrics['total_chars_with_schema']} "
+        f"est_tokens={prompt_metrics['estimated_tokens_chars_div_4']}"
+    )
 
     analyze_result = analyze_market_with_grounding(
         formatted,
@@ -606,8 +682,8 @@ if __name__ == "__main__":
         usdc_balance,
         recommendation_memory_context=recommendation_memory_context,
         previous_report=previous_report,
-        operator_intent=os.environ.get("OPERATOR_INTENT") or None,
-        monthly_target=f"月度净值目标 +{float(monthly_goal_context.get('target_pct') or 20.0):g}%",
+        operator_intent=operator_intent,
+        monthly_target=monthly_target_text,
     )
     recommendation_items = build_recommendation_items(
         analyze_result,
@@ -628,6 +704,7 @@ if __name__ == "__main__":
         schema_hash=prompt_metadata["schema_hash"],
         btc_price=float(current_btc_price),
         days_left_in_month=float(future_possibility_context.get("days_left_in_month") or 0.0),
+        prompt_metrics=prompt_metrics,
         input_snapshot={
             "positions": positions,
             "formatted_positions": formatted,
@@ -637,10 +714,11 @@ if __name__ == "__main__":
             "profit_optimization_context": profit_optimization_context,
             "recommendation_memory_context": recommendation_memory_context,
             "active_manual_pending_orders": active_manual_pending_orders,
+            "prompt_metrics": prompt_metrics,
             "market_sentiment_and_funding": market_sentiment_and_funding,
             "polymarket_event_situation": event_situation,
             "usdc_balance": usdc_balance,
-            "operator_intent": os.environ.get("OPERATOR_INTENT") or None,
+            "operator_intent": operator_intent,
             "previous_report_summary": (
                 previous_report.get("整体分析") if isinstance(previous_report, dict) else None
             ),
