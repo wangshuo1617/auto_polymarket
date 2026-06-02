@@ -944,6 +944,111 @@ def _intent_from_open_lots(trade_review_summary: dict[str, Any] | None) -> dict[
     return by_token
 
 
+def _open_lot_intents_by_token(trade_review_summary: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+    by_token: dict[str, dict[str, dict[str, Any]]] = {}
+    if not isinstance(trade_review_summary, dict):
+        return {}
+    for lot in trade_review_summary.get("open_lots") or []:
+        if not isinstance(lot, dict):
+            continue
+        token_id = str(lot.get("token_id") or "").strip()
+        tier_key = str(lot.get("tier_key") or "").strip()
+        if not token_id or tier_key not in ACTIONABLE_TIER_LABELS:
+            continue
+        cost = _to_float(lot.get("remaining_cost"), 0.0) or 0.0
+        if cost <= 0:
+            continue
+        bucket = by_token.setdefault(token_id, {})
+        row = bucket.setdefault(tier_key, {
+            "intent_tier_key": tier_key,
+            "intent_tier_label": lot.get("tier_label") or ACTIONABLE_TIER_LABELS.get(tier_key),
+            "source": "open_lot_entry_tier",
+            "remaining_cost_usdc": 0.0,
+            "buy_timestamps": [],
+        })
+        row["remaining_cost_usdc"] += cost
+        if lot.get("buy_timestamp"):
+            row["buy_timestamps"].append(lot.get("buy_timestamp"))
+    return {
+        token_id: sorted(
+            (
+                {**row, "remaining_cost_usdc": round(float(row.get("remaining_cost_usdc") or 0.0), 2)}
+                for row in tiers.values()
+            ),
+            key=lambda item: float(item.get("remaining_cost_usdc") or 0.0),
+            reverse=True,
+        )
+        for token_id, tiers in by_token.items()
+    }
+
+
+def _pending_buy_intents_by_token_tier(active_manual_pending_orders: dict[str, Any] | None) -> dict[str, dict[str, dict[str, Any]]]:
+    out: dict[str, dict[str, dict[str, Any]]] = {}
+    if not isinstance(active_manual_pending_orders, dict):
+        return out
+    for order in active_manual_pending_orders.get("orders") or []:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("action") or "").strip().lower() != "buy":
+            continue
+        if str(order.get("status") or "pending").strip().lower() not in {"pending", "executing"}:
+            continue
+        token_id = str(order.get("token_id") or "").strip()
+        tier_key = str(order.get("intent_tier_key") or "").strip()
+        if not token_id or tier_key not in ACTIONABLE_TIER_LABELS:
+            continue
+        row = out.setdefault(token_id, {}).setdefault(tier_key, {
+            "pending_buy_notional_usdc": 0.0,
+            "pending_order_ids": [],
+            "pending_plan_ids": [],
+        })
+        row["pending_buy_notional_usdc"] += _pending_order_buy_notional(order)
+        if order.get("id") is not None:
+            row["pending_order_ids"].append(order.get("id"))
+        if order.get("plan_id") is not None and order.get("plan_id") not in row["pending_plan_ids"]:
+            row["pending_plan_ids"].append(order.get("plan_id"))
+    return out
+
+
+def _held_allocations_by_token_tier(
+    *,
+    positions: list | None,
+    open_lot_intents: dict[str, list[dict[str, Any]]],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    by_token, _by_question = _build_position_indexes(positions)
+    out: dict[str, dict[str, dict[str, Any]]] = {}
+    for token_id, held in by_token.items():
+        held_value = float(held.get("value") or 0.0)
+        held_shares = float(held.get("shares") or 0.0)
+        lots = open_lot_intents.get(token_id) or []
+        total_cost = sum(float(lot.get("remaining_cost_usdc") or 0.0) for lot in lots)
+        if held_value <= 0 and held_shares <= 0:
+            continue
+        if total_cost <= 0:
+            continue
+        for lot in lots:
+            tier_key = str(lot.get("intent_tier_key") or "")
+            if tier_key not in ACTIONABLE_TIER_LABELS:
+                continue
+            ratio = float(lot.get("remaining_cost_usdc") or 0.0) / total_cost
+            row = out.setdefault(token_id, {}).setdefault(tier_key, {
+                "held_value_usdc": 0.0,
+                "held_shares": 0.0,
+                "remaining_cost_usdc": 0.0,
+                "intent_tier_label": lot.get("intent_tier_label") or ACTIONABLE_TIER_LABELS.get(tier_key),
+                "intent_source": lot.get("source") or "open_lot_entry_tier",
+            })
+            row["held_value_usdc"] += held_value * ratio
+            row["held_shares"] += held_shares * ratio
+            row["remaining_cost_usdc"] += float(lot.get("remaining_cost_usdc") or 0.0)
+    for tiers in out.values():
+        for row in tiers.values():
+            row["held_value_usdc"] = round(float(row.get("held_value_usdc") or 0.0), 2)
+            row["held_shares"] = round(float(row.get("held_shares") or 0.0), 6)
+            row["remaining_cost_usdc"] = round(float(row.get("remaining_cost_usdc") or 0.0), 2)
+    return out
+
+
 def _auxiliary_group_for(entry: dict[str, Any] | None) -> tuple[str, str, str] | None:
     if not isinstance(entry, dict):
         return ("unknown", "未识别", "当前 event 中未找到该 token，无法计算距离/价格")
@@ -978,7 +1083,11 @@ def _build_exposure_classification(
         days_left_in_month=days_left_in_month,
     )
     pending_intents = _intent_from_pending_orders(active_manual_pending_orders)
-    open_lot_intents = _intent_from_open_lots(trade_review_summary)
+    open_lot_intents = _open_lot_intents_by_token(trade_review_summary)
+    held_by_token_tier = _held_allocations_by_token_tier(
+        positions=positions,
+        open_lot_intents=open_lot_intents,
+    )
     core_items: list[dict[str, Any]] = []
     auxiliary_items: list[dict[str, Any]] = []
     grouped_aux: dict[str, dict[str, Any]] = {}
@@ -990,7 +1099,46 @@ def _build_exposure_classification(
         if held_value < 0.01 and held_shares < 1e-9:
             continue
         entry = market_by_token.get(token_id)
-        intent = pending_intents.get(token_id) or open_lot_intents.get(token_id)
+        tier_allocations = held_by_token_tier.get(token_id) or {}
+        if tier_allocations:
+            for intent_key, allocation in tier_allocations.items():
+                if intent_key not in ACTIONABLE_TIER_LABELS:
+                    continue
+                current_key = entry.get("current_tier_key") if entry else None
+                if current_key == intent_key:
+                    band_status = "in_band"
+                    band_label = "当前仍在意图档位区间"
+                elif current_key:
+                    band_status = "shifted_band"
+                    band_label = f"当前落入 {ACTIONABLE_TIER_LABELS.get(current_key, current_key)}"
+                elif entry:
+                    band_status = "out_of_band"
+                    band_label = "当前已滑出四档主战区"
+                else:
+                    band_status = "unknown"
+                    band_label = "当前 event 未匹配，无法判断是否出带"
+                core_items.append({
+                    "token_id": token_id,
+                    "question": (entry or {}).get("question"),
+                    "outcome": (entry or {}).get("outcome"),
+                    "intent_tier_key": intent_key,
+                    "intent_tier_label": allocation.get("intent_tier_label") or ACTIONABLE_TIER_LABELS.get(intent_key),
+                    "intent_source": allocation.get("intent_source"),
+                    "current_tier_key": current_key,
+                    "current_tier_label": ACTIONABLE_TIER_LABELS.get(current_key),
+                    "band_status": band_status,
+                    "band_label": band_label,
+                    "held_shares": round(float(allocation.get("held_shares") or 0.0), 6),
+                    "held_value_usdc": round(float(allocation.get("held_value_usdc") or 0.0), 2),
+                    "remaining_cost_usdc": round(float(allocation.get("remaining_cost_usdc") or 0.0), 2),
+                    "price": (entry or {}).get("price"),
+                    "strike": (entry or {}).get("strike"),
+                    "distance_pct": (entry or {}).get("distance_pct"),
+                    "pending_order_ids": [],
+                    "pending_plan_ids": [],
+                })
+            continue
+        intent = pending_intents.get(token_id)
         if intent and intent.get("intent_tier_key") in ACTIONABLE_TIER_LABELS:
             intent_key = str(intent["intent_tier_key"])
             current_key = entry.get("current_tier_key") if entry else None
@@ -1019,6 +1167,7 @@ def _build_exposure_classification(
                 "band_label": band_label,
                 "held_shares": round(held_shares, 6),
                 "held_value_usdc": round(held_value, 2),
+                "remaining_cost_usdc": None,
                 "price": (entry or {}).get("price"),
                 "strike": (entry or {}).get("strike"),
                 "distance_pct": (entry or {}).get("distance_pct"),
@@ -1998,7 +2147,7 @@ def get_monthly_trade_review_summary(
         "worst_combinations": worst_combinations,
         "conclusions": conclusions,
         "sample_trades": matched_trades[:20],
-        "open_lots": sorted(open_lots, key=lambda item: float(item.get("remaining_cost") or 0.0), reverse=True)[:20],
+        "open_lots": sorted(open_lots, key=lambda item: float(item.get("remaining_cost") or 0.0), reverse=True)[:200],
     }
 
 
@@ -2049,13 +2198,24 @@ def build_monthly_goal_context(
     total_target_profit = base * pct / 100.0 if base > 0 and pct > 0 else None
     phase_key, phase_label = _classify_time_phase(days_left_in_month)
     thresholds = _current_phase_thresholds(phase_key)
-    by_token, by_question_outcome = _build_position_indexes(positions)
     pending_buys_by_token = _active_pending_buys_by_token(active_manual_pending_orders)
+    open_lot_intents = _open_lot_intents_by_token(trade_review_summary)
+    held_by_token_tier = _held_allocations_by_token_tier(
+        positions=positions,
+        open_lot_intents=open_lot_intents,
+    )
+    pending_buys_by_token_tier = _pending_buy_intents_by_token_tier(active_manual_pending_orders)
     pending_tokens_seen: set[str] = set()
+    pending_token_tiers_seen: set[tuple[str, str]] = set()
     normalized_realized_overrides = _normalize_realized_overrides(realized_overrides or {})
 
     candidates_by_tier: dict[str, list[dict]] = {tier["key"]: [] for tier in MONTHLY_GOAL_TIERS}
     markets = polymarket_event_situation.get("markets", []) if isinstance(polymarket_event_situation, dict) else []
+    market_entries_by_token = _market_entries_by_token(
+        markets=markets,
+        current_btc_price=current_btc_price,
+        days_left_in_month=days_left_in_month,
+    )
     exposure_classification = _build_exposure_classification(
         positions=positions,
         markets=markets,
@@ -2064,6 +2224,7 @@ def build_monthly_goal_context(
         active_manual_pending_orders=active_manual_pending_orders,
         trade_review_summary=trade_review_summary,
     )
+    candidate_token_tiers_seen: set[tuple[str, str]] = set()
     for market in markets:
         if not isinstance(market, dict) or _market_is_settled(market):
             continue
@@ -2087,6 +2248,7 @@ def build_monthly_goal_context(
             )
             if tier_key != tier["key"]:
                 continue
+            tier_key = str(tier["key"])
             outcome_index = next(
                 (idx for idx, name in enumerate(outcomes)
                  if str(name or "").strip().lower() == str(tier["outcome"]).lower()),
@@ -2095,13 +2257,14 @@ def build_monthly_goal_context(
             if outcome_index < 0:
                 continue
             token_id = str(token_ids[outcome_index]) if outcome_index < len(token_ids) else ""
-            held = by_token.get(token_id) if token_id else None
+            held = (held_by_token_tier.get(token_id) or {}).get(tier_key) if token_id else None
             if held is None:
-                held = by_question_outcome.get(_position_match_key(question, tier["outcome"]), {"shares": 0.0, "value": 0.0})
-            pending_row = pending_buys_by_token.get(token_id) if token_id else None
+                held = {"held_shares": 0.0, "held_value_usdc": 0.0}
+            pending_row = (pending_buys_by_token_tier.get(token_id) or {}).get(tier_key) if token_id else None
             pending_buy_notional = float((pending_row or {}).get("pending_buy_notional_usdc") or 0.0)
             if pending_buy_notional > 0 and token_id:
                 pending_tokens_seen.add(token_id)
+                pending_token_tiers_seen.add((token_id, tier_key))
             price = _entry_price_for_outcome(market, outcome_index)
             candidate = {
                 "question": question,
@@ -2111,12 +2274,18 @@ def build_monthly_goal_context(
                 "strike": round(float(strike), 2),
                 "direction_in_question": direction,
                 "distance_pct": round(distance_pct, 2),
-                "held_shares": round(float(held.get("shares") or 0.0), 6),
-                "held_value_usdc": round(float(held.get("value") or 0.0), 2),
+                "held_shares": round(float(held.get("held_shares") or 0.0), 6),
+                "held_value_usdc": round(float(held.get("held_value_usdc") or 0.0), 2),
+                "held_intent_tier_key": tier_key if float(held.get("held_value_usdc") or 0.0) > 0 else None,
+                "current_tier_key": tier_key,
+                "band_status": "in_band" if float(held.get("held_value_usdc") or 0.0) > 0 else None,
+                "allocation_candidate": True,
                 "pending_buy_notional_usdc": round(pending_buy_notional, 2),
                 "pending_order_ids": list((pending_row or {}).get("pending_order_ids") or [])[:8],
                 "pending_plan_ids": list((pending_row or {}).get("pending_plan_ids") or [])[:8],
             }
+            if token_id:
+                candidate_token_tiers_seen.add((token_id, tier_key))
             if tier["key"] == "mid_no":
                 candidate["mid_no_entry_gate"] = _mid_no_entry_gate(
                     direction_in_question=direction,
@@ -2125,8 +2294,54 @@ def build_monthly_goal_context(
                     btc_momentum_context=btc_momentum_context,
                 )
             candidates_by_tier[tier["key"]].append(candidate)
+    for token_id in sorted(set(held_by_token_tier) | set(pending_buys_by_token_tier)):
+        entry = market_entries_by_token.get(token_id) or {}
+        tier_keys = set((held_by_token_tier.get(token_id) or {}).keys()) | set((pending_buys_by_token_tier.get(token_id) or {}).keys())
+        for tier_key in tier_keys:
+            if tier_key not in candidates_by_tier or (token_id, tier_key) in candidate_token_tiers_seen:
+                continue
+            held = (held_by_token_tier.get(token_id) or {}).get(tier_key) or {}
+            pending_row = (pending_buys_by_token_tier.get(token_id) or {}).get(tier_key) or {}
+            pending_buy_notional = float(pending_row.get("pending_buy_notional_usdc") or 0.0)
+            held_value = float(held.get("held_value_usdc") or 0.0)
+            held_shares = float(held.get("held_shares") or 0.0)
+            if held_value <= 0 and pending_buy_notional <= 0:
+                continue
+            if pending_buy_notional > 0:
+                pending_tokens_seen.add(token_id)
+                pending_token_tiers_seen.add((token_id, tier_key))
+            current_tier_key = entry.get("current_tier_key")
+            if current_tier_key == tier_key:
+                band_status = "in_band"
+            elif current_tier_key:
+                band_status = "shifted_band"
+            elif entry:
+                band_status = "out_of_band"
+            else:
+                band_status = "unknown"
+            candidate = {
+                "question": entry.get("question") or None,
+                "outcome": entry.get("outcome") or None,
+                "token_id": token_id,
+                "price": entry.get("price"),
+                "strike": entry.get("strike"),
+                "direction_in_question": entry.get("direction_in_question"),
+                "distance_pct": entry.get("distance_pct"),
+                "held_shares": round(held_shares, 6),
+                "held_value_usdc": round(held_value, 2),
+                "held_intent_tier_key": tier_key if held_value > 0 else None,
+                "current_tier_key": current_tier_key,
+                "current_tier_label": ACTIONABLE_TIER_LABELS.get(current_tier_key),
+                "band_status": band_status,
+                "allocation_candidate": False,
+                "intent_only_note": "按入场/挂单意图占用该档；当前不作为新增候选分配余量",
+                "pending_buy_notional_usdc": round(pending_buy_notional, 2),
+                "pending_order_ids": list(pending_row.get("pending_order_ids") or [])[:8],
+                "pending_plan_ids": list(pending_row.get("pending_plan_ids") or [])[:8],
+            }
+            candidates_by_tier[tier_key].append(candidate)
     for values in candidates_by_tier.values():
-        values.sort(key=lambda item: item.get("strike") or 0.0, reverse=True)
+        values.sort(key=lambda item: (0 if item.get("allocation_candidate") is False else 1, item.get("strike") or 0.0), reverse=True)
 
     realized_by_tier = realized_summary.get("by_tier") or {}
     tier_contexts: list[dict[str, Any]] = []
@@ -2137,10 +2352,14 @@ def build_monthly_goal_context(
         float(item.get("pending_buy_notional_usdc") or 0.0)
         for item in pending_buys_by_token.values()
     )
-    unattributed_pending_tokens = [
-        token_id for token_id in pending_buys_by_token
-        if token_id not in pending_tokens_seen
-    ]
+    unattributed_pending_tokens = []
+    for token_id, row in pending_buys_by_token.items():
+        tier_rows = pending_buys_by_token_tier.get(token_id) or {}
+        if not tier_rows:
+            unattributed_pending_tokens.append(token_id)
+            continue
+        if any((token_id, tier_key) not in pending_token_tiers_seen for tier_key in tier_rows):
+            unattributed_pending_tokens.append(token_id)
     unattributed_pending_buy_notional = sum(
         float(pending_buys_by_token[token_id].get("pending_buy_notional_usdc") or 0.0)
         for token_id in unattributed_pending_tokens
@@ -2209,13 +2428,17 @@ def build_monthly_goal_context(
         for candidate in candidates:
             market_gate = "allow"
             gate_reasons: list[str] = []
-            if tier_key == "mid_no":
+            if candidate.get("allocation_candidate") is False:
+                market_gate = "allow"
+                gate_reasons = ["该项按原入场/挂单意图占用本档，不作为新增候选分配余量"]
+            elif tier_key == "mid_no":
                 mid_gate = candidate.get("mid_no_entry_gate") or {}
                 market_gate = str(mid_gate.get("status") or "allow")
                 gate_reasons = list(mid_gate.get("reasons") or [])
             candidate_gate = _combine_entry_status(risk_entry_gate, market_gate)
-            candidate_gate_statuses.append(candidate_gate)
-            if candidate_gate != "block":
+            if candidate.get("allocation_candidate") is not False:
+                candidate_gate_statuses.append(candidate_gate)
+            if candidate_gate != "block" and candidate.get("allocation_candidate") is not False:
                 eligible_candidate_count += 1
             enriched = dict(candidate)
             enriched["entry_gate"] = candidate_gate
@@ -2252,7 +2475,7 @@ def build_monthly_goal_context(
             ))
         eligible_candidates_for_allocation = [
             c for c in enriched_candidates
-            if c.get("entry_gate") != "block"
+            if c.get("entry_gate") != "block" and c.get("allocation_candidate") is not False
         ]
         per_candidate_headroom = (
             (risk_adjusted_headroom or 0.0) / len(eligible_candidates_for_allocation)
@@ -2263,7 +2486,9 @@ def build_monthly_goal_context(
         for enriched in enriched_candidates:
             price = enriched.get("price")
             candidate_target_shares = None
-            if enriched.get("entry_gate") == "block":
+            if enriched.get("allocation_candidate") is False:
+                candidate_target = None
+            elif enriched.get("entry_gate") == "block":
                 candidate_target = 0.0
             elif per_candidate_headroom is not None:
                 candidate_target = max(0.0, per_candidate_headroom)

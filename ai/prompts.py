@@ -522,6 +522,8 @@ def _compact_monthly_goal_context(monthly_goal_context):
                 "pending_plan_ids", "target_position_usdc", "target_shares",
                 "quality_score", "quality_label", "quality_reasons",
                 "mid_no_entry_gate", "entry_gate", "entry_gate_reasons",
+                "allocation_candidate", "held_intent_tier_key", "current_tier_key",
+                "current_tier_label", "band_status", "intent_only_note",
             ], text_limit=400)
             for c in kept_candidates
         ]

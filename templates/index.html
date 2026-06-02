@@ -998,6 +998,70 @@
             return out;
         }
 
+        function _activeManualPendingBuysByTokenTier() {
+            const out = {};
+            Object.values(manualPendingById || {}).forEach(order => {
+                if (!order || String(order.action || '').toLowerCase() !== 'buy') return;
+                const status = String(order.status || 'pending').toLowerCase();
+                if (!['pending', 'executing'].includes(status)) return;
+                const tokenId = String(order.token_id || '');
+                const extra = order.extra && typeof order.extra === 'object' ? order.extra : {};
+                const tierKey = String(order.intent_tier_key || extra.intent_tier_key || '');
+                if (!tokenId || !MONTHLY_GOAL_TIERS.some(t => t.key === tierKey)) return;
+                if (!out[tokenId]) out[tokenId] = {};
+                if (!out[tokenId][tierKey]) out[tokenId][tierKey] = { notional: 0, orders: [] };
+                out[tokenId][tierKey].orders.push(order);
+                out[tokenId][tierKey].notional += _manualPendingBuyNotional(order, null);
+            });
+            return out;
+        }
+
+        function _monthlyGoalOpenLotAllocationsByToken() {
+            const out = {};
+            ((monthlyGoalTradeReview || {}).open_lots || []).forEach(lot => {
+                const tokenId = String((lot || {}).token_id || '');
+                const tierKey = String((lot || {}).tier_key || '');
+                const cost = Number((lot || {}).remaining_cost || 0);
+                const tier = MONTHLY_GOAL_TIERS.find(t => t.key === tierKey);
+                if (!tokenId || !tier || !Number.isFinite(cost) || cost <= 0) return;
+                if (!out[tokenId]) out[tokenId] = {};
+                if (!out[tokenId][tierKey]) {
+                    out[tokenId][tierKey] = {
+                        cost: 0,
+                        intentTierKey: tier.key,
+                        intentTierLabel: lot.tier_label || tier.label,
+                        source: 'open_lot_entry_tier',
+                    };
+                }
+                out[tokenId][tierKey].cost += cost;
+            });
+            return out;
+        }
+
+        function _monthlyGoalHeldAllocationsByTokenTier(positionsByAsset) {
+            const lotsByToken = _monthlyGoalOpenLotAllocationsByToken();
+            const out = {};
+            Object.keys(positionsByAsset || {}).forEach(tokenId => {
+                const held = positionsByAsset[tokenId] || { shares: 0, value: 0 };
+                const tiers = lotsByToken[tokenId] || {};
+                const totalCost = Object.values(tiers).reduce((sum, item) => sum + Number(item.cost || 0), 0);
+                if (!Number.isFinite(totalCost) || totalCost <= 0) return;
+                Object.keys(tiers).forEach(tierKey => {
+                    const item = tiers[tierKey];
+                    const ratio = Number(item.cost || 0) / totalCost;
+                    if (!out[tokenId]) out[tokenId] = {};
+                    out[tokenId][tierKey] = {
+                        heldShares: Number(held.shares || 0) * ratio,
+                        heldValue: Number(held.value || 0) * ratio,
+                        remainingCost: Number(item.cost || 0),
+                        intentTierLabel: item.intentTierLabel,
+                        source: item.source,
+                    };
+                });
+            });
+            return out;
+        }
+
         function _monthlyGoalCandidatesByTier() {
             const positionsByAsset = {};
             (latestPositionsData || []).forEach(p => {
@@ -1011,7 +1075,10 @@
             });
 
             const out = {};
-            const pendingBuysByToken = _activeManualPendingBuysByToken();
+            const heldByTokenTier = _monthlyGoalHeldAllocationsByTokenTier(positionsByAsset);
+            const pendingBuysByTokenTier = _activeManualPendingBuysByTokenTier();
+            const marketByToken = _monthlyGoalMarketEntriesByToken();
+            const seen = {};
             MONTHLY_GOAL_TIERS.forEach(tier => { out[tier.key] = []; });
             ((latestEventsData || {}).markets || []).forEach(market => {
                 const hasSettledPrice = (market.outcomePrices || []).some(price => Number(price) === 1);
@@ -1022,31 +1089,68 @@
                     if (index < 0) return;
                     const tokenId = String((market.token_id || [])[index] || '');
                     const price = _entryPriceForOutcome(market, index);
-                    const held = positionsByAsset[tokenId] || { shares: 0, value: 0 };
-                    const pendingOrders = pendingBuysByToken[tokenId] || [];
-                    const pendingBuyNotional = pendingOrders.reduce((sum, order) => sum + _manualPendingBuyNotional(order, price), 0);
+                    const held = (heldByTokenTier[tokenId] || {})[tier.key] || { heldShares: 0, heldValue: 0 };
+                    const pendingBucket = (pendingBuysByTokenTier[tokenId] || {})[tier.key] || { notional: 0, orders: [] };
                     const barrierMeta = market.barrierMeta || {};
                     const distancePct = Number(barrierMeta.distance_pct);
                     const candidate = {
                         question: market.question || '',
                         tokenId,
                         price,
-                        heldShares: held.shares,
-                        heldValue: held.value,
-                        pendingBuyNotional,
-                        pendingOrderIds: pendingOrders.map(o => o.id).filter(v => v != null).slice(0, 8),
+                        heldShares: held.heldShares || 0,
+                        heldValue: held.heldValue || 0,
+                        heldIntentTierKey: held.heldValue > 0 ? tier.key : null,
+                        currentTierKey: tier.key,
+                        bandStatus: held.heldValue > 0 ? 'in_band' : null,
+                        allocationCandidate: true,
+                        pendingBuyNotional: Number(pendingBucket.notional || 0),
+                        pendingOrderIds: (pendingBucket.orders || []).map(o => o.id).filter(v => v != null).slice(0, 8),
                         strike: _extractStrikeFromQuestion(market.question),
                         directionInQuestion: _extractDirectionFromQuestion(market.question),
                         distancePct: Number.isFinite(distancePct) ? distancePct : null,
                     };
+                    seen[tokenId + '|' + tier.key] = true;
                     if (tier.key === 'mid_no') {
                         candidate.midNoEntryGate = _monthlyGoalMidNoEntryGate(candidate);
                     }
                     out[tier.key].push(candidate);
                 });
             });
+            const allTokens = new Set(Object.keys(heldByTokenTier).concat(Object.keys(pendingBuysByTokenTier)));
+            allTokens.forEach(tokenId => {
+                const tierKeys = new Set(Object.keys(heldByTokenTier[tokenId] || {}).concat(Object.keys(pendingBuysByTokenTier[tokenId] || {})));
+                const entry = marketByToken[tokenId] || {};
+                tierKeys.forEach(tierKey => {
+                    if (!out[tierKey] || seen[tokenId + '|' + tierKey]) return;
+                    const held = (heldByTokenTier[tokenId] || {})[tierKey] || { heldShares: 0, heldValue: 0 };
+                    const pendingBucket = (pendingBuysByTokenTier[tokenId] || {})[tierKey] || { notional: 0, orders: [] };
+                    if (Number(held.heldValue || 0) <= 0 && Number(pendingBucket.notional || 0) <= 0) return;
+                    const currentTierKey = entry.currentTierKey || null;
+                    out[tierKey].push({
+                        question: entry.question || '',
+                        tokenId,
+                        price: entry.price,
+                        heldShares: held.heldShares || 0,
+                        heldValue: held.heldValue || 0,
+                        heldIntentTierKey: tierKey,
+                        currentTierKey,
+                        currentTierLabel: entry.currentTierLabel,
+                        bandStatus: currentTierKey === tierKey ? 'in_band' : (currentTierKey ? 'shifted_band' : 'out_of_band'),
+                        allocationCandidate: false,
+                        intentOnlyNote: '按入场/挂单意图占用该档；当前不作为新增候选分配余量',
+                        pendingBuyNotional: Number(pendingBucket.notional || 0),
+                        pendingOrderIds: (pendingBucket.orders || []).map(o => o.id).filter(v => v != null).slice(0, 8),
+                        strike: entry.strike || 0,
+                        directionInQuestion: entry.directionInQuestion || 'unknown',
+                        distancePct: entry.distancePct,
+                    });
+                });
+            });
             Object.keys(out).forEach(key => {
-                out[key].sort((a, b) => b.strike - a.strike);
+                out[key].sort((a, b) => {
+                    const allocDiff = (b.allocationCandidate === false ? 0 : 1) - (a.allocationCandidate === false ? 0 : 1);
+                    return allocDiff || ((b.strike || 0) - (a.strike || 0));
+                });
             });
             return out;
         }
@@ -1133,11 +1237,29 @@
             const core = [];
             const auxiliary = [];
             const groups = {};
+            const positionsByAsset = {};
             (latestPositionsData || []).forEach(p => {
                 const tokenId = String(p.asset || '');
                 if (!tokenId) return;
                 const size = Number(p.size || 0);
                 const value = Number(p.currentValue != null ? p.currentValue : (size * Number(p.curPrice || 0)));
+                if (!positionsByAsset[tokenId]) {
+                    positionsByAsset[tokenId] = {
+                        shares: 0,
+                        value: 0,
+                        title: p.title || '',
+                        outcome: p.outcome || '',
+                        curPrice: p.curPrice,
+                    };
+                }
+                if (Number.isFinite(size)) positionsByAsset[tokenId].shares += size;
+                if (Number.isFinite(value)) positionsByAsset[tokenId].value += value;
+            });
+            const heldByTokenTier = _monthlyGoalHeldAllocationsByTokenTier(positionsByAsset);
+            Object.keys(positionsByAsset).forEach(tokenId => {
+                const p = positionsByAsset[tokenId] || {};
+                const size = Number(p.shares || 0);
+                const value = Number(p.value || 0);
                 if ((!Number.isFinite(value) || value < 0.01) && (!Number.isFinite(size) || size <= 0)) return;
                 const entry = marketByToken[tokenId] || {
                     question: p.title || '',
@@ -1149,6 +1271,35 @@
                     currentTierKey: null,
                     currentTierLabel: null,
                 };
+                const tierAllocations = heldByTokenTier[tokenId] || {};
+                if (Object.keys(tierAllocations).length > 0) {
+                    Object.keys(tierAllocations).forEach(tierKey => {
+                        const allocation = tierAllocations[tierKey] || {};
+                        const tier = MONTHLY_GOAL_TIERS.find(t => t.key === tierKey);
+                        const bandStatus = entry.currentTierKey === tierKey
+                            ? 'in_band'
+                            : (entry.currentTierKey ? 'shifted_band' : 'out_of_band');
+                        core.push({
+                            tokenId,
+                            question: entry.question || p.title || '',
+                            outcome: entry.outcome || p.outcome || '',
+                            heldValue: allocation.heldValue || 0,
+                            heldShares: allocation.heldShares || 0,
+                            intentTierKey: tierKey,
+                            intentTierLabel: allocation.intentTierLabel || (tier ? tier.label : tierKey),
+                            currentTierLabel: entry.currentTierLabel,
+                            bandStatus,
+                            bandLabel: bandStatus === 'in_band'
+                                ? '仍在意图区间'
+                                : (bandStatus === 'shifted_band' ? '滑到其他档' : '当前出带'),
+                            price: entry.price,
+                            strike: entry.strike,
+                            distancePct: entry.distancePct,
+                            pendingOrderIds: [],
+                        });
+                    });
+                    return;
+                }
                 const intent = intentByToken[tokenId];
                 if (intent && intent.intentTierKey) {
                     const bandStatus = entry.currentTierKey === intent.intentTierKey
@@ -1478,7 +1629,9 @@
                 ) ? 'block' : (
                     overallLossStatus.status === 'caution' || lossBudgetStatus.status === 'caution' ? 'caution' : 'ok'
                 );
-                const marketCandidateStatuses = candidates.map(c => (
+                const allocatableCandidates = candidates.filter(c => c.allocationCandidate !== false);
+                const occupiedIntentCount = candidates.length - allocatableCandidates.length;
+                const marketCandidateStatuses = allocatableCandidates.map(c => (
                     c.midNoEntryGate ? c.midNoEntryGate.status : 'allow'
                 ));
                 const marketEntryStatus = tier.key === 'mid_no' && marketCandidateStatuses.length
@@ -1492,15 +1645,15 @@
                 candidates.forEach(c => {
                     const gate = _combineMonthlyGoalEntryStatus(
                         riskEntryStatus,
-                        c.midNoEntryGate ? c.midNoEntryGate.status : 'allow'
+                        c.allocationCandidate === false ? 'allow' : (c.midNoEntryGate ? c.midNoEntryGate.status : 'allow')
                     );
                     c.entryGate = gate;
                     c.quality = _monthlyGoalCandidateQuality(c, tier.key, gate, riskAdjustedHeadroom);
                 });
                 const eligibleCandidates = candidates.filter(c => _combineMonthlyGoalEntryStatus(
                     riskEntryStatus,
-                    c.midNoEntryGate ? c.midNoEntryGate.status : 'allow'
-                ) !== 'block');
+                    c.allocationCandidate === false ? 'allow' : (c.midNoEntryGate ? c.midNoEntryGate.status : 'allow')
+                ) !== 'block' && c.allocationCandidate !== false);
                 const validPrices = eligibleCandidates.map(c => c.price).filter(p => Number.isFinite(p) && p > 0);
                 const perTokenAmount = riskAdjustedHeadroom != null && eligibleCandidates.length > 0
                     ? riskAdjustedHeadroom / eligibleCandidates.length
@@ -1516,6 +1669,11 @@
                 const tokenPreview = previewCandidates.length
                     ? previewCandidates.slice(0, 3).map(c => {
                         const strike = c.strike ? ('$' + c.strike.toLocaleString('en-US')) : '?';
+                        if (c.allocationCandidate === false) {
+                            const band = c.bandStatus === 'in_band' ? '仍在区间' : (c.bandStatus === 'shifted_band' ? '滑到其他档' : '当前出带');
+                            const committed = Number(c.heldValue || 0) + Number(c.pendingBuyNotional || 0);
+                            return strike + ' · 意图占用 ' + formatMoneyNum(committed) + ' · ' + band;
+                        }
                         const gateStatus = String(c.entryGate || (c.midNoEntryGate && c.midNoEntryGate.status) || 'allow');
                         const gate = ' · ' + (gateStatus === 'block' ? '暂停' : (gateStatus === 'caution' ? '谨慎' : '确认'));
                         const dist = c.distancePct != null ? ' · 距' + Number(c.distancePct).toFixed(1) + '%' : '';
@@ -1525,6 +1683,7 @@
                     : '<span class="text-muted">当前无符合标签的 token</span>';
                 const priceHint = validPrices.length
                     ? '可新增候选 ' + eligibleCandidates.length + '/' + candidates.length + ' 个；均分有效余量'
+                        + (occupiedIntentCount ? '；意图占用 ' + occupiedIntentCount + ' 个' : '')
                     : '';
                 const realizedHint = monthlyGoalAutoRealized && monthlyGoalAutoRealized.error
                     ? '<small class="text-danger">自动加载失败</small>'
