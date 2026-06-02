@@ -262,6 +262,9 @@ def _compact_active_manual_pending_orders(
             "created_at": row.get("created_at"),
             "source": extra.get("source") or "dashboard_manual",
             "plan_role": extra.get("plan_role"),
+            "intent_tier_key": extra.get("intent_tier_key"),
+            "intent_tier_label": extra.get("intent_tier_label"),
+            "intent_tier_snapshot": extra.get("intent_tier_snapshot"),
             "notes": str(row.get("notes") or "")[:300] or None,
         })
 

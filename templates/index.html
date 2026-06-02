@@ -184,7 +184,7 @@
                 <button class="nav-link" id="recommendations-tab" data-bs-toggle="tab" data-bs-target="#recommendations" type="button" role="tab" aria-controls="recommendations" aria-selected="false">Recommendations</button>
             </li>
             <li class="nav-item" role="presentation">
-                <button class="nav-link" id="monthly-goal-tab" data-bs-toggle="tab" data-bs-target="#monthly-goal" type="button" role="tab" aria-controls="monthly-goal" aria-selected="false">本月目标</button>
+                <button class="nav-link" id="monthly-goal-tab" data-bs-toggle="tab" data-bs-target="#monthly-goal" type="button" role="tab" aria-controls="monthly-goal" aria-selected="false">月度策略面板</button>
             </li>
             <li class="nav-item" role="presentation">
                 <a class="nav-link" href="/recommendations" target="_blank" rel="noopener" title="Fair-value advisory recommendations (independent page)">📊 Advisory ↗</a>
@@ -462,6 +462,9 @@
         let dashboardPhaseLabel = _currentEtMonthPhase().label;
         let openOrdersById = {};
         let manualPendingById = {};
+        let manualPendingLoadSeq = 0;
+        let manualPendingPanelExpanded = false;
+        let monthlyGoalExposureExpanded = false;
         let fastSignalConfirmState = { direction: 'NEUTRAL', sinceMs: 0 };
         let latestBalanceSummary = null;
         let latestEventsData = null;
@@ -1048,6 +1051,203 @@
             return out;
         }
 
+        function _monthlyGoalMarketEntriesByToken() {
+            const out = {};
+            ((latestEventsData || {}).markets || []).forEach(market => {
+                if (!market || (market.outcomePrices || []).some(price => Number(price) === 1)) return;
+                const outcomes = market.outcomes || [];
+                const tokenIds = market.token_id || [];
+                const barrierMeta = market.barrierMeta || {};
+                const distancePct = Number(barrierMeta.distance_pct);
+                tokenIds.forEach((tokenIdRaw, idx) => {
+                    const tokenId = String(tokenIdRaw || '');
+                    if (!tokenId) return;
+                    const outcome = String(outcomes[idx] || '');
+                    const tier = MONTHLY_GOAL_TIERS.find(t => t.outcome.toLowerCase() === outcome.toLowerCase() && _hasMonthlyGoalBadge(market, t));
+                    out[tokenId] = {
+                        question: market.question || '',
+                        outcome,
+                        price: _entryPriceForOutcome(market, idx),
+                        strike: _extractStrikeFromQuestion(market.question),
+                        directionInQuestion: _extractDirectionFromQuestion(market.question),
+                        distancePct: Number.isFinite(distancePct) ? distancePct : null,
+                        currentTierKey: tier ? tier.key : null,
+                        currentTierLabel: tier ? tier.label : null,
+                    };
+                });
+            });
+            return out;
+        }
+
+        function _monthlyGoalIntentByToken() {
+            const out = {};
+            Object.values(manualPendingById || {}).forEach(order => {
+                if (!order) return;
+                const tokenId = String(order.token_id || '');
+                const extra = order.extra && typeof order.extra === 'object' ? order.extra : {};
+                const tierKey = String(order.intent_tier_key || extra.intent_tier_key || '');
+                const tier = MONTHLY_GOAL_TIERS.find(t => t.key === tierKey);
+                if (!tokenId || !tier || out[tokenId]) return;
+                out[tokenId] = {
+                    intentTierKey: tier.key,
+                    intentTierLabel: order.intent_tier_label || extra.intent_tier_label || tier.label,
+                    source: 'manual_pending_intent',
+                    pendingOrderIds: [order.id].filter(v => v != null),
+                };
+            });
+            ((monthlyGoalTradeReview || {}).open_lots || []).forEach(lot => {
+                const tokenId = String((lot || {}).token_id || '');
+                const tierKey = String((lot || {}).tier_key || '');
+                const tier = MONTHLY_GOAL_TIERS.find(t => t.key === tierKey);
+                if (!tokenId || !tier || out[tokenId]) return;
+                out[tokenId] = {
+                    intentTierKey: tier.key,
+                    intentTierLabel: lot.tier_label || tier.label,
+                    source: 'open_lot_entry_tier',
+                };
+            });
+            return out;
+        }
+
+        function _monthlyGoalAuxiliaryGroup(entry) {
+            if (!entry) return { key: 'unknown', label: '未识别', reason: '当前 event 未匹配' };
+            const outcome = String(entry.outcome || '').toLowerCase();
+            const direction = String(entry.directionInQuestion || '').toLowerCase();
+            const distance = Number(entry.distancePct);
+            const price = Number(entry.price);
+            if (outcome === 'yes' && direction === 'below' && Number.isFinite(distance) && distance >= 10) {
+                return { key: 'tail_hedge', label: '尾部下跌保险', reason: '远距离 dip Yes，作为尾部保险/凸性仓' };
+            }
+            if (Number.isFinite(distance) && distance <= 3) {
+                return { key: 'near_barrier_tactical', label: '近障碍战术仓', reason: '距离 barrier 很近，默认按战术/退出管理' };
+            }
+            if (outcome === 'no' && direction === 'above' && Number.isFinite(price) && price < 0.58) {
+                return { key: 'near_barrier_tactical', label: '近障碍战术仓', reason: 'No 价格低于主战区下沿' };
+            }
+            return { key: 'other_auxiliary', label: '其他辅助仓', reason: '不属于当前四档主战区' };
+        }
+
+        function _monthlyGoalExposureClassification() {
+            const marketByToken = _monthlyGoalMarketEntriesByToken();
+            const intentByToken = _monthlyGoalIntentByToken();
+            const core = [];
+            const auxiliary = [];
+            const groups = {};
+            (latestPositionsData || []).forEach(p => {
+                const tokenId = String(p.asset || '');
+                if (!tokenId) return;
+                const size = Number(p.size || 0);
+                const value = Number(p.currentValue != null ? p.currentValue : (size * Number(p.curPrice || 0)));
+                if ((!Number.isFinite(value) || value < 0.01) && (!Number.isFinite(size) || size <= 0)) return;
+                const entry = marketByToken[tokenId] || {
+                    question: p.title || '',
+                    outcome: p.outcome || '',
+                    price: Number(p.curPrice || 0),
+                    strike: _extractStrikeFromQuestion(p.title),
+                    directionInQuestion: _extractDirectionFromQuestion(p.title),
+                    distancePct: null,
+                    currentTierKey: null,
+                    currentTierLabel: null,
+                };
+                const intent = intentByToken[tokenId];
+                if (intent && intent.intentTierKey) {
+                    const bandStatus = entry.currentTierKey === intent.intentTierKey
+                        ? 'in_band'
+                        : (entry.currentTierKey ? 'shifted_band' : 'out_of_band');
+                    core.push({
+                        tokenId,
+                        question: entry.question || p.title || '',
+                        outcome: entry.outcome || p.outcome || '',
+                        heldValue: value,
+                        heldShares: size,
+                        intentTierKey: intent.intentTierKey,
+                        intentTierLabel: intent.intentTierLabel,
+                        currentTierLabel: entry.currentTierLabel,
+                        bandStatus,
+                        bandLabel: bandStatus === 'in_band'
+                            ? '仍在意图区间'
+                            : (bandStatus === 'shifted_band' ? '滑到其他档' : '当前出带'),
+                        price: entry.price,
+                        strike: entry.strike,
+                        distancePct: entry.distancePct,
+                        pendingOrderIds: intent.pendingOrderIds || [],
+                    });
+                    return;
+                }
+                const group = _monthlyGoalAuxiliaryGroup(entry);
+                const item = {
+                    tokenId,
+                    question: entry.question || p.title || '',
+                    outcome: entry.outcome || p.outcome || '',
+                    heldValue: value,
+                    heldShares: size,
+                    groupKey: group.key,
+                    groupLabel: group.label,
+                    reason: group.reason,
+                    price: entry.price,
+                    strike: entry.strike,
+                    distancePct: entry.distancePct,
+                };
+                auxiliary.push(item);
+                if (!groups[group.key]) groups[group.key] = { key: group.key, label: group.label, heldValue: 0, count: 0, items: [] };
+                groups[group.key].heldValue += Number.isFinite(value) ? value : 0;
+                groups[group.key].count += 1;
+                groups[group.key].items.push(item);
+            });
+            core.sort((a, b) => Number(b.heldValue || 0) - Number(a.heldValue || 0));
+            auxiliary.sort((a, b) => Number(b.heldValue || 0) - Number(a.heldValue || 0));
+            return {
+                core,
+                auxiliary,
+                groups: Object.values(groups).sort((a, b) => Number(b.heldValue || 0) - Number(a.heldValue || 0)),
+            };
+        }
+
+        function _renderMonthlyGoalExposureClassification() {
+            const exposure = _monthlyGoalExposureClassification();
+            if (exposure.core.length === 0 && exposure.auxiliary.length === 0) return '';
+            const coreRows = exposure.core.slice(0, 8).map(item => {
+                const statusClass = item.bandStatus === 'in_band' ? 'success' : (item.bandStatus === 'shifted_band' ? 'warning' : 'secondary');
+                const dist = item.distancePct != null ? ' · 距' + Number(item.distancePct).toFixed(1) + '%' : '';
+                const pending = item.pendingOrderIds && item.pendingOrderIds.length ? ' · pending#' + item.pendingOrderIds.join(',') : '';
+                return '<tr>'
+                    + '<td class="text-wrap-mobile">' + escapeHtml(item.question || '—') + '<br><small class="text-muted">' + escapeHtml(item.outcome || '—') + dist + pending + '</small></td>'
+                    + '<td><span class="badge text-bg-primary">' + escapeHtml(item.intentTierLabel || item.intentTierKey || '—') + '</span></td>'
+                    + '<td><span class="badge text-bg-' + statusClass + '">' + escapeHtml(item.bandLabel || item.bandStatus || '—') + '</span><br><small class="text-muted">当前 ' + escapeHtml(item.currentTierLabel || '未入四档') + '</small></td>'
+                    + '<td>' + formatMoneyNum(item.heldValue) + '<br><small class="text-muted">' + formatTokenAmount(item.heldShares) + ' 张</small></td>'
+                    + '</tr>';
+            }).join('');
+            const auxRows = exposure.auxiliary.slice(0, 8).map(item => {
+                const dist = item.distancePct != null ? ' · 距' + Number(item.distancePct).toFixed(1) + '%' : '';
+                return '<tr>'
+                    + '<td class="text-wrap-mobile">' + escapeHtml(item.question || '—') + '<br><small class="text-muted">' + escapeHtml(item.outcome || '—') + dist + '</small></td>'
+                    + '<td><span class="badge text-bg-secondary">' + escapeHtml(item.groupLabel || item.groupKey || '辅助') + '</span></td>'
+                    + '<td><small class="text-muted">' + escapeHtml(item.reason || '') + '</small></td>'
+                    + '<td>' + formatMoneyNum(item.heldValue) + '<br><small class="text-muted">' + formatTokenAmount(item.heldShares) + ' 张</small></td>'
+                    + '</tr>';
+            }).join('');
+            const groupHint = exposure.groups.length
+                ? exposure.groups.map(g => escapeHtml(g.label) + ' ' + formatMoneyNum(g.heldValue)).join('；')
+                : '无';
+            const collapseClass = monthlyGoalExposureExpanded ? 'collapse show' : 'collapse';
+            const collapseAria = monthlyGoalExposureExpanded ? 'true' : 'false';
+            const collapseLabel = monthlyGoalExposureExpanded ? '收起' : '展开';
+            return '<div class="card shadow-sm mb-3"><div class="card-body">'
+                + '<div class="d-flex flex-wrap justify-content-between gap-2 mb-2">'
+                + '<div><h2 class="h5 mb-1">核心意图与辅助仓位</h2>'
+                + '<div class="text-muted small">主分类按挂单/成交时意图锁定；当前行情只标记 in-band/out-of-band。辅助仓位只用于风险/退出管理，不参与四档目标补仓。</div></div>'
+                + '<div class="text-end"><button class="btn btn-outline-secondary btn-sm mb-1" type="button" data-bs-toggle="collapse" data-bs-target="#monthlyGoalExposureCollapse" aria-expanded="' + collapseAria + '" aria-controls="monthlyGoalExposureCollapse" onclick="monthlyGoalExposureExpanded = !monthlyGoalExposureExpanded; this.textContent = monthlyGoalExposureExpanded ? \'收起\' : \'展开\'">' + collapseLabel + '</button>'
+                + '<div class="small text-muted">辅助分组：' + groupHint + '</div></div></div>'
+                + '<div id="monthlyGoalExposureCollapse" class="' + collapseClass + '"><div class="row g-3">'
+                + '<div class="col-lg-6"><div class="table-responsive"><table class="table table-sm align-middle mb-0">'
+                + '<thead><tr><th>核心持仓</th><th>入场意图</th><th>当前状态</th><th>市值</th></tr></thead>'
+                + '<tbody>' + (coreRows || '<tr><td colspan="4" class="text-muted">暂无锁定意图的核心仓位</td></tr>') + '</tbody></table></div></div>'
+                + '<div class="col-lg-6"><div class="table-responsive"><table class="table table-sm align-middle mb-0">'
+                + '<thead><tr><th>辅助仓位</th><th>分组</th><th>用途</th><th>市值</th></tr></thead>'
+                + '<tbody>' + (auxRows || '<tr><td colspan="4" class="text-muted">暂无辅助仓位</td></tr>') + '</tbody></table></div></div>'
+                + '</div></div></div></div>';
+        }
+
         function _monthlyGoalAutoRealizedByTier() {
             const byTier = (monthlyGoalAutoRealized && monthlyGoalAutoRealized.by_tier) || {};
             const out = {};
@@ -1204,7 +1404,7 @@
                 + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">复盘已实现</div><div class="value ' + (Number(summary.realized_pnl || 0) >= 0 ? 'text-success' : 'text-danger') + '">' + formatMoneyNum(summary.realized_pnl) + '</div></div></div>'
                 + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">复盘回报</div><div class="value">' + (summary.return_pct != null ? Number(summary.return_pct).toFixed(1) + '%' : '—') + '</div></div></div>'
                 + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">已平仓 lot</div><div class="value">' + escapeHtml(coverage.matched_trade_count || 0) + '</div></div></div>'
-                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">未平仓 lot</div><div class="value">' + escapeHtml(coverage.open_lot_count || 0) + '</div></div></div>'
+                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">未结清买入批次</div><div class="value">' + escapeHtml(coverage.open_lot_count || 0) + '</div></div></div>'
                 + '</div>'
                 + '<ul class="mb-2">' + conclusionHtml + '</ul>'
                 + comboTable
@@ -1316,7 +1516,8 @@
                 const tokenPreview = previewCandidates.length
                     ? previewCandidates.slice(0, 3).map(c => {
                         const strike = c.strike ? ('$' + c.strike.toLocaleString('en-US')) : '?';
-                        const gate = c.midNoEntryGate ? ' · ' + (c.midNoEntryGate.status === 'block' ? '暂停' : (c.midNoEntryGate.status === 'caution' ? '谨慎' : '确认')) : '';
+                        const gateStatus = String(c.entryGate || (c.midNoEntryGate && c.midNoEntryGate.status) || 'allow');
+                        const gate = ' · ' + (gateStatus === 'block' ? '暂停' : (gateStatus === 'caution' ? '谨慎' : '确认'));
                         const dist = c.distancePct != null ? ' · 距' + Number(c.distancePct).toFixed(1) + '%' : '';
                         const quality = c.quality ? ' · Q' + Math.round(c.quality.score) + '/' + c.quality.label : '';
                         return strike + ' @ ' + (c.price != null ? formatPrice(c.price) : '—') + dist + gate + quality;
@@ -1410,9 +1611,10 @@
                     + '<button class="btn btn-primary btn-sm" onclick="saveMonthlyGoalTargets()">保存</button>'
                     + '</div>'
                 : '<div class="d-flex justify-content-end mb-2"><button class="btn btn-outline-primary btn-sm" onclick="editMonthlyGoalTargets()">编辑目标仓位/已实现</button></div>';
+            const exposureClassificationHtml = _renderMonthlyGoalExposureClassification();
             el.innerHTML = '<div class="card shadow-sm mb-3"><div class="card-body">'
                 + '<div class="d-flex flex-wrap justify-content-between align-items-end gap-2 mb-3">'
-                + '<div><h2 class="h4 mb-1">本月目标</h2><div class="text-muted small">基于月初净值、当前 Events 标签和目标仓位组合计算；' + autoSource + '</div></div>'
+                + '<div><h2 class="h4 mb-1">月度策略面板</h2><div class="text-muted small">基于月初净值、当前 Events 标签和目标仓位组合计算；' + autoSource + '</div></div>'
                 + '<div style="width:180px;"><label class="form-label small mb-1">本月目标盈利 %</label><div class="input-group input-group-sm"><input id="monthlyGoalTargetPctInput" type="number" class="form-control" min="0.1" step="0.1" value="' + targetPct + '" onchange="setMonthlyGoalTarget(this.value)"><span class="input-group-text">%</span></div></div>'
                 + '</div>'
                 + '<div class="row g-2 mb-3">'
@@ -1430,6 +1632,7 @@
                 + realizedBreakdown
                 + '<div class="text-muted small mt-2">拆分逻辑：未手动调整时按月初/月中/月末动态组合限制进攻档；手动调整后保留你的计划显示，但新增买入按 min(手动上限, 阶段建议上限, 风险预算上限) 计算。目标仓位是上限/余量，不是必须补满的任务；防错预算按自动 FIFO gross亏损计算，手动已实现覆盖不会重置预算消耗。</div>'
                 + '</div></div>'
+                + exposureClassificationHtml
                 + _renderMonthlyGoalReview();
         }
 
@@ -1893,6 +2096,16 @@
                     const sellRefPrice = p.bestBid != null ? Number(p.bestBid) : Number(p.curPrice || 0);
                     const value = p.currentValue != null ? Number(p.currentValue) : (Number(p.size || 0) * sellRefPrice);
                     const pnlClass = (p.percentPnl != null && Number(p.percentPnl) >= 0) ? 'text-success' : 'text-danger';
+                    const isRedeemable = !!p.redeemable;
+                    const isResolved = isRedeemable || !!p.isResolved;
+                    const statusHtml = isRedeemable
+                        ? '<span class="badge text-bg-warning ms-1">Redeemable</span>'
+                        : (isResolved ? '<span class="badge text-bg-secondary ms-1">Resolved</span>' : '');
+                    const actionHtml = isRedeemable
+                        ? '<button class="btn btn-warning btn-sm" onclick="redeemPosition(' + jsSingleQuoted(p.conditionId || '') + ', ' + jsSingleQuoted(p.asset || '') + ', this)">Redeem</button>'
+                        : (isResolved
+                            ? '<button class="btn btn-secondary btn-sm" disabled>Resolved</button>'
+                            : '<button class="btn btn-danger btn-sm" onclick="openSellModal(' + jsSingleQuoted(p.conditionId || '') + ', ' + jsSingleQuoted(p.asset || '') + ', ' + sellRefPrice + ')">Sell</button>');
                     content += '<tr>'
                         + '<td><span class="badge text-bg-primary">Position</span></td>'
                         + '<td class="text-wrap-mobile">' + escapeHtml(p.outcome || '—') + '</td>'
@@ -1900,8 +2113,8 @@
                         + '<td>' + formatTokenAmount(p.size) + '</td>'
                         + '<td><small>Avg ' + formatPrice(p.avgPrice) + '<br><span class="text-success">Bid ' + formatPrice(p.bestBid) + '</span> / <span class="text-danger">Ask ' + formatPrice(p.bestAsk) + '</span></small></td>'
                         + '<td>' + formatMoney(value) + '</td>'
-                        + '<td class="' + pnlClass + '">' + formatPct(p.percentPnl) + '</td>'
-                        + '<td><button class="btn btn-danger btn-sm" onclick="openSellModal(' + jsSingleQuoted(p.conditionId || '') + ', ' + jsSingleQuoted(p.asset || '') + ', ' + sellRefPrice + ')">Sell</button></td>'
+                        + '<td class="' + pnlClass + '">' + formatPct(p.percentPnl) + statusHtml + '</td>'
+                        + '<td>' + actionHtml + '</td>'
                         + '</tr>';
                 });
 
@@ -2025,17 +2238,31 @@
         function loadManualPending() {
             const panel = document.getElementById('manual-pending-panel');
             if (!panel) return;
-            Promise.all([
+            const loadSeq = ++manualPendingLoadSeq;
+            Promise.allSettled([
                 fetchJsonSafe('/api/manual_pending'),
                 fetchJsonSafe('/api/recommendation_plans/pending'),
                 fetchJsonSafe('/api/entry_reviews?status=pending'),
                 fetchJsonSafe('/api/execution_quality?limit=8'),
             ])
-                .then(([data, recData, reviewData, executionData]) => {
+                .then(results => {
+                    if (loadSeq !== manualPendingLoadSeq) return;
+                    const _fulfilled = (idx) => results[idx] && results[idx].status === 'fulfilled' ? results[idx].value : null;
+                    const data = _fulfilled(0);
+                    if (!data || data.error || !Array.isArray(data.orders)) {
+                        const err = (data && data.error) || (results[0] && results[0].reason && results[0].reason.message) || 'manual pending 加载失败';
+                        if (!panel.innerHTML) {
+                            panel.innerHTML = '<div class="alert alert-warning py-2">Manual pending 加载失败：' + _escapeHtml(err) + '</div>';
+                        }
+                        return;
+                    }
+                    const recData = _fulfilled(1) || {};
+                    const reviewData = _fulfilled(2) || {};
+                    const executionData = _fulfilled(3) || {};
                     const manualOrders = data && Array.isArray(data.orders) ? data.orders : [];
-                    const recPlans = recData && Array.isArray(recData.plans) ? recData.plans : [];
-                    const reviewTasks = reviewData && Array.isArray(reviewData.tasks) ? reviewData.tasks : [];
-                    const executionTrades = executionData && Array.isArray(executionData.trades) ? executionData.trades : [];
+                    const recPlans = recData && !recData.error && Array.isArray(recData.plans) ? recData.plans : [];
+                    const reviewTasks = reviewData && !reviewData.error && Array.isArray(reviewData.tasks) ? reviewData.tasks : [];
+                    const executionTrades = executionData && !executionData.error && Array.isArray(executionData.trades) ? executionData.trades : [];
                     if (manualOrders.length === 0 && recPlans.length === 0 && reviewTasks.length === 0 && executionTrades.length === 0) { panel.innerHTML = ''; return; }
                     manualPendingById = {};
                     // 按 plan_id 分组,plan_id 缺失用 id
@@ -2069,8 +2296,19 @@
                         const cls = pnl >= 0 ? 'text-success' : 'text-danger';
                         return '<span class="' + cls + '">' + _escapeHtml(_formatExecutionPct(snap.price_change_from_fill_pct)) + '<br>$' + _escapeHtml(_formatExecutionMoney(snap.unrealized_pnl_usdc)) + '</span>';
                     }
-                    let html = '<div class="card border-warning shadow-sm"><div class="card-body p-2 p-md-3">' +
-                        '<h6 class="mb-2 text-warning">⏳ 待触发计划 / 入场复查 / 执行追踪 (' + (manualOrders.length + recPlans.length + reviewTasks.length + executionTrades.length) + ')</h6>';
+                    const pendingTotal = manualOrders.length + recPlans.length + reviewTasks.length + executionTrades.length;
+                    const pendingCollapseClass = manualPendingPanelExpanded ? 'collapse show' : 'collapse';
+                    const pendingCollapseAria = manualPendingPanelExpanded ? 'true' : 'false';
+                    const pendingCollapseLabel = manualPendingPanelExpanded ? '收起' : '展开';
+                    let html = '<div class="card border-warning shadow-sm"><div class="card-body p-2 p-md-3">'
+                        + '<div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-2">'
+                        + '<div><h6 class="mb-1 text-warning">⏳ 待触发计划 / 入场复查 / 执行追踪 (' + pendingTotal + ')</h6>'
+                        + '<div class="small text-muted">Manual pending ' + manualOrders.length
+                        + ' · 推荐计划 ' + recPlans.length
+                        + ' · 入场复查 ' + reviewTasks.length
+                        + ' · 执行追踪 ' + executionTrades.length + '</div></div>'
+                        + '<button class="btn btn-outline-secondary btn-sm" type="button" data-bs-toggle="collapse" data-bs-target="#manualPendingCollapse" aria-expanded="' + pendingCollapseAria + '" aria-controls="manualPendingCollapse" onclick="manualPendingPanelExpanded = !manualPendingPanelExpanded; this.textContent = manualPendingPanelExpanded ? \'收起\' : \'展开\'">' + pendingCollapseLabel + '</button>'
+                        + '</div><div id="manualPendingCollapse" class="' + pendingCollapseClass + '">';
                     if (reviewTasks.length > 0) {
                         html += '<div class="small fw-semibold mb-1">Post-entry reviews</div>'
                             + '<div class="table-responsive mb-2"><table class="table table-sm align-middle mb-0">'
@@ -2192,10 +2430,15 @@
                         });
                         html += '</tbody></table></div>';
                     }
-                    html += '</div></div>';
+                    html += '</div></div></div>';
                     panel.innerHTML = html;
                 })
-                .catch(() => { panel.innerHTML = ''; });
+                .catch(error => {
+                    if (loadSeq !== manualPendingLoadSeq) return;
+                    if (!panel.innerHTML) {
+                        panel.innerHTML = '<div class="alert alert-warning py-2">Manual pending 加载失败：' + _escapeHtml(error && error.message ? error.message : String(error)) + '</div>';
+                    }
+                });
         }
 
         function cancelManualPending(id) {
@@ -3582,6 +3825,47 @@
               .catch(error => showError('排队失败: ' + (error.message || error)))
               .finally(() => setBusy(false));
         });
+
+        function redeemPosition(conditionId, tokenId, btn) {
+            if (!conditionId || !tokenId) {
+              alert('缺少 conditionId/tokenId，无法 redeem');
+              return;
+            }
+            if (!confirm('确认 redeem 这个已结算持仓？\n\nRedeem 会通过 Polymarket gasless relayer 发起链上交易。')) {
+              return;
+            }
+            const button = btn || null;
+            const oldText = button ? button.textContent : '';
+            if (button) {
+              button.disabled = true;
+              button.textContent = 'Redeeming…';
+            }
+            fetchJsonSafe('/api/redeem_position', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ condition_id: conditionId, token_id: tokenId })
+            })
+            .then(data => {
+              if (data.error) {
+                  alert('Redeem 失败: ' + data.error);
+                  return;
+              }
+              const r = data.redeem || {};
+              const tx = r.tx_hash ? ('\nTx: ' + r.tx_hash) : '';
+              const state = r.state ? ('\nState: ' + r.state) : '';
+              alert('Redeem 已提交' + state + tx);
+              loadPositions();
+              loadBalance();
+              loadOrders();
+            })
+            .catch(error => alert('Redeem 失败: ' + error.message))
+            .finally(() => {
+              if (button) {
+                  button.disabled = false;
+                  button.textContent = oldText || 'Redeem';
+              }
+            });
+        }
 
         function cancelOrder(orderId) {
             if (confirm('Are you sure to cancel this order?')) {

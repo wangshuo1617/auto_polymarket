@@ -476,6 +476,7 @@ def _compact_monthly_goal_context(monthly_goal_context):
         "overall_loss_budget_usage_pct", "overall_loss_budget_status",
         "total_remaining_profit_usdc", "month_label", "phase_key",
         "phase_label", "days_left_in_month", "current_phase_thresholds",
+        "core_exposure_status", "auxiliary_exposure_groups",
         "trade_review_context", "discipline_notes",
     ], text_limit=900)
 
@@ -527,6 +528,47 @@ def _compact_monthly_goal_context(monthly_goal_context):
         tier_out["omitted_allow_candidate_count"] = max(0, len(candidates) - len(kept_candidates))
         compact_tiers.append(tier_out)
     out["tiers"] = compact_tiers
+    exposure = monthly_goal_context.get("core_exposure_status") or {}
+    if isinstance(exposure, dict):
+        core_positions = [
+            item for item in (exposure.get("core_positions") or [])
+            if isinstance(item, dict)
+        ]
+        aux_positions = [
+            item for item in (exposure.get("auxiliary_positions") or [])
+            if isinstance(item, dict)
+        ]
+        out["core_exposure_status"] = _select_keys(exposure, [
+            "source", "basis_note", "core_position_count", "out_of_band_count",
+            "auxiliary_position_count",
+        ], text_limit=500)
+        out["core_exposure_status"]["core_positions"] = [
+            _select_keys(item, [
+                "question", "outcome", "intent_tier_key", "intent_tier_label",
+                "intent_source", "current_tier_key", "current_tier_label",
+                "band_status", "band_label", "held_value_usdc", "held_shares",
+                "price", "strike", "distance_pct", "pending_order_ids",
+            ], text_limit=350)
+            for item in core_positions[:12]
+        ]
+        out["core_exposure_status"]["auxiliary_positions"] = [
+            _select_keys(item, [
+                "question", "outcome", "group_key", "group_label", "reason",
+                "held_value_usdc", "held_shares", "price", "strike", "distance_pct",
+            ], text_limit=350)
+            for item in aux_positions[:12]
+        ]
+    aux_groups = [
+        item for item in (monthly_goal_context.get("auxiliary_exposure_groups") or [])
+        if isinstance(item, dict)
+    ]
+    out["auxiliary_exposure_groups"] = [
+        _select_keys(item, [
+            "group_key", "group_label", "held_value_usdc", "held_shares",
+            "position_count",
+        ], text_limit=250)
+        for item in aux_groups[:8]
+    ]
     return out
 
 
@@ -714,7 +756,7 @@ SYSTEM_INSTRUCTION_TEMPLATE = """# Role
 9. **收益优化上下文**（大幅增强）：包含：
    - `portfolio_summary`：总净值（USDC + 持仓市值）、现金比例
    - `monthly_progress`：月度进度（月初基准净值、当前净值、月度盈亏金额与百分比）
-   - `monthly_goal_context`：本月目标分层上下文（各档目标仓位上限/余量、阶段建议上限、风控有效上限、目标盈利、已实现盈利、待实现盈利、gross realized loss 防错预算、entry_gate、候选 token、候选 `quality_score/quality_label` 启发式质量分、阶段阈值和纪律备注；active buy pending 已计入 `current_committed_value_usdc` 并扣减新增余量；`trade_review_context` 会总结已平仓 lot 的买入时快照复盘结论，包括哪些档位/阶段/距离/gate 组合应加权、降权或暂停；`sample_quality=insufficient` 的复盘结论只能提示观察；`plan_expected_return_pct` 表示按 Dashboard 当前手动/自动目标仓位组合计算的预期收益率，`effective_plan_expected_return_pct` 表示按 min(手动上限, 阶段建议上限, 风险预算上限) 计算的风控有效预期收益率；若 `custom_target_positions_included=true`，说明 Dashboard 手动目标仓位占比已被纳入但不能绕过阶段/风险有效上限；若 `manual_ui_realized_overrides_included=true`，说明 Dashboard 手动 realized 覆盖已被纳入；注意 realized 手动覆盖只影响目标进度，防错预算仍使用自动 FIFO gross realized loss）
+   - `monthly_goal_context`：本月目标分层上下文（各档目标仓位上限/余量、阶段建议上限、风控有效上限、目标盈利、已实现盈利、待实现盈利、gross realized loss 防错预算、entry_gate、候选 token、候选 `quality_score/quality_label` 启发式质量分、阶段阈值和纪律备注；active buy pending 已计入 `current_committed_value_usdc` 并扣减新增余量；`core_exposure_status` 中核心仓位按挂单/成交时 `intent_tier` 锁定主分类，`band_status=out_of_band/shifted_band` 只表示当前行情滑出入场意图区间，收益归因仍属于原意图档；`auxiliary_exposure_groups` 是尾部保险、近障碍战术等非核心但有价值仓位，只能用于风险/退出管理，不能用来填补四档目标缺口；`trade_review_context` 会总结已平仓 lot 的买入时快照复盘结论，包括哪些档位/阶段/距离/gate 组合应加权、降权或暂停；`sample_quality=insufficient` 的复盘结论只能提示观察；`plan_expected_return_pct` 表示按 Dashboard 当前手动/自动目标仓位组合计算的预期收益率，`effective_plan_expected_return_pct` 表示按 min(手动上限, 阶段建议上限, 风险预算上限) 计算的风控有效预期收益率；若 `custom_target_positions_included=true`，说明 Dashboard 手动目标仓位占比已被纳入但不能绕过阶段/风险有效上限；若 `manual_ui_realized_overrides_included=true`，说明 Dashboard 手动 realized 覆盖已被纳入；注意 realized 手动覆盖只影响目标进度，防错预算仍使用自动 FIFO gross realized loss）
    - `risk_budget`：基于总净值的风险预算（非仅 USDC 余额）
    - `position_safety_assessment`：每个持仓的安全度分级（safe_to_hold / monitor / at_risk）
    - `theta_income`：每个持仓的 Theta 日收益和到期总收益

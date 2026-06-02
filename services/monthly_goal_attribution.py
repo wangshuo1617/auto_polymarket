@@ -755,6 +755,11 @@ def _current_et_month_bounds(now: datetime | None = None) -> tuple[datetime, dat
     return start_et, end_et, start_et.strftime("%Y-%m")
 
 
+def _monthly_btc_event_slug(month_start_et: datetime) -> str:
+    month_name = month_start_et.strftime("%B").lower()
+    return f"what-price-will-bitcoin-hit-in-{month_name}-{month_start_et.year}"
+
+
 def _to_float(value: Any, default: float | None = 0.0) -> float | None:
     try:
         if value is None:
@@ -837,6 +842,248 @@ def _entry_price_for_outcome(market: dict, outcome_index: int) -> float | None:
         if price is not None and 0 < price < 1:
             return price
     return None
+
+
+def _market_entries_by_token(
+    *,
+    markets: list,
+    current_btc_price: float | None,
+    days_left_in_month: float,
+) -> dict[str, dict[str, Any]]:
+    """按当前 event 快照给 token 补充当前价格/距离/四档归属。"""
+    out: dict[str, dict[str, Any]] = {}
+    if current_btc_price is None or current_btc_price <= 0:
+        return out
+    for market in markets or []:
+        if not isinstance(market, dict) or _market_is_settled(market):
+            continue
+        question = str(market.get("question") or "")
+        strike, direction = _extract_strike_and_direction(question)
+        yes_price, no_price = _parse_market_prices(market)
+        if strike is None or direction == "unknown" or yes_price is None or no_price is None:
+            continue
+        outcomes = _ensure_list(market.get("outcomes"))
+        token_ids = _ensure_list(market.get("token_id") or market.get("clobTokenIds"))
+        distance_pct = abs(strike - float(current_btc_price)) / float(current_btc_price) * 100.0
+        for idx, token_id_raw in enumerate(token_ids):
+            token_id = str(token_id_raw or "").strip()
+            if not token_id:
+                continue
+            outcome = str(outcomes[idx]) if idx < len(outcomes) else ""
+            price = _entry_price_for_outcome(market, idx)
+            current_tier_key = _tier_key_for(
+                outcome=outcome,
+                yes_price=yes_price,
+                no_price=no_price,
+                distance_pct=distance_pct,
+                days_left=days_left_in_month,
+            )
+            out[token_id] = {
+                "question": question,
+                "outcome": outcome,
+                "token_id": token_id,
+                "price": round(price, 6) if price is not None else None,
+                "strike": round(float(strike), 2),
+                "direction_in_question": direction,
+                "distance_pct": round(distance_pct, 2),
+                "yes_price": round(yes_price, 6),
+                "no_price": round(no_price, 6),
+                "current_tier_key": current_tier_key,
+                "current_tier_label": ACTIONABLE_TIER_LABELS.get(current_tier_key),
+            }
+    return out
+
+
+def _intent_from_pending_orders(active_manual_pending_orders: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    by_token: dict[str, dict[str, Any]] = {}
+    if not isinstance(active_manual_pending_orders, dict):
+        return by_token
+    for order in active_manual_pending_orders.get("orders") or []:
+        if not isinstance(order, dict):
+            continue
+        token_id = str(order.get("token_id") or "").strip()
+        tier_key = str(order.get("intent_tier_key") or "").strip()
+        if not token_id or tier_key not in ACTIONABLE_TIER_LABELS:
+            continue
+        current = by_token.setdefault(token_id, {
+            "intent_tier_key": tier_key,
+            "intent_tier_label": order.get("intent_tier_label") or ACTIONABLE_TIER_LABELS.get(tier_key),
+            "source": "manual_pending_intent",
+            "pending_order_ids": [],
+            "pending_plan_ids": [],
+        })
+        if order.get("id") is not None:
+            current["pending_order_ids"].append(order.get("id"))
+        if order.get("plan_id") is not None and order.get("plan_id") not in current["pending_plan_ids"]:
+            current["pending_plan_ids"].append(order.get("plan_id"))
+    return by_token
+
+
+def _intent_from_open_lots(trade_review_summary: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    by_token: dict[str, dict[str, Any]] = {}
+    if not isinstance(trade_review_summary, dict):
+        return by_token
+    for lot in trade_review_summary.get("open_lots") or []:
+        if not isinstance(lot, dict):
+            continue
+        token_id = str(lot.get("token_id") or "").strip()
+        tier_key = str(lot.get("tier_key") or "").strip()
+        if not token_id or tier_key not in ACTIONABLE_TIER_LABELS:
+            continue
+        cost = _to_float(lot.get("remaining_cost"), 0.0) or 0.0
+        current = by_token.get(token_id)
+        if current and float(current.get("remaining_cost_usdc") or 0.0) >= cost:
+            continue
+        by_token[token_id] = {
+            "intent_tier_key": tier_key,
+            "intent_tier_label": lot.get("tier_label") or ACTIONABLE_TIER_LABELS.get(tier_key),
+            "source": "open_lot_entry_tier",
+            "remaining_cost_usdc": round(cost, 2),
+            "buy_timestamp": lot.get("buy_timestamp"),
+        }
+    return by_token
+
+
+def _auxiliary_group_for(entry: dict[str, Any] | None) -> tuple[str, str, str] | None:
+    if not isinstance(entry, dict):
+        return ("unknown", "未识别", "当前 event 中未找到该 token，无法计算距离/价格")
+    outcome = str(entry.get("outcome") or "").strip().lower()
+    question = str(entry.get("question") or "").strip().lower()
+    distance = _to_float(entry.get("distance_pct"), None)
+    price = _to_float(entry.get("price"), None)
+    direction = str(entry.get("direction_in_question") or "").strip().lower()
+    if outcome == "yes" and direction == "below" and distance is not None and distance >= 10.0:
+        return ("tail_hedge", "尾部下跌保险", "远距离 dip Yes，作为尾部保险/凸性仓，不参与四档补仓目标")
+    if distance is not None and distance <= 3.0:
+        return ("near_barrier_tactical", "近障碍战术仓", "距离 barrier 很近，属于高波动战术/退出管理，不参与稳定目标补仓")
+    if outcome == "no" and direction == "above" and price is not None and price < 0.58:
+        return ("near_barrier_tactical", "近障碍战术仓", "No 价格低于主战区下沿，更偏战术交易或风险处理")
+    if outcome == "yes" and direction == "below" and price is not None and price > 0.30:
+        return ("near_barrier_tactical", "近障碍战术仓", "dip Yes 价格高于低价Yes区间，更偏风险处理")
+    return ("other_auxiliary", "其他辅助仓", "不属于当前四档主战区，但可保留为观察/人工管理对象")
+
+
+def _build_exposure_classification(
+    *,
+    positions: list | None,
+    markets: list,
+    current_btc_price: float | None,
+    days_left_in_month: float,
+    active_manual_pending_orders: dict[str, Any] | None,
+    trade_review_summary: dict[str, Any] | None,
+) -> dict[str, Any]:
+    market_by_token = _market_entries_by_token(
+        markets=markets,
+        current_btc_price=current_btc_price,
+        days_left_in_month=days_left_in_month,
+    )
+    pending_intents = _intent_from_pending_orders(active_manual_pending_orders)
+    open_lot_intents = _intent_from_open_lots(trade_review_summary)
+    core_items: list[dict[str, Any]] = []
+    auxiliary_items: list[dict[str, Any]] = []
+    grouped_aux: dict[str, dict[str, Any]] = {}
+    by_token, _by_question = _build_position_indexes(positions)
+
+    for token_id, held in by_token.items():
+        held_value = float(held.get("value") or 0.0)
+        held_shares = float(held.get("shares") or 0.0)
+        if held_value < 0.01 and held_shares < 1e-9:
+            continue
+        entry = market_by_token.get(token_id)
+        intent = pending_intents.get(token_id) or open_lot_intents.get(token_id)
+        if intent and intent.get("intent_tier_key") in ACTIONABLE_TIER_LABELS:
+            intent_key = str(intent["intent_tier_key"])
+            current_key = entry.get("current_tier_key") if entry else None
+            if current_key == intent_key:
+                band_status = "in_band"
+                band_label = "当前仍在意图档位区间"
+            elif current_key:
+                band_status = "shifted_band"
+                band_label = f"当前落入 {ACTIONABLE_TIER_LABELS.get(current_key, current_key)}"
+            elif entry:
+                band_status = "out_of_band"
+                band_label = "当前已滑出四档主战区"
+            else:
+                band_status = "unknown"
+                band_label = "当前 event 未匹配，无法判断是否出带"
+            core_items.append({
+                "token_id": token_id,
+                "question": (entry or {}).get("question"),
+                "outcome": (entry or {}).get("outcome"),
+                "intent_tier_key": intent_key,
+                "intent_tier_label": intent.get("intent_tier_label") or ACTIONABLE_TIER_LABELS.get(intent_key),
+                "intent_source": intent.get("source"),
+                "current_tier_key": current_key,
+                "current_tier_label": ACTIONABLE_TIER_LABELS.get(current_key),
+                "band_status": band_status,
+                "band_label": band_label,
+                "held_shares": round(held_shares, 6),
+                "held_value_usdc": round(held_value, 2),
+                "price": (entry or {}).get("price"),
+                "strike": (entry or {}).get("strike"),
+                "distance_pct": (entry or {}).get("distance_pct"),
+                "pending_order_ids": list(intent.get("pending_order_ids") or [])[:8],
+                "pending_plan_ids": list(intent.get("pending_plan_ids") or [])[:8],
+            })
+            continue
+
+        aux = _auxiliary_group_for(entry)
+        if aux is None:
+            continue
+        group_key, group_label, reason = aux
+        item = {
+            "token_id": token_id,
+            "question": (entry or {}).get("question"),
+            "outcome": (entry or {}).get("outcome"),
+            "group_key": group_key,
+            "group_label": group_label,
+            "reason": reason,
+            "held_shares": round(held_shares, 6),
+            "held_value_usdc": round(held_value, 2),
+            "price": (entry or {}).get("price"),
+            "strike": (entry or {}).get("strike"),
+            "distance_pct": (entry or {}).get("distance_pct"),
+        }
+        auxiliary_items.append(item)
+        group = grouped_aux.setdefault(group_key, {
+            "group_key": group_key,
+            "group_label": group_label,
+            "held_value_usdc": 0.0,
+            "held_shares": 0.0,
+            "position_count": 0,
+            "items": [],
+        })
+        group["held_value_usdc"] += held_value
+        group["held_shares"] += held_shares
+        group["position_count"] += 1
+        group["items"].append(item)
+
+    core_items.sort(key=lambda item: float(item.get("held_value_usdc") or 0.0), reverse=True)
+    auxiliary_items.sort(key=lambda item: float(item.get("held_value_usdc") or 0.0), reverse=True)
+    groups = []
+    for group in grouped_aux.values():
+        group["held_value_usdc"] = round(float(group.get("held_value_usdc") or 0.0), 2)
+        group["held_shares"] = round(float(group.get("held_shares") or 0.0), 6)
+        group["items"] = sorted(
+            group["items"],
+            key=lambda item: float(item.get("held_value_usdc") or 0.0),
+            reverse=True,
+        )[:8]
+        groups.append(group)
+    groups.sort(key=lambda item: float(item.get("held_value_usdc") or 0.0), reverse=True)
+    return {
+        "source": "entry_intent_plus_current_band",
+        "basis_note": (
+            "主分类优先使用挂单/成交时 intent_tier；当前行情只作为 in_band/out_of_band 状态。"
+            "辅助仓位不参与四档目标收益和新增补仓余量。"
+        ),
+        "core_positions": core_items[:20],
+        "core_position_count": len(core_items),
+        "out_of_band_count": sum(1 for item in core_items if item.get("band_status") in {"out_of_band", "shifted_band"}),
+        "auxiliary_positions": auxiliary_items[:20],
+        "auxiliary_position_count": len(auxiliary_items),
+        "auxiliary_groups": groups,
+    }
 
 
 def _current_phase_thresholds(phase_key: str) -> dict[str, str]:
@@ -1134,6 +1381,7 @@ def get_monthly_goal_realized_summary(
     month_start_et, month_end_et, month_label = _current_et_month_bounds(now)
     month_start_utc = month_start_et.astimezone(timezone.utc)
     month_end_utc = month_end_et.astimezone(timezone.utc)
+    monthly_event_slug = _monthly_btc_event_slug(month_start_et)
     fill_profile = str(profile or "analyze").strip() or "analyze"
     with get_cursor() as cur:
         cur.execute(
@@ -1144,10 +1392,10 @@ def get_monthly_goal_realized_summary(
             FROM advisory_chain_fills
             WHERE profile = %s
               AND fill_timestamp < %s
-              AND event_slug LIKE 'what-price-will-bitcoin-hit-in%%'
+              AND event_slug = %s
             ORDER BY fill_timestamp ASC, id ASC
             """,
-            (fill_profile, month_end_utc),
+            (fill_profile, month_end_utc, monthly_event_slug),
         )
         rows = list(cur.fetchall())
 
@@ -1332,6 +1580,7 @@ def get_monthly_goal_realized_summary(
 
     return {
         "month_label": month_label,
+        "event_slug": monthly_event_slug,
         "month_start_et": month_start_et.isoformat(),
         "month_end_et": month_end_et.isoformat(),
         "source": "advisory_chain_fills",
@@ -1515,6 +1764,7 @@ def get_monthly_trade_review_summary(
     month_start_et, month_end_et, month_label = _current_et_month_bounds(now)
     month_start_utc = month_start_et.astimezone(timezone.utc)
     month_end_utc = month_end_et.astimezone(timezone.utc)
+    monthly_event_slug = _monthly_btc_event_slug(month_start_et)
     fill_profile = str(profile or "analyze").strip() or "analyze"
     with get_cursor() as cur:
         cur.execute(
@@ -1525,10 +1775,10 @@ def get_monthly_trade_review_summary(
             FROM advisory_chain_fills
             WHERE profile = %s
               AND fill_timestamp < %s
-              AND event_slug LIKE 'what-price-will-bitcoin-hit-in%%'
+              AND event_slug = %s
             ORDER BY fill_timestamp ASC, id ASC
             """,
-            (fill_profile, month_end_utc),
+            (fill_profile, month_end_utc, monthly_event_slug),
         )
         rows = list(cur.fetchall())
 
@@ -1731,6 +1981,7 @@ def get_monthly_trade_review_summary(
         "source": "advisory_chain_fills_decision_snapshot_fifo",
         "profile": fill_profile,
         "month_label": month_label,
+        "event_slug": monthly_event_slug,
         "month_start_et": month_start_et.isoformat(),
         "month_end_et": month_end_et.isoformat(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1805,6 +2056,14 @@ def build_monthly_goal_context(
 
     candidates_by_tier: dict[str, list[dict]] = {tier["key"]: [] for tier in MONTHLY_GOAL_TIERS}
     markets = polymarket_event_situation.get("markets", []) if isinstance(polymarket_event_situation, dict) else []
+    exposure_classification = _build_exposure_classification(
+        positions=positions,
+        markets=markets,
+        current_btc_price=current_btc_price,
+        days_left_in_month=days_left_in_month,
+        active_manual_pending_orders=active_manual_pending_orders,
+        trade_review_summary=trade_review_summary,
+    )
     for market in markets:
         if not isinstance(market, dict) or _market_is_settled(market):
             continue
@@ -2133,6 +2392,8 @@ def build_monthly_goal_context(
         "days_left_in_month": round(float(days_left_in_month or 0.0), 4),
         "current_phase_thresholds": thresholds,
         "tiers": tier_contexts,
+        "core_exposure_status": exposure_classification,
+        "auxiliary_exposure_groups": exposure_classification.get("auxiliary_groups") or [],
         "trade_review_context": trade_review_context,
         "discipline_notes": [
             "remaining_profit_usdc 只用于排序和选择机会，不能作为放宽止损、追价或突破仓位上限的理由。",
@@ -2143,6 +2404,8 @@ def build_monthly_goal_context(
             "中价No需要同时满足价格区间、barrier distance、BTC未朝barrier快速移动；快速逼近后需要冷却确认。",
             "trade_review_context 的结论用于校准加权/降权；sample_quality=insufficient 只能提示观察，不得作为加仓依据。",
             "不得为了补某档缺口而买入不在 current_phase_threshold 内的 token。",
+            "core_exposure_status 中主分类按入场/挂单意图锁定；out_of_band 只表示当前滑出区间，归因仍属于原 intent_tier。",
+            "auxiliary_exposure_groups（尾部保险、近障碍战术等）只用于风险/退出管理，不参与四档目标收益、缺口补仓或 headroom 计算。",
             "若某档已超额完成，应优先保护利润或转入观察，除非出现更高质量且符合风控的机会。",
             "低价 Yes 缺口不能通过无催化彩票仓补；下方 dip No 缺口不能通过第一次逼近 barrier 逆势抄底补。",
         ],

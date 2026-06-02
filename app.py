@@ -7,6 +7,7 @@ import re
 import secrets
 import subprocess
 import sys
+import threading
 import time
 import calendar
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,7 @@ from services.entry_review import (
     list_entry_review_tasks,
 )
 from services.execution_quality import list_recent_execution_quality
+from services.polymarket_redeem import redeem_position
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
 from py_clob_client_v2.clob_types import (
@@ -69,6 +71,8 @@ from data.polymarket import (
 
 app = Flask(__name__)
 app.secret_key = os.getenv("DASHBOARD_SECRET_KEY") or secrets.token_hex(32)
+_redeem_inflight_lock = threading.Lock()
+_redeem_inflight_keys: set[tuple[str, str]] = set()
 
 # Advisory blueprint (fair-value rebalancer recommendations + manual trade log).
 # 受 before_request 全局认证保护; 失败导入不应阻断 dashboard 主功能.
@@ -382,7 +386,7 @@ def api_events():
         now_et = datetime.now(ET_TIMEZONE)
         days_in_month = calendar.monthrange(now_et.year, now_et.month)[1]
         days_left_in_month = max(0, days_in_month - now_et.day) + (24 - now_et.hour) / 24.0
-        phase_label = _classify_time_phase(days_left_in_month)[1]
+        phase_key, phase_label = _classify_time_phase(days_left_in_month)
         token_ids: List[str] = []
         for market in data.get("markets") or []:
             for tid in (market.get("token_id") or []):
@@ -1280,6 +1284,15 @@ def api_positions():
             except (TypeError, ValueError):
                 return None
 
+        def _to_bool(v):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return v != 0
+            if v is None:
+                return False
+            return str(v).strip().lower() in {"1", "true", "yes", "y"}
+
         token_ids = [str(p.get("asset")) for p in positions if p.get("asset")]
         best_prices = {}
         if token_ids:
@@ -1291,6 +1304,7 @@ def api_positions():
         result = []
         for p in positions:
             asset = p.get("asset")
+            condition_id = p.get("conditionId") or p.get("condition_id")
             px = best_prices.get(str(asset)) if asset else None
             best_bid = _to_float_or_none((px or {}).get("best_bid"))
             best_ask = _to_float_or_none((px or {}).get("best_ask"))
@@ -1306,11 +1320,14 @@ def api_positions():
             percent_pnl = p.get("percentPnl")
             if best_bid is not None and avg_price and avg_price > 0:
                 percent_pnl = ((best_bid / avg_price) - 1.0) * 100
+            redeemable = _to_bool(p.get("redeemable"))
+            negative_risk = _to_bool(p.get("negativeRisk") if "negativeRisk" in p else p.get("negative_risk"))
             result.append({
                 "asset": asset,
-                "conditionId": p.get("conditionId"),
+                "conditionId": condition_id,
                 "title": p.get("title") or "—",
                 "outcome": p.get("outcome") or "—",
+                "outcomeIndex": p.get("outcomeIndex") if p.get("outcomeIndex") is not None else p.get("outcome_index"),
                 "size": size,
                 "avgPrice": avg_price,
                 "curPrice": valuation_price,
@@ -1322,10 +1339,48 @@ def api_positions():
                 "currentValue": current_value,
                 "percentPnl": percent_pnl,
                 "endDate": p.get("endDate"),
+                "redeemable": redeemable,
+                "isResolved": redeemable or _to_bool(p.get("resolved") or p.get("isResolved")),
+                "negativeRisk": negative_risk,
+                "collateralToken": p.get("collateralToken") or p.get("collateral_token") or p.get("collateral"),
             })
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/redeem_position', methods=['POST'])
+def api_redeem_position():
+    """通过 Polymarket gasless relayer 赎回已 resolved/redeemable 的持仓。"""
+    data = request.get_json(silent=True) or {}
+    condition_id = str(data.get("condition_id") or data.get("conditionId") or "").strip()
+    token_id = str(data.get("token_id") or data.get("asset") or "").strip()
+    if not condition_id or not token_id:
+        return jsonify({"error": "condition_id/token_id 必填"}), 400
+    key = (APP_PM_PROFILE, condition_id.lower())
+    with _redeem_inflight_lock:
+        if key in _redeem_inflight_keys:
+            return jsonify({"error": "该 market 正在 redeem, 请等待完成后刷新", "code": "redeem_inflight"}), 409
+        _redeem_inflight_keys.add(key)
+    try:
+        result = redeem_position(
+            condition_id=condition_id,
+            token_id=token_id,
+            profile=APP_PM_PROFILE,
+            wait=False,
+        )
+        return jsonify({"ok": True, "redeem": result.to_dict()})
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except RuntimeError as rexc:
+        logger.exception("api_redeem_position runtime error")
+        return jsonify({"error": str(rexc)}), 409
+    except Exception as e:
+        logger.exception("api_redeem_position failed")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        with _redeem_inflight_lock:
+            _redeem_inflight_keys.discard(key)
 
 
 @app.route('/api/open_orders')
