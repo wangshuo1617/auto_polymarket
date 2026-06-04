@@ -14,8 +14,8 @@
             margin: 0 auto;
         }
         .dashboard-title {
-            font-size: clamp(1.8rem, 4vw, 3rem);
-            margin-bottom: 0.75rem;
+            font-size: clamp(1.45rem, 3vw, 2.25rem);
+            margin-bottom: 0;
         }
         .dashboard-title-tip {
             display: inline-flex;
@@ -52,6 +52,44 @@
             border-radius: 999px;
             padding: 0.35rem 0.75rem;
             font-weight: 500;
+        }
+        .dashboard-topbar {
+            background: linear-gradient(135deg, #ffffff 0%, #f1f5ff 100%);
+            border: 1px solid #dee2e6;
+            border-radius: 0.85rem;
+            box-shadow: 0 0.25rem 0.75rem rgba(15, 23, 42, 0.05);
+            padding: 0.9rem 1rem;
+            margin-bottom: 1rem;
+        }
+        .top-status-row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: stretch;
+            gap: 0.5rem;
+            margin-top: 0.65rem;
+        }
+        .top-status-row .balance-chip {
+            border-radius: 0.7rem;
+            font-size: 0.86rem;
+            line-height: 1.35;
+        }
+        .top-status-wide {
+            flex: 1 1 360px;
+        }
+        .top-chip-label {
+            display: block;
+            color: #6c757d;
+            font-size: 0.72rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+        }
+        .top-chip-main {
+            font-weight: 700;
+        }
+        .top-chip-sub {
+            color: #6c757d;
+            font-size: 0.78rem;
         }
         .tab-pane {
             padding-top: 0.9rem;
@@ -142,36 +180,30 @@
 </head>
 <body>
     <div class="container-fluid px-3 px-md-4 py-3 py-md-4 dashboard-shell">
-        <div class="d-flex justify-content-between align-items-start gap-2">
-            <h1 class="dashboard-title">
-                Polymarket Dashboard
-                <span id="phaseBadge" class="badge text-bg-info ms-2 align-middle" style="font-size:0.85rem;">月中</span>
-                <span
-                    id="dashboardHelpTrigger"
-                    class="badge text-bg-dark dashboard-title-tip"
-                    data-bs-toggle="popover"
-                    data-bs-placement="right"
-                    data-bs-trigger="hover focus"
-                    data-bs-html="true"
-                    data-bs-custom-class="dashboard-help-popover"
-                    title="快速反思 / 策略速查"
-                    aria-label="查看快速反思与策略速查"
-                >?</span>
-            </h1>
-            <a href="/logout" class="btn btn-outline-secondary btn-sm mt-1">Logout</a>
-        </div>
-        <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
-            <div id="balance" class="balance-chip">Loading...</div>
-            <div id="btc-price" class="balance-chip">BTC: Loading...</div>
-            <div id="btc-fast-signal" class="balance-chip">Fast: warming...</div>
-            <button type="button" class="btn btn-outline-primary btn-sm" id="btnPositionAnalyze">Position Analyze</button>
-            <a href="/report/latest" target="_blank" rel="noopener" class="btn btn-outline-secondary btn-sm">Latest Report</a>
-            <button type="button" class="btn btn-outline-success btn-sm" id="btnWalletTransfer" data-bs-toggle="modal" data-bs-target="#walletTransferModal">💰 充值/提现</button>
-        </div>
-        <div class="mb-3">
-            <textarea id="operatorIntent" class="form-control form-control-sm" rows="2"
-                placeholder="操作员意图（可选）：例如「我倾向于持有 Dip 65k Yes，寻找新的进攻性机会」"
-                style="font-size:0.82rem; resize:vertical;"></textarea>
+        <div class="dashboard-topbar">
+            <div class="d-flex justify-content-between align-items-start gap-2">
+                <h1 class="dashboard-title">
+                    Polymarket Dashboard
+                    <span id="phaseBadge" class="badge text-bg-info ms-2 align-middle" style="font-size:0.85rem;">月中</span>
+                    <span
+                        id="dashboardHelpTrigger"
+                        class="badge text-bg-dark dashboard-title-tip"
+                        data-bs-toggle="popover"
+                        data-bs-placement="right"
+                        data-bs-trigger="hover focus"
+                        data-bs-html="true"
+                        data-bs-custom-class="dashboard-help-popover"
+                        title="快速反思 / 策略速查"
+                        aria-label="查看快速反思与策略速查"
+                    >?</span>
+                </h1>
+                <a href="/logout" class="btn btn-outline-secondary btn-sm mt-1">Logout</a>
+            </div>
+            <div class="top-status-row">
+                <div id="balance" class="balance-chip top-status-wide">Loading...</div>
+                <div id="btc-price" class="balance-chip top-status-wide">BTC: Loading...</div>
+                <div id="btc-fast-signal" class="balance-chip">Fast: warming...</div>
+            </div>
         </div>
         <ul class="nav nav-tabs" id="myTab" role="tablist">
             <li class="nav-item" role="presentation">
@@ -192,10 +224,34 @@
             <li class="nav-item" role="presentation">
                 <button class="nav-link" id="chat-tab" data-bs-toggle="tab" data-bs-target="#chat" type="button" role="tab" aria-controls="chat" aria-selected="false">💬 Chat</button>
             </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="quick-actions-tab" data-bs-toggle="tab" data-bs-target="#quick-actions" type="button" role="tab" aria-controls="quick-actions" aria-selected="false">常用操作</button>
+            </li>
         </ul>
         <div class="tab-content" id="myTabContent">
             <div class="tab-pane fade show active" id="events" role="tabpanel" aria-labelledby="events-tab">
                 <div id="events-content">Loading...</div>
+            </div>
+            <div class="tab-pane fade" id="quick-actions" role="tabpanel" aria-labelledby="quick-actions-tab">
+                <div class="card shadow-sm">
+                    <div class="card-body">
+                        <div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">
+                            <div>
+                                <h2 class="h4 mb-1">常用操作</h2>
+                                <div class="text-muted small">手动触发分析、查看最新报告、以及 Polymarket 钱包充值/提现。</div>
+                            </div>
+                        </div>
+                        <label class="form-label small mb-1" for="operatorIntent">Position Analyze 操作员意图（可选）</label>
+                        <textarea id="operatorIntent" class="form-control form-control-sm mb-3" rows="3"
+                            placeholder="例如「我倾向于持有 Dip 65k Yes，寻找新的进攻性机会」"
+                            style="font-size:0.82rem; resize:vertical;"></textarea>
+                        <div class="d-flex flex-wrap gap-2">
+                            <button type="button" class="btn btn-outline-primary btn-sm" id="btnPositionAnalyze">Position Analyze</button>
+                            <a href="/report/latest" target="_blank" rel="noopener" class="btn btn-outline-secondary btn-sm">Latest Report</a>
+                            <button type="button" class="btn btn-outline-success btn-sm" id="btnWalletTransfer" data-bs-toggle="modal" data-bs-target="#walletTransferModal">💰 充值/提现</button>
+                        </div>
+                    </div>
+                </div>
             </div>
             <div class="tab-pane fade" id="positions" role="tabpanel" aria-labelledby="positions-tab">
                 <div id="manual-pending-panel" class="mb-3"></div>
@@ -465,11 +521,13 @@
         let manualPendingLoadSeq = 0;
         let manualPendingPanelExpanded = false;
         let monthlyGoalExposureExpanded = false;
+        let monthlyGoalReviewTradesExpanded = false;
         let fastSignalConfirmState = { direction: 'NEUTRAL', sinceMs: 0 };
         let latestBalanceSummary = null;
         let latestEventsData = null;
         let latestPositionsData = [];
         let latestOpenOrdersData = [];
+        let monthlyGoalQualityByToken = {};
         let positionsLoadError = null;
         let openOrdersLoadError = null;
         let monthlyGoalPrefsLoadedFor = null;
@@ -1049,17 +1107,83 @@
                 Object.keys(tiers).forEach(tierKey => {
                     const item = tiers[tierKey];
                     const ratio = Number(item.cost || 0) / totalCost;
+                    const heldValue = Number(held.value || 0) * ratio;
+                    const remainingCost = Number(item.cost || 0);
+                    const unrealizedPnl = heldValue - remainingCost;
                     if (!out[tokenId]) out[tokenId] = {};
                     out[tokenId][tierKey] = {
                         heldShares: Number(held.shares || 0) * ratio,
-                        heldValue: Number(held.value || 0) * ratio,
-                        remainingCost: Number(item.cost || 0),
+                        heldValue,
+                        remainingCost,
+                        heldUnrealizedPnl: unrealizedPnl,
+                        heldUnrealizedLoss: Math.max(0, -unrealizedPnl),
                         intentTierLabel: item.intentTierLabel,
                         source: item.source,
                     };
                 });
             });
             return out;
+        }
+
+        function _monthlyGoalPositionAmounts(position) {
+            const size = Number(position && position.size || 0);
+            const currentValue = Number(position && position.currentValue != null
+                ? position.currentValue
+                : (size * Number(position && position.curPrice || 0)));
+            const cashPnl = Number(position && position.cashPnl);
+            const avgPrice = Number(position && position.avgPrice);
+            const initialValue = Number(position && position.initialValue);
+            let costBasis = null;
+            if (Number.isFinite(cashPnl)) {
+                costBasis = currentValue - cashPnl;
+            } else if (Number.isFinite(avgPrice) && size > 0) {
+                costBasis = avgPrice * size;
+            } else if (Number.isFinite(initialValue)) {
+                costBasis = initialValue;
+            }
+            if (costBasis == null || !Number.isFinite(costBasis)) {
+                return { size, currentValue, costBasis: null, unrealizedPnl: null };
+            }
+            costBasis = Math.max(0, costBasis);
+            return { size, currentValue, costBasis, unrealizedPnl: currentValue - costBasis };
+        }
+
+        function _monthlyGoalCurrentEventTokenSet() {
+            const tokenSet = new Set();
+            ((latestEventsData || {}).markets || []).forEach(market => {
+                (market.token_id || []).forEach(tokenId => {
+                    const token = String(tokenId || '');
+                    if (token) tokenSet.add(token);
+                });
+            });
+            return tokenSet;
+        }
+
+        function _monthlyGoalPortfolioUnrealizedLoss() {
+            const monthlyTokens = _monthlyGoalCurrentEventTokenSet();
+            if (!monthlyTokens.size) {
+                return { totalPnl: 0, totalLoss: 0, count: 0, missingCostCount: 0, missingCostValue: 0, tokenScopeAvailable: false };
+            }
+            let totalPnl = 0;
+            let totalLoss = 0;
+            let count = 0;
+            let missingCostCount = 0;
+            let missingCostValue = 0;
+            (latestPositionsData || []).forEach(position => {
+                const tokenId = String(position && position.asset || '');
+                if (!monthlyTokens.has(tokenId)) return;
+                const amounts = _monthlyGoalPositionAmounts(position || {});
+                if (Number(amounts.size || 0) <= 0 && Number(amounts.currentValue || 0) <= 0) return;
+                count += 1;
+                if (!Number.isFinite(amounts.unrealizedPnl)) {
+                    missingCostCount += 1;
+                    missingCostValue += Math.max(0, Number(amounts.currentValue || 0));
+                    return;
+                }
+                totalPnl += amounts.unrealizedPnl;
+                totalLoss += Math.max(0, -amounts.unrealizedPnl);
+            });
+            return { totalPnl, totalLoss, count, missingCostCount, missingCostValue, tokenScopeAvailable: true };
         }
 
         function _monthlyGoalCandidatesByTier() {
@@ -1089,7 +1213,13 @@
                     if (index < 0) return;
                     const tokenId = String((market.token_id || [])[index] || '');
                     const price = _entryPriceForOutcome(market, index);
-                    const held = (heldByTokenTier[tokenId] || {})[tier.key] || { heldShares: 0, heldValue: 0 };
+                    const held = (heldByTokenTier[tokenId] || {})[tier.key] || {
+                        heldShares: 0,
+                        heldValue: 0,
+                        remainingCost: 0,
+                        heldUnrealizedPnl: 0,
+                        heldUnrealizedLoss: 0,
+                    };
                     const pendingBucket = (pendingBuysByTokenTier[tokenId] || {})[tier.key] || { notional: 0, orders: [] };
                     const barrierMeta = market.barrierMeta || {};
                     const distancePct = Number(barrierMeta.distance_pct);
@@ -1099,6 +1229,9 @@
                         price,
                         heldShares: held.heldShares || 0,
                         heldValue: held.heldValue || 0,
+                        heldCost: held.remainingCost || 0,
+                        heldUnrealizedPnl: held.heldUnrealizedPnl || 0,
+                        heldUnrealizedLoss: held.heldUnrealizedLoss || 0,
                         heldIntentTierKey: held.heldValue > 0 ? tier.key : null,
                         currentTierKey: tier.key,
                         bandStatus: held.heldValue > 0 ? 'in_band' : null,
@@ -1122,7 +1255,13 @@
                 const entry = marketByToken[tokenId] || {};
                 tierKeys.forEach(tierKey => {
                     if (!out[tierKey] || seen[tokenId + '|' + tierKey]) return;
-                    const held = (heldByTokenTier[tokenId] || {})[tierKey] || { heldShares: 0, heldValue: 0 };
+                    const held = (heldByTokenTier[tokenId] || {})[tierKey] || {
+                        heldShares: 0,
+                        heldValue: 0,
+                        remainingCost: 0,
+                        heldUnrealizedPnl: 0,
+                        heldUnrealizedLoss: 0,
+                    };
                     const pendingBucket = (pendingBuysByTokenTier[tokenId] || {})[tierKey] || { notional: 0, orders: [] };
                     if (Number(held.heldValue || 0) <= 0 && Number(pendingBucket.notional || 0) <= 0) return;
                     const currentTierKey = entry.currentTierKey || null;
@@ -1132,6 +1271,9 @@
                         price: entry.price,
                         heldShares: held.heldShares || 0,
                         heldValue: held.heldValue || 0,
+                        heldCost: held.remainingCost || 0,
+                        heldUnrealizedPnl: held.heldUnrealizedPnl || 0,
+                        heldUnrealizedLoss: held.heldUnrealizedLoss || 0,
                         heldIntentTierKey: tierKey,
                         currentTierKey,
                         currentTierLabel: entry.currentTierLabel,
@@ -1498,6 +1640,94 @@
             return 'secondary';
         }
 
+        function _shortTokenId(tokenId) {
+            const s = String(tokenId || '');
+            if (!s) return '—';
+            return s.length > 18 ? s.slice(0, 8) + '…' + s.slice(-6) : s;
+        }
+
+        function _reviewTradeTime(value) {
+            if (!value) return '—';
+            const dt = new Date(value);
+            if (isNaN(dt.getTime())) return escapeHtml(value);
+            return dt.toLocaleString('zh-CN', {
+                timeZone: 'Asia/Shanghai',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false,
+            });
+        }
+
+        function _reviewTokenSummaryTooltip(item) {
+            const tokens = Array.isArray(item.token_summaries) ? item.token_summaries : [];
+            if (!tokens.length) return '';
+            const lines = tokens.slice(0, 8).map(token => {
+                const pnl = Number(token.realized_pnl || 0);
+                const ret = token.return_pct != null ? Number(token.return_pct).toFixed(1) + '%' : '—';
+                const question = String(token.question || '未知市场');
+                const shortQuestion = question.length > 42 ? question.slice(0, 42) + '…' : question;
+                const exitType = token.exit_types && token.exit_types.settlement ? '结算' : '卖出';
+                return [
+                    (token.outcome || '—') + ' · ' + shortQuestion,
+                    '  ' + token.match_count + '笔 · ' + formatTokenAmount(token.matched_shares) + '张 · ' + exitType,
+                    '  成本 ' + formatMoneyNum(token.matched_buy_cost)
+                        + ' / 回收 ' + formatMoneyNum(token.sell_proceeds)
+                        + ' / PnL ' + formatMoneyNum(pnl)
+                        + ' / ' + ret,
+                    token.latest_exit_timestamp ? '  最近出场 ' + _reviewTradeTime(token.latest_exit_timestamp) : '',
+                ].filter(Boolean).join('\n');
+            });
+            if (tokens.length > 8) {
+                lines.push('…另有 ' + (tokens.length - 8) + ' 个 token');
+            }
+            return lines.join('\n\n');
+        }
+
+        function _renderMonthlyGoalReviewTokenDetails(review) {
+            const trades = (Array.isArray(review.closed_trades) ? review.closed_trades : (Array.isArray(review.sample_trades) ? review.sample_trades : []))
+                .slice()
+                .sort((a, b) => String(b.sell_timestamp || '').localeCompare(String(a.sell_timestamp || '')));
+            const collapseClass = monthlyGoalReviewTradesExpanded ? 'collapse show' : 'collapse';
+            const collapseAria = monthlyGoalReviewTradesExpanded ? 'true' : 'false';
+            const collapseLabel = monthlyGoalReviewTradesExpanded ? '收起明细' : '展开明细';
+            const rows = trades.map(trade => {
+                const pnl = Number(trade.realized_pnl || 0);
+                const pnlClass = pnl >= 0 ? 'text-success' : 'text-danger';
+                const isSettlement = trade.exit_type === 'settlement';
+                const settlementBadge = isSettlement
+                    ? '<span class="badge text-bg-' + (trade.resolution_status === 'won' ? 'success' : 'danger') + ' ms-1">'
+                        + (trade.resolution_status === 'won' ? '结算赢' : '结算输') + '</span>'
+                    : '';
+                const meta = [
+                    trade.tier_label || trade.tier_key,
+                    trade.phase_label || trade.phase_key,
+                    trade.distance_bucket_label || trade.distance_bucket,
+                    trade.entry_gate_label || trade.entry_gate,
+                ].filter(Boolean).map(escapeHtml).join(' · ');
+                return '<tr>'
+                    + '<td>' + _reviewTradeTime(trade.sell_timestamp) + '<br><small class="text-muted">入 ' + _reviewTradeTime(trade.buy_timestamp) + '</small></td>'
+                    + '<td class="text-wrap-mobile"><strong>' + escapeHtml(trade.outcome || '—') + '</strong>' + settlementBadge + ' · ' + escapeHtml(trade.question || '—')
+                    + '<br><small class="text-muted">token ' + escapeHtml(_shortTokenId(trade.token_id)) + (meta ? ' · ' + meta : '') + '</small></td>'
+                    + '<td>' + formatPrice(trade.buy_price) + ' → ' + formatPrice(trade.sell_price)
+                    + '<br><small class="text-muted">' + formatTokenAmount(trade.matched_shares) + ' 张</small></td>'
+                    + '<td>' + formatMoneyNum(trade.matched_buy_cost) + '<br><small class="text-muted">回收 ' + formatMoneyNum(trade.sell_proceeds) + '</small></td>'
+                    + '<td class="' + pnlClass + '"><strong>' + formatMoneyNum(pnl) + '</strong><br><small>' + (trade.return_pct != null ? Number(trade.return_pct).toFixed(1) + '%' : '—') + '</small></td>'
+                    + '</tr>';
+            }).join('');
+            return '<div class="border rounded mt-3">'
+                + '<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 p-2 bg-light">'
+                + '<div><strong>具体 token 出场明细</strong><br><small class="text-muted">按出场时间倒序；包含真实 sell 和已结算归零/兑付的剩余 lot。</small></div>'
+                + '<button class="btn btn-outline-secondary btn-sm" type="button" data-bs-toggle="collapse" data-bs-target="#monthlyGoalReviewTradesCollapse" aria-expanded="' + collapseAria + '" aria-controls="monthlyGoalReviewTradesCollapse" onclick="monthlyGoalReviewTradesExpanded = !monthlyGoalReviewTradesExpanded; this.textContent = monthlyGoalReviewTradesExpanded ? \'收起明细\' : \'展开明细\'">' + collapseLabel + '</button>'
+                + '</div>'
+                + '<div id="monthlyGoalReviewTradesCollapse" class="' + collapseClass + '">'
+                + (rows
+                    ? '<div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>出场时间</th><th>Token / 市场</th><th>价格 / 数量</th><th>成本 / 回收</th><th>收益</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+                    : '<div class="text-muted small p-3">暂无已出场 token 明细。</div>')
+                + '</div></div>';
+        }
+
         function _renderMonthlyGoalReview() {
             const review = monthlyGoalTradeReview;
             if (!review) {
@@ -1528,9 +1758,13 @@
             const comboRows = worst.concat(best).slice(0, 6).map(item => {
                 const pnl = Number(item.realized_pnl || 0);
                 const pnlClass = pnl >= 0 ? 'text-success' : 'text-danger';
+                const tokenTooltip = _reviewTokenSummaryTooltip(item);
+                const tokenSummaryHtml = '<small class="text-muted"'
+                    + (tokenTooltip ? ' title="' + escapeHtml(tokenTooltip) + '" style="cursor: help; text-decoration: underline dotted;"' : '')
+                    + '>' + escapeHtml(item.token_count || 0) + ' token</small>';
                 return '<tr>'
                     + '<td class="text-wrap-mobile">' + escapeHtml(item.label || item.key || '—') + '</td>'
-                    + '<td>' + escapeHtml(item.match_count || 0) + '<br><small class="text-muted">' + escapeHtml(item.token_count || 0) + ' token</small></td>'
+                    + '<td>' + escapeHtml(item.match_count || 0) + '<br>' + tokenSummaryHtml + '</td>'
                     + '<td>' + escapeHtml(item.sample_quality_label || item.sample_quality || '—') + '</td>'
                     + '<td class="' + pnlClass + '">' + formatMoneyNum(pnl) + '</td>'
                     + '<td>' + (item.worst_match_pnl != null ? formatMoneyNum(item.worst_match_pnl) : '—') + '</td>'
@@ -1559,6 +1793,7 @@
                 + '</div>'
                 + '<ul class="mb-2">' + conclusionHtml + '</ul>'
                 + comboTable
+                + _renderMonthlyGoalReviewTokenDetails(review)
                 + '<div class="text-muted small mt-2">复盘结论只用于校准纪律：盈利组合也必须通过当前 entry_gate、阶段上限和防错预算；亏损组合后续默认降权、缩小仓位或等待更强确认。</div>'
                 + '</div></div>';
         }
@@ -1570,6 +1805,7 @@
             const baseValue = Number(
                 dashboardTargetBaseValue != null ? dashboardTargetBaseValue : (latestBalanceSummary && latestBalanceSummary.profile_value)
             );
+            const currentNetValue = Number(latestBalanceSummary && latestBalanceSummary.profile_value);
             const activePrefs = _activeMonthlyGoalPrefs();
             const targetPct = Number(activePrefs.targetPct || 20);
             const targetProfit = Number.isFinite(baseValue) ? baseValue * targetPct / 100 : null;
@@ -1578,6 +1814,7 @@
             const allocationsByTier = {};
             allocationPlan.allocations.forEach(item => { allocationsByTier[item.tierKey] = item; });
             const candidatesByTier = _monthlyGoalCandidatesByTier();
+            const portfolioUnrealizedLoss = _monthlyGoalPortfolioUnrealizedLoss();
             const autoRealizedByTier = _monthlyGoalAutoRealizedByTier();
             const autoTotalRealized = Number(monthlyGoalAutoRealized && monthlyGoalAutoRealized.total_realized || 0);
             const autoClassifiedRealized = Number(monthlyGoalAutoRealized && monthlyGoalAutoRealized.classified_realized || 0);
@@ -1589,10 +1826,12 @@
             const autoTotalGrossRealizedLoss = Number.isFinite(reportedTotalGrossLoss)
                 ? Math.max(0, reportedTotalGrossLoss)
                 : derivedTierGrossLoss + Math.max(0, autoUnclassifiedRealizedLoss);
+            const autoTotalLossBudgetUsed = autoTotalGrossRealizedLoss + Math.max(0, Number(portfolioUnrealizedLoss.totalLoss || 0));
             const overallLossBudget = Number.isFinite(baseValue) ? baseValue * MONTHLY_GOAL_OVERALL_LOSS_BUDGET_PCT / 100 : null;
-            const overallLossStatus = _monthlyGoalLossStatus(autoTotalGrossRealizedLoss, overallLossBudget);
+            const overallLossStatus = _monthlyGoalLossStatus(autoTotalLossBudgetUsed, overallLossBudget);
             let totalRealized = 0;
             let totalRemaining = 0;
+            monthlyGoalQualityByToken = {};
 
             let rows = '';
             MONTHLY_GOAL_TIERS.forEach(tier => {
@@ -1621,9 +1860,11 @@
                 const autoStats = autoRealizedByTier[tier.key] || { realizedPnl: 0, grossRealizedLoss: 0 };
                 const autoRealized = Number(autoStats.realizedPnl || 0);
                 const grossRealizedLoss = Number(autoStats.grossRealizedLoss || 0);
+                const grossUnrealizedLoss = candidates.reduce((sum, c) => sum + Math.max(0, Number(c.heldUnrealizedLoss || 0)), 0);
+                const lossBudgetUsed = grossRealizedLoss + grossUnrealizedLoss;
                 const lossBudgetPct = Number(MONTHLY_GOAL_TIER_LOSS_BUDGET_PCT_BY_TIER[tier.key] || 0);
                 const lossBudgetAmount = Number.isFinite(baseValue) ? baseValue * lossBudgetPct / 100 : null;
-                const lossBudgetStatus = _monthlyGoalLossStatus(grossRealizedLoss, lossBudgetAmount);
+                const lossBudgetStatus = _monthlyGoalLossStatus(lossBudgetUsed, lossBudgetAmount);
                 const riskEntryStatus = (
                     overallLossStatus.status === 'stop_new_entries' || lossBudgetStatus.status === 'stop_new_entries'
                 ) ? 'block' : (
@@ -1649,6 +1890,14 @@
                     );
                     c.entryGate = gate;
                     c.quality = _monthlyGoalCandidateQuality(c, tier.key, gate, riskAdjustedHeadroom);
+                    if (c.tokenId) {
+                        monthlyGoalQualityByToken[String(c.tokenId)] = {
+                            quality: c.quality,
+                            tierKey: tier.key,
+                            tierLabel: tier.label,
+                            entryGate: gate,
+                        };
+                    }
                 });
                 const eligibleCandidates = candidates.filter(c => _combineMonthlyGoalEntryStatus(
                     riskEntryStatus,
@@ -1689,10 +1938,12 @@
                     ? '<small class="text-danger">自动加载失败</small>'
                     : '<small class="text-muted">自动 ' + formatMoneyNum(autoRealized) + (hasManual ? ' · 手动覆盖' : '') + '</small>';
                 const lossBudgetHint = lossBudgetAmount != null
-                    ? '<small class="text-muted">已用 ' + formatMoneyNum(grossRealizedLoss)
+                    ? '<small class="text-muted">已用 ' + formatMoneyNum(lossBudgetUsed)
                         + ' / 预算 ' + formatMoneyNum(lossBudgetAmount)
                         + (lossBudgetStatus.usagePct != null ? ' (' + lossBudgetStatus.usagePct.toFixed(0) + '%)' : '')
-                        + '</small><br><small class="text-muted">余量 ' + formatMoneyNum(Math.max(0, lossBudgetAmount - grossRealizedLoss)) + ' · ' + lossBudgetPct.toFixed(1) + '%基数</small>'
+                        + '</small><br><small class="text-muted">已实现亏损 ' + formatMoneyNum(grossRealizedLoss)
+                        + '；当前浮亏 ' + formatMoneyNum(grossUnrealizedLoss)
+                        + '</small><br><small class="text-muted">余量 ' + formatMoneyNum(Math.max(0, lossBudgetAmount - lossBudgetUsed)) + ' · ' + lossBudgetPct.toFixed(1) + '%基数</small>'
                     : '<small class="text-muted">缺少目标基数</small>';
                 const phaseHint = allocation.exceedsPhaseSuggestion
                     ? '<br><small class="text-warning">阶段建议 ' + phaseSuggestedPositionPct.toFixed(1) + '%；新增按更保守上限</small>'
@@ -1745,7 +1996,12 @@
                 warnings.push('部分手动目标高于当前阶段建议，前端与 AI 会保留你的手动计划显示，但新增买入按更保守的有效上限计算。');
             }
             if (overallLossStatus.status === 'stop_new_entries') {
-                warnings.push('本月总防错预算已用完，应暂停新增买入，只做保护利润、降风险或观察。');
+                const recoveryGap = Number.isFinite(baseValue) && Number.isFinite(currentNetValue)
+                    ? Math.max(0, baseValue - currentNetValue)
+                    : null;
+                warnings.push('本月总防错预算已用完，主目标切换为先回到月初净值'
+                    + (recoveryGap != null ? '（缺口 ' + formatMoneyNum(recoveryGap) + '）' : '')
+                    + '；暂停正常尺寸追目标买入，但允许小仓、强确认、可止损的恢复型交易。');
             } else if (overallLossStatus.status === 'caution') {
                 warnings.push('本月总防错预算已进入谨慎区，新买入需要更强确认和更小仓位。');
             }
@@ -1759,8 +2015,11 @@
                 ? '<div class="text-muted small mt-2">自动总已实现 ' + formatMoneyNum(autoTotalRealized)
                     + '；已归类 ' + formatMoneyNum(autoClassifiedRealized)
                     + '；未归类 ' + formatMoneyNum(autoUnclassifiedRealized)
-                    + '；gross亏损占用防错预算 ' + formatMoneyNum(autoTotalGrossRealizedLoss)
+                    + '；已实现gross亏损 ' + formatMoneyNum(autoTotalGrossRealizedLoss)
+                    + '；当前月度持仓gross浮亏 ' + formatMoneyNum(portfolioUnrealizedLoss.totalLoss)
+                    + '；防错预算合计占用 ' + formatMoneyNum(autoTotalLossBudgetUsed)
                     + (autoUntrackedSellUsdc >= 0.005 ? '；缺少成本的卖出流水 ' + formatMoneyNum(autoUntrackedSellUsdc) + ' 未计入 realized' : '')
+                    + (portfolioUnrealizedLoss.missingCostCount ? '；' + portfolioUnrealizedLoss.missingCostCount + ' 个持仓缺少成本，市值 ' + formatMoneyNum(portfolioUnrealizedLoss.missingCostValue) + ' 未计入浮亏' : '')
                     + '。</div>'
                 : '';
             const editControls = monthlyGoalEditMode
@@ -1781,7 +2040,7 @@
                 + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">目标盈利</div><div class="value text-success">' + formatMoneyNum(targetProfit) + '</div></div></div>'
                 + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">调整后预期收益率</div><div class="value text-info">' + allocationPlan.plannedReturnPct.toFixed(1) + '%</div><small class="text-muted">风控有效 ' + allocationPlan.effectivePlannedReturnPct.toFixed(1) + '%；仓位 ' + allocationPlan.totalPositionPct.toFixed(1) + '%</small></div></div>'
                 + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">待实现盈利</div><div class="value text-primary">' + formatMoneyNum(remainingForGoal) + '</div><small class="text-muted">已实现 ' + formatMoneyNum(totalRealized) + '</small></div></div>'
-                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">剩余防错预算</div><div class="value text-danger">' + formatMoneyNum(overallLossBudget != null ? Math.max(0, overallLossBudget - autoTotalGrossRealizedLoss) : null) + '</div><small class="text-muted">已用 ' + formatMoneyNum(autoTotalGrossRealizedLoss) + ' / ' + formatMoneyNum(overallLossBudget) + '</small></div></div>'
+                + '<div class="col-6 col-md"><div class="monthly-goal-kpi"><div class="label">剩余防错预算</div><div class="value text-danger">' + formatMoneyNum(overallLossBudget != null ? Math.max(0, overallLossBudget - autoTotalLossBudgetUsed) : null) + '</div><small class="text-muted">已用 ' + formatMoneyNum(autoTotalLossBudgetUsed) + ' / ' + formatMoneyNum(overallLossBudget) + '</small><br><small class="text-muted">已实现 ' + formatMoneyNum(autoTotalGrossRealizedLoss) + ' · 浮亏 ' + formatMoneyNum(portfolioUnrealizedLoss.totalLoss) + '</small></div></div>'
                 + '</div>'
                 + warning
                 + editControls
@@ -1789,10 +2048,11 @@
                 + '<thead><tr><th>等级</th><th>目标仓位上限</th><th>目标仓位数</th><th>目标盈利数</th><th>已实现盈利数</th><th>防错预算</th><th>待实现盈利数</th><th>当前候选 token</th></tr></thead>'
                 + '<tbody>' + rows + '</tbody></table></div>'
                 + realizedBreakdown
-                + '<div class="text-muted small mt-2">拆分逻辑：未手动调整时按月初/月中/月末动态组合限制进攻档；手动调整后保留你的计划显示，但新增买入按 min(手动上限, 阶段建议上限, 风险预算上限) 计算。目标仓位是上限/余量，不是必须补满的任务；防错预算按自动 FIFO gross亏损计算，手动已实现覆盖不会重置预算消耗。</div>'
+                + '<div class="text-muted small mt-2">拆分逻辑：未手动调整时按月初/月中/月末动态组合限制进攻档；手动调整后保留你的计划显示，但新增买入按 min(手动上限, 阶段建议上限, 风险预算上限) 计算。目标仓位是上限/余量，不是必须补满的任务；防错预算按自动 FIFO 已实现 gross亏损 + 当前月度持仓 gross浮亏计算，手动已实现覆盖不会重置预算消耗。</div>'
                 + '</div></div>'
                 + exposureClassificationHtml
                 + _renderMonthlyGoalReview();
+            refreshEventQualityCells();
         }
 
         function _monthlyGoalTargetRow(tier, allocation, profileValue) {
@@ -1813,6 +2073,62 @@
                 + (effectivePositionPct < targetPositionPct - 1e-9 ? '；当前阶段有效上限 ' + effectivePositionPct.toFixed(1) + '%' : '')
                 + '（' + (profitAmount != null ? formatMoneyNum(profitAmount) : '—') + '）'
                 + '</li>';
+        }
+
+        let dashboardTradingLessons = {
+            phase_reminders: [],
+            common_mistakes: [],
+            load_error: '经验教训加载中…'
+        };
+
+        function _renderDashboardPhaseLessons(phase) {
+            const lessons = dashboardTradingLessons && Array.isArray(dashboardTradingLessons.phase_reminders)
+                ? dashboardTradingLessons.phase_reminders
+                : [];
+            const rows = lessons.map(item => {
+                const label = escapeHtml((item && item.phase) || '');
+                const text = escapeHtml((item && item.dashboard_text) || '');
+                return label && text ? "<li><strong>" + label + "</strong>：" + text + "</li>" : '';
+            }).filter(Boolean).join('');
+            const loadError = dashboardTradingLessons && dashboardTradingLessons.load_error
+                ? "<li class='text-danger'>" + escapeHtml(dashboardTradingLessons.load_error) + "</li>"
+                : '';
+            return "<div class='mb-2'><strong>阶段提醒（按你的历史）</strong><ul>"
+                + "<li><strong>当前阶段：" + escapeHtml(phase) + "</strong></li>"
+                + (rows || loadError)
+                + "</ul></div>";
+        }
+
+        function _renderDashboardCommonMistakes() {
+            const lessons = dashboardTradingLessons && Array.isArray(dashboardTradingLessons.common_mistakes)
+                ? dashboardTradingLessons.common_mistakes
+                : [];
+            const rows = lessons.map(item => {
+                const wrong = escapeHtml((item && item.wrong) || '');
+                const correction = escapeHtml((item && item.correction) || '');
+                return wrong && correction ? "<li>" + wrong + " → " + correction + "</li>" : '';
+            }).filter(Boolean).join('');
+            const loadError = dashboardTradingLessons && dashboardTradingLessons.load_error
+                ? "<li class='text-danger'>" + escapeHtml(dashboardTradingLessons.load_error) + "</li>"
+                : '';
+            return "<div><strong>你常犯的错误</strong><ul>" + (rows || loadError) + "</ul></div>";
+        }
+
+        function loadTradingLessons() {
+            return fetchJsonSafe('/api/trading_lessons')
+                .then(data => {
+                    dashboardTradingLessons = data || { phase_reminders: [], common_mistakes: [] };
+                    updateDashboardHelpPopover();
+                })
+                .catch(error => {
+                    console.warn('load trading lessons failed', error);
+                    dashboardTradingLessons = {
+                        phase_reminders: [],
+                        common_mistakes: [],
+                        load_error: '经验教训加载失败，请检查 data/trading_lessons.json：' + (error.message || error)
+                    };
+                    updateDashboardHelpPopover();
+                });
         }
 
         function buildDashboardHelpContent(profileValue, phaseLabel, targetPct) {
@@ -1839,25 +2155,13 @@
                 + "<li><strong>低价Yes</strong>：月初 <code>0.10≤Yes≤0.25</code> 且 <code>5%~10%</code>；月中 <code>0.10≤Yes≤0.30</code> 且 <code>3%~8%</code>；月末 <code>0.08≤Yes≤0.22</code> 且 <code>2%~5%</code>。</li>"
                 + "<li><strong>No观察 / Yes观察</strong>：不落在以上区间，先列入 watchlist，不代表永远不做，只代表现在不急着做。</li>"
                 + "</ul></div>"
-                + "<div class='mb-2'><strong>阶段提醒（按你的历史）</strong><ul>"
-                + "<li><strong>当前阶段：" + phase + "</strong></li>"
-                + "<li><strong>月初</strong>：不要预设没 edge，可正常找机会。</li>"
-                + "<li><strong>月中</strong>：No 不再默认主战区；只有确认后的中价No才做，Yes 的弹性机会更值得关注。</li>"
-                + "<li><strong>月末</strong>：盈利更偏向 No，继续以防守型 No 为主。</li>"
-                + "</ul></div>"
+                + _renderDashboardPhaseLessons(phase)
                 + "<div class='mb-2'><strong>分层盈利目标（当前 " + goalPct.toFixed(1) + "% 目标）</strong><br>未手动调整时按月初/月中/月末动态组合限制进攻档；手动调整后保留你的输入，但新增买入按更保守的有效上限。<br>"
                 + "当前组合预期收益 = <strong>" + allocationPlan.plannedReturnPct.toFixed(1) + "%</strong>，风控有效 = <strong>" + allocationPlan.effectivePlannedReturnPct.toFixed(1) + "%</strong>，仓位合计 = <strong>" + allocationPlan.totalPositionPct.toFixed(1) + "%</strong>。"
                 + "</div>"
                 + "<div class='mb-2'><strong>当前目标拆分</strong><ul>" + currentRows + "</ul></div>"
-                + "<div><strong>你常犯的错误</strong><ul>"
-                + "<li>因为标准高价No近期赚钱就放大仓位 → 改成只把它当防守/稳定仓，不用它追月度目标</li>"
-                + "<li>第一次逼近 barrier 就抄中价No，尤其是下方 dip No → 改成等试探失败确认后再进，并把单 token 仓位压小</li>"
-                + "<li>看到下方 dip No 价格进入中价No/舒服高价No区间就觉得安全 → 改成先看 barrier 方向、是否 downside/dip 和离场纪律，再看分类标签</li>"
-                + "<li>没有催化就买低价Yes，或用低价Yes追月度目标 → 改成只做小额尾部对冲，突破/跌破催化确认后才短线参与</li>"
-                + "<li>到 +10%/+20% 浮盈后太贪、没有主动止盈 → 改成 +10% 先卖 30%-50%，+20% 再卖 30%-50%，剩余仓位再博弹性</li>"
-                + "<li>因月度进度落后拖延止损 → 改成先保本金，再谈追目标</li>"
-                + "<li>把核心No轮动到高风险Yes → 改成核心防守仓默认不轮动</li>"
-                + "</ul></div></div>";
+                + _renderDashboardCommonMistakes()
+                + "</div>";
         }
 
         function updateDashboardHelpPopover() {
@@ -1886,14 +2190,13 @@
                     );
                     let availStr = '';
                     if (data.available_balance != null) {
-                        availStr = ' &nbsp;|&nbsp; 可用: <strong>' + formatMoneyNum(data.available_balance) + '</strong>';
+                        availStr = ' · 可用 ' + formatMoneyNum(data.available_balance);
                     }
                     document.getElementById('balance').innerHTML =
-                        'Cash: <strong>' + (data.cash_balance || '—') + '</strong>'
-                        + availStr
-                        + ' &nbsp;|&nbsp; Profile: <strong>' + profileStr + '</strong>'
-                        + ' &nbsp;|&nbsp; 月初收益率: <strong>' + monthlyReturnStr + '</strong>'
-                        + ' &nbsp;|&nbsp; 月初净值: <strong>' + monthStartStr + '</strong>';
+                        '<span class="top-chip-label">账户净值</span>'
+                        + '<span class="top-chip-main">Profile ' + profileStr + '</span>'
+                        + '<span class="top-chip-sub"> · Cash ' + (data.cash_balance || '—') + availStr + '</span>'
+                        + '<br><span class="top-chip-sub">月初净值 ' + monthStartStr + ' · 本月 ' + monthlyReturnStr + '</span>';
                     updateDashboardHelpPopover();
                     renderMonthlyGoal();
                 })
@@ -1909,6 +2212,11 @@
             return '$' + Number(num).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
         }
 
+        function formatPlainPct(num) {
+            if (num == null || isNaN(Number(num))) return '—';
+            return Number(num).toFixed(2) + '%';
+        }
+
         function loadBtcPrice() {
             fetchJsonSafe('/api/btc_1h_kline')
                 .then(data => {
@@ -1921,7 +2229,25 @@
                     const h = formatBtcPrice(data.high);
                     const l = formatBtcPrice(data.low);
                     const c = formatBtcPrice(data.close);
-                    document.getElementById('btc-price').innerHTML = 'BTC: <strong>' + priceStr + '</strong> &nbsp;|&nbsp; 1h O ' + o + ' / H ' + h + ' / L ' + l + ' / C ' + c;
+                    const vol = data.volatility || {};
+                    const regimeLabel = {
+                        trend_up: '上行趋势',
+                        trend_down: '下行趋势',
+                        range: '震荡',
+                        unknown: '未知',
+                    }[vol.market_regime || 'unknown'] || vol.market_regime || '未知';
+                    const volLine = '最新TR ' + formatPlainPct(vol.latest_tr_pct)
+                        + ' · 昨日TR ' + formatPlainPct(vol.previous_tr_pct)
+                        + ' · ATR波动 ' + formatPlainPct(vol.atr_pct)
+                        + ' · 波动分位 ' + formatPlainPct(vol.tr_percentile_30d)
+                        + ' · 30日均TR ' + formatPlainPct(vol.avg_tr_pct_30d)
+                        + ' · 实现波动 ' + formatPlainPct(vol.realized_vol_daily_pct)
+                        + ' · ' + escapeHtml(regimeLabel);
+                    document.getElementById('btc-price').innerHTML =
+                        '<span class="top-chip-label">BTC 市场</span>'
+                        + '<span class="top-chip-main">' + priceStr + '</span>'
+                        + '<span class="top-chip-sub"> · 1h O ' + o + ' / H ' + h + ' / L ' + l + ' / C ' + c + '</span>'
+                        + '<br><span class="top-chip-sub">' + volLine + '</span>';
                 })
                 .catch(error => {
                     document.getElementById('btc-price').textContent = 'BTC: Error';
@@ -2017,6 +2343,53 @@
                 .finally(function() { btn.disabled = false; });
         });
 
+        function _renderEventQualitySnapshot(snapshot) {
+            if (!snapshot || !snapshot.quality) return '<span class="text-muted small">观察</span>';
+            const quality = snapshot.quality || {};
+            const label = String(quality.label || 'watch');
+            const tone = label === 'excellent' ? 'success'
+                : (label === 'good' ? 'primary'
+                    : (label === 'watch' ? 'warning' : 'secondary'));
+            const gateStatus = String(snapshot.entryGate || 'allow');
+            const gate = gateStatus === 'block' ? '暂停' : (gateStatus === 'caution' ? '谨慎' : '确认');
+            return '<span class="badge text-bg-' + tone + '">Q' + Math.round(Number(quality.score || 0)) + '/' + escapeHtml(label) + '</span>'
+                + '<br><small class="text-muted">' + escapeHtml(snapshot.tierLabel || '') + ' · ' + gate + '</small>';
+        }
+
+        function refreshEventQualityCells() {
+            document.querySelectorAll('[data-event-quality-token]').forEach(cell => {
+                const tokenId = cell.getAttribute('data-event-quality-token') || '';
+                const snapshot = monthlyGoalQualityByToken[tokenId];
+                if (snapshot) cell.innerHTML = _renderEventQualitySnapshot(snapshot);
+            });
+        }
+
+        function _eventOutcomeQualityHtml(market, outcome, index, tokenId) {
+            const cached = monthlyGoalQualityByToken[String(tokenId || '')];
+            if (cached) return _renderEventQualitySnapshot(cached);
+            const tier = MONTHLY_GOAL_TIERS.find(t => (
+                String(t.outcome || '').toLowerCase() === String(outcome || '').toLowerCase()
+                && _hasMonthlyGoalBadge(market, t)
+            ));
+            if (!tier) {
+                return '<span class="text-muted small">观察</span>';
+            }
+            const barrierMeta = market.barrierMeta || {};
+            const candidate = {
+                price: _entryPriceForOutcome(market, index),
+                strike: _extractStrikeFromQuestion(market.question),
+                directionInQuestion: _extractDirectionFromQuestion(market.question),
+                distancePct: Number.isFinite(Number(barrierMeta.distance_pct)) ? Number(barrierMeta.distance_pct) : null,
+                pendingBuyNotional: 0,
+            };
+            if (tier.key === 'mid_no') {
+                candidate.midNoEntryGate = _monthlyGoalMidNoEntryGate(candidate);
+            }
+            const gateStatus = candidate.midNoEntryGate ? candidate.midNoEntryGate.status : 'allow';
+            const quality = _monthlyGoalCandidateQuality(candidate, tier.key, gateStatus, null);
+            return _renderEventQualitySnapshot({ quality, tierLabel: tier.label, entryGate: gateStatus });
+        }
+
         function loadEvents() {
             fetchJsonSafe('/api/events')
                 .then(data => {
@@ -2062,11 +2435,12 @@
                         });
                         content += '</div>';
                         content += '<div class="table-responsive">';
-                        content += '<table class="table table-sm align-middle mb-0"><thead><tr><th>Outcome</th><th>Mid</th><th>Best Bid</th><th>Best Ask</th><th>Actions</th></tr></thead><tbody>';
+                        content += '<table class="table table-sm align-middle mb-0"><thead><tr><th>Outcome</th><th>Mid</th><th>Best Bid</th><th>Best Ask</th><th>Q评分</th><th>Actions</th></tr></thead><tbody>';
                         market.outcomes.forEach((outcome, index) => {
                             const price = market.outcomePrices[index];
                             const bestBid = (market.bestBids || [])[index];
                             const bestAsk = (market.bestAsks || [])[index];
+                            const tokenId = (market.token_id || [])[index] || '';
                             const fmtPx = v => (v == null || isNaN(Number(v))) ? '—' : Number(v).toFixed(3);
                             // 快速下单：买单按 best ask（吃单）/ 卖单按 best bid，避免无脑用 mid
                             const buyPx = (bestAsk != null && !isNaN(Number(bestAsk))) ? Number(bestAsk) : Number(price);
@@ -2075,6 +2449,7 @@
                             content += '<td>' + price + '</td>';
                             content += '<td class="text-success">' + fmtPx(bestBid) + '</td>';
                             content += '<td class="text-danger">' + fmtPx(bestAsk) + '</td>';
+                            content += '<td data-event-quality-token="' + escapeAttr(tokenId) + '">' + _eventOutcomeQualityHtml(market, outcome, index, tokenId) + '</td>';
                             content += '<td><div class="d-flex flex-wrap gap-1">';
                             content += '<button class="btn btn-success btn-sm" onclick="openBuyModal(\'' + market.market_id + '\', \'' + market.token_id[index] + '\', ' + buyPx + ')">Buy</button>';
                             content += '<button class="btn btn-danger btn-sm" onclick="openSellModal(\'' + market.market_id + '\', \'' + market.token_id[index] + '\', ' + sellPx + ')">Sell</button>';
@@ -2087,6 +2462,7 @@
                     container.innerHTML = content;
                     initTooltips(container);
                     renderMonthlyGoal();
+                    renderExposureOverview();
                 })
                 .catch(error => {
                     document.getElementById('events-content').innerHTML = 'Error loading events: ' + error;
@@ -2148,6 +2524,29 @@
             const matched = Number(order.size_matched);
             if (Number.isFinite(original) && Number.isFinite(matched)) return Math.max(0, original - matched);
             return 0;
+        }
+
+        function _exposureGroupBarrierBadgeHtml(groupKey, title) {
+            const markets = ((latestEventsData || {}).markets || []);
+            const key = String(groupKey || '');
+            const titleText = String(title || '');
+            const market = markets.find(m => (
+                String((m || {}).market_id || '') === key
+                || String((m || {}).question || '') === titleText
+            ));
+            const barrierMeta = (market || {}).barrierMeta || {};
+            if (barrierMeta.distance_label) {
+                return ' <span class="badge text-bg-primary ms-2 align-middle">' + escapeHtml(barrierMeta.distance_label) + '</span>';
+            }
+            const currentBtcPrice = Number((latestEventsData || {}).current_btc_price);
+            const strike = _extractStrikeFromQuestion(titleText);
+            const direction = _extractDirectionFromQuestion(titleText);
+            if (!Number.isFinite(currentBtcPrice) || currentBtcPrice <= 0 || !strike || direction === 'unknown') {
+                return '';
+            }
+            const distancePct = Math.abs(strike - currentBtcPrice) / currentBtcPrice * 100;
+            const actionWord = direction === 'above' ? '上破' : '下破';
+            return ' <span class="badge text-bg-primary ms-2 align-middle">距' + actionWord + ' barrier ' + distancePct.toFixed(1) + '%</span>';
         }
 
         function _buildExposureGroups() {
@@ -2242,7 +2641,7 @@
 
                 content += '<div class="card event-card shadow-sm mb-3"><div class="card-body p-2 p-md-3">';
                 content += '<div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-2">';
-                content += '<h3 class="text-wrap-mobile mb-0">' + escapeHtml(group.title || '—') + '</h3>';
+                content += '<h3 class="text-wrap-mobile mb-0">' + escapeHtml(group.title || '—') + _exposureGroupBarrierBadgeHtml(key, group.title) + '</h3>';
                 content += '<div class="d-flex flex-wrap gap-1 small">'
                     + '<span class="badge text-bg-secondary">持仓 ' + formatMoney(groupPositionValue) + '</span>'
                     + '<span class="badge text-bg-success">BUY ' + formatMoney(groupBuyNotional) + '</span>'
@@ -2290,7 +2689,7 @@
                         + '<td class="text-wrap-mobile">' + escapeHtml(order.outcome || '—') + '</td>'
                         + '<td><span class="badge text-bg-' + sideClass + '">' + escapeHtml(side || '—') + '</span></td>'
                         + '<td>' + formatTokenAmount(remaining) + '<br><small class="text-muted">filled ' + formatOrderSize(order.size) + '</small></td>'
-                        + '<td>' + formatPrice(order.price) + '</td>'
+                        + '<td><small>Limit ' + formatPrice(order.price) + '<br><span class="text-success">Bid ' + formatPrice(order.bestBid) + '</span> / <span class="text-danger">Ask ' + formatPrice(order.bestAsk) + '</span></small></td>'
                         + '<td>' + exposure + '</td>'
                         + '<td><span class="badge text-bg-secondary">' + escapeHtml(order.status || 'open') + '</span></td>'
                         + '<td><div class="d-flex flex-wrap gap-1">'
@@ -4125,6 +4524,7 @@
         document.getElementById('phaseBadge').textContent = dashboardPhaseLabel;
 
         // Load data on page load
+        loadTradingLessons();
         loadBalance();
         loadBtcPrice();
         loadBtcFastSignal();

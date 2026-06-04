@@ -5,6 +5,7 @@ Polymarket 持仓分析主入口
 import json
 import os
 import calendar
+import fcntl
 import hashlib
 import logging
 from pathlib import Path
@@ -501,6 +502,19 @@ def _build_btc_momentum_context(btc_4h_k_data: list, current_btc_price: float) -
 
 
 if __name__ == "__main__":
+    lock_path = Path(__file__).resolve().parent / "logs" / "position_analyze.lock"
+    lock_path.parent.mkdir(exist_ok=True)
+    lock_file = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"{datetime.now(ET_TIMEZONE):%m-%d %H:%M} position_analyze 已在运行，本轮跳过")
+        raise SystemExit(0)
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(f"pid={os.getpid()} started_at={datetime.now(timezone.utc).isoformat()}\n")
+    lock_file.flush()
+
     email_sender = EmailSender()
     recommendation_db = RecommendationDB()
     recommendation_db.init_tables()
@@ -623,6 +637,7 @@ if __name__ == "__main__":
             target_position_overrides=monthly_goal_setting.get("target_position_overrides") or {},
             btc_momentum_context=btc_momentum_context,
             active_manual_pending_orders=active_manual_pending_orders,
+            monthly_progress=monthly_progress,
             profile=ANALYZE_PROFILE,
         )
         profit_optimization_context["monthly_goal_context"] = monthly_goal_context

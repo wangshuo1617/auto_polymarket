@@ -13,6 +13,7 @@ wheels/
 *.ipynb
 output/
 *.json
+!data/trading_lessons.json
 price_warn_*.py
 logs/
 *.sql

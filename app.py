@@ -33,6 +33,8 @@ from services.entry_review import (
 )
 from services.execution_quality import list_recent_execution_quality
 from services.polymarket_redeem import redeem_position
+from services.trading_lessons import get_dashboard_trading_lessons
+from services.volatility import build_daily_volatility_profile
 
 from flask import Flask, Response, render_template, request, jsonify, session, redirect, url_for
 from py_clob_client_v2.clob_types import (
@@ -53,7 +55,7 @@ _project_root = Path(__file__).resolve().parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from data.binance import get_btc_price, get_1h_klines_data
+from data.binance import get_btc_price, get_1h_klines_data, get_1d_klines_data
 from data.polymarket import (
     get_client,
     get_event_situation,
@@ -414,6 +416,16 @@ def api_events():
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading_lessons')
+def api_trading_lessons():
+    """Dashboard 与 AI prompt 共用的交易经验教训。"""
+    try:
+        return jsonify(get_dashboard_trading_lessons())
+    except Exception as e:
+        logger.exception("api_trading_lessons error")
+        return jsonify({"error": str(e)}), 500
 
 
 def _current_et_month_bounds() -> tuple[datetime, datetime, str]:
@@ -1396,11 +1408,35 @@ def api_open_orders():
             except (TypeError, ValueError):
                 return 0.0
 
+        def _to_float_or_none(value):
+            try:
+                if value is None:
+                    return None
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
         def _format_size(value):
             return str(int(value)) if float(value).is_integer() else str(round(value, 6))
 
+        token_ids = [
+            str(order.get("asset_id") or order.get("token_id") or order.get("asset"))
+            for order in orders
+            if order.get("asset_id") or order.get("token_id") or order.get("asset")
+        ]
+        best_prices = {}
+        if token_ids:
+            try:
+                best_prices = get_best_prices(token_ids, profile=APP_PM_PROFILE)
+            except Exception as exc:
+                logger.warning("api_open_orders get_best_prices failed: %s", exc)
+
         market_cache = {}
         for order in orders:
+            token_id = str(order.get("asset_id") or order.get("token_id") or order.get("asset") or "")
+            px = best_prices.get(token_id) if token_id else None
+            order["bestBid"] = _to_float_or_none((px or {}).get("best_bid"))
+            order["bestAsk"] = _to_float_or_none((px or {}).get("best_ask"))
             original_size = _to_float(order.get("original_size"))
             matched_size = _to_float(order.get("size_matched"))
             remaining_size = max(original_size - matched_size, 0.0)
@@ -1966,8 +2002,31 @@ def api_btc_1h_kline():
     try:
         price = get_btc_price()
         klines = get_1h_klines_data(limit=1)
+        volatility = None
+        try:
+            daily_klines = get_1d_klines_data(limit=30)
+            volatility = build_daily_volatility_profile(daily_klines)
+            tr_pct_values = []
+            prev_close = None
+            for candle in daily_klines or []:
+                try:
+                    high = float(candle[2])
+                    low = float(candle[3])
+                    close = float(candle[4])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if close > 0:
+                    base_close = prev_close if prev_close and prev_close > 0 else close
+                    true_range = max(high - low, abs(high - base_close), abs(low - base_close))
+                    tr_pct_values.append(true_range / close * 100.0)
+                    prev_close = close
+            if tr_pct_values and isinstance(volatility, dict):
+                volatility["avg_tr_pct_30d"] = round(sum(tr_pct_values) / len(tr_pct_values), 2)
+                volatility["sample_days"] = len(tr_pct_values)
+        except Exception as exc:
+            logger.warning("api_btc_1h_kline volatility failed: %s", exc)
         if not klines:
-            return jsonify({"price": price, "open": None, "high": None, "low": None, "close": None})
+            return jsonify({"price": price, "open": None, "high": None, "low": None, "close": None, "volatility": volatility})
         candle = klines[0]
         return jsonify({
             "price": price,
@@ -1975,6 +2034,7 @@ def api_btc_1h_kline():
             "high": float(candle[2]),
             "low": float(candle[3]),
             "close": float(candle[4]),
+            "volatility": volatility,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500

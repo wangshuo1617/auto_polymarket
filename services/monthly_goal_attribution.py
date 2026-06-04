@@ -9,6 +9,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import psycopg2.extras
+import requests
 
 from data.database import get_conn, get_cursor
 from services.profit_optimizer import _extract_strike_and_direction, _parse_market_prices
@@ -781,12 +782,106 @@ def _ensure_list(value: Any) -> list:
     return []
 
 
-def _position_value(position: dict) -> tuple[float, float]:
+def _parse_dt(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not value:
+        return None
+    try:
+        raw = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _monthly_event_resolution_by_token(event_slug: str) -> dict[str, dict[str, Any]]:
+    """读取本月事件中已结算市场的 token payout,用于把未 sell 的 lost/won lot 计入复盘。"""
+    if not event_slug:
+        return {}
+    try:
+        response = requests.get(f"https://gamma-api.polymarket.com/events/slug/{event_slug}", timeout=15)
+        response.raise_for_status()
+        event = response.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("monthly event resolution fetch failed: event_slug=%s error=%s", event_slug, exc)
+        return {}
+
+    by_token: dict[str, dict[str, Any]] = {}
+    for market in event.get("markets") or []:
+        if not isinstance(market, dict):
+            continue
+        outcomes = _ensure_list(market.get("outcomes"))
+        token_ids = [str(t) for t in _ensure_list(market.get("clobTokenIds"))]
+        prices = [_to_float(p, None) for p in _ensure_list(market.get("outcomePrices"))]
+        if not outcomes or not token_ids or len(token_ids) != len(outcomes) or len(prices) != len(outcomes):
+            continue
+        is_resolved = (
+            bool(market.get("resolved"))
+            or bool(market.get("isResolved"))
+            or str(market.get("umaResolutionStatus") or "").lower() == "resolved"
+            or bool(market.get("closed"))
+        )
+        if not is_resolved:
+            continue
+        # 避免把普通 closed/paused 市场误判为结算：只有 payout 近似 0/1 时才纳入。
+        payouts: list[float] = []
+        for price in prices:
+            if price is None:
+                payouts = []
+                break
+            if price <= 0.001:
+                payouts.append(0.0)
+            elif price >= 0.999:
+                payouts.append(1.0)
+            else:
+                payouts = []
+                break
+        if not payouts:
+            continue
+        settled_at = (
+            _parse_dt(market.get("closedTime"))
+            or _parse_dt(market.get("umaEndDate"))
+            or _parse_dt(market.get("updatedAt"))
+        )
+        for token_id, outcome, payout in zip(token_ids, outcomes, payouts):
+            if not token_id:
+                continue
+            by_token[token_id] = {
+                "payout": payout,
+                "question": market.get("question"),
+                "outcome": outcome,
+                "market_slug": market.get("slug"),
+                "settled_at": settled_at.isoformat() if settled_at else None,
+                "resolution_status": "won" if payout >= 0.999 else "lost",
+            }
+    return by_token
+
+
+def _position_amounts(position: dict) -> tuple[float, float, float | None, float | None]:
     size = _to_float(position.get("size"), 0.0) or 0.0
     current_value = _to_float(position.get("currentValue"), None)
     if current_value is None:
         cur_price = _to_float(position.get("curPrice"), 0.0) or 0.0
         current_value = size * cur_price
+    cash_pnl = _to_float(position.get("cashPnl"), None)
+    avg_price = _to_float(position.get("avgPrice"), None)
+    initial_value = _to_float(position.get("initialValue"), None)
+    cost_basis = None
+    if cash_pnl is not None:
+        cost_basis = current_value - cash_pnl
+    elif avg_price is not None and size > 0:
+        cost_basis = avg_price * size
+    elif initial_value is not None:
+        cost_basis = initial_value
+    if cost_basis is not None:
+        cost_basis = max(0.0, float(cost_basis))
+    unrealized_pnl = current_value - cost_basis if cost_basis is not None else None
+    return size, current_value, cost_basis, unrealized_pnl
+
+
+def _position_value(position: dict) -> tuple[float, float]:
+    size, current_value, _cost_basis, _unrealized_pnl = _position_amounts(position)
     return size, current_value
 
 
@@ -800,20 +895,40 @@ def _build_position_indexes(positions: list | None) -> tuple[dict[str, dict], di
     for pos in positions or []:
         if not isinstance(pos, dict):
             continue
-        size, value = _position_value(pos)
-        entry = {"shares": size, "value": value}
+        size, value, cost_basis, unrealized_pnl = _position_amounts(pos)
+        entry = {"shares": size, "value": value, "cost": cost_basis, "unrealized_pnl": unrealized_pnl}
         token_id = str(pos.get("asset") or pos.get("token_id") or pos.get("tokenId") or "").strip()
         if token_id:
-            current = by_token.setdefault(token_id, {"shares": 0.0, "value": 0.0})
+            current = by_token.setdefault(token_id, {
+                "shares": 0.0,
+                "value": 0.0,
+                "cost": 0.0,
+                "unrealized_pnl": 0.0,
+                "cost_known": False,
+            })
             current["shares"] += size
             current["value"] += value
+            if cost_basis is not None and unrealized_pnl is not None:
+                current["cost"] += cost_basis
+                current["unrealized_pnl"] += unrealized_pnl
+                current["cost_known"] = True
         question = pos.get("title") or pos.get("question") or pos.get("market") or pos.get("condition")
         outcome = pos.get("outcome") or pos.get("side")
         key = _position_match_key(question, outcome)
         if key[0] and key[1]:
-            current = by_question_outcome.setdefault(key, {"shares": 0.0, "value": 0.0})
+            current = by_question_outcome.setdefault(key, {
+                "shares": 0.0,
+                "value": 0.0,
+                "cost": 0.0,
+                "unrealized_pnl": 0.0,
+                "cost_known": False,
+            })
             current["shares"] += entry["shares"]
             current["value"] += entry["value"]
+            if entry["cost"] is not None and entry["unrealized_pnl"] is not None:
+                current["cost"] += entry["cost"]
+                current["unrealized_pnl"] += entry["unrealized_pnl"]
+                current["cost_known"] = True
     return by_token, by_question_outcome
 
 
@@ -892,6 +1007,64 @@ def _market_entries_by_token(
                 "current_tier_label": ACTIONABLE_TIER_LABELS.get(current_tier_key),
             }
     return out
+
+
+def _monthly_event_token_ids(markets: list) -> set[str]:
+    token_ids: set[str] = set()
+    for market in markets or []:
+        if not isinstance(market, dict):
+            continue
+        for token_id in _ensure_list(market.get("token_id") or market.get("clobTokenIds")):
+            token = str(token_id or "").strip()
+            if token:
+                token_ids.add(token)
+    return token_ids
+
+
+def _portfolio_unrealized_loss_summary(
+    *,
+    positions: list | None,
+    monthly_token_ids: set[str],
+) -> dict[str, Any]:
+    """按当前月度 event 全部持仓估算浮亏，供总防错预算使用。"""
+    if not monthly_token_ids:
+        return {
+            "total_unrealized_pnl_usdc": 0.0,
+            "total_gross_unrealized_loss_usdc": 0.0,
+            "position_count": 0,
+            "missing_cost_position_count": 0,
+            "missing_cost_value_usdc": 0.0,
+            "token_scope_available": False,
+        }
+    total_unrealized_pnl = 0.0
+    total_gross_unrealized_loss = 0.0
+    position_count = 0
+    missing_cost_count = 0
+    missing_cost_value = 0.0
+    for pos in positions or []:
+        if not isinstance(pos, dict):
+            continue
+        token_id = str(pos.get("asset") or pos.get("token_id") or pos.get("tokenId") or "").strip()
+        if monthly_token_ids and token_id not in monthly_token_ids:
+            continue
+        size, current_value, cost_basis, unrealized_pnl = _position_amounts(pos)
+        if size <= 0 and current_value <= 0:
+            continue
+        position_count += 1
+        if cost_basis is None or unrealized_pnl is None:
+            missing_cost_count += 1
+            missing_cost_value += max(0.0, current_value)
+            continue
+        total_unrealized_pnl += unrealized_pnl
+        total_gross_unrealized_loss += max(0.0, -unrealized_pnl)
+    return {
+        "total_unrealized_pnl_usdc": round(total_unrealized_pnl, 6),
+        "total_gross_unrealized_loss_usdc": round(total_gross_unrealized_loss, 6),
+        "position_count": position_count,
+        "missing_cost_position_count": missing_cost_count,
+        "missing_cost_value_usdc": round(missing_cost_value, 6),
+        "token_scope_available": True,
+    }
 
 
 def _intent_from_pending_orders(active_manual_pending_orders: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
@@ -1030,22 +1203,31 @@ def _held_allocations_by_token_tier(
             tier_key = str(lot.get("intent_tier_key") or "")
             if tier_key not in ACTIONABLE_TIER_LABELS:
                 continue
-            ratio = float(lot.get("remaining_cost_usdc") or 0.0) / total_cost
+            cost_alloc = float(lot.get("remaining_cost_usdc") or 0.0)
+            ratio = cost_alloc / total_cost
+            value_alloc = held_value * ratio
+            unrealized_pnl = value_alloc - cost_alloc
             row = out.setdefault(token_id, {}).setdefault(tier_key, {
                 "held_value_usdc": 0.0,
                 "held_shares": 0.0,
                 "remaining_cost_usdc": 0.0,
+                "held_unrealized_pnl_usdc": 0.0,
+                "held_unrealized_loss_usdc": 0.0,
                 "intent_tier_label": lot.get("intent_tier_label") or ACTIONABLE_TIER_LABELS.get(tier_key),
                 "intent_source": lot.get("source") or "open_lot_entry_tier",
             })
-            row["held_value_usdc"] += held_value * ratio
+            row["held_value_usdc"] += value_alloc
             row["held_shares"] += held_shares * ratio
-            row["remaining_cost_usdc"] += float(lot.get("remaining_cost_usdc") or 0.0)
+            row["remaining_cost_usdc"] += cost_alloc
+            row["held_unrealized_pnl_usdc"] += unrealized_pnl
+            row["held_unrealized_loss_usdc"] += max(0.0, -unrealized_pnl)
     for tiers in out.values():
         for row in tiers.values():
             row["held_value_usdc"] = round(float(row.get("held_value_usdc") or 0.0), 2)
             row["held_shares"] = round(float(row.get("held_shares") or 0.0), 6)
             row["remaining_cost_usdc"] = round(float(row.get("remaining_cost_usdc") or 0.0), 2)
+            row["held_unrealized_pnl_usdc"] = round(float(row.get("held_unrealized_pnl_usdc") or 0.0), 2)
+            row["held_unrealized_loss_usdc"] = round(float(row.get("held_unrealized_loss_usdc") or 0.0), 2)
     return out
 
 
@@ -1766,11 +1948,14 @@ def _new_review_group(key: str, label: str) -> dict[str, Any]:
         "matched_shares": 0.0,
         "token_count": 0,
         "_tokens": set(),
+        "_token_stats": {},
     }
 
 
 def _add_review_match(group: dict[str, Any], *, token_id: str, shares: float, cost: float,
-                      proceeds: float, realized: float) -> None:
+                      proceeds: float, realized: float, question: str | None = None,
+                      outcome: str | None = None, exit_timestamp: datetime | None = None,
+                      exit_type: str = "sell") -> None:
     group["match_count"] += 1
     group["matched_shares"] += shares
     group["matched_buy_cost"] += cost
@@ -1785,11 +1970,41 @@ def _add_review_match(group: dict[str, Any], *, token_id: str, shares: float, co
     worst = group.get("worst_match_pnl")
     group["worst_match_pnl"] = realized if worst is None else min(float(worst), realized)
     group["_tokens"].add(token_id)
+    stats = group["_token_stats"].setdefault(token_id, {
+        "token_id": token_id,
+        "question": question,
+        "outcome": outcome,
+        "match_count": 0,
+        "matched_shares": 0.0,
+        "matched_buy_cost": 0.0,
+        "sell_proceeds": 0.0,
+        "realized_pnl": 0.0,
+        "worst_match_pnl": None,
+        "latest_exit_timestamp": None,
+        "exit_types": {},
+    })
+    if question and not stats.get("question"):
+        stats["question"] = question
+    if outcome and not stats.get("outcome"):
+        stats["outcome"] = outcome
+    stats["match_count"] += 1
+    stats["matched_shares"] += shares
+    stats["matched_buy_cost"] += cost
+    stats["sell_proceeds"] += proceeds
+    stats["realized_pnl"] += realized
+    token_worst = stats.get("worst_match_pnl")
+    stats["worst_match_pnl"] = realized if token_worst is None else min(float(token_worst), realized)
+    if isinstance(exit_timestamp, datetime):
+        ts = exit_timestamp.isoformat()
+        if not stats.get("latest_exit_timestamp") or ts > str(stats.get("latest_exit_timestamp")):
+            stats["latest_exit_timestamp"] = ts
+    stats["exit_types"][exit_type] = int(stats["exit_types"].get(exit_type) or 0) + 1
 
 
 def _finalize_review_group(group: dict[str, Any]) -> dict[str, Any]:
     out = dict(group)
     tokens = out.pop("_tokens", set())
+    token_stats = out.pop("_token_stats", {})
     cost = float(out.get("matched_buy_cost") or 0.0)
     count = int(out.get("match_count") or 0)
     wins = int(out.get("win_count") or 0)
@@ -1808,6 +2023,25 @@ def _finalize_review_group(group: dict[str, Any]) -> dict[str, Any]:
     for key in ("matched_buy_cost", "sell_proceeds", "realized_pnl", "gross_profit", "gross_loss", "matched_shares", "worst_match_pnl"):
         if out.get(key) is not None:
             out[key] = round(float(out.get(key) or 0.0), 6)
+    summaries = []
+    for stats in token_stats.values():
+        token_cost = float(stats.get("matched_buy_cost") or 0.0)
+        summaries.append({
+            "token_id": stats.get("token_id"),
+            "question": stats.get("question"),
+            "outcome": stats.get("outcome"),
+            "match_count": int(stats.get("match_count") or 0),
+            "matched_shares": round(float(stats.get("matched_shares") or 0.0), 6),
+            "matched_buy_cost": round(token_cost, 6),
+            "sell_proceeds": round(float(stats.get("sell_proceeds") or 0.0), 6),
+            "realized_pnl": round(float(stats.get("realized_pnl") or 0.0), 6),
+            "return_pct": round(float(stats.get("realized_pnl") or 0.0) / token_cost * 100.0, 2) if token_cost > 0 else None,
+            "worst_match_pnl": round(float(stats.get("worst_match_pnl") or 0.0), 6) if stats.get("worst_match_pnl") is not None else None,
+            "latest_exit_timestamp": stats.get("latest_exit_timestamp"),
+            "exit_types": stats.get("exit_types") or {},
+        })
+    summaries.sort(key=lambda item: abs(float(item.get("realized_pnl") or 0.0)), reverse=True)
+    out["token_summaries"] = summaries[:20]
     return out
 
 
@@ -1915,6 +2149,7 @@ def get_monthly_trade_review_summary(
     month_end_utc = month_end_et.astimezone(timezone.utc)
     monthly_event_slug = _monthly_btc_event_slug(month_start_et)
     fill_profile = str(profile or "analyze").strip() or "analyze"
+    resolution_by_token = _monthly_event_resolution_by_token(monthly_event_slug)
     with get_cursor() as cur:
         cur.execute(
             """
@@ -1950,6 +2185,87 @@ def get_monthly_trade_review_summary(
     total_realized = 0.0
     total_cost = 0.0
     total_proceeds = 0.0
+    settled_trade_count = 0
+    settled_lost_count = 0
+    settled_won_count = 0
+
+    def record_closed_lot(
+        *,
+        lot: dict[str, Any],
+        token_id: str,
+        matched_shares: float,
+        cost_basis: float,
+        proceeds: float,
+        realized: float,
+        exit_timestamp: datetime | None,
+        exit_price: float,
+        exit_type: str = "sell",
+        resolution_status: str | None = None,
+    ) -> None:
+        nonlocal total_realized, total_cost, total_proceeds
+        snapshot = lot.get("tier_snapshot") or {}
+        tier_key = str(lot.get("entry_tier_key") or snapshot.get("tier_key") or "") or None
+        tier_label = lot.get("entry_tier_label") or snapshot.get("tier_label") or ACTIONABLE_TIER_LABELS.get(tier_key or "")
+        phase_key = str(snapshot.get("phase_key") or "unknown")
+        phase_label = snapshot.get("phase_label") or phase_key
+        distance_bucket = str(snapshot.get("distance_bucket") or _distance_bucket(snapshot.get("distance_pct")))
+        entry_gate = _snapshot_gate(snapshot)
+        combo_key, combo_label = _combo_key_label(
+            tier_key=tier_key,
+            tier_label=tier_label,
+            phase_key=phase_key,
+            phase_label=phase_label,
+            distance_bucket=distance_bucket,
+            entry_gate=entry_gate,
+        )
+        for bucket, key, label in (
+            ("by_tier", tier_key or "unclassified", tier_label or "未归类"),
+            ("by_phase", phase_key, phase_label),
+            ("by_distance_bucket", distance_bucket, MONTHLY_REVIEW_DISTANCE_BUCKET_LABELS.get(distance_bucket, distance_bucket)),
+            ("by_entry_gate", entry_gate, MONTHLY_REVIEW_GATE_LABELS.get(entry_gate, entry_gate)),
+            ("by_combo", combo_key, combo_label),
+        ):
+            _add_review_match(
+                _review_group(groups[bucket], key, label),
+                token_id=token_id,
+                shares=matched_shares,
+                cost=cost_basis,
+                proceeds=proceeds,
+                realized=realized,
+                question=lot.get("question"),
+                outcome=lot.get("outcome"),
+                exit_timestamp=exit_timestamp,
+                exit_type=exit_type,
+            )
+        total_realized += realized
+        total_cost += cost_basis
+        total_proceeds += proceeds
+        matched_trades.append({
+            "token_id": token_id,
+            "question": lot.get("question"),
+            "outcome": lot.get("outcome"),
+            "tier_key": tier_key,
+            "tier_label": tier_label,
+            "phase_key": phase_key,
+            "phase_label": phase_label,
+            "distance_bucket": distance_bucket,
+            "distance_bucket_label": MONTHLY_REVIEW_DISTANCE_BUCKET_LABELS.get(distance_bucket, distance_bucket),
+            "distance_pct": snapshot.get("distance_pct"),
+            "entry_gate": entry_gate,
+            "entry_gate_label": MONTHLY_REVIEW_GATE_LABELS.get(entry_gate, entry_gate),
+            "buy_timestamp": lot.get("buy_timestamp").isoformat() if isinstance(lot.get("buy_timestamp"), datetime) else None,
+            "sell_timestamp": exit_timestamp.isoformat() if isinstance(exit_timestamp, datetime) else None,
+            "buy_price": round(float(lot.get("buy_price") or 0.0), 6),
+            "sell_price": round(float(exit_price or 0.0), 6),
+            "matched_shares": round(matched_shares, 6),
+            "matched_buy_cost": round(cost_basis, 6),
+            "sell_proceeds": round(proceeds, 6),
+            "realized_pnl": round(realized, 6),
+            "return_pct": round(realized / cost_basis * 100.0, 2) if cost_basis > 0 else None,
+            "decision_context": snapshot.get("decision_context"),
+            "exit_type": exit_type,
+            "resolution_status": resolution_status,
+        })
 
     for row in rows:
         ts = row["fill_timestamp"]
@@ -2001,64 +2317,17 @@ def get_monthly_trade_review_summary(
             cost_basis = lot_cost * (matched_shares / lot_shares)
             realized = proceeds - cost_basis
             if in_month:
-                snapshot = lot.get("tier_snapshot") or {}
-                tier_key = str(lot.get("entry_tier_key") or snapshot.get("tier_key") or "") or None
-                tier_label = lot.get("entry_tier_label") or snapshot.get("tier_label") or ACTIONABLE_TIER_LABELS.get(tier_key or "")
-                phase_key = str(snapshot.get("phase_key") or "unknown")
-                phase_label = snapshot.get("phase_label") or phase_key
-                distance_bucket = str(snapshot.get("distance_bucket") or _distance_bucket(snapshot.get("distance_pct")))
-                entry_gate = _snapshot_gate(snapshot)
-                combo_key, combo_label = _combo_key_label(
-                    tier_key=tier_key,
-                    tier_label=tier_label,
-                    phase_key=phase_key,
-                    phase_label=phase_label,
-                    distance_bucket=distance_bucket,
-                    entry_gate=entry_gate,
+                record_closed_lot(
+                    lot=lot,
+                    token_id=token_id,
+                    matched_shares=matched_shares,
+                    cost_basis=cost_basis,
+                    proceeds=proceeds,
+                    realized=realized,
+                    exit_timestamp=ts if isinstance(ts, datetime) else None,
+                    exit_price=float(row.get("price") or 0.0),
+                    exit_type="sell",
                 )
-                for bucket, key, label in (
-                    ("by_tier", tier_key or "unclassified", tier_label or "未归类"),
-                    ("by_phase", phase_key, phase_label),
-                    ("by_distance_bucket", distance_bucket, MONTHLY_REVIEW_DISTANCE_BUCKET_LABELS.get(distance_bucket, distance_bucket)),
-                    ("by_entry_gate", entry_gate, MONTHLY_REVIEW_GATE_LABELS.get(entry_gate, entry_gate)),
-                    ("by_combo", combo_key, combo_label),
-                ):
-                    _add_review_match(
-                        _review_group(groups[bucket], key, label),
-                        token_id=token_id,
-                        shares=matched_shares,
-                        cost=cost_basis,
-                        proceeds=proceeds,
-                        realized=realized,
-                    )
-                total_realized += realized
-                total_cost += cost_basis
-                total_proceeds += proceeds
-                trade = {
-                    "token_id": token_id,
-                    "question": lot.get("question"),
-                    "outcome": lot.get("outcome"),
-                    "tier_key": tier_key,
-                    "tier_label": tier_label,
-                    "phase_key": phase_key,
-                    "phase_label": phase_label,
-                    "distance_bucket": distance_bucket,
-                    "distance_bucket_label": MONTHLY_REVIEW_DISTANCE_BUCKET_LABELS.get(distance_bucket, distance_bucket),
-                    "distance_pct": snapshot.get("distance_pct"),
-                    "entry_gate": entry_gate,
-                    "entry_gate_label": MONTHLY_REVIEW_GATE_LABELS.get(entry_gate, entry_gate),
-                    "buy_timestamp": lot.get("buy_timestamp").isoformat() if isinstance(lot.get("buy_timestamp"), datetime) else None,
-                    "sell_timestamp": ts.isoformat() if isinstance(ts, datetime) else None,
-                    "buy_price": round(float(lot.get("buy_price") or 0.0), 6),
-                    "sell_price": round(float(row.get("price") or 0.0), 6),
-                    "matched_shares": round(matched_shares, 6),
-                    "matched_buy_cost": round(cost_basis, 6),
-                    "sell_proceeds": round(proceeds, 6),
-                    "realized_pnl": round(realized, 6),
-                    "return_pct": round(realized / cost_basis * 100.0, 2) if cost_basis > 0 else None,
-                    "decision_context": snapshot.get("decision_context"),
-                }
-                matched_trades.append(trade)
             lot["shares"] = max(0.0, lot_shares - matched_shares)
             lot["cost"] = max(0.0, lot_cost - cost_basis)
             remaining -= matched_shares
@@ -2072,9 +2341,40 @@ def get_monthly_trade_review_summary(
     for lots in lots_by_token.values():
         for lot in lots:
             if lot.get("buy_timestamp") and lot["buy_timestamp"] < month_end_utc and float(lot.get("shares") or 0.0) > 1e-9:
+                token_id = str(lot.get("token_id") or "")
+                resolution = resolution_by_token.get(token_id)
+                if resolution:
+                    settled_at = _parse_dt(resolution.get("settled_at")) or datetime.now(timezone.utc)
+                    if month_start_utc <= settled_at < month_end_utc:
+                        remaining_shares = float(lot.get("shares") or 0.0)
+                        remaining_cost = float(lot.get("cost") or 0.0)
+                        payout = float(resolution.get("payout") or 0.0)
+                        proceeds = remaining_shares * payout
+                        realized = proceeds - remaining_cost
+                        resolved_lot = dict(lot)
+                        resolved_lot["question"] = resolved_lot.get("question") or resolution.get("question")
+                        resolved_lot["outcome"] = resolved_lot.get("outcome") or resolution.get("outcome")
+                        record_closed_lot(
+                            lot=resolved_lot,
+                            token_id=token_id,
+                            matched_shares=remaining_shares,
+                            cost_basis=remaining_cost,
+                            proceeds=proceeds,
+                            realized=realized,
+                            exit_timestamp=settled_at,
+                            exit_price=payout,
+                            exit_type="settlement",
+                            resolution_status=str(resolution.get("resolution_status") or ""),
+                        )
+                        settled_trade_count += 1
+                        if payout >= 0.999:
+                            settled_won_count += 1
+                        else:
+                            settled_lost_count += 1
+                        continue
                 snapshot = lot.get("tier_snapshot") or {}
                 open_lots.append({
-                    "token_id": lot.get("token_id"),
+                    "token_id": token_id,
                     "question": lot.get("question"),
                     "outcome": lot.get("outcome"),
                     "tier_key": lot.get("entry_tier_key") or snapshot.get("tier_key"),
@@ -2120,11 +2420,19 @@ def get_monthly_trade_review_summary(
         "buy_snapshot_coverage_pct": round(buy_lots_with_snapshot / buy_lot_count * 100.0, 2) if buy_lot_count else None,
         "ai_context_coverage_pct": round(buy_lots_with_ai_context / buy_lot_count * 100.0, 2) if buy_lot_count else None,
         "matched_trade_count": len(matched_trades),
+        "settled_trade_count": settled_trade_count,
+        "settled_lost_count": settled_lost_count,
+        "settled_won_count": settled_won_count,
         "open_lot_count": len(open_lots),
         "untracked_sell_usdc": round(untracked_sell_usdc, 6),
         "untracked_sell_shares": round(untracked_sell_shares, 6),
     }
     conclusions = _build_review_conclusions(combo_groups, coverage)
+    closed_trades = sorted(
+        matched_trades,
+        key=lambda item: str(item.get("sell_timestamp") or ""),
+        reverse=True,
+    )
     matched_trades.sort(key=lambda item: abs(float(item.get("realized_pnl") or 0.0)), reverse=True)
     return {
         "source": "advisory_chain_fills_decision_snapshot_fifo",
@@ -2146,6 +2454,7 @@ def get_monthly_trade_review_summary(
         "best_combinations": best_combinations,
         "worst_combinations": worst_combinations,
         "conclusions": conclusions,
+        "closed_trades": closed_trades[:200],
         "sample_trades": matched_trades[:20],
         "open_lots": sorted(open_lots, key=lambda item: float(item.get("remaining_cost") or 0.0), reverse=True)[:200],
     }
@@ -2181,6 +2490,7 @@ def build_monthly_goal_context(
     btc_momentum_context: dict[str, Any] | None = None,
     trade_review_summary: dict[str, Any] | None = None,
     active_manual_pending_orders: dict[str, Any] | None = None,
+    monthly_progress: dict[str, Any] | None = None,
     profile: str = "analyze",
 ) -> dict[str, Any]:
     """构建供 AI 使用的本月目标分层上下文。"""
@@ -2199,10 +2509,15 @@ def build_monthly_goal_context(
     phase_key, phase_label = _classify_time_phase(days_left_in_month)
     thresholds = _current_phase_thresholds(phase_key)
     pending_buys_by_token = _active_pending_buys_by_token(active_manual_pending_orders)
+    markets = polymarket_event_situation.get("markets", []) if isinstance(polymarket_event_situation, dict) else []
     open_lot_intents = _open_lot_intents_by_token(trade_review_summary)
     held_by_token_tier = _held_allocations_by_token_tier(
         positions=positions,
         open_lot_intents=open_lot_intents,
+    )
+    unrealized_summary = _portfolio_unrealized_loss_summary(
+        positions=positions,
+        monthly_token_ids=_monthly_event_token_ids(markets),
     )
     pending_buys_by_token_tier = _pending_buy_intents_by_token_tier(active_manual_pending_orders)
     pending_tokens_seen: set[str] = set()
@@ -2210,7 +2525,6 @@ def build_monthly_goal_context(
     normalized_realized_overrides = _normalize_realized_overrides(realized_overrides or {})
 
     candidates_by_tier: dict[str, list[dict]] = {tier["key"]: [] for tier in MONTHLY_GOAL_TIERS}
-    markets = polymarket_event_situation.get("markets", []) if isinstance(polymarket_event_situation, dict) else []
     market_entries_by_token = _market_entries_by_token(
         markets=markets,
         current_btc_price=current_btc_price,
@@ -2259,7 +2573,13 @@ def build_monthly_goal_context(
             token_id = str(token_ids[outcome_index]) if outcome_index < len(token_ids) else ""
             held = (held_by_token_tier.get(token_id) or {}).get(tier_key) if token_id else None
             if held is None:
-                held = {"held_shares": 0.0, "held_value_usdc": 0.0}
+                held = {
+                    "held_shares": 0.0,
+                    "held_value_usdc": 0.0,
+                    "remaining_cost_usdc": 0.0,
+                    "held_unrealized_pnl_usdc": 0.0,
+                    "held_unrealized_loss_usdc": 0.0,
+                }
             pending_row = (pending_buys_by_token_tier.get(token_id) or {}).get(tier_key) if token_id else None
             pending_buy_notional = float((pending_row or {}).get("pending_buy_notional_usdc") or 0.0)
             if pending_buy_notional > 0 and token_id:
@@ -2276,6 +2596,9 @@ def build_monthly_goal_context(
                 "distance_pct": round(distance_pct, 2),
                 "held_shares": round(float(held.get("held_shares") or 0.0), 6),
                 "held_value_usdc": round(float(held.get("held_value_usdc") or 0.0), 2),
+                "held_cost_usdc": round(float(held.get("remaining_cost_usdc") or 0.0), 2),
+                "held_unrealized_pnl_usdc": round(float(held.get("held_unrealized_pnl_usdc") or 0.0), 2),
+                "held_unrealized_loss_usdc": round(float(held.get("held_unrealized_loss_usdc") or 0.0), 2),
                 "held_intent_tier_key": tier_key if float(held.get("held_value_usdc") or 0.0) > 0 else None,
                 "current_tier_key": tier_key,
                 "band_status": "in_band" if float(held.get("held_value_usdc") or 0.0) > 0 else None,
@@ -2305,6 +2628,9 @@ def build_monthly_goal_context(
             pending_buy_notional = float(pending_row.get("pending_buy_notional_usdc") or 0.0)
             held_value = float(held.get("held_value_usdc") or 0.0)
             held_shares = float(held.get("held_shares") or 0.0)
+            held_cost = float(held.get("remaining_cost_usdc") or 0.0)
+            held_unrealized_pnl = float(held.get("held_unrealized_pnl_usdc") or 0.0)
+            held_unrealized_loss = float(held.get("held_unrealized_loss_usdc") or 0.0)
             if held_value <= 0 and pending_buy_notional <= 0:
                 continue
             if pending_buy_notional > 0:
@@ -2329,6 +2655,9 @@ def build_monthly_goal_context(
                 "distance_pct": entry.get("distance_pct"),
                 "held_shares": round(held_shares, 6),
                 "held_value_usdc": round(held_value, 2),
+                "held_cost_usdc": round(held_cost, 2),
+                "held_unrealized_pnl_usdc": round(held_unrealized_pnl, 2),
+                "held_unrealized_loss_usdc": round(held_unrealized_loss, 2),
                 "held_intent_tier_key": tier_key if held_value > 0 else None,
                 "current_tier_key": current_tier_key,
                 "current_tier_label": ACTIONABLE_TIER_LABELS.get(current_tier_key),
@@ -2342,6 +2671,18 @@ def build_monthly_goal_context(
             candidates_by_tier[tier_key].append(candidate)
     for values in candidates_by_tier.values():
         values.sort(key=lambda item: (0 if item.get("allocation_candidate") is False else 1, item.get("strike") or 0.0), reverse=True)
+
+    tier_unrealized_by_tier: dict[str, dict[str, float]] = {
+        tier["key"]: {"cost": 0.0, "pnl": 0.0, "loss": 0.0}
+        for tier in MONTHLY_GOAL_TIERS
+    }
+    for tiers in held_by_token_tier.values():
+        for tier_key, row in tiers.items():
+            if tier_key not in tier_unrealized_by_tier:
+                continue
+            tier_unrealized_by_tier[tier_key]["cost"] += float(row.get("remaining_cost_usdc") or 0.0)
+            tier_unrealized_by_tier[tier_key]["pnl"] += float(row.get("held_unrealized_pnl_usdc") or 0.0)
+            tier_unrealized_by_tier[tier_key]["loss"] += float(row.get("held_unrealized_loss_usdc") or 0.0)
 
     realized_by_tier = realized_summary.get("by_tier") or {}
     tier_contexts: list[dict[str, Any]] = []
@@ -2378,8 +2719,13 @@ def build_monthly_goal_context(
     total_realized_loss = float(realized_summary.get("total_realized_loss") or 0.0)
     classified_realized_loss = float(realized_summary.get("classified_realized_loss") or 0.0)
     unclassified_realized_loss = float(realized_summary.get("unclassified_realized_loss") or 0.0)
+    total_unrealized_pnl = float(unrealized_summary.get("total_unrealized_pnl_usdc") or 0.0)
+    total_unrealized_loss = float(unrealized_summary.get("total_gross_unrealized_loss_usdc") or 0.0)
+    classified_unrealized_loss = sum(float(item.get("loss") or 0.0) for item in tier_unrealized_by_tier.values())
+    unclassified_unrealized_loss = max(0.0, total_unrealized_loss - classified_unrealized_loss)
+    total_loss_budget_used = total_realized_loss + total_unrealized_loss
     overall_loss_budget_usdc = base * MONTHLY_GOAL_OVERALL_LOSS_BUDGET_PCT / 100.0 if base > 0 else 0.0
-    overall_loss_status, overall_loss_usage_pct = _loss_budget_status(total_realized_loss, overall_loss_budget_usdc)
+    overall_loss_status, overall_loss_usage_pct = _loss_budget_status(total_loss_budget_used, overall_loss_budget_usdc)
     for tier in MONTHLY_GOAL_TIERS:
         tier_key = tier["key"]
         allocation = allocations_by_tier.get(tier_key) or {}
@@ -2404,10 +2750,15 @@ def build_monthly_goal_context(
         realized_row = realized_by_tier.get(tier_key) if isinstance(realized_by_tier, dict) else None
         auto_realized = float((realized_row or {}).get("realized_pnl") or 0.0)
         auto_realized_loss = float((realized_row or {}).get("gross_realized_loss") or max(0.0, -auto_realized))
+        tier_unrealized = tier_unrealized_by_tier.get(tier_key) or {}
+        tier_held_cost = float(tier_unrealized.get("cost") or 0.0)
+        tier_unrealized_pnl = float(tier_unrealized.get("pnl") or 0.0)
+        tier_unrealized_loss = float(tier_unrealized.get("loss") or 0.0)
+        loss_budget_used = auto_realized_loss + tier_unrealized_loss
         loss_budget_pct = float(MONTHLY_GOAL_TIER_LOSS_BUDGET_PCT_BY_TIER.get(tier_key, 0.0))
         loss_budget_usdc = base * loss_budget_pct / 100.0 if base > 0 else 0.0
-        loss_budget_remaining_usdc = max(0.0, loss_budget_usdc - auto_realized_loss)
-        loss_budget_status, loss_budget_usage_pct = _loss_budget_status(auto_realized_loss, loss_budget_usdc)
+        loss_budget_remaining_usdc = max(0.0, loss_budget_usdc - loss_budget_used)
+        loss_budget_status, loss_budget_usage_pct = _loss_budget_status(loss_budget_used, loss_budget_usdc)
         if overall_loss_status == "stop_new_entries" or loss_budget_status == "stop_new_entries":
             risk_entry_gate = "block"
         elif overall_loss_status == "caution" or loss_budget_status == "caution":
@@ -2528,6 +2879,9 @@ def build_monthly_goal_context(
             "effective_position_cap_usdc": round(effective_position_cap, 2) if effective_position_cap is not None else None,
             "risk_adjusted_position_cap_usdc": round(risk_adjusted_position_cap, 2) if risk_adjusted_position_cap is not None else None,
             "current_held_value_usdc": round(held_value, 2),
+            "current_held_cost_usdc": round(tier_held_cost, 2),
+            "current_unrealized_pnl_usdc": round(tier_unrealized_pnl, 2),
+            "gross_unrealized_loss_usdc": round(tier_unrealized_loss, 2),
             "current_held_shares": round(held_shares, 6),
             "current_pending_buy_notional_usdc": round(pending_buy_notional, 2),
             "current_committed_value_usdc": round(committed_value, 2),
@@ -2543,6 +2897,7 @@ def build_monthly_goal_context(
             "loss_budget_pct": round(loss_budget_pct, 4),
             "loss_budget_usdc": round(loss_budget_usdc, 2),
             "gross_realized_loss_usdc": round(auto_realized_loss, 2),
+            "loss_budget_used_usdc": round(loss_budget_used, 2),
             "loss_budget_remaining_usdc": round(loss_budget_remaining_usdc, 2),
             "loss_budget_usage_pct": round(loss_budget_usage_pct, 2) if loss_budget_usage_pct is not None else None,
             "loss_budget_status": loss_budget_status,
@@ -2564,8 +2919,57 @@ def build_monthly_goal_context(
         max(0.0, (total_target_profit or 0.0) - effective_total_realized)
         if total_target_profit is not None else None
     )
+    monthly_progress = monthly_progress or {}
+    baseline_net_value = _to_float(monthly_progress.get("baseline_net_value"), None)
+    current_net_value = _to_float(monthly_progress.get("current_net_value"), None)
+    if baseline_net_value is None and base > 0:
+        baseline_net_value = base
+    recovery_gap = (
+        max(0.0, float(baseline_net_value) - float(current_net_value))
+        if baseline_net_value is not None and current_net_value is not None else None
+    )
+    recovery_mode = overall_loss_status == "stop_new_entries"
+    primary_objective = (
+        "recover_to_month_start_net_value"
+        if recovery_mode and (recovery_gap or 0.0) > 0
+        else ("protect_month_start_net_value" if recovery_mode else "pursue_monthly_target_under_risk_budget")
+    )
+    recovery_total_cap = None
+    recovery_single_cap = None
+    if recovery_mode and base > 0:
+        gap_for_cap = recovery_gap if recovery_gap is not None and recovery_gap > 0 else base * 0.03
+        recovery_total_cap = min(base * 0.05, gap_for_cap * 0.35)
+        recovery_single_cap = min(base * 0.015, recovery_total_cap / 2.0)
     return {
         "source": "backend_monthly_goal_context",
+        "active_goal_mode": "recovery_to_month_start" if recovery_mode else "monthly_target",
+        "primary_objective": primary_objective,
+        "recovery_target_net_value_usdc": round(float(baseline_net_value), 2) if baseline_net_value is not None else None,
+        "current_net_value_usdc": round(float(current_net_value), 2) if current_net_value is not None else None,
+        "recovery_gap_to_month_start_usdc": round(recovery_gap, 2) if recovery_gap is not None else None,
+        "recovery_trade_policy": {
+            "allowed": bool(recovery_mode),
+            "mode": "controlled_recovery" if recovery_mode else "normal",
+            "total_new_risk_cap_usdc": round(recovery_total_cap, 2) if recovery_total_cap is not None else None,
+            "single_trade_cap_usdc": round(recovery_single_cap, 2) if recovery_single_cap is not None else None,
+            "requires_confirmation": True,
+            "allowed_trade_types": [
+                "risk-reducing rotation",
+                "small confirmed swing with explicit stop",
+                "safe theta recovery after at-risk exposure is reduced",
+            ],
+            "forbidden_trade_types": [
+                "near-barrier dip No",
+                "full-size catch-up trade",
+                "averaging down at-risk positions",
+                "uncatalyzed low-price lottery Yes",
+            ],
+            "note": "防错预算用完不是永久空仓；允许用小仓、强确认、可止损的恢复型交易追回月初净值，但不能扩大左尾风险。",
+        },
+        "recovery_mode_note": (
+            "防错预算用完后，主目标切换为先回到月初净值；+20% 月度目标降级为次要参考；允许小仓、强确认、可止损的恢复型交易。"
+            if recovery_mode else "防错预算未用完，仍按月度目标在风控内寻找机会。"
+        ),
         "target_pct": pct,
         "target_pct_source": target_pct_source,
         "plan_expected_return_pct": round(plan_expected_return_pct, 4),
@@ -2579,7 +2983,7 @@ def build_monthly_goal_context(
         "dashboard_target_pct_included": target_pct_source != "backend_default",
         "manual_ui_realized_overrides_included": bool(normalized_realized_overrides),
         "realized_overrides": normalized_realized_overrides,
-        "manual_ui_override_note": "Dashboard 保存的目标百分比、目标仓位占比和手动 realized 覆盖会进入 AI；未覆盖的 realized 档位继续使用自动 FIFO realized。防错预算始终使用自动 FIFO 统计的 gross realized loss，手动 realized 覆盖不能重置预算消耗。",
+        "manual_ui_override_note": "Dashboard 保存的目标百分比、目标仓位占比和手动 realized 覆盖会进入 AI；未覆盖的 realized 档位继续使用自动 FIFO realized。防错预算使用自动 FIFO gross realized loss + 当前月度持仓 gross unrealized loss，手动 realized 覆盖不能重置预算消耗。",
         "target_base_value_usdc": round(base, 2),
         "target_base_value_source": "monthly_progress.baseline_net_value_or_current_net_value",
         "requested_target_profit_usdc": round(base * pct / 100.0, 2) if base > 0 and pct > 0 else None,
@@ -2603,11 +3007,23 @@ def build_monthly_goal_context(
         "total_gross_realized_loss_usdc": round(total_realized_loss, 2),
         "classified_gross_realized_loss_usdc": round(classified_realized_loss, 2),
         "unclassified_gross_realized_loss_usdc": round(unclassified_realized_loss, 2),
+        "total_unrealized_pnl_usdc": round(total_unrealized_pnl, 2),
+        "total_gross_unrealized_loss_usdc": round(total_unrealized_loss, 2),
+        "classified_gross_unrealized_loss_usdc": round(classified_unrealized_loss, 2),
+        "unclassified_gross_unrealized_loss_usdc": round(unclassified_unrealized_loss, 2),
+        "total_loss_budget_used_usdc": round(total_loss_budget_used, 2),
         "overall_loss_budget_pct": MONTHLY_GOAL_OVERALL_LOSS_BUDGET_PCT,
         "overall_loss_budget_usdc": round(overall_loss_budget_usdc, 2),
-        "overall_loss_budget_remaining_usdc": round(max(0.0, overall_loss_budget_usdc - total_realized_loss), 2),
+        "overall_loss_budget_remaining_usdc": round(max(0.0, overall_loss_budget_usdc - total_loss_budget_used), 2),
         "overall_loss_budget_usage_pct": round(overall_loss_usage_pct, 2) if overall_loss_usage_pct is not None else None,
         "overall_loss_budget_status": overall_loss_status,
+        "unrealized_loss_scope": "current monthly event positions; total budget includes all current event tokens, tier budget includes actionable intent tiers only",
+        "unrealized_loss_coverage": {
+            "token_scope_available": unrealized_summary.get("token_scope_available"),
+            "position_count": unrealized_summary.get("position_count"),
+            "missing_cost_position_count": unrealized_summary.get("missing_cost_position_count"),
+            "missing_cost_value_usdc": round(float(unrealized_summary.get("missing_cost_value_usdc") or 0.0), 2),
+        },
         "untracked_sell_usdc": round(float(realized_summary.get("untracked_sell_usdc") or 0.0), 2),
         "total_remaining_profit_usdc": round(total_remaining, 2) if total_remaining is not None else None,
         "sum_tier_remaining_profit_usdc": round(total_tier_remaining, 2),
@@ -2622,8 +3038,11 @@ def build_monthly_goal_context(
         "trade_review_context": trade_review_context,
         "discipline_notes": [
             "remaining_profit_usdc 只用于排序和选择机会，不能作为放宽止损、追价或突破仓位上限的理由。",
+            "active_goal_mode=recovery_to_month_start 时，+20% 目标降级为参考，主目标是先追回/守住月初净值。",
+            "recovery_trade_policy.allowed=true 时，不应完全空仓等待；必须主动筛选小仓、强确认、可止损的恢复型交易，但不得扩大 near-barrier 左尾风险。",
             "target_position_gap_usdc/headroom_to_position_limit_usdc 是仓位上限余量，不是必须补满的任务。",
             "新增建议必须优先使用 headroom_to_risk_adjusted_cap_usdc；若手动目标超过阶段建议，不得按手动上限补仓。",
+            "防错预算同时计入已实现 gross 亏损和当前浮亏；浮亏会随盘口变化，预算归零时先降风险再谈目标缺口。",
             "active manual pending buy 已计入 current_committed_value_usdc 并扣减新增余量；unattributed pending 需要人工复核。",
             "entry_gate 为 block 时，不应新增该档买入；entry_gate 为 caution 时，只能小仓位且必须有更强确认。",
             "中价No需要同时满足价格区间、barrier distance、BTC未朝barrier快速移动；快速逼近后需要冷却确认。",

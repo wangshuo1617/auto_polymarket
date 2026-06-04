@@ -34,6 +34,7 @@ def build_daily_volatility_profile(btc_1d_k_data: list, atr_period: int = 14) ->
             "market_regime": "unknown",
             "atr": None,
             "atr_pct": None,
+            "previous_tr_pct": None,
             "tr_percentile_30d": None,
             "adaptive_exit_template": None,
             "note": "1d K线样本不足，无法计算ATR与波动分位",
@@ -53,6 +54,7 @@ def build_daily_volatility_profile(btc_1d_k_data: list, atr_period: int = 14) ->
             "market_regime": "unknown",
             "atr": None,
             "atr_pct": None,
+            "previous_tr_pct": None,
             "tr_percentile_30d": None,
             "adaptive_exit_template": None,
             "note": "1d K线样本不足，无法计算ATR与波动分位",
@@ -79,6 +81,7 @@ def build_daily_volatility_profile(btc_1d_k_data: list, atr_period: int = 14) ->
     atr_pct = (atr / last_close) * 100.0 if last_close > 0 else 0.0
 
     latest_tr_pct = tr_pct_values[-1]
+    previous_tr_pct = tr_pct_values[-2] if len(tr_pct_values) >= 2 else None
     tr_percentile_30d = _percentile_rank(tr_pct_values, latest_tr_pct)
 
     lookback = min(8, len(closes))
@@ -122,6 +125,7 @@ def build_daily_volatility_profile(btc_1d_k_data: list, atr_period: int = 14) ->
         "atr": round(atr, 2),
         "atr_pct": round(atr_pct, 2),
         "latest_tr_pct": round(latest_tr_pct, 2),
+        "previous_tr_pct": round(previous_tr_pct, 2) if previous_tr_pct is not None else None,
         "tr_percentile_30d": tr_percentile_30d,
         "realized_vol_daily_pct": round(realized_vol_daily_pct, 2),
         "adaptive_exit_template": adaptive_exit_template,

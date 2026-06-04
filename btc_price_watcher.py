@@ -12,6 +12,8 @@ import logging
 import logging.handlers
 import os
 import signal
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -45,6 +47,11 @@ class WatchConfig:
     urgent_interval: int
     startup_send: bool
     dry_run: bool
+    enable_analyze_trigger: bool
+    analyze_trigger_levels: set[str]
+    analyze_min_interval: int
+    analyze_daily_cap: int
+    analyze_respect_quiet: bool
 
 
 def _env_int(name: str, default: int) -> int:
@@ -99,6 +106,12 @@ def _parse_hhmm(text: str, default: tuple[int, int]) -> tuple[int, int]:
 def load_config(args: argparse.Namespace) -> WatchConfig:
     qs = _parse_hhmm(os.getenv("BTC_WATCHER_QUIET_START", "22:00"), (22, 0))
     qe = _parse_hhmm(os.getenv("BTC_WATCHER_QUIET_END", "06:00"), (6, 0))
+    trigger_levels = {
+        item.strip().lower()
+        for item in str(os.getenv("BTC_WATCHER_ANALYZE_TRIGGER_LEVELS", "alert,urgent")).split(",")
+        if item.strip()
+    }
+    trigger_levels = trigger_levels & {"watch", "alert", "urgent"}
     return WatchConfig(
         poll_seconds=max(15, int(args.poll_seconds or _env_int("BTC_WATCHER_POLL_SECONDS", 60))),
         quiet_start_hour=qs[0],
@@ -111,6 +124,11 @@ def load_config(args: argparse.Namespace) -> WatchConfig:
         urgent_interval=max(300, _env_int("BTC_WATCHER_URGENT_INTERVAL", 300)),
         startup_send=not args.no_startup_send and _env_bool("BTC_WATCHER_STARTUP_SEND", True),
         dry_run=bool(args.dry_run),
+        enable_analyze_trigger=_env_bool("BTC_WATCHER_ENABLE_ANALYZE_TRIGGER", False),
+        analyze_trigger_levels=trigger_levels or {"alert", "urgent"},
+        analyze_min_interval=max(900, _env_int("BTC_WATCHER_ANALYZE_MIN_INTERVAL", 1800)),
+        analyze_daily_cap=max(0, _env_int("BTC_WATCHER_ANALYZE_DAILY_CAP", 8)),
+        analyze_respect_quiet=_env_bool("BTC_WATCHER_ANALYZE_RESPECT_QUIET", True),
     )
 
 
@@ -309,6 +327,33 @@ def _risk_level(
     return level, reasons
 
 
+def _fast_move_level(moves: dict[str, Optional[float]]) -> tuple[Optional[str], list[str]]:
+    """只根据 BTC 快速变动判断是否需要额外 AI 分析，避免单纯 barrier 逼近反复触发。"""
+    reasons: list[str] = []
+    m5 = abs(moves.get("move_5m_pct") or 0.0)
+    m15 = abs(moves.get("move_15m_pct") or 0.0)
+    m60 = abs(moves.get("move_60m_pct") or 0.0)
+    if m5 >= 0.35:
+        reasons.append(f"5m 变动 {moves['move_5m_pct']:+.2f}%")
+        return "urgent", reasons
+    if m15 >= 0.90:
+        reasons.append(f"15m 变动 {moves['move_15m_pct']:+.2f}%")
+        return "urgent", reasons
+    if m15 >= 0.60 or m60 >= 1.20:
+        if m15 >= 0.60:
+            reasons.append(f"15m 变动 {moves['move_15m_pct']:+.2f}%")
+        if m60 >= 1.20:
+            reasons.append(f"60m 变动 {moves['move_60m_pct']:+.2f}%")
+        return "alert", reasons
+    if m15 >= 0.35 or m60 >= 0.80:
+        if m15 >= 0.35:
+            reasons.append(f"15m 变动 {moves['move_15m_pct']:+.2f}%")
+        if m60 >= 0.80:
+            reasons.append(f"60m 变动 {moves['move_60m_pct']:+.2f}%")
+        return "watch", reasons
+    return None, reasons
+
+
 def _interval_for_level(level: str, cfg: WatchConfig) -> int:
     return {
         "urgent": cfg.urgent_interval,
@@ -378,6 +423,131 @@ def _build_email(
     return subject, "\n".join(body_lines)
 
 
+def _analyze_trigger_count(state: dict[str, Any], now: datetime) -> int:
+    day_key = now.strftime("%Y-%m-%d")
+    if state.get("last_analyze_trigger_day") != day_key:
+        state["last_analyze_trigger_day"] = day_key
+        state["analyze_trigger_count"] = 0
+    return int(state.get("analyze_trigger_count") or 0)
+
+
+def _build_analyze_trigger_reason(
+    *,
+    price: float,
+    moves: dict[str, Optional[float]],
+    barrier: dict[str, Any],
+    level: str,
+    reasons: list[str],
+) -> str:
+    parts = [
+        f"BTC watcher fast-move trigger: level={level}",
+        f"price=${price:,.2f}",
+        f"5m={_fmt_move(moves.get('move_5m_pct'))}",
+        f"15m={_fmt_move(moves.get('move_15m_pct'))}",
+        f"60m={_fmt_move(moves.get('move_60m_pct'))}",
+        "reasons=" + "；".join(reasons),
+    ]
+    if barrier:
+        parts.append(
+            "nearest_barrier="
+            f"{barrier.get('question')} distance={float(barrier.get('distance_pct') or 0.0):.2f}% "
+            f"position={barrier.get('position_outcome') or 'none'}"
+        )
+    return " | ".join(parts)
+
+
+def _should_trigger_position_analyze(
+    *,
+    cfg: WatchConfig,
+    state: dict[str, Any],
+    now: datetime,
+    now_ts: float,
+    quiet: bool,
+    startup: bool,
+    moves: dict[str, Optional[float]],
+) -> tuple[bool, Optional[str], list[str]]:
+    skip_reasons: list[str] = []
+    if not cfg.enable_analyze_trigger:
+        return False, None, ["disabled"]
+    if cfg.dry_run:
+        return False, None, ["dry_run"]
+    if startup:
+        return False, None, ["startup"]
+    if quiet and cfg.analyze_respect_quiet:
+        return False, None, ["quiet_time"]
+
+    move_level, move_reasons = _fast_move_level(moves)
+    if not move_level:
+        return False, None, ["no_fast_move"]
+    if move_level not in cfg.analyze_trigger_levels:
+        return False, move_level, [f"level_{move_level}_not_enabled"]
+
+    last_ts = float(state.get("last_analyze_trigger_ts") or 0.0)
+    elapsed = now_ts - last_ts if last_ts > 0 else None
+    if elapsed is not None and elapsed < cfg.analyze_min_interval:
+        skip_reasons.append(f"min_interval {elapsed:.0f}s/{cfg.analyze_min_interval}s")
+
+    count = _analyze_trigger_count(state, now)
+    if cfg.analyze_daily_cap > 0 and count >= cfg.analyze_daily_cap:
+        skip_reasons.append(f"daily_cap {count}/{cfg.analyze_daily_cap}")
+
+    return not skip_reasons, move_level, (move_reasons if not skip_reasons else skip_reasons)
+
+
+def _trigger_position_analyze(
+    *,
+    state: dict[str, Any],
+    now: datetime,
+    now_ts: float,
+    price: float,
+    moves: dict[str, Optional[float]],
+    barrier: dict[str, Any],
+    level: str,
+    reasons: list[str],
+) -> bool:
+    project_root = Path(__file__).resolve().parent
+    log_path = project_root / "logs" / "position_analyze_trigger.log"
+    log_path.parent.mkdir(exist_ok=True)
+    trigger_reason = _build_analyze_trigger_reason(
+        price=price,
+        moves=moves,
+        barrier=barrier,
+        level=level,
+        reasons=reasons,
+    )
+    operator_intent = (
+        "BTC 价格出现快速异动，触发额外持仓分析。请优先检查当前持仓安全、已触发止损、"
+        "防错预算/追回月初净值模式、危险 pending，以及是否需要减仓或取消订单；不要为了追目标新增高风险仓位。"
+    )
+    env = {
+        **os.environ,
+        "ANALYZE_TRIGGER_TYPE": "btc_watcher_fast_move",
+        "ANALYZE_TRIGGER_REASON": trigger_reason,
+        "OPERATOR_INTENT": operator_intent,
+    }
+    try:
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            log_file.write(f"\n===== {now.isoformat()} trigger position_analyze =====\n{trigger_reason}\n")
+            proc = subprocess.Popen(
+                [sys.executable, "position_analyze.py"],
+                cwd=str(project_root),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+    except Exception as exc:
+        logger.exception("触发 position_analyze 失败: %s", exc)
+        return False
+
+    state["last_analyze_trigger_ts"] = now_ts
+    state["last_analyze_trigger_reason"] = trigger_reason
+    state["last_analyze_trigger_pid"] = proc.pid
+    state["analyze_trigger_count"] = _analyze_trigger_count(state, now) + 1
+    logger.info("已后台触发 position_analyze: pid=%s reason=%s", proc.pid, trigger_reason)
+    return True
+
+
 def _should_send(
     *,
     now_ts: float,
@@ -414,6 +584,15 @@ def run_once(cfg: WatchConfig, state: dict[str, Any], *, startup: bool = False) 
         and not quiet
         and _should_send(now_ts=now_ts, state=state, level=level, interval_sec=interval_sec, startup=startup)
     )
+    should_analyze, analyze_level, analyze_reasons = _should_trigger_position_analyze(
+        cfg=cfg,
+        state=state,
+        now=now,
+        now_ts=now_ts,
+        quiet=quiet,
+        startup=startup,
+        moves=moves,
+    )
     subject, body = _build_email(
         price=price,
         moves=moves,
@@ -424,9 +603,21 @@ def run_once(cfg: WatchConfig, state: dict[str, Any], *, startup: bool = False) 
         quiet=quiet,
     )
     logger.info(
-        "BTC watcher: price=%.2f level=%s interval=%ss quiet=%s send=%s reasons=%s",
-        price, level, interval_sec, quiet, should_send, ";".join(reasons)
+        "BTC watcher: price=%.2f level=%s interval=%ss quiet=%s send=%s analyze=%s analyze_level=%s reasons=%s analyze_reasons=%s",
+        price, level, interval_sec, quiet, should_send, should_analyze, analyze_level, ";".join(reasons), ";".join(analyze_reasons)
     )
+    analyze_triggered = False
+    if should_analyze and analyze_level:
+        analyze_triggered = _trigger_position_analyze(
+            state=state,
+            now=now,
+            now_ts=now_ts,
+            price=price,
+            moves=moves,
+            barrier=barrier,
+            level=analyze_level,
+            reasons=analyze_reasons,
+        )
     if should_send:
         if cfg.dry_run:
             logger.info("DRY-RUN 邮件: %s\n%s", subject, body)
@@ -440,6 +631,7 @@ def run_once(cfg: WatchConfig, state: dict[str, Any], *, startup: bool = False) 
     state["last_price"] = price
     state["last_checked_ts"] = now_ts
     state["last_quiet"] = quiet
+    state["last_analyze_skip_reasons"] = analyze_reasons
     _save_state(state)
     return {
         "price": price,
@@ -449,6 +641,7 @@ def run_once(cfg: WatchConfig, state: dict[str, Any], *, startup: bool = False) 
         "interval_sec": interval_sec,
         "quiet": quiet,
         "sent": should_send,
+        "analyze_triggered": analyze_triggered,
         "subject": subject,
     }
 
@@ -474,7 +667,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
     logger.info(
-        "BTC watcher 启动: enabled=%s dry_run=%s poll=%ss quiet=%02d:%02d-%02d:%02d(BJ)",
+        "BTC watcher 启动: enabled=%s dry_run=%s poll=%ss quiet=%02d:%02d-%02d:%02d(BJ) analyze_trigger=%s levels=%s min_interval=%ss daily_cap=%s",
         _env_bool("BTC_WATCHER_ENABLE_EMAIL", ENABLE_BTC_HOURLY_EMAIL),
         cfg.dry_run,
         cfg.poll_seconds,
@@ -482,6 +675,10 @@ def main() -> int:
         cfg.quiet_start_minute,
         cfg.quiet_end_hour,
         cfg.quiet_end_minute,
+        cfg.enable_analyze_trigger,
+        ",".join(sorted(cfg.analyze_trigger_levels)),
+        cfg.analyze_min_interval,
+        cfg.analyze_daily_cap,
     )
 
     first = True

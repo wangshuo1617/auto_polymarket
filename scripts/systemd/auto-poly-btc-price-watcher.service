@@ -14,6 +14,8 @@ Environment=BTC_WATCHER_ENABLE_EMAIL=1
 Environment=BTC_WATCHER_POLL_SECONDS=60
 Environment=BTC_WATCHER_QUIET_START=22:00
 Environment=BTC_WATCHER_QUIET_END=06:00
+# 只保留 BTC 价格邮件监控；position_analyze 交回固定频率任务/手动触发。
+Environment=BTC_WATCHER_ENABLE_ANALYZE_TRIGGER=0
 ExecStart=/bin/bash -c 'exec /snap/astral-uv/current/bin/uv run btc_price_watcher.py'
 Restart=on-failure
 RestartSec=60

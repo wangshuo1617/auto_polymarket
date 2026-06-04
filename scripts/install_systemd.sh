@@ -11,6 +11,7 @@ TARGET_DIR="/etc/systemd/system"
 SERVICES=(
   auto-poly-app
   auto-poly-usdc-monitor
+  auto-poly-btc-price-watcher
   auto-poly-advisory-batch
   auto-poly-advisory-settlement
   auto-poly-etf-volume-monitor

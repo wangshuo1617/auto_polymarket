@@ -14,7 +14,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 ET_TIMEZONE = ZoneInfo("America/New_York")
-_BASELINE_FILE = Path("data/monthly_baseline.json")
+_BASELINE_FILE = Path(__file__).resolve().parents[1] / "data" / "monthly_baseline.json"
 logger = logging.getLogger(__name__)
 
 # 肥尾修正乘数: GBM 假设正态分布，BTC 实际收益分布肥尾显著。
