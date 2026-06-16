@@ -766,7 +766,21 @@ if __name__ == "__main__":
     print(f"{time_now} AI分析完成,开始发送邮件")
 
     email_subject = f"{time_now} Polymarket持仓情况分析,当前BTC价格: {get_btc_price():,.2f}"
-    email_content = generate_html_template(analyze_result)
+    report_meta = {
+        "generated_at": datetime.now(ET_TIMEZONE).strftime("%Y-%m-%d %H:%M") + " ET",
+        "data_sources": [
+            "Polymarket CLOB：持仓 / 挂单 / 事件市场现价、USDC 余额",
+            "Binance：BTC 现价、4h / 1d K 线、合约资金费率",
+            "Deribit：BTC DVOL 隐含波动率",
+            "Fear & Greed 指数 (alternative.me)",
+            "BTC 现货 ETF 净流入 (SoSoValue)",
+            "RSI 24h 指标 (Binance K 线计算)",
+            "稳定币宏观流动性 (DeFiLlama)",
+            "历史推荐记忆与上一期分析报告",
+            "AI 模型：Gemini + Google Search 实时检索",
+        ],
+    }
+    email_content = generate_html_template(analyze_result, meta=report_meta)
     output_dir = Path(__file__).resolve().parent / "output"
     output_dir.mkdir(exist_ok=True)
     with open(output_dir / f"{time_now}_email.html", "w") as f:
