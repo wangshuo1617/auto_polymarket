@@ -188,29 +188,57 @@ def generate_market_snapshot(snapshot_text):
 
 
 def generate_report_meta_footer(meta):
-    """生成报告底部的『生成时间 + 参考数据』说明区块。
+    """生成报告底部的『生成时间 + 具体数据快照 + 参考数据来源』说明区块。
 
-    meta 形如 {"generated_at": "2026-06-16 14:30 ET", "data_sources": [str, ...]}。
-    meta 为空时返回空串, 保持向后兼容。
+    meta 形如:
+      {
+        "generated_at": "2026-06-16 14:30 ET",
+        "data_snapshot": [{"label": "BTC 现价", "value": "$66,488.73"}, ...],
+        "data_sources": [str, ...],
+      }
+    三个字段均可选; meta 为空或字段全空时返回空串, 保持向后兼容。
     """
     if not meta:
         return ""
     generated_at = str(meta.get("generated_at") or "").strip()
+    data_snapshot = meta.get("data_snapshot") or []
     data_sources = meta.get("data_sources") or []
     rows = ""
     if generated_at:
         rows += (
-            '<div style="margin-bottom:8px;">'
+            '<div style="margin-bottom:12px;">'
             '<span style="color:#64748b;">🕒 报告生成时间：</span>'
             f'<span style="color:#94a3b8;">{generated_at}</span>'
             '</div>'
         )
+    if data_snapshot:
+        trs = ""
+        for item in data_snapshot:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            value = item.get("value")
+            if value is None or str(value).strip() == "":
+                value = "N/A"
+            trs += (
+                '<tr>'
+                f'<td style="color:#64748b; padding:2px 12px 2px 0; vertical-align:top; '
+                f'white-space:nowrap;">{label}</td>'
+                f'<td style="color:#cbd5e1; padding:2px 0;">{value}</td>'
+                '</tr>'
+            )
+        if trs:
+            rows += (
+                '<div style="color:#64748b; margin-bottom:6px;">📊 生成时数据快照：</div>'
+                '<table style="border-collapse:collapse; margin:0 0 12px 0; '
+                f'font-size:12px;">{trs}</table>'
+            )
     if data_sources:
         items = "".join(
             f'<li style="margin-bottom:2px;">{src}</li>' for src in data_sources
         )
         rows += (
-            '<div style="color:#64748b; margin-bottom:6px;">📚 生成时参考数据：</div>'
+            '<div style="color:#64748b; margin-bottom:6px;">📚 数据来源：</div>'
             f'<ul style="margin:0 0 0 18px; padding:0; color:#94a3b8;">{items}</ul>'
         )
     if not rows:

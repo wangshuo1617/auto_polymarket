@@ -305,6 +305,91 @@ def _save_report(data: dict) -> None:
         pass
 
 
+def _build_report_data_snapshot(
+    *,
+    current_btc_price,
+    usdc_balance,
+    market_sentiment_and_funding: dict,
+    daily_volatility_profile: dict,
+    dvol_data: dict,
+    future_possibility_context: dict,
+) -> list[dict]:
+    """汇总生成本份报告时实际使用的具体数据值, 供报告邮件底部展示。
+
+    全部用 .get() 容错: 任一数据源缺失只影响对应条目, 不影响报告发送。
+    """
+    msf = market_sentiment_and_funding if isinstance(market_sentiment_and_funding, dict) else {}
+    ctx = msf.get("market_context") or {}
+    sent = msf.get("sentiment_data") or {}
+    liq = msf.get("liquidity_data") or {}
+    vol = daily_volatility_profile if isinstance(daily_volatility_profile, dict) else {}
+    dvol = dvol_data if isinstance(dvol_data, dict) else {}
+    fpc = future_possibility_context if isinstance(future_possibility_context, dict) else {}
+
+    snapshot: list[dict] = []
+
+    def add(label, value):
+        snapshot.append({"label": label, "value": value})
+
+    # 价格 / 资金
+    btc_price = current_btc_price if current_btc_price else ctx.get("btc_price")
+    if btc_price:
+        try:
+            add("BTC 现价", f"${float(btc_price):,.2f}")
+        except (TypeError, ValueError):
+            add("BTC 现价", str(btc_price))
+    if ctx.get("price_change") not in (None, ""):
+        add("24h 涨跌", str(ctx.get("price_change")))
+    if usdc_balance not in (None, ""):
+        add("USDC 可用余额", str(usdc_balance))
+
+    # 情绪
+    fng = sent.get("fear_greed") or {}
+    if fng.get("value") is not None:
+        fng_text = f"{fng.get('value')}"
+        if fng.get("status"):
+            fng_text += f"（{fng.get('status')}）"
+        add("恐惧贪婪指数", fng_text)
+    if sent.get("long_short_ratio") is not None:
+        add("多空比", str(sent.get("long_short_ratio")))
+    rsi_list = sent.get("rsi_24h")
+    if isinstance(rsi_list, list) and rsi_list:
+        latest_rsi = next((x for x in reversed(rsi_list) if x is not None), None)
+        if latest_rsi is not None:
+            add("RSI (最新)", f"{latest_rsi}")
+
+    # 资金面 / 流动性
+    if liq.get("funding_rate_pct") not in (None, ""):
+        add("资金费率", str(liq.get("funding_rate_pct")))
+    if liq.get("open_interest") not in (None, ""):
+        add("未平仓合约 (OI)", str(liq.get("open_interest")))
+    etf = liq.get("etf_net_inflow_2w")
+    if isinstance(etf, list) and etf:
+        last_etf = etf[-1]
+        if isinstance(last_etf, dict) and last_etf:
+            d, v = next(iter(last_etf.items()))
+            add("ETF 净流入 (最新日)", f"{d} {v}")
+    if liq.get("stablecoin_macro_liquidity") not in (None, "", "N/A"):
+        add("稳定币总市值", str(liq.get("stablecoin_macro_liquidity")))
+
+    # 波动率
+    if dvol.get("dvol_annualized") is not None:
+        add("Deribit DVOL (年化)", f"{dvol.get('dvol_annualized')}%")
+    if vol.get("atr_pct") is not None:
+        add("ATR%（日）", f"{vol.get('atr_pct')}%")
+    if vol.get("market_regime") and vol.get("market_regime") != "unknown":
+        add("市场结构", str(vol.get("market_regime")))
+
+    # 月度时间窗
+    if fpc.get("days_left_in_month") is not None:
+        try:
+            add("距月末剩余", f"{float(fpc.get('days_left_in_month')):.1f} 天")
+        except (TypeError, ValueError):
+            add("距月末剩余", str(fpc.get("days_left_in_month")))
+
+    return snapshot
+
+
 def _classify_run_status(analyze_result: dict | None, items: list) -> str:
     """第四轮加固 #5：把 run.status 区分为
         - completed         : 模型给出完整结构化输出 + 至少一条 recommendation
@@ -768,6 +853,14 @@ if __name__ == "__main__":
     email_subject = f"{time_now} Polymarket持仓情况分析,当前BTC价格: {get_btc_price():,.2f}"
     report_meta = {
         "generated_at": datetime.now(ET_TIMEZONE).strftime("%Y-%m-%d %H:%M") + " ET",
+        "data_snapshot": _build_report_data_snapshot(
+            current_btc_price=current_btc_price,
+            usdc_balance=usdc_balance,
+            market_sentiment_and_funding=market_sentiment_and_funding,
+            daily_volatility_profile=daily_volatility_profile,
+            dvol_data=dvol_data,
+            future_possibility_context=future_possibility_context,
+        ),
         "data_sources": [
             "Polymarket CLOB：持仓 / 挂单 / 事件市场现价、USDC 余额",
             "Binance：BTC 现价、4h / 1d K 线、合约资金费率",
