@@ -255,7 +255,18 @@ if __name__ == "__main__":
     print(f"{time_now} AI 分析完成，开始发送邮件")
 
     email_subject = f"{time_now} Polymarket 黄金持仓分析 当前金价: ${current_gold_price:,.2f}/oz"
-    email_content = generate_html_template(analyze_result)
+    report_meta = {
+        "generated_at": datetime.now(ET_TIMEZONE).strftime("%Y-%m-%d %H:%M") + " ET",
+        "data_sources": [
+            "Polymarket CLOB：黄金 event 持仓 / 挂单 / 现价、USDC 余额",
+            "Yahoo Finance (GC=F)：黄金现价、4h / 1d K 线",
+            "日内波动率画像 (Gold K 线计算)",
+            "收益优化上下文 (持仓 theta / 安全度)",
+            "上一期分析报告",
+            "AI 模型：Gemini + Google Search 实时检索（利率 / 央行购金 / DXY / 地缘）",
+        ],
+    }
+    email_content = generate_html_template(analyze_result, meta=report_meta)
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
     with open(out_dir / f"{time_now}_gold_email.html", "w", encoding="utf-8") as f:
