@@ -1,6 +1,6 @@
 """
 面向 Polymarket 月度价格预测事件的收益优化上下文构建。
-支持 BTC / 原油 (oil) / 黄金 (gold) 等资产。仅提供分析输入，不直接下单。
+支持 BTC / 原油 (oil) 等资产。仅提供分析输入，不直接下单。
 """
 from __future__ import annotations
 
@@ -989,7 +989,6 @@ def _get_current_price(future_possibility_context: dict, asset: str = "btc") -> 
     key_map = {
         "btc": "current_btc_price",
         "oil": "current_oil_price",
-        "gold": "current_gold_price",
     }
     key = key_map.get(asset, f"current_{asset}_price")
     price = _to_float(future_possibility_context.get(key), 0.0)

@@ -271,7 +271,6 @@ journalctl -u auto-poly-advisory-batch -f
 ```
 auto_polymarket/
 ├── position_analyze.py            # 月度账号持仓分析主入口
-├── position_analyze_gold.py       # 黄金账号持仓分析入口
 ├── recommendation_auto_executor.py # AI advisory 推荐自动执行器
 ├── app.py                         # Flask Dashboard
 ├── config.py                      # 配置入口（读取 .env）
@@ -380,7 +379,7 @@ chmod +x auto_polymarket.sh
 3. 在后台启动新的价格监控服务
 
 账号绑定说明：
-- `position_analyze.py` / `position_analyze_gold.py` 显式使用 `analyze` profile
+- `position_analyze.py` 显式使用 `analyze` profile
 
 ### 方式二：手动运行
 
